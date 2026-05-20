@@ -1,0 +1,14 @@
+{
+  "mqtt_broker": "tcp://localhost:1883",
+  "mqtt_client_id": "lexa-ocpp",
+  "port": 8887,
+  "cert_path": "/etc/lexa/certs/ocpp.crt",
+  "key_path": "/etc/lexa/certs/ocpp-key.pem",
+  "stations": [
+    {
+      "id": "cs-001",
+      "max_current_a": 32.0,
+      "voltage_v": 230.0
+    }
+  ]
+}

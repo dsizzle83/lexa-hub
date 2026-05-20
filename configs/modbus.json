@@ -1,0 +1,28 @@
+{
+  "mqtt_broker": "tcp://localhost:1883",
+  "mqtt_client_id": "lexa-modbus",
+  "poll_interval_s": 10,
+  "devices": [
+    {
+      "name": "inverter-0",
+      "url": "tcp://192.168.1.10:5020",
+      "unit_id": 1,
+      "role": "inverter",
+      "max_w": 10000
+    },
+    {
+      "name": "battery-0",
+      "url": "tcp://192.168.1.11:5021",
+      "unit_id": 1,
+      "role": "battery",
+      "max_w": 5000
+    },
+    {
+      "name": "meter-0",
+      "url": "tcp://192.168.1.12:5022",
+      "unit_id": 1,
+      "role": "meter",
+      "max_w": 0
+    }
+  ]
+}

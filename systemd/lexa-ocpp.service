@@ -1,0 +1,27 @@
+[Unit]
+Description=LEXA OCPP 2.0.1 CSMS (EV Charger Server)
+Documentation=https://github.com/lexa/lexa-hub
+After=network.target mosquitto.service
+Requires=mosquitto.service
+
+[Service]
+Type=simple
+User=lexa
+Group=lexa
+ExecStart=/usr/local/sbin/lexa-ocpp -config /etc/lexa/ocpp.json
+Restart=on-failure
+RestartSec=5s
+
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lexa-ocpp
+
+# OCPP listens on a privileged port only when port < 1024.
+# For port 8887 (default) no special capability is needed.
+# AmbientCapabilities=CAP_NET_BIND_SERVICE  # uncomment if port < 1024
+
+[Install]
+WantedBy=multi-user.target

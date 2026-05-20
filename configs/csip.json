@@ -1,0 +1,11 @@
+{
+  "mqtt_broker": "tcp://localhost:1883",
+  "mqtt_client_id": "lexa-csip",
+  "server": "https://csip-server.example.com:8443",
+  "ca_cert": "/etc/lexa/certs/ca.pem",
+  "client_cert": "/etc/lexa/certs/client.pem",
+  "client_key": "/etc/lexa/certs/client-key.pem",
+  "lfdi": "",
+  "discovery_interval_s": 60,
+  "response_set_path": "/rsps/0/r"
+}

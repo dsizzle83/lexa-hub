@@ -1,0 +1,30 @@
+[Unit]
+Description=LEXA CSIP/IEEE 2030.5 Northbound Client
+Documentation=https://github.com/lexa/lexa-hub
+After=network.target mosquitto.service
+Requires=mosquitto.service
+# wolfSSL mTLS requires the network to be fully up before connecting.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lexa
+Group=lexa
+ExecStart=/usr/local/sbin/lexa-csip -config /etc/lexa/csip.json
+Restart=on-failure
+RestartSec=10s
+
+# CSIP server may be temporarily unreachable; back off before retry.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lexa-csip
+
+# Certificates must be readable by the lexa user.
+ReadOnlyPaths=/etc/lexa/certs
+
+[Install]
+WantedBy=multi-user.target

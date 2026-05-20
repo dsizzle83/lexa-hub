@@ -1,0 +1,24 @@
+[Unit]
+Description=LEXA Modbus/SunSpec Device Service
+Documentation=https://github.com/lexa/lexa-hub
+After=network.target mosquitto.service
+Requires=mosquitto.service
+
+[Service]
+Type=simple
+User=lexa
+Group=lexa
+ExecStart=/usr/local/sbin/lexa-modbus -config /etc/lexa/modbus.json
+Restart=on-failure
+RestartSec=5s
+
+# Give Modbus connections time to settle before the next restart.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lexa-modbus
+
+[Install]
+WantedBy=multi-user.target

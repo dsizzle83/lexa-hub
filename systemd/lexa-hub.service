@@ -1,0 +1,24 @@
+[Unit]
+Description=LEXA Hub Orchestrator (Energy Optimizer)
+Documentation=https://github.com/lexa/lexa-hub
+After=mosquitto.service lexa-modbus.service lexa-csip.service
+Requires=mosquitto.service
+Wants=lexa-modbus.service lexa-csip.service lexa-ocpp.service
+
+[Service]
+Type=simple
+User=lexa
+Group=lexa
+ExecStart=/usr/local/sbin/lexa-hub -config /etc/lexa/hub.json
+Restart=on-failure
+RestartSec=5s
+
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lexa-hub
+
+[Install]
+WantedBy=multi-user.target
