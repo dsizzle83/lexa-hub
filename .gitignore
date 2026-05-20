@@ -2,3 +2,8 @@ bin/
 *-key.pem
 *.key
 *.env
+/modbus
+/ocpp
+/hub
+/csip
+/telemetry
