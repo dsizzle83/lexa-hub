@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"lexa-hub/internal/csip/model"
+	"lexa-hub/internal/northbound/model"
 )
 
 // Fetcher abstracts the HTTP GET + XML parse cycle. The walker calls
@@ -45,6 +45,23 @@ type ResourceTree struct {
 	Programs          []ProgramState // one per DERProgram
 	MirrorUsagePoints *model.MirrorUsagePointList
 	DERList           *model.DERList
+	// DERResources contains per-DER capability, settings, status, and availability.
+	DERResources      []DERResourceState
+
+	// Pricing function set (§10.5) — nil/empty when not available.
+	PricingProfiles []TariffState
+
+	// Billing function set (§10.7) — nil/empty when not available.
+	BillingAccounts []CustomerAccountState
+
+	// Flow Reservation function set (§10.9) — nil when not available.
+	// This is the current set of FlowReservationResponses from the server.
+	FlowReservations *model.FlowReservationResponseList
+
+	// FlowReservationRequestPath is the href to POST new FlowReservationRequests
+	// to (the EndDevice's FlowReservationRequestListLink.Href). Empty when the
+	// server does not expose this link.
+	FlowReservationRequestPath string
 
 	// ClockOffset is (server time − local time) in seconds, computed from
 	// the /tm resource during discovery. Add this to time.Now().Unix() to get
@@ -57,17 +74,42 @@ type ResourceTree struct {
 	ResponseSetPath string
 }
 
-// ProgramState groups a DERProgram with its discovered controls.
+// ProgramState groups a DERProgram with its discovered controls and curves.
 type ProgramState struct {
 	Program        model.DERProgram
 	DefaultControl *model.DefaultDERControl
 	Controls       *model.DERControlList
+	// ActiveControls is the active DERControlList (a subset of Controls with
+	// only the currently-active events). Fetched from ActiveDERControlListLink
+	// when the program exposes it.
+	ActiveControls *model.DERControlList
+	// ExtendedControls is populated when the program has a DERCurveListLink;
+	// it carries the full DERControlBase including curve-linked modes.
+	ExtendedControls *model.ExtendedDERControlList
+	// ExtendedDefault is the DefaultDERControl with the full extended base.
+	ExtendedDefault *model.ExtendedDefaultDERControl
+	// Curves maps DERCurve href → DERCurve for fast resolution of curve links.
+	Curves map[string]model.DERCurve
+}
+
+// DERResourceState holds device-level monitoring data for one DER.
+type DERResourceState struct {
+	DER          model.DER
+	Capability   *model.DERCapabilityFull
+	Settings     *model.DERSettingsFull
+	Status       *model.DERStatusFull
+	Availability *model.DERAvailability
 }
 
 // Walker performs CSIP-compliant resource discovery.
 type Walker struct {
 	fetcher Fetcher
 	lfdi    string // our LFDI, used to find our EndDevice in the list
+}
+
+// logf writes a log message with the "walker: " prefix.
+func (w *Walker) logf(format string, args ...interface{}) {
+	log.Printf("walker: "+format, args...)
 }
 
 // NewWalker creates a walker that will use the given Fetcher for HTTP
@@ -143,6 +185,42 @@ func (w *Walker) Discover(dcapPath string) (*ResourceTree, error) {
 			return nil, fmt.Errorf("step 3b (DERList): %w", err)
 		}
 		tree.DERList = derList
+
+		// Step 3c: Per-DER capability, status, settings, and availability.
+		// All sub-resources are non-fatal — a DER that doesn't expose them still
+		// participates in control via the DERControlList above.
+		for _, der := range derList.DER {
+			rs := DERResourceState{DER: der}
+			if der.DERCapabilityLink != nil {
+				if cap, err := w.fetchDERCapabilityFull(der.DERCapabilityLink.Href); err != nil {
+					w.logf("DERCapability %s: %v (skipped)", der.DERCapabilityLink.Href, err)
+				} else {
+					rs.Capability = cap
+				}
+			}
+			if der.DERSettingsLink != nil {
+				if set, err := w.fetchDERSettingsFull(der.DERSettingsLink.Href); err != nil {
+					w.logf("DERSettings %s: %v (skipped)", der.DERSettingsLink.Href, err)
+				} else {
+					rs.Settings = set
+				}
+			}
+			if der.DERStatusLink != nil {
+				if st, err := w.fetchDERStatusFull(der.DERStatusLink.Href); err != nil {
+					w.logf("DERStatus %s: %v (skipped)", der.DERStatusLink.Href, err)
+				} else {
+					rs.Status = st
+				}
+			}
+			if der.DERAvailabilityLink != nil {
+				if av, err := w.fetchDERAvailability(der.DERAvailabilityLink.Href); err != nil {
+					w.logf("DERAvailability %s: %v (skipped)", der.DERAvailabilityLink.Href, err)
+				} else {
+					rs.Availability = av
+				}
+			}
+			tree.DERResources = append(tree.DERResources, rs)
+		}
 	}
 
 	// Step 4: FunctionSetAssignmentsList
@@ -169,27 +247,75 @@ func (w *Walker) Discover(dcapPath string) (*ResourceTree, error) {
 		for _, prog := range progList.DERProgram {
 			ps := ProgramState{Program: prog}
 
-			// Step 6a: DefaultDERControl (the fallback)
+			// Step 6a: DefaultDERControl — fetch once as extended; derive simple for scheduler.
 			if prog.DefaultDERControlLink != nil {
-				dderc, err := w.fetchDefaultDERControl(prog.DefaultDERControlLink.Href)
+				exd, err := w.fetchExtendedDefaultDERControl(prog.DefaultDERControlLink.Href)
 				if err != nil {
 					return nil, fmt.Errorf("step 6 (DefaultDERControl for %s): %w", prog.MRID, err)
 				}
-				ps.DefaultControl = dderc
+				ps.ExtendedDefault = exd
+				ps.DefaultControl = extendedDefaultToSimple(exd)
 			}
 
-			// Step 6b: DERControlList (active/scheduled events)
+			// Step 6b: DERControlList — fetch once as extended; derive simple for scheduler.
 			if prog.DERControlListLink != nil {
-				ctrls, err := w.fetchDERControlList(prog.DERControlListLink.Href)
+				ext, err := w.fetchExtendedDERControlList(prog.DERControlListLink.Href)
 				if err != nil {
 					return nil, fmt.Errorf("step 6 (DERControlList for %s): %w", prog.MRID, err)
 				}
-				ps.Controls = ctrls
+				ps.ExtendedControls = ext
+				ps.Controls = extendedListToSimple(ext)
+			}
+
+			// Step 6c: ActiveDERControlList (currently active events only).
+			// Non-fatal: not all servers publish this endpoint.
+			if prog.ActiveDERControlListLink != nil {
+				act, err := w.fetchDERControlList(prog.ActiveDERControlListLink.Href)
+				if err != nil {
+					w.logf("ActiveDERControlList for %s: %v (skipped)", prog.MRID, err)
+				} else {
+					ps.ActiveControls = act
+				}
+			}
+
+			// Step 6d: DERCurveList — resolve all curves for this program.
+			// Non-fatal: programs without curves just use scalar modes.
+			if prog.DERCurveListLink != nil {
+				curves, err := w.fetchDERCurveList(prog.DERCurveListLink.Href)
+				if err != nil {
+					w.logf("DERCurveList for %s: %v (skipped)", prog.MRID, err)
+				} else {
+					ps.Curves = make(map[string]model.DERCurve, len(curves.DERCurve))
+					for _, c := range curves.DERCurve {
+						ps.Curves[c.Href] = c
+					}
+				}
 			}
 
 			tree.Programs = append(tree.Programs, ps)
 		}
 	}
+
+	// Step 7: Pricing function set (§10.5) — walk each FSA's TariffProfileListLink.
+	// Failures are non-fatal: pricing is optional and its absence must not
+	// prevent DER control from being published.
+	for _, fsa := range fsaList.FunctionSetAssignments {
+		states := w.discoverPricingFromFSA(fsa)
+		tree.PricingProfiles = append(tree.PricingProfiles, states...)
+	}
+
+	// Step 8: Billing function set (§10.7) — walk each FSA's CustomerAccountListLink.
+	for _, fsa := range fsaList.FunctionSetAssignments {
+		states := w.discoverBillingFromFSA(fsa)
+		tree.BillingAccounts = append(tree.BillingAccounts, states...)
+	}
+
+	// Step 9: Flow Reservation function set (§10.9) — read existing responses
+	// from our EndDevice and record the request list path for future POSTs.
+	if self.FlowReservationRequestListLink != nil {
+		tree.FlowReservationRequestPath = self.FlowReservationRequestListLink.Href
+	}
+	tree.FlowReservations = w.discoverFlowReservation(self)
 
 	// MirrorUsagePointList (for telemetry — Milestone 5, but discover it now)
 	if dcap.MirrorUsagePointListLink != nil {
@@ -253,11 +379,6 @@ func (w *Walker) fetchDERControlList(path string) (*model.DERControlList, error)
 	return &r, w.fetchAndParse(path, &r)
 }
 
-func (w *Walker) fetchDefaultDERControl(path string) (*model.DefaultDERControl, error) {
-	var r model.DefaultDERControl
-	return &r, w.fetchAndParse(path, &r)
-}
-
 func (w *Walker) fetchDERList(path string) (*model.DERList, error) {
 	var r model.DERList
 	return &r, w.fetchAndParse(path, &r)
@@ -265,6 +386,41 @@ func (w *Walker) fetchDERList(path string) (*model.DERList, error) {
 
 func (w *Walker) fetchMirrorUsagePointList(path string) (*model.MirrorUsagePointList, error) {
 	var r model.MirrorUsagePointList
+	return &r, w.fetchAndParse(path, &r)
+}
+
+func (w *Walker) fetchDERCurveList(path string) (*model.DERCurveList, error) {
+	var r model.DERCurveList
+	return &r, w.fetchAndParse(path, &r)
+}
+
+func (w *Walker) fetchExtendedDERControlList(path string) (*model.ExtendedDERControlList, error) {
+	var r model.ExtendedDERControlList
+	return &r, w.fetchAndParse(path, &r)
+}
+
+func (w *Walker) fetchExtendedDefaultDERControl(path string) (*model.ExtendedDefaultDERControl, error) {
+	var r model.ExtendedDefaultDERControl
+	return &r, w.fetchAndParse(path, &r)
+}
+
+func (w *Walker) fetchDERCapabilityFull(path string) (*model.DERCapabilityFull, error) {
+	var r model.DERCapabilityFull
+	return &r, w.fetchAndParse(path, &r)
+}
+
+func (w *Walker) fetchDERSettingsFull(path string) (*model.DERSettingsFull, error) {
+	var r model.DERSettingsFull
+	return &r, w.fetchAndParse(path, &r)
+}
+
+func (w *Walker) fetchDERStatusFull(path string) (*model.DERStatusFull, error) {
+	var r model.DERStatusFull
+	return &r, w.fetchAndParse(path, &r)
+}
+
+func (w *Walker) fetchDERAvailability(path string) (*model.DERAvailability, error) {
+	var r model.DERAvailability
 	return &r, w.fetchAndParse(path, &r)
 }
 
@@ -284,6 +440,70 @@ func (w *Walker) fetchResponseSetPostPath(listHref string) (string, error) {
 		return "", fmt.Errorf("ResponseSet[0] at %s has no ResponseListLink", listHref)
 	}
 	return rsl.ResponseSet[0].ResponseList.Href, nil
+}
+
+// extendedDefaultToSimple converts ExtendedDefaultDERControl to the plain
+// DefaultDERControl used by the scheduler (which only touches scalar modes).
+func extendedDefaultToSimple(e *model.ExtendedDefaultDERControl) *model.DefaultDERControl {
+	return &model.DefaultDERControl{
+		Resource:    e.Resource,
+		MRID:        e.MRID,
+		Description: e.Description,
+		Version:     e.Version,
+		DERControlBase: model.DERControlBase{
+			OpModConnect:        e.DERControlBase.OpModConnect,
+			OpModEnergize:       e.DERControlBase.OpModEnergize,
+			OpModFixedPFAbsorbW: e.DERControlBase.OpModFixedPFAbsorbW,
+			OpModFixedPFInjectW: e.DERControlBase.OpModFixedPFInjectW,
+			OpModFixedVar:       e.DERControlBase.OpModFixedVar,
+			OpModFixedW:         e.DERControlBase.OpModFixedW,
+			OpModMaxLimW:        e.DERControlBase.OpModMaxLimW,
+			OpModExpLimW:        e.DERControlBase.OpModExpLimW,
+			OpModGenLimW:        e.DERControlBase.OpModGenLimW,
+			OpModImpLimW:        e.DERControlBase.OpModImpLimW,
+			OpModLoadLimW:       e.DERControlBase.OpModLoadLimW,
+			RampTms:             e.DERControlBase.RampTms,
+		},
+	}
+}
+
+// extendedListToSimple converts ExtendedDERControlList to DERControlList for
+// the scheduler (which only touches scalar modes).
+func extendedListToSimple(e *model.ExtendedDERControlList) *model.DERControlList {
+	list := &model.DERControlList{
+		Resource: e.Resource,
+		All:      e.All,
+		Results:  e.Results,
+		PollRate: e.PollRate,
+	}
+	for _, c := range e.DERControl {
+		list.DERControl = append(list.DERControl, model.DERControl{
+			Resource:     c.Resource,
+			MRID:         c.MRID,
+			Description:  c.Description,
+			Version:      c.Version,
+			CreationTime: c.CreationTime,
+			EventStatus:  c.EventStatus,
+			Interval:     c.Interval,
+			DERControlBase: model.DERControlBase{
+				OpModConnect:        c.DERControlBase.OpModConnect,
+				OpModEnergize:       c.DERControlBase.OpModEnergize,
+				OpModFixedPFAbsorbW: c.DERControlBase.OpModFixedPFAbsorbW,
+				OpModFixedPFInjectW: c.DERControlBase.OpModFixedPFInjectW,
+				OpModFixedVar:       c.DERControlBase.OpModFixedVar,
+				OpModFixedW:         c.DERControlBase.OpModFixedW,
+				OpModMaxLimW:        c.DERControlBase.OpModMaxLimW,
+				OpModExpLimW:        c.DERControlBase.OpModExpLimW,
+				OpModGenLimW:        c.DERControlBase.OpModGenLimW,
+				OpModImpLimW:        c.DERControlBase.OpModImpLimW,
+				OpModLoadLimW:       c.DERControlBase.OpModLoadLimW,
+				RampTms:             c.DERControlBase.RampTms,
+			},
+			RandomizeStart:    c.RandomizeStart,
+			RandomizeDuration: c.RandomizeDuration,
+		})
+	}
+	return list
 }
 
 // fetchAndParse is the single point where HTTP and XML meet.

@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
-	"lexa-hub/internal/csip/model"
+	"lexa-hub/internal/northbound/model"
 	"lexa-hub/internal/orchestrator"
 )
 

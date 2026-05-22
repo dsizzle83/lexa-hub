@@ -6,7 +6,7 @@ import (
 	"math"
 	"time"
 
-	"lexa-hub/internal/csip/model"
+	"lexa-hub/internal/northbound/model"
 )
 
 // exportGuard carries state across ticks for the conservative export-limit rule.
@@ -160,36 +160,44 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// Rule 2: CSIP fixed dispatch — discharge battery to meet explicit grid export request.
 	batteries = applyFixedDispatchRule(state.CSIPControl, batteries, solarW, homeLoadW, o.SOCReserve, &plan)
 
+	// Rule 2.5: Follow the 24-hour cost-optimal plan.
+	// Fires only when a plan exists and CSIP has not already mandated fixed dispatch.
+	// Sets battery setpoints and EV current limits from the plan; downstream limit
+	// rules (3 & 3.5) still run to enforce live CSIP constraints.
+	planFollowed := false
+	if state.CSIPControl == nil || state.CSIPControl.Base.OpModFixedW == nil {
+		batteries, surplusW, planFollowed = applyPlanRule(state.DailyPlanTarget, batteries, state.EVSEs, surplusW, &plan)
+	}
+
 	// Rule 3: Export/import limit — absorb excess into EVSEs, battery, then curtail solar.
+	// Always runs (CSIP compliance cannot be skipped).
 	batteries, surplusW = o.applyExportLimitRule(state.Solar, state.EVSEs, evseW, limits, state.Grid.NetW, o.SOCFullThreshold, surplusW, batteries, &plan)
 
 	// Rule 3.5: Import limit enforcement — discharge battery to reduce grid import.
 	batteries = o.applyImportLimitRule(batteries, limits, state.Grid.NetW, o.SOCReserve, &plan)
 
-	// Rule 4: Self-consumption — route solar surplus to battery.
-	batteries, surplusW = applySelfConsumptionRule(batteries, surplusW, o.ExcessSolarThreshold, o.SOCFullThreshold, &plan)
+	if !planFollowed {
+		// Rule 4: Self-consumption — route solar surplus to battery.
+		batteries, surplusW = applySelfConsumptionRule(batteries, surplusW, o.ExcessSolarThreshold, o.SOCFullThreshold, &plan)
 
-	// Rule 5: TOU peak discharge.
-	// CSIP dispatch (OpModFixedW) is handled in Rule 2; this rule covers autonomous peak shifting.
-	serverNow := time.Unix(o.now().Unix()+state.ClockOffset, 0)
-	isPeak := o.CostModel != nil && o.CostModel.IsPeakHour(serverNow)
-	peakReason := ""
-	if isPeak {
-		peakReason = fmt.Sprintf("peak TOU hour (rate=%.3f/kWh)", o.CostModel.CurrentRate(serverNow))
-	}
-	batteries, surplusW = applyDemandResponseRule(batteries, surplusW, o.SOCReserve, false, isPeak, peakReason, &plan)
+		// Rule 5: TOU peak discharge.
+		// CSIP dispatch (OpModFixedW) is handled in Rule 2; this rule covers autonomous peak shifting.
+		serverNow := time.Unix(o.now().Unix()+state.ClockOffset, 0)
+		isPeak := o.CostModel != nil && o.CostModel.IsPeakHour(serverNow)
+		peakReason := ""
+		if isPeak {
+			peakReason = fmt.Sprintf("peak TOU hour (rate=%.3f/kWh)", o.CostModel.CurrentRate(serverNow))
+		}
+		batteries, surplusW = applyDemandResponseRule(batteries, surplusW, o.SOCReserve, false, isPeak, peakReason, &plan)
 
-	// Rule 6: EV charging allocation.
-	// Suppress EV while the import guard hasn't accumulated enough consecutive
-	// ticks of stable positive import — prevents EV from resuming during the
-	// battery over-discharge transient that briefly makes the site look like
-	// it has surplus (grid.NetW < 0).
-	cooldown := o.EVImportCooldownCycles
-	if cooldown <= 0 {
-		cooldown = 20
+		// Rule 6: EV charging allocation.
+		cooldown := o.EVImportCooldownCycles
+		if cooldown <= 0 {
+			cooldown = 20
+		}
+		evImportSuppressed := !math.IsNaN(limits.importLimitW) && o.impGuard.evSafeCount < cooldown
+		applyEVChargingRule(state.EVSEs, limits, state.Grid.NetW, solarW, surplusW, evImportSuppressed, &plan)
 	}
-	evImportSuppressed := !math.IsNaN(limits.importLimitW) && o.impGuard.evSafeCount < cooldown
-	applyEVChargingRule(state.EVSEs, limits, state.Grid.NetW, solarW, surplusW, evImportSuppressed, &plan)
 
 	// Final: restore unconstrained devices so prior setpoints don't persist.
 	applyRestoreRule(state.Solar, batteries, o.SOCReserve, &plan)
@@ -267,6 +275,75 @@ func computePowerBalance(state SystemState) (solarW, batteryW, evseW, surplusW f
 		surplusW = solarW
 	}
 	return
+}
+
+// applyPlanRule applies the battery setpoint and EV current limit from the
+// 24-hour cost-optimal plan.  Returns updated batteries, updated surplusW, and
+// true when the plan was applied (suppressing the reactive self-consumption,
+// TOU, and EV charging rules downstream).
+//
+// The plan setpoint is a guidance value; the export/import limit rules still
+// run after this to enforce live CSIP compliance.
+func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSEState, surplusW float64, plan *Plan) ([]BatteryState, float64, bool) {
+	if target == nil {
+		return batteries, surplusW, false
+	}
+	setW := target.BattSetpointW
+	if math.IsNaN(setW) {
+		return batteries, surplusW, false
+	}
+
+	// Distribute the planned setpoint across connected batteries proportionally
+	// to their nameplate capacity (or equally when capacity is unknown).
+	totalCap := 0.0
+	for _, b := range batteries {
+		if b.Connected {
+			cap := b.MaxDischargeW + b.MaxChargeW
+			if cap <= 0 {
+				cap = 1
+			}
+			totalCap += cap
+		}
+	}
+	if totalCap == 0 {
+		return batteries, surplusW, false
+	}
+
+	for i, b := range batteries {
+		if !b.Connected {
+			continue
+		}
+		cap := b.MaxDischargeW + b.MaxChargeW
+		if cap <= 0 {
+			cap = 1
+		}
+		share := setW * cap / totalCap
+		// Clamp to device limits.
+		share = math.Max(-b.MaxChargeW, math.Min(b.MaxDischargeW, share))
+		batteries[i].PowerW = share
+		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+			Name:      b.Name,
+			SetpointW: share,
+		})
+	}
+
+	// Set EV current from plan; only override EVSEs with active sessions.
+	for _, ev := range evses {
+		if ev.Connected {
+			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+				StationID:   ev.StationID,
+				ConnectorID: ev.ConnectorID,
+				MaxCurrentA: target.EVMaxCurrentA,
+			})
+		}
+	}
+
+	plan.AddDecision("plan/follow",
+		fmt.Sprintf("following 24h plan: battery=%.0fW ev=%.1fA", setW, target.EVMaxCurrentA),
+		fmt.Sprintf("set %d batteries, %d EVSEs", len(batteries), len(evses)))
+
+	// Zero surplusW so self-consumption and TOU rules don't fire after us.
+	return batteries, 0, true
 }
 
 // applyFixedDispatchRule discharges batteries to meet an explicit grid export

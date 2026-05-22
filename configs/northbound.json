@@ -1,6 +1,6 @@
 {
   "mqtt_broker": "tcp://localhost:1883",
-  "mqtt_client_id": "lexa-csip",
+  "mqtt_client_id": "lexa-northbound",
   "server": "https://csip-server.example.com:8443",
   "ca_cert": "/etc/lexa/certs/ca.pem",
   "client_cert": "/etc/lexa/certs/client.pem",

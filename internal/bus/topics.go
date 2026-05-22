@@ -3,13 +3,18 @@
 //
 // Topic layout:
 //
-//	lexa/measurements/{device}       modbus → hub, telemetry
-//	lexa/battery/{device}/metrics    modbus → hub
-//	lexa/csip/control                csip   → hub
-//	lexa/evse/{station}/state        ocpp   → hub
-//	lexa/control/battery/{device}    hub    → modbus
-//	lexa/control/solar/{device}      hub    → modbus
-//	lexa/evse/{station}/command      hub    → ocpp
+//	lexa/measurements/{device}                modbus       → hub, telemetry
+//	lexa/battery/{device}/metrics             modbus       → hub
+//	lexa/csip/control                         northbound   → hub (retained)
+//	lexa/csip/pricing                         northbound   → hub (retained)
+//	lexa/csip/billing                         northbound   → hub (retained)
+//	lexa/csip/flowreservation/status          northbound   → hub (retained)
+//	lexa/csip/flowreservation/request         hub          → northbound (QoS 1)
+//	lexa/northbound/schedule                  northbound   → hub (retained)
+//	lexa/evse/{station}/state                 ocpp         → hub
+//	lexa/control/battery/{device}             hub          → modbus
+//	lexa/control/solar/{device}               hub          → modbus
+//	lexa/evse/{station}/command               hub          → ocpp
 package bus
 
 import "fmt"
@@ -23,6 +28,18 @@ func BattMetricsTopic(device string) string {
 }
 
 const TopicCSIPControl = "lexa/csip/control"
+
+// Pricing, billing, and flow reservation topics (IEEE 2030.5 §10.5/10.7/10.9).
+const (
+	TopicCSIPPricing   = "lexa/csip/pricing"
+	TopicCSIPBilling   = "lexa/csip/billing"
+	TopicCSIPFRStatus  = "lexa/csip/flowreservation/status"
+	TopicCSIPFRRequest = "lexa/csip/flowreservation/request"
+)
+
+// TopicNorthboundSchedule is published by lexa-northbound after each discovery
+// walk. It carries the resolved 24-hour DER control schedule (retained, QoS 1).
+const TopicNorthboundSchedule = "lexa/northbound/schedule"
 
 func EVSEStateTopic(stationID string) string {
 	return fmt.Sprintf("lexa/evse/%s/state", stationID)

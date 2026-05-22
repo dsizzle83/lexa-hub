@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// Config is the JSON configuration for lexa-csip.
+// Config is the JSON configuration for lexa-northbound.
 type Config struct {
 	MQTTBroker   string `json:"mqtt_broker"`
 	MQTTClientID string `json:"mqtt_client_id"`
@@ -36,7 +36,7 @@ func loadConfig(path string) (*Config, error) {
 		cfg.MQTTBroker = "tcp://localhost:1883"
 	}
 	if cfg.MQTTClientID == "" {
-		cfg.MQTTClientID = "lexa-csip"
+		cfg.MQTTClientID = "lexa-northbound"
 	}
 	if cfg.DiscoveryIntervalS == 0 {
 		cfg.DiscoveryIntervalS = 60

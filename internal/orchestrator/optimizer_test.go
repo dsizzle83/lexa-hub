@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"lexa-hub/internal/csip/model"
+	"lexa-hub/internal/northbound/model"
 	"lexa-hub/internal/orchestrator"
 )
 

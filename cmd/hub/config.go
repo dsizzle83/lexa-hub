@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"lexa-hub/internal/orchestrator"
 )
 
 // DeviceConfig describes a device role and capacity for the orchestrator.
@@ -31,6 +33,9 @@ type Config struct {
 
 	Devices  []DeviceConfig  `json:"devices"`
 	Stations []StationConfig `json:"stations"`
+
+	// Planner holds the 24-hour cost-optimal dispatch configuration.
+	Planner orchestrator.PlannerCfg `json:"planner"`
 }
 
 func loadConfig(path string) (*Config, error) {

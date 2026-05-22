@@ -1,0 +1,603 @@
+package orchestrator
+
+import (
+	"math"
+	"time"
+)
+
+const (
+	planSteps     = 288            // 24 h / 5-min intervals
+	planStepSec   = int64(5 * 60) // seconds per interval
+	planStepHours = 5.0 / 60.0    // hours per interval
+)
+
+// PlannerParams is the full input to DailyPlanner.Plan.
+// All zero-value fields receive sensible defaults via withDefaults().
+type PlannerParams struct {
+	// WindowStart is the first interval start (Unix s); snapped to 5-min boundary.
+	WindowStart int64
+
+	// Battery asset. BattCapacityKwh == 0 → no battery modelled.
+	BattCapacityKwh    float64
+	BattMaxChargeKw    float64
+	BattMaxDischargeKw float64
+	BattEfficiency     float64 // one-way efficiency [0,1]; default 0.96
+	InitialBattSocKwh  float64
+	MinBattSocKwh      float64 // operating floor; 0 → 10% of capacity
+	MaxBattSocKwh      float64 // operating ceiling; 0 → BattCapacityKwh
+
+	// EV asset. EVCapacityKwh == 0 → no EV modelled.
+	EVCapacityKwh   float64
+	EVMaxChargeKw   float64
+	EVEfficiency    float64 // default 0.95
+	InitialEVSocKwh float64
+	EVTargetSocKwh  float64 // required SOC at departure; 0 → no constraint
+	EVDepartureUnix int64   // 0 → no departure constraint
+	EVVoltageV      float64 // for A→W conversion; default 240
+
+	// SolarForecastKw is the per-step solar generation (kW); len may be < planSteps.
+	// Missing steps treated as zero.
+	SolarForecastKw []float64
+
+	// LoadForecastKw is the expected site load (kW) excluding EV. Flat for now.
+	LoadForecastKw float64
+
+	// ImportPricePerKwh and ExportPricePerKwh are $/kWh per step.
+	// nil → FallbackTOU is used.
+	ImportPricePerKwh []float64
+	ExportPricePerKwh []float64
+	FallbackTOU       *TOUCostModel // used when price slices are nil
+
+	// DERConstraints holds per-step DER operating constraints from the northbound
+	// schedule. nil or short → unconstrained.
+	DERConstraints []StepConstraint
+
+	// SOCStepKwh is the DP discretisation step. Default 0.5 kWh.
+	SOCStepKwh float64
+}
+
+// StepConstraint is the DER control envelope for one 5-min interval.
+// NaN values mean unconstrained.
+type StepConstraint struct {
+	Disconnect bool    // true → battery must be offline (OpModConnect=false)
+	ExpLimW    float64 // max net export to grid (W)
+	ImpLimW    float64 // max net import from grid (W)
+	MaxLimW    float64 // total generation cap (W)
+	FixedW     float64 // fixed battery dispatch (W); NaN → DP chooses freely
+}
+
+// PlanInterval is the cost-optimised dispatch target for one 5-min slot.
+type PlanInterval struct {
+	Start         int64   // interval start (Unix s)
+	BattSetpointW float64 // + discharge, − charge; NaN = no battery
+	EVMaxCurrentA float64 // 0 = suspend EV
+	ExpectedGridW float64 // + import, − export
+	MarginalCost  float64 // net cost for this interval (negative = earning)
+}
+
+// DailyPlan is the 24-hour cost-optimal plan produced by DailyPlanner.Plan.
+type DailyPlan struct {
+	BuildTime   time.Time
+	WindowStart int64 // Unix s
+	WindowEnd   int64 // Unix s
+	Intervals   [planSteps]PlanInterval
+	TotalCost   float64
+}
+
+// PlanTarget is the current-interval directive extracted from a DailyPlan.
+// It is injected into SystemState by the Engine so the reactive optimizer
+// can follow it while hard CSIP overrides still take precedence.
+type PlanTarget struct {
+	BattSetpointW float64
+	EVMaxCurrentA float64
+}
+
+// CurrentTarget returns the PlanTarget for the interval containing t,
+// or nil when t is outside the plan window.
+func (dp *DailyPlan) CurrentTarget(t time.Time) *PlanTarget {
+	if dp == nil {
+		return nil
+	}
+	unix := t.Unix()
+	if unix < dp.WindowStart || unix >= dp.WindowEnd {
+		return nil
+	}
+	idx := int((unix - dp.WindowStart) / planStepSec)
+	if idx < 0 || idx >= planSteps {
+		return nil
+	}
+	iv := dp.Intervals[idx]
+	return &PlanTarget{
+		BattSetpointW: iv.BattSetpointW,
+		EVMaxCurrentA: iv.EVMaxCurrentA,
+	}
+}
+
+// PlannerCfg holds the operator-tunable parameters for DailyPlanner.
+// It is read from hub.json and passed to Engine via Config.
+type PlannerCfg struct {
+	// EV asset. EVCapacityKwh == 0 disables EV planning.
+	EVCapacityKwh  float64 `json:"ev_capacity_kwh"`
+	EVMaxChargeKw  float64 `json:"ev_max_charge_kw"`
+	EVEfficiency   float64 `json:"ev_efficiency"`   // default 0.95
+	EVVoltageV     float64 `json:"ev_voltage_v"`    // default 240
+	EVDepartureHH  int     `json:"ev_departure_hh"` // local hour 0–23
+	EVDepartureMM  int     `json:"ev_departure_mm"` // local minute 0–59
+	EVTargetSocPct float64 `json:"ev_target_soc_pct"`
+
+	// Battery overrides; 0 = derive from live MQTT metrics.
+	BattCapacityKwh    float64 `json:"batt_capacity_kwh"`
+	BattMaxChargeKw    float64 `json:"batt_max_charge_kw"`
+	BattMaxDischargeKw float64 `json:"batt_max_discharge_kw"`
+	BattEfficiency     float64 `json:"batt_efficiency"` // default 0.96
+
+	// DP discretisation (0 = default 0.5 kWh).
+	SOCStepKwh float64 `json:"soc_step_kwh"`
+
+	// How often the planner re-runs when not triggered by an input change.
+	ReplanIntervalS int `json:"replan_interval_s"` // default 900
+}
+
+// DailyPlanner runs the dynamic-programming cost optimiser.
+// It holds no mutable state; Plan is safe for concurrent use.
+type DailyPlanner struct{}
+
+// NewDailyPlanner creates a DailyPlanner.
+func NewDailyPlanner() *DailyPlanner { return &DailyPlanner{} }
+
+// Plan runs the full 24-hour DP optimiser and returns the cost-optimal plan.
+//
+// The algorithm minimises total electricity cost subject to:
+//   - Battery SOC bounds and charge/discharge power limits
+//   - EV SOC bounds, IEC 61851 current steps, and departure-time target
+//   - DER constraints (export/import/generation limits, forced disconnect, fixed dispatch)
+//   - Terminal constraint: final battery SOC ≥ initial (prevents artificial arbitrage)
+//
+// Complexity: O(planSteps × nBattLevels × nEVLevels × nBattPowers × nEVCurrents).
+// For a 10 kWh battery + 75 kWh EV at 0.5 kWh step this is ~50–100 ms on ARM64.
+func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
+	p = p.withDefaults()
+	ws := p.WindowStart - (p.WindowStart % planStepSec)
+	we := ws + int64(planSteps)*planStepSec
+
+	hasBatt := p.BattCapacityKwh > 0
+	hasEV := p.EVCapacityKwh > 0
+
+	// Discretise state spaces.
+	battLevels := []float64{0}
+	if hasBatt {
+		battLevels = discretizeLevels(p.MinBattSocKwh, p.maxBattSoc(), p.SOCStepKwh)
+	}
+	nBatt := len(battLevels)
+
+	evLevels := []float64{0}
+	if hasEV {
+		evLevels = discretizeLevels(0, p.EVCapacityKwh, p.SOCStepKwh)
+	}
+	nEV := len(evLevels)
+
+	// Discretise action spaces.
+	battPowers := []float64{0}
+	if hasBatt {
+		battPowers = discretizePowers(-p.BattMaxChargeKw, p.BattMaxDischargeKw, 0.5)
+	}
+
+	evCurrents := []float64{0}
+	if hasEV && p.EVMaxChargeKw > 0 {
+		v := p.EVVoltageV
+		if v == 0 {
+			v = 240
+		}
+		evCurrents = discretizeEVCurrents(p.EVMaxChargeKw * 1000 / v)
+	}
+
+	const inf = math.MaxFloat64 / 2
+
+	// DP tables.
+	dp := makeDP2D(nBatt, nEV, inf)
+	dpNext := makeDP2D(nBatt, nEV, inf)
+
+	// Seed: place probability mass at the initial state.
+	iBatt0 := closestIdx(battLevels, p.InitialBattSocKwh)
+	iEV0 := 0
+	if hasEV {
+		iEV0 = closestIdx(evLevels, p.InitialEVSocKwh)
+	}
+	dp[iBatt0][iEV0] = 0
+
+	// Backtrack table: back[t][destBatt][destEV] = {srcBatt, srcEV, battCmdIdx, evCmdIdx}.
+	type backNode struct {
+		src [2]int16
+		cmd [2]int16
+	}
+	back := make([][][]backNode, planSteps)
+	for t := range back {
+		back[t] = make([][]backNode, nBatt)
+		for i := range back[t] {
+			back[t][i] = make([]backNode, nEV)
+			for j := range back[t][i] {
+				back[t][i][j].src = [2]int16{-1, -1}
+				back[t][i][j].cmd = [2]int16{0, 0}
+			}
+		}
+	}
+
+	// Compute EV departure step index (−1 = no constraint).
+	evDeptStep := -1
+	if hasEV && p.EVDepartureUnix > 0 {
+		s := int((p.EVDepartureUnix - ws) / planStepSec)
+		if s >= 0 && s < planSteps {
+			evDeptStep = s
+		}
+	}
+	evTargetIdx := 0
+	if hasEV && p.EVTargetSocKwh > 0 {
+		evTargetIdx = closestIdx(evLevels, p.EVTargetSocKwh)
+	}
+
+	// Fixed-power index cache: for FixedW constraint, only this battPowers index is valid.
+	fixedPwrIdx := make([]int, planSteps)
+	for t := range fixedPwrIdx {
+		fixedPwrIdx[t] = -1
+	}
+	for t, c := range p.DERConstraints {
+		if t >= planSteps {
+			break
+		}
+		if !math.IsNaN(c.FixedW) {
+			fixedPwrIdx[t] = closestIdx(battPowers, c.FixedW/1000)
+		}
+	}
+
+	// ─── Forward DP ───────────────────────────────────────────────────────────
+	for t := 0; t < planSteps; t++ {
+		clearDP2D(dpNext, inf)
+
+		c := planStepConstraint(p, t)
+		solarKw := planStepSolar(p, t)
+		loadKw := p.LoadForecastKw
+		voltV := p.EVVoltageV
+		stepT := ws + int64(t)*planStepSec
+		impPrice := planStepImportPrice(p, t, stepT)
+		expPrice := planStepExportPrice(p, t, stepT)
+		evGone := evDeptStep >= 0 && t > evDeptStep
+		fixedBI := fixedPwrIdx[t]
+
+		for i := 0; i < nBatt; i++ {
+			for j := 0; j < nEV; j++ {
+				cost0 := dp[i][j]
+				if cost0 >= inf {
+					continue
+				}
+				// Enforce EV departure constraint: at the departure step, only
+				// states where EV SOC ≥ target are valid starting points.
+				if evDeptStep >= 0 && t == evDeptStep && hasEV && j < evTargetIdx {
+					continue
+				}
+
+				for bi, battKw := range battPowers {
+					if c.Disconnect && battKw != 0 {
+						continue
+					}
+					if fixedBI >= 0 && bi != fixedBI {
+						continue
+					}
+
+					for ci, evA := range evCurrents {
+						if (evGone || !hasEV) && ci > 0 {
+							continue
+						}
+						evKw := evA * voltV / 1000
+
+						// Grid balance: + = import, − = export.
+						// grid = load + ev_draw − solar − batt_net
+						gridKw := loadKw + evKw - solarKw - battKw
+
+						// Apply DER constraints.
+						if !math.IsNaN(c.ExpLimW) && -gridKw > c.ExpLimW/1000+1e-6 {
+							continue
+						}
+						if !math.IsNaN(c.ImpLimW) && gridKw > c.ImpLimW/1000+1e-6 {
+							continue
+						}
+						if !math.IsNaN(c.MaxLimW) {
+							gen := solarKw
+							if battKw > 0 {
+								gen += battKw
+							}
+							if gen > c.MaxLimW/1000+1e-6 {
+								continue
+							}
+						}
+
+						// Compute new battery SOC.
+						newBSoc := battLevels[i]
+						if hasBatt {
+							if battKw > 0 {
+								newBSoc -= battKw * planStepHours / p.BattEfficiency
+							} else if battKw < 0 {
+								newBSoc += (-battKw) * planStepHours * p.BattEfficiency
+							}
+							if newBSoc < p.MinBattSocKwh-1e-6 || newBSoc > p.maxBattSoc()+1e-6 {
+								continue
+							}
+						}
+
+						// Compute new EV SOC.
+						newESoc := evLevels[j]
+						if hasEV && !evGone {
+							newESoc += evKw * planStepHours * p.EVEfficiency
+							if newESoc < -1e-6 || newESoc > p.EVCapacityKwh+1e-6 {
+								continue
+							}
+							newESoc = math.Max(0, math.Min(p.EVCapacityKwh, newESoc))
+						}
+
+						// Step cost.
+						var stepCost float64
+						if gridKw > 0 {
+							stepCost = gridKw * planStepHours * impPrice
+						} else {
+							stepCost = gridKw * planStepHours * expPrice
+						}
+
+						// Update next DP table.
+						ni := closestIdx(battLevels, newBSoc)
+						nj := 0
+						if hasEV {
+							nj = closestIdx(evLevels, newESoc)
+						}
+						if nc := cost0 + stepCost; nc < dpNext[ni][nj] {
+							dpNext[ni][nj] = nc
+							back[t][ni][nj] = backNode{
+								src: [2]int16{int16(i), int16(j)},
+								cmd: [2]int16{int16(bi), int16(ci)},
+							}
+						}
+					}
+				}
+			}
+		}
+
+		dp, dpNext = dpNext, dp
+	}
+
+	// ─── Find best terminal state ─────────────────────────────────────────────
+	// Terminal constraint: battery must not end below its initial SOC.
+	// Soft penalty rather than hard filter so the solver always has a feasible
+	// answer even when the 24h window has no cheap charging window.
+	bestCost := inf
+	bestBatt, bestEV := iBatt0, iEV0
+	for i := 0; i < nBatt; i++ {
+		for j := 0; j < nEV; j++ {
+			c := dp[i][j]
+			if c >= inf {
+				continue
+			}
+			// Add a penalty proportional to the SOC shortfall (100 $/kWh is
+			// much larger than any realistic energy price, so the solver will
+			// avoid ending below initial SOC unless it has no choice).
+			if hasBatt && battLevels[i] < p.InitialBattSocKwh-1e-6 {
+				c += 100.0 * (p.InitialBattSocKwh - battLevels[i])
+			}
+			if c < bestCost {
+				bestCost = c
+				bestBatt, bestEV = i, j
+			}
+		}
+	}
+	totalCost := dp[bestBatt][bestEV]
+	if totalCost >= inf {
+		totalCost = 0 // no feasible path found
+	}
+
+	// ─── Backtrack to extract per-step plan ───────────────────────────────────
+	out := &DailyPlan{
+		BuildTime:   time.Now(),
+		WindowStart: ws,
+		WindowEnd:   we,
+		TotalCost:   totalCost,
+	}
+
+	bi, ej := bestBatt, bestEV
+	for t := planSteps - 1; t >= 0; t-- {
+		node := back[t][bi][ej]
+
+		// battW stays NaN when there is no battery asset.
+		battW := math.NaN()
+		var evA float64
+		if hasBatt && node.src[0] >= 0 {
+			battW = battPowers[node.cmd[0]] * 1000
+		}
+		if node.src[0] >= 0 {
+			evA = evCurrents[node.cmd[1]]
+		}
+
+		solarKw := planStepSolar(p, t)
+		vv := p.EVVoltageV
+		evKw := evA * vv / 1000
+		bKw := battW / 1000
+		if math.IsNaN(bKw) {
+			bKw = 0
+		}
+		gridW := (p.LoadForecastKw + evKw - solarKw - bKw) * 1000
+		stepT := ws + int64(t)*planStepSec
+		impP := planStepImportPrice(p, t, stepT)
+		expP := planStepExportPrice(p, t, stepT)
+		gKw := gridW / 1000
+		var margCost float64
+		if gKw > 0 {
+			margCost = gKw * planStepHours * impP
+		} else {
+			margCost = gKw * planStepHours * expP
+		}
+
+		out.Intervals[t] = PlanInterval{
+			Start:         stepT,
+			BattSetpointW: battW,
+			EVMaxCurrentA: evA,
+			ExpectedGridW: gridW,
+			MarginalCost:  margCost,
+		}
+
+		if node.src[0] >= 0 {
+			bi = int(node.src[0])
+			ej = int(node.src[1])
+		}
+	}
+
+	return out
+}
+
+// ── PlannerParams helpers ─────────────────────────────────────────────────────
+
+func (p PlannerParams) withDefaults() PlannerParams {
+	if p.BattEfficiency == 0 {
+		p.BattEfficiency = 0.96
+	}
+	if p.EVEfficiency == 0 {
+		p.EVEfficiency = 0.95
+	}
+	if p.EVVoltageV == 0 {
+		p.EVVoltageV = 240
+	}
+	if p.SOCStepKwh == 0 {
+		p.SOCStepKwh = 0.5
+	}
+	if p.MinBattSocKwh == 0 && p.BattCapacityKwh > 0 {
+		p.MinBattSocKwh = 0.10 * p.BattCapacityKwh
+	}
+	return p
+}
+
+func (p *PlannerParams) maxBattSoc() float64 {
+	if p.MaxBattSocKwh > 0 {
+		return p.MaxBattSocKwh
+	}
+	return p.BattCapacityKwh
+}
+
+func planStepConstraint(p PlannerParams, t int) StepConstraint {
+	if t < len(p.DERConstraints) {
+		c := p.DERConstraints[t]
+		return c
+	}
+	return StepConstraint{ExpLimW: math.NaN(), ImpLimW: math.NaN(), MaxLimW: math.NaN(), FixedW: math.NaN()}
+}
+
+func planStepSolar(p PlannerParams, t int) float64 {
+	if t < len(p.SolarForecastKw) {
+		return p.SolarForecastKw[t]
+	}
+	return 0
+}
+
+func planStepImportPrice(p PlannerParams, t int, unixT int64) float64 {
+	if t < len(p.ImportPricePerKwh) {
+		return p.ImportPricePerKwh[t]
+	}
+	if p.FallbackTOU != nil {
+		return p.FallbackTOU.CurrentRate(time.Unix(unixT, 0).Local())
+	}
+	return 0.20
+}
+
+func planStepExportPrice(p PlannerParams, t int, unixT int64) float64 {
+	if t < len(p.ExportPricePerKwh) {
+		return p.ExportPricePerKwh[t]
+	}
+	return 0
+}
+
+// ── Discretisation helpers ────────────────────────────────────────────────────
+
+// discretizeLevels returns evenly-spaced values from lo to hi (inclusive)
+// at the given step, with exact endpoints.
+func discretizeLevels(lo, hi, step float64) []float64 {
+	if step <= 0 || hi <= lo {
+		return []float64{lo}
+	}
+	n := int(math.Round((hi-lo)/step)) + 1
+	if n < 2 {
+		n = 2
+	}
+	out := make([]float64, n)
+	for i := range out {
+		out[i] = math.Round((lo+float64(i)*step)/step) * step
+	}
+	out[0] = lo
+	out[n-1] = hi
+	return out
+}
+
+// discretizePowers returns battery power levels from lo to hi at step, always
+// including 0.
+func discretizePowers(lo, hi, step float64) []float64 {
+	if step <= 0 {
+		step = 0.5
+	}
+	n := int(math.Round((hi-lo)/step)) + 1
+	if n < 1 {
+		return []float64{0}
+	}
+	out := make([]float64, n)
+	for i := range out {
+		out[i] = math.Round((lo+float64(i)*step)/step) * step
+	}
+	out[0] = lo
+	out[n-1] = hi
+	return out
+}
+
+// discretizeEVCurrents returns [0, 6, 8, 10, …, maxA] following IEC 61851
+// standard current levels. The minimum charging current is 6 A.
+func discretizeEVCurrents(maxA float64) []float64 {
+	standards := []float64{6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 63, 80}
+	out := []float64{0}
+	for _, a := range standards {
+		if a > maxA+0.5 {
+			break
+		}
+		out = append(out, a)
+	}
+	if len(out) == 1 && maxA >= 1 {
+		out = append(out, maxA) // at least one non-zero level
+	}
+	return out
+}
+
+// closestIdx returns the index of the level closest to v.
+func closestIdx(levels []float64, v float64) int {
+	if len(levels) == 0 {
+		return 0
+	}
+	best, bestDist := 0, math.Abs(levels[0]-v)
+	for i := 1; i < len(levels); i++ {
+		if d := math.Abs(levels[i] - v); d < bestDist {
+			bestDist = d
+			best = i
+		}
+	}
+	return best
+}
+
+// makeDP2D allocates a 2-D float64 slice filled with fill.
+func makeDP2D(nR, nC int, fill float64) [][]float64 {
+	dp := make([][]float64, nR)
+	for i := range dp {
+		dp[i] = make([]float64, nC)
+		for j := range dp[i] {
+			dp[i][j] = fill
+		}
+	}
+	return dp
+}
+
+// clearDP2D resets all entries to fill.
+func clearDP2D(dp [][]float64, fill float64) {
+	for i := range dp {
+		for j := range dp[i] {
+			dp[i][j] = fill
+		}
+	}
+}

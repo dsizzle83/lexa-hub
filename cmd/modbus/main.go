@@ -27,7 +27,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
-	"lexa-hub/internal/csip/model"
+	"lexa-hub/internal/northbound/model"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/southbound/battery"
 	"lexa-hub/internal/southbound/device"

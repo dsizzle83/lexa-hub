@@ -3,8 +3,8 @@ package scheduler
 import (
 	"testing"
 
-	"lexa-hub/internal/csip/discovery"
-	"lexa-hub/internal/csip/model"
+	"lexa-hub/internal/northbound/discovery"
+	"lexa-hub/internal/northbound/model"
 )
 
 // ───────────────────────────────────────────────────────────────────────

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"lexa-hub/internal/csip/discovery"
+	"lexa-hub/internal/northbound/discovery"
 )
 
 // Compile-time assertion: WolfSSLFetcher must satisfy discovery.Fetcher.

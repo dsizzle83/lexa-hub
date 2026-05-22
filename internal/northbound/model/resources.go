@@ -56,6 +56,7 @@ type DeviceCapability struct {
 	DERProgramListLink             *ListLink `xml:"DERProgramListLink,omitempty"`
 	TimeLink                       *Link     `xml:"TimeLink,omitempty"`
 	ResponseSetListLink            *ListLink `xml:"ResponseSetListLink,omitempty"`
+	TariffProfileListLink          *ListLink `xml:"TariffProfileListLink,omitempty"`
 
 	// DeviceCapability-specific links
 	EndDeviceListLink              *ListLink `xml:"EndDeviceListLink,omitempty"`
@@ -121,6 +122,8 @@ type EndDevice struct {
 	FunctionSetAssignmentsListLink   *ListLink `xml:"FunctionSetAssignmentsListLink,omitempty"`
 	RegistrationLink                 *Link     `xml:"RegistrationLink,omitempty"`
 	LogEventListLink                 *ListLink `xml:"LogEventListLink,omitempty"`
+	FlowReservationRequestListLink   *ListLink `xml:"FlowReservationRequestListLink,omitempty"`
+	FlowReservationResponseListLink  *ListLink `xml:"FlowReservationResponseListLink,omitempty"`
 }
 
 // EndDeviceList is a collection of EndDevice resources.
@@ -160,12 +163,14 @@ type FunctionSetAssignments struct {
 	// Subscribable indicates subscription support.
 	Subscribable uint8 `xml:"subscribable,attr,omitempty"`
 
-	// Links to DER program lists, time, etc.
-	DERProgramListLink  *ListLink `xml:"DERProgramListLink,omitempty"`
-	TimeLink            *Link     `xml:"TimeLink,omitempty"`
-	MRID                string    `xml:"mRID,omitempty"`
-	Description         string    `xml:"description,omitempty"`
-	Version             uint16    `xml:"version,omitempty"`
+	// Links to assigned function set resource lists.
+	DERProgramListLink     *ListLink `xml:"DERProgramListLink,omitempty"`
+	TimeLink               *Link     `xml:"TimeLink,omitempty"`
+	TariffProfileListLink  *ListLink `xml:"TariffProfileListLink,omitempty"`
+	CustomerAccountListLink *ListLink `xml:"CustomerAccountListLink,omitempty"`
+	MRID                   string    `xml:"mRID,omitempty"`
+	Description            string    `xml:"description,omitempty"`
+	Version                uint16    `xml:"version,omitempty"`
 }
 
 // FunctionSetAssignmentsList is a collection of FSA resources.
@@ -380,15 +385,18 @@ type ReadingType struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns ReadingType"`
 	Resource
 
-	AccumulationBehaviour uint8  `xml:"accumulationBehaviour,omitempty"`
-	CommodityType         uint8  `xml:"commodity,omitempty"`
-	DataQualifier         uint8  `xml:"dataQualifier,omitempty"`
-	FlowDirection         uint8  `xml:"flowDirection,omitempty"`
-	IntervalLength        uint32 `xml:"intervalLength,omitempty"`
-	Kind                  uint8  `xml:"kind,omitempty"`
-	Phase                 uint16 `xml:"phase,omitempty"`
-	PowerOfTenMultiplier  int8   `xml:"powerOfTenMultiplier,omitempty"`
-	Uom                   uint8  `xml:"uom,omitempty"`
+	AccumulationBehaviour    uint8  `xml:"accumulationBehaviour,omitempty"`
+	CommodityType            uint8  `xml:"commodity,omitempty"`
+	DataQualifier            uint8  `xml:"dataQualifier,omitempty"`
+	FlowDirection            uint8  `xml:"flowDirection,omitempty"`
+	IntervalLength           uint32 `xml:"intervalLength,omitempty"`
+	Kind                     uint8  `xml:"kind,omitempty"`
+	NumberOfConsumptionBlocks uint8 `xml:"numberOfConsumptionBlocks,omitempty"`
+	NumberOfTouTiers         uint8  `xml:"numberOfTouTiers,omitempty"`
+	Phase                    uint16 `xml:"phase,omitempty"`
+	PowerOfTenMultiplier     int8   `xml:"powerOfTenMultiplier,omitempty"`
+	TieredConsumptionBlocks  *bool  `xml:"tieredConsumptionBlocks,omitempty"`
+	Uom                      uint8  `xml:"uom,omitempty"`
 }
 
 // Reading is a single measured value within a MirrorReadingSet.

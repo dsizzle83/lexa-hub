@@ -24,8 +24,8 @@ import (
 	"math"
 	"time"
 
-	"lexa-hub/internal/csip/model"
-	"lexa-hub/internal/csip/scheduler"
+	"lexa-hub/internal/northbound/model"
+	"lexa-hub/internal/northbound/scheduler"
 )
 
 // ── Device state snapshots ────────────────────────────────────────────────────
@@ -191,6 +191,11 @@ type SystemState struct {
 
 	// ClockOffset is (server_time − local_time) in seconds; from CSIP discovery.
 	ClockOffset int64
+
+	// DailyPlanTarget is the cost-optimal target for the current 5-min interval,
+	// set by the Engine from the most recent DailyPlan. Nil when no plan is available
+	// or the current time is outside the plan window.
+	DailyPlanTarget *PlanTarget
 }
 
 // TotalSolarW sums generation across all solar devices.

@@ -8,17 +8,25 @@ import (
 	"sync"
 	"time"
 
-	"lexa-hub/internal/csip/discovery"
-	"lexa-hub/internal/csip/scheduler"
+	"lexa-hub/internal/northbound/discovery"
+	"lexa-hub/internal/northbound/scheduler"
 )
+
+// plannerInput holds the external inputs consumed by the daily planner.
+// Protected by Engine.planInMu.
+type plannerInput struct {
+	derConstraints []StepConstraint
+	importPrices   []float64 // per planSteps step; nil = use FallbackTOU
+	exportPrices   []float64
+}
 
 // Engine is the central orchestrator.  It runs a continuous control loop that:
 //  1. Reads the current SystemState via its reader
 //  2. Passes it to the Optimizer
 //  3. Executes the resulting Plan via the registered actuators
 //
-// The Engine is safe for concurrent use: SetCSIPPrograms may be called from
-// any goroutine while the engine is running.
+// The Engine is safe for concurrent use: SetCSIPPrograms, SetDERConstraints,
+// and SetPrices may be called from any goroutine while the engine is running.
 type Engine struct {
 	reader    SystemReader
 	optimizer Optimizer
@@ -37,6 +45,19 @@ type Engine struct {
 	clockOffset int64
 	sched       *scheduler.Scheduler
 
+	// Daily planner — produces 24-hour cost-optimal dispatch plans.
+	planner    *DailyPlanner
+	plannerCfg PlannerCfg
+
+	// planInMu guards plannerInput, updated via SetDERConstraints / SetPrices.
+	planInMu plannerInput
+	planInL  sync.RWMutex
+
+	// dailyPlan is the most recent planner output; guarded by dailyPlanMu.
+	dailyPlan    *DailyPlan
+	dailyPlanMu  sync.RWMutex
+	plannerWake  chan struct{} // buffered(1): signals the planner goroutine
+
 	// Last plan — updated after every tick; readable from any goroutine.
 	planMu   sync.RWMutex
 	lastPlan Plan
@@ -44,9 +65,9 @@ type Engine struct {
 	// Debug mode: print full decision trace on every tick.
 	Debug bool
 
-	stop        chan struct{}
-	done        chan struct{}
-	urgentWake  chan struct{} // poked by SetCSIPPrograms on OpModConnect=false
+	stop       chan struct{}
+	done       chan struct{}
+	urgentWake chan struct{} // poked by SetCSIPPrograms on OpModConnect=false
 }
 
 // Config groups optional Engine tunables.
@@ -55,6 +76,8 @@ type Config struct {
 	Interval time.Duration
 	// Debug enables step-by-step decision tracing.
 	Debug bool
+	// Planner holds the daily-planner asset and scheduling configuration.
+	Planner PlannerCfg
 }
 
 // New creates an Engine.  Call RegisterBatteryActuator, RegisterSolarActuator,
@@ -71,10 +94,41 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 		solarActuators: make(map[string]SolarActuator),
 		evseActuators:  make(map[string]EVSEActuator),
 		sched:          scheduler.New(),
+		planner:        NewDailyPlanner(),
+		plannerCfg:     cfg.Planner,
+		plannerWake:    make(chan struct{}, 1),
 		Debug:          cfg.Debug,
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
 		urgentWake:     make(chan struct{}, 1),
+	}
+}
+
+// SetDERConstraints stores per-step DER operating constraints derived from the
+// northbound 24-hour schedule.  Triggers an immediate re-plan.
+// Safe for concurrent use.
+func (e *Engine) SetDERConstraints(constraints []StepConstraint) {
+	e.planInL.Lock()
+	e.planInMu.derConstraints = constraints
+	e.planInL.Unlock()
+	e.signalReplan()
+}
+
+// SetPrices stores per-step electricity import and export prices ($/kWh).
+// Both slices must have len == planSteps.  Triggers an immediate re-plan.
+// Safe for concurrent use.
+func (e *Engine) SetPrices(importPrices, exportPrices []float64) {
+	e.planInL.Lock()
+	e.planInMu.importPrices = importPrices
+	e.planInMu.exportPrices = exportPrices
+	e.planInL.Unlock()
+	e.signalReplan()
+}
+
+func (e *Engine) signalReplan() {
+	select {
+	case e.plannerWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -122,9 +176,11 @@ func (e *Engine) SetCSIPPrograms(programs []discovery.ProgramState, clockOffset 
 	}
 }
 
-// Start launches the control loop goroutine.  Pair with Stop.
+// Start launches the control loop goroutine and the daily planner goroutine.
+// Pair with Stop.
 func (e *Engine) Start() {
 	go e.run()
+	go e.plannerLoop()
 }
 
 // Stop signals the control loop to exit and waits for it to finish.
@@ -156,6 +212,159 @@ func (e *Engine) run() {
 	}
 }
 
+// plannerLoop re-runs the daily planner whenever its inputs change or the
+// replan cadence fires.  It runs as a separate goroutine so the DP does not
+// block the 15-second control-loop tick.
+func (e *Engine) plannerLoop() {
+	interval := time.Duration(e.plannerCfg.ReplanIntervalS) * time.Second
+	if interval <= 0 {
+		interval = 15 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Plan immediately on startup.
+	e.replan()
+
+	for {
+		select {
+		case <-e.stop:
+			return
+		case <-e.plannerWake:
+			e.replan()
+			ticker.Reset(interval)
+		case <-ticker.C:
+			e.replan()
+		}
+	}
+}
+
+// replan builds PlannerParams from current state and runs the DP.
+func (e *Engine) replan() {
+	state, err := e.reader.ReadSystemState()
+	if err != nil {
+		log.Printf("[orchestrator] planner: read state error: %v", err)
+		return
+	}
+
+	e.planInL.RLock()
+	inp := e.planInMu
+	e.planInL.RUnlock()
+
+	params := e.buildPlannerParams(state, inp)
+	plan := e.planner.Plan(params)
+
+	e.dailyPlanMu.Lock()
+	e.dailyPlan = plan
+	e.dailyPlanMu.Unlock()
+
+	log.Printf("[orchestrator] replan: window=%s–%s cost=%.3f slots=%d",
+		time.Unix(plan.WindowStart, 0).Format("15:04"),
+		time.Unix(plan.WindowEnd, 0).Format("15:04"),
+		plan.TotalCost,
+		planSteps)
+}
+
+// buildPlannerParams derives PlannerParams from SystemState and planner inputs.
+func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) PlannerParams {
+	cfg := e.plannerCfg
+	now := state.Timestamp
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	p := PlannerParams{
+		WindowStart:       now.Unix(),
+		LoadForecastKw:    math.Max(0, state.InferredLoadW()-state.TotalEVSEW()) / 1000,
+		DERConstraints:    inp.derConstraints,
+		ImportPricePerKwh: inp.importPrices,
+		ExportPricePerKwh: inp.exportPrices,
+		SOCStepKwh:        cfg.SOCStepKwh,
+	}
+
+	// Solar forecast: flat from current generation.
+	if solarW := state.TotalSolarW(); solarW > 0 {
+		flatKw := solarW / 1000
+		p.SolarForecastKw = make([]float64, planSteps)
+		for i := range p.SolarForecastKw {
+			p.SolarForecastKw[i] = flatKw
+		}
+	}
+
+	// Fallback TOU if no live pricing.
+	if p.ImportPricePerKwh == nil {
+		p.FallbackTOU = DefaultTOUCostModel()
+	}
+
+	// Battery: prefer live MQTT metrics, fall back to config.
+	for _, b := range state.Batteries {
+		if !b.Connected {
+			continue
+		}
+		capKwh := cfg.BattCapacityKwh
+		if !math.IsNaN(b.CapacityWh) && b.CapacityWh > 0 {
+			capKwh = b.CapacityWh / 1000
+		}
+		maxCKw := cfg.BattMaxChargeKw
+		if maxCKw == 0 {
+			maxCKw = b.MaxChargeW / 1000
+		}
+		maxDKw := cfg.BattMaxDischargeKw
+		if maxDKw == 0 {
+			maxDKw = b.MaxDischargeW / 1000
+		}
+		initSocKwh := 0.0
+		if !math.IsNaN(b.SOC) && capKwh > 0 {
+			initSocKwh = b.SOC / 100 * capKwh
+		}
+		p.BattCapacityKwh = capKwh
+		p.BattMaxChargeKw = maxCKw
+		p.BattMaxDischargeKw = maxDKw
+		p.BattEfficiency = cfg.BattEfficiency
+		p.InitialBattSocKwh = initSocKwh
+		break // use first connected battery
+	}
+
+	// EV: config capacity + live SOC from EVSE state.
+	if cfg.EVCapacityKwh > 0 {
+		p.EVCapacityKwh = cfg.EVCapacityKwh
+		p.EVMaxChargeKw = cfg.EVMaxChargeKw
+		p.EVEfficiency = cfg.EVEfficiency
+		p.EVVoltageV = cfg.EVVoltageV
+		if p.EVVoltageV == 0 {
+			p.EVVoltageV = 240
+		}
+		// Pick live EV SOC if an active session is present.
+		for _, ev := range state.EVSEs {
+			if ev.SessionActive && !math.IsNaN(ev.SOC) {
+				p.InitialEVSocKwh = ev.SOC / 100 * cfg.EVCapacityKwh
+				if cfg.EVMaxChargeKw == 0 && ev.MaxCurrentA > 0 {
+					p.EVMaxChargeKw = ev.MaxCurrentA * p.EVVoltageV / 1000
+				}
+			}
+		}
+		// Target SOC and departure time.
+		if cfg.EVTargetSocPct > 0 {
+			p.EVTargetSocKwh = cfg.EVTargetSocPct / 100 * cfg.EVCapacityKwh
+			if cfg.EVDepartureHH > 0 || cfg.EVDepartureMM > 0 {
+				p.EVDepartureUnix = nextDailyOccurrence(now, cfg.EVDepartureHH, cfg.EVDepartureMM).Unix()
+			}
+		}
+	}
+
+	return p
+}
+
+// nextDailyOccurrence returns the next occurrence of HH:MM local time at or after now.
+func nextDailyOccurrence(now time.Time, hh, mm int) time.Time {
+	loc := now.Location()
+	candidate := time.Date(now.Year(), now.Month(), now.Day(), hh, mm, 0, 0, loc)
+	if candidate.Before(now) {
+		candidate = candidate.Add(24 * time.Hour)
+	}
+	return candidate
+}
+
 // tick is one optimization cycle.
 func (e *Engine) tick() {
 	// 1. Read system state.
@@ -178,18 +387,24 @@ func (e *Engine) tick() {
 		state.CSIPControl = FromActiveControl(active)
 	}
 
-	// 3. Optimize.
+	// 3. Inject daily plan target for the current 5-min interval.
+	e.dailyPlanMu.RLock()
+	dp := e.dailyPlan
+	e.dailyPlanMu.RUnlock()
+	state.DailyPlanTarget = dp.CurrentTarget(state.Timestamp)
+
+	// 4. Optimize.
 	plan := e.optimizer.Optimize(state)
 
-	// 4. Execute plan.
+	// 5. Execute plan.
 	e.executePlan(plan)
 
-	// 5. Store plan for external inspection (e.g. /status endpoint).
+	// 6. Store plan for external inspection (e.g. /status endpoint).
 	e.planMu.Lock()
 	e.lastPlan = plan
 	e.planMu.Unlock()
 
-	// 6. Log decisions.
+	// 7. Log decisions.
 	if e.Debug || len(plan.Decisions) > 0 {
 		e.logPlan(state, plan)
 	}

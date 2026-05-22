@@ -11,7 +11,7 @@ Wants=network-online.target
 Type=simple
 User=lexa
 Group=lexa
-ExecStart=/usr/local/sbin/lexa-csip -config /etc/lexa/csip.json
+ExecStart=/usr/local/sbin/lexa-northbound -config /etc/lexa/northbound.json
 Restart=on-failure
 RestartSec=10s
 
@@ -21,7 +21,7 @@ StartLimitBurst=5
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=lexa-csip
+SyslogIdentifier=lexa-northbound
 
 # Certificates must be readable by the lexa user.
 ReadOnlyPaths=/etc/lexa/certs

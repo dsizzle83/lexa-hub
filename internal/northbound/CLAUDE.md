@@ -1,4 +1,4 @@
-# CSIP / IEEE 2030.5 Northbound Stack
+# IEEE 2030.5 Northbound Stack
 
 ## Packages
 ```

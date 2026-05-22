@@ -28,8 +28,8 @@ import (
 	"sync"
 	"time"
 
-	"lexa-hub/internal/csip/discovery"
-	"lexa-hub/internal/csip/model"
+	"lexa-hub/internal/northbound/discovery"
+	"lexa-hub/internal/northbound/model"
 )
 
 // ActiveControl is what the client should apply right now.
