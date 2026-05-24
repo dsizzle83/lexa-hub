@@ -123,11 +123,11 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 				if bm.CapacityWh != nil {
 					b.CapacityWh = *bm.CapacityWh
 				}
-				if bm.MaxChargeW > 0 {
-					b.MaxChargeW = bm.MaxChargeW
+				if bm.MaxChargeW != nil && *bm.MaxChargeW > 0 {
+					b.MaxChargeW = *bm.MaxChargeW
 				}
-				if bm.MaxDischargeW > 0 {
-					b.MaxDischargeW = bm.MaxDischargeW
+				if bm.MaxDischargeW != nil && *bm.MaxDischargeW > 0 {
+					b.MaxDischargeW = *bm.MaxDischargeW
 				}
 			}
 			state.Batteries = append(state.Batteries, b)
@@ -209,17 +209,23 @@ func busToEVSEState(msg bus.EVSEState) orchestrator.EVSEState {
 	if msg.SOC != nil {
 		soc = *msg.SOC
 	}
+	deref := func(p *float64) float64 {
+		if p == nil {
+			return 0
+		}
+		return *p
+	}
 	return orchestrator.EVSEState{
 		StationID:     msg.StationID,
 		ConnectorID:   msg.ConnectorID,
 		Connected:     msg.Connected,
 		SessionActive: msg.SessionActive,
-		CurrentA:      msg.CurrentA,
-		MaxCurrentA:   msg.MaxCurrentA,
-		VoltageV:      msg.VoltageV,
-		PowerW:        msg.PowerW,
+		CurrentA:      deref(msg.CurrentA),
+		MaxCurrentA:   deref(msg.MaxCurrentA),
+		VoltageV:      deref(msg.VoltageV),
+		PowerW:        deref(msg.PowerW),
 		Status:        msg.Status,
 		SOC:           soc,
-		EnergyWh:      msg.EnergyWh,
+		EnergyWh:      deref(msg.EnergyWh),
 	}
 }

@@ -84,10 +84,6 @@ type DefaultOptimizer struct {
 	// Default 20 (≈ 1 min at a 3 s engine tick).
 	EVImportCooldownCycles int
 
-	// NowFunc returns the current time.  Nil means time.Now.
-	// Override in tests to inject a deterministic clock.
-	NowFunc func() time.Time
-
 	// expGuard holds per-limit-session state for the export-limit rule.
 	expGuard exportGuard
 
@@ -119,13 +115,6 @@ func NewDefaultOptimizer() *DefaultOptimizer {
 	}
 }
 
-func (o *DefaultOptimizer) now() time.Time {
-	if o.NowFunc != nil {
-		return o.NowFunc()
-	}
-	return time.Now()
-}
-
 // gridConstraints holds effective export/import/max limits after applying CSIP
 // overrides on top of grid-reported values.  NaN means unconstrained.
 type gridConstraints struct {
@@ -136,7 +125,11 @@ type gridConstraints struct {
 
 // Optimize evaluates all rules against state and returns a Plan.
 func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
-	plan := Plan{Timestamp: o.now()}
+	now := state.Timestamp
+	if now.IsZero() {
+		now = time.Now()
+	}
+	plan := Plan{Timestamp: now}
 
 	// Rule 1: CSIP disconnect — highest priority, always early-return.
 	if csipDisconnectRule(state.CSIPControl, state.Batteries, &plan) {
@@ -182,7 +175,7 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 
 		// Rule 5: TOU peak discharge.
 		// CSIP dispatch (OpModFixedW) is handled in Rule 2; this rule covers autonomous peak shifting.
-		serverNow := time.Unix(o.now().Unix()+state.ClockOffset, 0)
+		serverNow := time.Unix(now.Unix()+state.ClockOffset, 0)
 		isPeak := o.CostModel != nil && o.CostModel.IsPeakHour(serverNow)
 		peakReason := ""
 		if isPeak {

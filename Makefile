@@ -67,7 +67,7 @@ tidy:
 	go mod tidy
 
 test:
-	go test ./internal/...
+	go test -race ./internal/...
 
 clean:
 	rm -rf $(BINDIR)

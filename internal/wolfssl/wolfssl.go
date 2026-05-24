@@ -203,6 +203,18 @@ func Accept(ssl unsafe.Pointer) error {
 	return nil
 }
 
+// SetVerifyDomain pins the SSL session to the given hostname so that
+// wolfSSL verifies the peer cert's CN / Subject Alternative Names
+// match host during Connect. Must be called before Connect.
+func SetVerifyDomain(ssl unsafe.Pointer, host string) error {
+	c := C.CString(host)
+	defer C.free(unsafe.Pointer(c))
+	if int(C.wolfSSL_check_domain_name((*C.WOLFSSL)(ssl), c)) != Success {
+		return fmt.Errorf("wolfSSL_check_domain_name(%q) failed", host)
+	}
+	return nil
+}
+
 // Connect performs the client-side TLS handshake.
 func Connect(ssl unsafe.Pointer) error {
 	ret := int(C.wolfSSL_connect((*C.WOLFSSL)(ssl)))

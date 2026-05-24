@@ -20,6 +20,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -85,6 +86,14 @@ func main() {
 	log.Println("lexa-ocpp: shutting down")
 }
 
+// f64ptr returns a pointer to v, or nil if v is NaN.
+func f64ptr(v float64) *float64 {
+	if math.IsNaN(v) {
+		return nil
+	}
+	return &v
+}
+
 // ── MQTT ↔ OCPP bridge ───────────────────────────────────────────────────────
 
 type connectorStatus string
@@ -113,7 +122,13 @@ type stationState struct {
 }
 
 // mqttBridge wraps the OCPP CSMS and publishes EVSE state changes to MQTT.
+//
+// mu protects stations and all stationState fields. Callers must hold mu
+// for any read or write of stations or stationState. publishAll snapshots
+// the required state under mu.RLock then publishes outside the lock so
+// network I/O never runs while mu is held.
 type mqttBridge struct {
+	mu       sync.RWMutex
 	mc       mqtt.Client
 	csms     ocpp2.CSMS
 	stations map[string]*stationState
@@ -127,17 +142,21 @@ func newMQTTBridge(mc mqtt.Client, csms ocpp2.CSMS) *mqttBridge {
 	}
 
 	csms.SetNewChargingStationHandler(func(cs ocpp2.ChargingStationConnection) {
-		s := b.getOrCreate(cs.ID())
+		b.mu.Lock()
+		s := b.getOrCreateLocked(cs.ID())
 		s.connected = true
+		b.mu.Unlock()
 		log.Printf("[ocpp] connected: %s addr=%s", cs.ID(), cs.RemoteAddr())
 		b.publishAll(cs.ID())
 		go b.triggerStatusNotification(cs.ID())
 	})
 
 	csms.SetChargingStationDisconnectedHandler(func(cs ocpp2.ChargingStationConnection) {
+		b.mu.Lock()
 		if s, ok := b.stations[cs.ID()]; ok {
 			s.connected = false
 		}
+		b.mu.Unlock()
 		log.Printf("[ocpp] disconnected: %s", cs.ID())
 		b.publishAll(cs.ID())
 	})
@@ -148,7 +167,9 @@ func newMQTTBridge(mc mqtt.Client, csms ocpp2.CSMS) *mqttBridge {
 	return b
 }
 
-func (b *mqttBridge) getOrCreate(id string) *stationState {
+// getOrCreateLocked returns the stationState for id, creating it if absent.
+// Caller must hold mu for writing.
+func (b *mqttBridge) getOrCreateLocked(id string) *stationState {
 	if s, ok := b.stations[id]; ok {
 		return s
 	}
@@ -164,62 +185,79 @@ func (b *mqttBridge) getOrCreate(id string) *stationState {
 }
 
 func (b *mqttBridge) setStationConfig(id string, maxCurrentA, voltageV float64) {
-	s := b.getOrCreate(id)
+	b.mu.Lock()
+	s := b.getOrCreateLocked(id)
 	s.maxCurrentA = maxCurrentA
 	s.voltageV = voltageV
+	b.mu.Unlock()
 }
 
 func (b *mqttBridge) publishAll(stationID string) {
+	// Snapshot state under the read lock so we never hold the lock
+	// during network I/O.
+	b.mu.RLock()
 	s, ok := b.stations[stationID]
 	if !ok {
+		b.mu.RUnlock()
 		return
 	}
 	now := time.Now().Unix()
+	var msgs []bus.EVSEState
 	if len(s.connectors) == 0 {
 		msg := bus.EVSEState{
 			StationID:   s.id,
 			ConnectorID: 0,
 			Connected:   s.connected,
-			MaxCurrentA: s.maxCurrentA,
-			VoltageV:    s.voltageV,
+			MaxCurrentA: f64ptr(s.maxCurrentA),
+			VoltageV:    f64ptr(s.voltageV),
 			Status:      string(statusAvailable),
 			Ts:          now,
 		}
 		if !math.IsNaN(s.soc) {
-			msg.SOC = &s.soc
+			soc := s.soc
+			msg.SOC = &soc
 		}
-		_ = mqttutil.PublishJSON(b.mc, bus.EVSEStateTopic(s.id), msg)
-		return
+		msgs = append(msgs, msg)
+	} else {
+		for _, c := range s.connectors {
+			active := c.status == statusOccupied
+			var powerW float64
+			if active {
+				powerW = s.currentA * s.voltageV
+			}
+			msg := bus.EVSEState{
+				StationID:     s.id,
+				ConnectorID:   c.connectorID,
+				Connected:     s.connected,
+				SessionActive: active,
+				CurrentA:      f64ptr(s.currentA),
+				MaxCurrentA:   f64ptr(s.maxCurrentA),
+				VoltageV:      f64ptr(s.voltageV),
+				PowerW:        f64ptr(powerW),
+				EnergyWh:      f64ptr(s.energyWh),
+				Status:        string(c.status),
+				Ts:            now,
+			}
+			if !math.IsNaN(s.soc) {
+				soc := s.soc
+				msg.SOC = &soc
+			}
+			msgs = append(msgs, msg)
+		}
 	}
-	for _, c := range s.connectors {
-		active := c.status == statusOccupied
-		powerW := 0.0
-		if active {
-			powerW = s.currentA * s.voltageV
-		}
-		msg := bus.EVSEState{
-			StationID:     s.id,
-			ConnectorID:   c.connectorID,
-			Connected:     s.connected,
-			SessionActive: active,
-			CurrentA:      s.currentA,
-			MaxCurrentA:   s.maxCurrentA,
-			VoltageV:      s.voltageV,
-			PowerW:        powerW,
-			EnergyWh:      s.energyWh,
-			Status:        string(c.status),
-			Ts:            now,
-		}
-		if !math.IsNaN(s.soc) {
-			msg.SOC = &s.soc
-		}
-		_ = mqttutil.PublishJSON(b.mc, bus.EVSEStateTopic(s.id), msg)
+	b.mu.RUnlock()
+
+	for _, msg := range msgs {
+		_ = mqttutil.PublishJSON(b.mc, bus.EVSEStateTopic(stationID), msg)
 	}
 }
 
 func (b *mqttBridge) applyCommand(cmd bus.EVSECommand) error {
+	b.mu.RLock()
 	s, ok := b.stations[cmd.StationID]
-	if !ok || !s.connected {
+	connected := ok && s.connected
+	b.mu.RUnlock()
+	if !connected {
 		return nil
 	}
 	evseID := cmd.ConnectorID
@@ -246,10 +284,12 @@ func (b *mqttBridge) applyCommand(cmd bus.EVSECommand) error {
 	if callErr != nil {
 		return callErr
 	}
+	t := time.NewTimer(10 * time.Second)
+	defer t.Stop()
 	select {
 	case err := <-errCh:
 		return err
-	case <-time.After(10 * time.Second):
+	case <-t.C:
 		return nil
 	}
 }
@@ -274,8 +314,10 @@ func (h *availForwarder) OnHeartbeat(csID string, _ *availability.HeartbeatReque
 
 func (h *availForwarder) OnStatusNotification(csID string, req *availability.StatusNotificationRequest) (*availability.StatusNotificationResponse, error) {
 	status := connectorStatus(req.ConnectorStatus)
-	s := h.bridge.getOrCreate(csID)
+	h.bridge.mu.Lock()
+	s := h.bridge.getOrCreateLocked(csID)
 	s.connectors[req.ConnectorID] = &connState{connectorID: req.ConnectorID, status: status}
+	h.bridge.mu.Unlock()
 	log.Printf("[ocpp] StatusNotification cs=%s connector=%d status=%s", csID, req.ConnectorID, status)
 	h.bridge.publishAll(csID)
 	return &availability.StatusNotificationResponse{}, nil
@@ -284,7 +326,8 @@ func (h *availForwarder) OnStatusNotification(csID string, req *availability.Sta
 type meterForwarder struct{ bridge *mqttBridge }
 
 func (h *meterForwarder) OnMeterValues(csID string, req *meter.MeterValuesRequest) (*meter.MeterValuesResponse, error) {
-	s := h.bridge.getOrCreate(csID)
+	h.bridge.mu.Lock()
+	s := h.bridge.getOrCreateLocked(csID)
 	for _, mv := range req.MeterValue {
 		for _, sv := range mv.SampledValue {
 			v := sv.Value
@@ -309,8 +352,10 @@ func (h *meterForwarder) OnMeterValues(csID string, req *meter.MeterValuesReques
 			}
 		}
 	}
+	currentA, soc, energyWh := s.currentA, s.soc, s.energyWh
+	h.bridge.mu.Unlock()
 	log.Printf("[ocpp] MeterValues cs=%s evse=%d current=%.1fA soc=%.1f%% energy=%.0fWh",
-		csID, req.EvseID, s.currentA, s.soc, s.energyWh)
+		csID, req.EvseID, currentA, soc, energyWh)
 	h.bridge.publishAll(csID)
 	return meter.NewMeterValuesResponse(), nil
 }

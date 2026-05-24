@@ -131,8 +131,22 @@ func (c *Client) Dial() error {
 	if err := wolfssl.SetFD(ssl, int(file.Fd())); err != nil {
 		return err
 	}
+
+	host, _, err := net.SplitHostPort(c.cfg.ServerAddr)
+	if err != nil {
+		return fmt.Errorf("parse server address %q: %w", c.cfg.ServerAddr, err)
+	}
+	if err := wolfssl.SetVerifyDomain(ssl, host); err != nil {
+		return fmt.Errorf("set verify domain: %w", err)
+	}
+
 	if err := wolfssl.Connect(ssl); err != nil {
 		return fmt.Errorf("TLS handshake: %w", err)
+	}
+	if wolfssl.CipherName(ssl) != DefaultCipherList || wolfssl.Version(ssl) != "TLSv1.2" {
+		wolfssl.Shutdown(ssl)
+		return fmt.Errorf("CSIP §5.2.1.1: negotiated %s/%s, want %s/TLSv1.2",
+			wolfssl.Version(ssl), wolfssl.CipherName(ssl), DefaultCipherList)
 	}
 
 	c.ssl = ssl
@@ -197,6 +211,9 @@ func (c *Client) Post(path string, body []byte, contentType string) ([]byte, err
 	if c.ssl == nil {
 		return nil, errors.New("client not connected; call Dial first")
 	}
+	if err := validateRequestParam(path, "path"); err != nil {
+		return nil, err
+	}
 	req := buildPostRequest(path, c.cfg.ServerAddr, body, contentType)
 	if _, err := wolfssl.Write(c.ssl, req); err != nil {
 		return nil, fmt.Errorf("write request: %w", err)
@@ -211,6 +228,9 @@ func (c *Client) Post(path string, body []byte, contentType string) ([]byte, err
 func (c *Client) Get(path string) ([]byte, error) {
 	if c.ssl == nil {
 		return nil, errors.New("client not connected; call Dial first")
+	}
+	if err := validateRequestParam(path, "path"); err != nil {
+		return nil, err
 	}
 	req := buildGetRequest(path, c.cfg.ServerAddr)
 	if _, err := wolfssl.Write(c.ssl, req); err != nil {
@@ -246,10 +266,14 @@ func (c *Client) readResponse() ([]byte, error) {
 	}
 
 	// Phase 2: read exactly Content-Length body bytes.
-	cl := responseContentLength(buf[:headerEnd])
+	headers := buf[:headerEnd]
+	if isChunkedEncoding(headers) {
+		return nil, fmt.Errorf("Transfer-Encoding: chunked is not supported")
+	}
+	cl := responseContentLength(headers)
 	if cl < 0 {
-		// No Content-Length: fall back to reading until server closes.
-		for {
+		// No Content-Length: read until server closes, but cap at maxResponseBody.
+		for len(buf) <= maxResponseBody {
 			n, err := wolfssl.Read(c.ssl, scratch)
 			if n > 0 {
 				buf = append(buf, scratch[:n]...)
@@ -257,6 +281,9 @@ func (c *Client) readResponse() ([]byte, error) {
 			if err != nil || n == 0 {
 				break
 			}
+		}
+		if len(buf) > maxResponseBody {
+			return nil, fmt.Errorf("response body too large: exceeded %d bytes (no Content-Length)", maxResponseBody)
 		}
 		return buf, nil
 	}
@@ -279,6 +306,22 @@ func (c *Client) readResponse() ([]byte, error) {
 		return nil, fmt.Errorf("truncated response: got %d bytes, expected %d", len(buf), need)
 	}
 	return buf[:need], nil
+}
+
+// isChunkedEncoding reports whether the raw HTTP header block contains
+// Transfer-Encoding: chunked (case-insensitive). Our parser does not
+// implement chunked decoding, so callers must reject such responses.
+func isChunkedEncoding(headers []byte) bool {
+	lower := bytes.ToLower(headers)
+	for _, line := range bytes.Split(lower, []byte("\r\n")) {
+		if bytes.HasPrefix(line, []byte("transfer-encoding:")) {
+			val := bytes.TrimSpace(line[len("transfer-encoding:"):])
+			if bytes.Equal(val, []byte("chunked")) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // responseContentLength returns the Content-Length value from a raw

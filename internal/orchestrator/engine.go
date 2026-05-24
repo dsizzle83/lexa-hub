@@ -65,9 +65,10 @@ type Engine struct {
 	// Debug mode: print full decision trace on every tick.
 	Debug bool
 
-	stop       chan struct{}
-	done       chan struct{}
-	urgentWake chan struct{} // poked by SetCSIPPrograms on OpModConnect=false
+	stop        chan struct{}
+	done        chan struct{}
+	plannerDone chan struct{} // closed when plannerLoop exits
+	urgentWake  chan struct{} // poked by SetCSIPPrograms on OpModConnect=false
 }
 
 // Config groups optional Engine tunables.
@@ -100,6 +101,7 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 		Debug:          cfg.Debug,
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
+		plannerDone:    make(chan struct{}),
 		urgentWake:     make(chan struct{}, 1),
 	}
 }
@@ -183,10 +185,11 @@ func (e *Engine) Start() {
 	go e.plannerLoop()
 }
 
-// Stop signals the control loop to exit and waits for it to finish.
+// Stop signals both goroutines to exit and waits for them to finish.
 func (e *Engine) Stop() {
 	close(e.stop)
 	<-e.done
+	<-e.plannerDone
 }
 
 // run is the main control loop.
@@ -216,6 +219,7 @@ func (e *Engine) run() {
 // replan cadence fires.  It runs as a separate goroutine so the DP does not
 // block the 15-second control-loop tick.
 func (e *Engine) plannerLoop() {
+	defer close(e.plannerDone)
 	interval := time.Duration(e.plannerCfg.ReplanIntervalS) * time.Second
 	if interval <= 0 {
 		interval = 15 * time.Minute
@@ -274,6 +278,7 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 	}
 
 	p := PlannerParams{
+		Now:               now,
 		WindowStart:       now.Unix(),
 		LoadForecastKw:    math.Max(0, state.InferredLoadW()-state.TotalEVSEW()) / 1000,
 		DERConstraints:    inp.derConstraints,

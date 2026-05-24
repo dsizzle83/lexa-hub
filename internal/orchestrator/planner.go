@@ -14,6 +14,10 @@ const (
 // PlannerParams is the full input to DailyPlanner.Plan.
 // All zero-value fields receive sensible defaults via withDefaults().
 type PlannerParams struct {
+	// Now is the caller's current time, stamped when ReadSystemState was called.
+	// Zero → Plan uses time.Now() as a fallback.
+	Now time.Time
+
 	// WindowStart is the first interval start (Unix s); snapped to 5-min boundary.
 	WindowStart int64
 
@@ -392,8 +396,12 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 	}
 
 	// ─── Backtrack to extract per-step plan ───────────────────────────────────
+	buildTime := p.Now
+	if buildTime.IsZero() {
+		buildTime = time.Now()
+	}
 	out := &DailyPlan{
-		BuildTime:   time.Now(),
+		BuildTime:   buildTime,
 		WindowStart: ws,
 		WindowEnd:   we,
 		TotalCost:   totalCost,

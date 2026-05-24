@@ -227,7 +227,8 @@ func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
 	}
 	m, err := r.live.ReadMeasurements()
 	if err != nil {
-		r.live = nil // reset so next poll retries
+		_ = r.live.Close() // release fd before clearing the reference
+		r.live = nil       // reset so next poll reconnects
 	}
 	return m, err
 }

@@ -17,8 +17,8 @@ type BattMetrics struct {
 	SOC           *float64 `json:"soc_pct,omitempty"`
 	SOH           *float64 `json:"soh_pct,omitempty"`
 	CapacityWh    *float64 `json:"capacity_wh,omitempty"`
-	MaxChargeW    float64  `json:"max_charge_w"`
-	MaxDischargeW float64  `json:"max_discharge_w"`
+	MaxChargeW    *float64 `json:"max_charge_w,omitempty"`
+	MaxDischargeW *float64 `json:"max_discharge_w,omitempty"`
 	Ts            int64    `json:"ts"`
 }
 
@@ -61,12 +61,12 @@ type EVSEState struct {
 	ConnectorID   int      `json:"connector_id"`
 	Connected     bool     `json:"connected"`
 	SessionActive bool     `json:"session_active"`
-	CurrentA      float64  `json:"current_a"`
-	MaxCurrentA   float64  `json:"max_current_a"`
-	VoltageV      float64  `json:"voltage_v"`
-	PowerW        float64  `json:"power_w"`
+	CurrentA      *float64 `json:"current_a,omitempty"`
+	MaxCurrentA   *float64 `json:"max_current_a,omitempty"`
+	VoltageV      *float64 `json:"voltage_v,omitempty"`
+	PowerW        *float64 `json:"power_w,omitempty"`
 	SOC           *float64 `json:"soc_pct,omitempty"`
-	EnergyWh      float64  `json:"energy_wh"`
+	EnergyWh      *float64 `json:"energy_wh,omitempty"`
 	Status        string   `json:"status"`
 	Ts            int64    `json:"ts"`
 }
@@ -173,9 +173,9 @@ type FlowReservationRequestMsg struct {
 	Description string `json:"description,omitempty"`
 
 	// EnergyRequestedWh is the total energy transfer needed (Wh).
-	EnergyRequestedWh float64 `json:"energy_requested_wh"`
+	EnergyRequestedWh *float64 `json:"energy_requested_wh,omitempty"`
 	// PowerRequestedW is the desired charge/discharge rate (W).
-	PowerRequestedW float64 `json:"power_requested_w"`
+	PowerRequestedW *float64 `json:"power_requested_w,omitempty"`
 	// DurationRequested is the minimum charging duration needed (seconds).
 	DurationRequested uint32 `json:"duration_requested"`
 
@@ -201,8 +201,8 @@ type ReservationMsg struct {
 	CurrentStatus uint8   `json:"current_status"`  // 0=scheduled, 1=active, 2=cancelled, 3=superseded
 	IntervalStart int64   `json:"interval_start"`
 	Duration      uint32  `json:"duration"`
-	EnergyAvailWh float64 `json:"energy_avail_wh"`
-	PowerAvailW   float64 `json:"power_avail_w"`
+	EnergyAvailWh *float64 `json:"energy_avail_wh,omitempty"`
+	PowerAvailW   *float64 `json:"power_avail_w,omitempty"`
 }
 
 // ─── DER 24-hour schedule (northbound → hub) ─────────────────────────────────

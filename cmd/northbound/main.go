@@ -25,10 +25,12 @@ import (
 	"encoding/pem"
 	"encoding/xml"
 	"flag"
+	"fmt"
 	"log"
 	"math"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -52,9 +54,10 @@ import (
 // messages from the hub via MQTT and POSTs them to the utility server, tracking
 // the path to use for each end device.
 type flowReservationManager struct {
+	mu          sync.RWMutex
 	fetcher     *tlsclient.WolfSSLFetcher
 	lfdi        string
-	requestPath string // EndDevice FlowReservationRequestListLink.Href
+	requestPath string // EndDevice FlowReservationRequestListLink.Href; guarded by mu
 }
 
 func newFlowReservationManager(f *tlsclient.WolfSSLFetcher, lfdi string) *flowReservationManager {
@@ -64,7 +67,9 @@ func newFlowReservationManager(f *tlsclient.WolfSSLFetcher, lfdi string) *flowRe
 // setRequestPath updates the server path to POST new requests to. Called after
 // each discovery walk with the path from the EndDevice resource.
 func (m *flowReservationManager) setRequestPath(path string) {
+	m.mu.Lock()
 	m.requestPath = path
+	m.mu.Unlock()
 }
 
 // handleRequest is the MQTT message handler for TopicCSIPFRRequest. It
@@ -76,7 +81,10 @@ func (m *flowReservationManager) handleRequest(payload []byte) {
 		log.Printf("lexa-northbound: flowreservation decode: %v", err)
 		return
 	}
-	if m.requestPath == "" {
+	m.mu.RLock()
+	requestPath := m.requestPath
+	m.mu.RUnlock()
+	if requestPath == "" {
 		log.Printf("lexa-northbound: flowreservation: no request path yet — server may not support FR")
 		return
 	}
@@ -88,7 +96,7 @@ func (m *flowReservationManager) handleRequest(payload []byte) {
 		DurationRequested: msg.DurationRequested,
 		EnergyRequested: &model.UnitValue{
 			Multiplier: 0,
-			Value:      int64(msg.EnergyRequestedWh),
+			Value:      int64(derefF64(msg.EnergyRequestedWh)),
 		},
 		IntervalRequested: model.DateTimeInterval{
 			Start:    msg.IntervalStart,
@@ -96,7 +104,7 @@ func (m *flowReservationManager) handleRequest(payload []byte) {
 		},
 		PowerRequested: &model.UnitValue{
 			Multiplier: 0,
-			Value:      int64(msg.PowerRequestedW),
+			Value:      int64(derefF64(msg.PowerRequestedW)),
 		},
 		RequestStatus: model.RequestStatus{
 			DateTime:      msg.Ts,
@@ -109,9 +117,9 @@ func (m *flowReservationManager) handleRequest(payload []byte) {
 		log.Printf("lexa-northbound: flowreservation marshal: %v", err)
 		return
 	}
-	_, location, err := m.fetcher.Post(m.requestPath, body, "application/sep+xml")
+	_, location, err := m.fetcher.Post(requestPath, body, "application/sep+xml")
 	if err != nil {
-		log.Printf("lexa-northbound: flowreservation POST %s: %v", m.requestPath, err)
+		log.Printf("lexa-northbound: flowreservation POST %s: %v", requestPath, err)
 		return
 	}
 	log.Printf("lexa-northbound: flowreservation POSTed mrid=%s location=%s", msg.MRID, location)
@@ -523,10 +531,12 @@ func publishFlowReservations(mc mqtt.Client, tree *discovery.ResourceTree) {
 				Duration:      frr.Interval.Duration,
 			}
 			if frr.EnergyAvailable != nil {
-				rm.EnergyAvailWh = unitValueToFloat(frr.EnergyAvailable)
+				v := unitValueToFloat(frr.EnergyAvailable)
+				rm.EnergyAvailWh = &v
 			}
 			if frr.PowerAvailable != nil {
-				rm.PowerAvailW = unitValueToFloat(frr.PowerAvailable)
+				v := unitValueToFloat(frr.PowerAvailable)
+				rm.PowerAvailW = &v
 			}
 			msg.Reservations = append(msg.Reservations, rm)
 		}
@@ -542,6 +552,13 @@ func unitValueToFloat(uv *model.UnitValue) float64 {
 		return 0
 	}
 	return float64(uv.Value) * math.Pow10(int(uv.Multiplier))
+}
+
+func derefF64(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+	return *p
 }
 
 // toActiveControl converts a scheduler.ActiveControl to the MQTT bus message.
@@ -595,7 +612,7 @@ func lfdiFromCert(path string) (string, error) {
 	}
 	block, _ := pem.Decode(data)
 	if block == nil {
-		return "", nil
+		return "", fmt.Errorf("no PEM block found in %s", path)
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {

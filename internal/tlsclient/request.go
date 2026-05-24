@@ -1,6 +1,19 @@
 package tlsclient
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
+
+// validateRequestParam rejects strings that contain CR, LF, or space.
+// These characters would allow a hostile server to inject additional HTTP
+// headers or smuggle a second request via attacker-controlled path/host values.
+func validateRequestParam(s, name string) error {
+	if strings.ContainsAny(s, "\r\n ") {
+		return fmt.Errorf("invalid %s: contains CR, LF, or space", name)
+	}
+	return nil
+}
 
 // buildGetRequest constructs an HTTP/1.1 GET request for the given path.
 // The Host header is required by HTTP/1.1 and 2030.5 conformance test

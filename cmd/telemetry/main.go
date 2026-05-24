@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"encoding/xml"
 	"flag"
+	"fmt"
 	"log"
 	"math"
 	"os"
@@ -90,9 +91,11 @@ func main() {
 		log.Fatal("lexa-telemetry: no MUPs registered — exiting")
 	}
 
-	// Maintain the latest measurement per device.
+	// mu guards both latest measurements and clockOffset so snapshots are
+	// always from the same lock epoch (no clock/data skew between locks).
 	var mu sync.RWMutex
 	latest := make(map[string]device.Measurements)
+	var clockOffset int64
 
 	// Initialise to NaN so we don't post zeros before the first poll.
 	for _, dev := range cfg.Devices {
@@ -119,12 +122,10 @@ func main() {
 	}
 
 	// Subscribe to clock offset updates from the CSIP service.
-	var clockOffset int64
-	var clockMu sync.Mutex
 	if err := mqttutil.Subscribe(mc, bus.TopicCSIPControl, func(_ string, msg bus.ActiveControl) {
-		clockMu.Lock()
+		mu.Lock()
 		clockOffset = msg.ClockOffset
-		clockMu.Unlock()
+		mu.Unlock()
 	}); err != nil {
 		log.Printf("lexa-telemetry: subscribe csip control: %v", err)
 	}
@@ -147,11 +148,8 @@ func main() {
 			for k, v := range latest {
 				snap[k] = v
 			}
-			mu.RUnlock()
-
-			clockMu.Lock()
 			offset := clockOffset
-			clockMu.Unlock()
+			mu.RUnlock()
 
 			for i := range mups {
 				ep := &mups[i]
@@ -264,7 +262,7 @@ func lfdiFromCert(path string) (string, error) {
 	}
 	block, _ := pem.Decode(data)
 	if block == nil {
-		return "", nil
+		return "", fmt.Errorf("no PEM block found in %s", path)
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {

@@ -65,7 +65,7 @@ func PublishJSONRetained(client mqtt.Client, topic string, v any) error {
 // Subscribe registers handler for messages on topic (supports MQTT wildcards).
 // handler receives the raw topic string and the JSON-decoded value of type T.
 func Subscribe[T any](client mqtt.Client, topic string, handler func(topic string, msg T)) error {
-	tok := client.Subscribe(topic, 0, func(_ mqtt.Client, m mqtt.Message) {
+	tok := client.Subscribe(topic, 1, func(_ mqtt.Client, m mqtt.Message) {
 		var v T
 		if err := json.Unmarshal(m.Payload(), &v); err != nil {
 			log.Printf("[mqtt] unmarshal on %s: %v", m.Topic(), err)

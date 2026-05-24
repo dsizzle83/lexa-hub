@@ -418,12 +418,10 @@ func TestScenario_ExcessSolarWithEV(t *testing.T) {
 func TestOptimizer_TOU_PeakHour_DischargeBattery(t *testing.T) {
 	opt := orchestrator.NewDefaultOptimizer()
 	opt.CostModel = orchestrator.DefaultTOUCostModel()
-	// Force 5 pm — within the 16:00–21:00 peak window in DefaultTOUCostModel.
-	opt.NowFunc = func() time.Time {
-		return time.Date(2025, 1, 15, 17, 0, 0, 0, time.Local)
-	}
 
 	s := state0()
+	// Force 5 pm — within the 16:00–21:00 peak window in DefaultTOUCostModel.
+	s.Timestamp = time.Date(2025, 1, 15, 17, 0, 0, 0, time.Local)
 	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 80, 5000)}
 
 	plan := opt.Optimize(s)
