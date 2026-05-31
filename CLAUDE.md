@@ -15,7 +15,8 @@ Each concern runs as its own process and communicates only via Mosquitto MQTT:
     ├─ lexa-northbound — IEEE 2030.5 discovery walker; publishes active DER control
     ├─ lexa-telemetry— subscribes to measurements; POSTs MUP readings to northbound server
     ├─ lexa-ocpp     — OCPP 2.0.1 CSMS for EV chargers
-    └─ lexa-hub      — energy optimizer engine (the "brain")
+    ├─ lexa-hub      — energy optimizer engine (the "brain")
+    └─ lexa-api      — HTTP /status + /logs on :9100 (legacy dashboard adapter)
 ```
 
 ## MQTT topic map
@@ -39,6 +40,7 @@ cmd/
   modbus/     SunSpec/Modbus device poller + control applicator
   ocpp/       OCPP 2.0.1 CSMS for EV chargers
   telemetry/  MUP telemetry poster (wolfSSL CGo)
+  api/        HTTP API server — subscribes to MQTT, serves /status + /logs SSE
 
 internal/
   bus/        MQTT topic constants + JSON message types (shared by all services)
@@ -58,7 +60,7 @@ configs/     Example JSON configs for each service
 
 ```bash
 go mod tidy                  # fetch dependencies (first time)
-make build                   # builds all 5 binaries into bin/
+make build                   # builds all 6 binaries into bin/
 make test                    # runs internal package unit tests
 ```
 
@@ -88,6 +90,7 @@ All configs live in `/etc/lexa/`. Edit the copies created by `make install-confi
 | `/etc/lexa/modbus.json` | lexa-modbus |
 | `/etc/lexa/ocpp.json` | lexa-ocpp |
 | `/etc/lexa/telemetry.json` | lexa-telemetry |
+| `/etc/lexa/api.json` | lexa-api |
 | `/etc/lexa/certs/` | ca.pem, client.pem, ocpp.crt etc. |
 
 ## Critical invariants
