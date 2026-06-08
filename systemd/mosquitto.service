@@ -1,0 +1,16 @@
+[Unit]
+Description=Mosquitto MQTT Broker
+After=network.target
+Before=lexa-modbus.service lexa-hub.service lexa-ocpp.service lexa-api.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/mosquitto -c /etc/mosquitto/mosquitto.conf
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mosquitto
+
+[Install]
+WantedBy=multi-user.target

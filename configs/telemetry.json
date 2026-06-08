@@ -1,11 +1,11 @@
 {
   "mqtt_broker": "tcp://localhost:1883",
   "mqtt_client_id": "lexa-telemetry",
-  "server": "https://csip-server.example.com:8443",
+  "server": "69.0.0.20:11111",
   "ca_cert": "/etc/lexa/certs/ca.pem",
   "client_cert": "/etc/lexa/certs/client.pem",
   "client_key": "/etc/lexa/certs/client-key.pem",
   "lfdi": "",
   "devices": ["inverter-0", "battery-0", "meter-0"],
-  "mup_post_rate_s": 300
+  "mup_post_rate_s": 60
 }

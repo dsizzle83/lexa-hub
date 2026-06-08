@@ -16,18 +16,52 @@ $(BINDIR)/lexa-%: cmd/%/*.go internal/**/*.go go.mod
 	@mkdir -p $(BINDIR)
 	go build -o $@ ./cmd/$*
 
-# Cross-compile for Digi SOM (ARM64 Linux).
-# Run on a machine with a proper cross toolchain; CGo is required for lexa-northbound
-# and lexa-telemetry (wolfSSL). lexa-hub, lexa-ocpp, and lexa-modbus are
-# pure Go and can be cross-compiled without CGo.
+# Cross-compile for Digi ConnectCore 93 (ARM64 Linux).
+#
+# Prerequisites (one-time setup):
+#   sudo apt-get install -y gcc-aarch64-linux-gnu cmake automake autoconf libtool
+#   make wolfssl-arm64          # builds + installs wolfSSL into WOLFSSL_SYSROOT
+#
+# Pure-Go services (no CGo):
+GOARM64 := GOARCH=arm64 GOOS=linux CGO_ENABLED=0 go build
+
+# CGo services (wolfSSL mTLS):
+WOLFSSL_SYSROOT ?= /tmp/wolfssl-arm64-sysroot
+GOARM64_CGO := CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+	CC=aarch64-linux-gnu-gcc \
+	CGO_CFLAGS="-I$(WOLFSSL_SYSROOT)/include" \
+	CGO_LDFLAGS="-L$(WOLFSSL_SYSROOT)/lib -lwolfssl -lm" \
+	go build
+
 build-arm64:
 	@mkdir -p $(BINDIR)/arm64
-	GOARCH=arm64 GOOS=linux CGO_ENABLED=0 go build -o $(BINDIR)/arm64/lexa-hub      ./cmd/hub
-	GOARCH=arm64 GOOS=linux CGO_ENABLED=0 go build -o $(BINDIR)/arm64/lexa-modbus   ./cmd/modbus
-	GOARCH=arm64 GOOS=linux CGO_ENABLED=0 go build -o $(BINDIR)/arm64/lexa-ocpp     ./cmd/ocpp
-	GOARCH=arm64 GOOS=linux CGO_ENABLED=0 go build -o $(BINDIR)/arm64/lexa-api      ./cmd/api
+	$(GOARM64)     -o $(BINDIR)/arm64/lexa-hub        ./cmd/hub
+	$(GOARM64)     -o $(BINDIR)/arm64/lexa-modbus     ./cmd/modbus
+	$(GOARM64)     -o $(BINDIR)/arm64/lexa-ocpp       ./cmd/ocpp
+	$(GOARM64)     -o $(BINDIR)/arm64/lexa-api        ./cmd/api
+	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-northbound ./cmd/northbound
+	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-telemetry  ./cmd/telemetry
 
-	@echo "NOTE: lexa-northbound and lexa-telemetry require CGo (wolfSSL). Build on target or with cross toolchain."
+# Build and install wolfSSL static library for ARM64 cross-compilation.
+# Downloads wolfSSL 5.7.6, cross-compiles with aarch64-linux-gnu-gcc,
+# and installs headers + libwolfssl.a into WOLFSSL_SYSROOT.
+WOLFSSL_VER := 5.7.6-stable
+wolfssl-arm64:
+	@echo "Building wolfSSL $(WOLFSSL_VER) for ARM64 → $(WOLFSSL_SYSROOT)"
+	@mkdir -p /tmp/wolfssl-build-arm64
+	cd /tmp && wget -q https://github.com/wolfSSL/wolfssl/archive/refs/tags/v$(WOLFSSL_VER).tar.gz \
+		-O wolfssl-$(WOLFSSL_VER).tar.gz && tar xzf wolfssl-$(WOLFSSL_VER).tar.gz
+	cd /tmp/wolfssl-$(WOLFSSL_VER) && autoreconf -i
+	cd /tmp/wolfssl-build-arm64 && /tmp/wolfssl-$(WOLFSSL_VER)/configure \
+		--host=aarch64-linux-gnu CC=aarch64-linux-gnu-gcc \
+		--prefix=$(WOLFSSL_SYSROOT) \
+		--enable-tls13 --enable-aesccm --enable-tlsx \
+		--enable-certgen --enable-opensslall \
+		--enable-static --disable-shared \
+		--disable-examples --disable-crypttests
+	$(MAKE) -C /tmp/wolfssl-build-arm64 -j$$(nproc)
+	$(MAKE) -C /tmp/wolfssl-build-arm64 install prefix=$(WOLFSSL_SYSROOT)
+	@echo "wolfSSL installed to $(WOLFSSL_SYSROOT)"
 
 # Install binaries (run on the target device as root)
 install: build
