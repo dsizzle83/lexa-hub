@@ -228,6 +228,104 @@ is affected, but to bring the upstream side back:
 
 ---
 
+## Serial console: input is dead (host→board), output works
+
+**Symptom:** over the USB serial console (`/dev/ttyACM0`, picocom `-b 115200`) you
+see all boot output and the Linux login prompt, but **nothing you type reaches the
+board** — no echo, and you cannot interrupt U-Boot autoboot.
+
+**This is a hardware-level fault in the DVK's onboard USB-serial console bridge,
+not a software/picocom/terminal problem.** How it was proven (so nobody re-chases
+the wrong things):
+
+- The console bridge is a **Cypress USB-Serial `04b4:0002`** (single channel).
+- Board→host works (you see output); the USB link is fine both directions.
+- The board's console UART is `ttyLP5` (`/proc/tty/driver/fsl-lpuart`, port 5,
+  `mmio 0x425A0010`). Its receive counter is **`rx:0`** and never moves.
+- Writing bytes straight to `/dev/ttyACM0` from the host (bypassing picocom) — in
+  **every** DTR/RTS combination — leaves `ttyLP5` `rx` at exactly 0.
+- The board side is correctly configured to receive: `stty -F /dev/ttyLP5 -a` shows
+  `cread` (receiver on), `-crtscts -ixon -ixoff` (no flow control); pinmux shows
+  both pads claimed by `425a0000.serial`. So bytes simply never arrive at the SoC
+  RX pin.
+- Host side is clean: `ModemManager` stopped, nothing else holding the port.
+
+Conclusion: the bridge's transmit-toward-SoC path (or its trace to UART5 RX) is
+dead. Output-only console. Not fixable from software on host or board.
+
+### Things that are NOT the cause (already ruled out)
+picocom flags, terminal/line-discipline state, `SIGKILL` leftovers, hardware/software
+flow control, DTR/RTS gating, ModemManager (it *was* probing the port — a real
+nuisance, keep it disabled — but stopping it did not restore input), board UART
+config, and pin muxing.
+
+### How to get a working serial console again
+1. **External USB-TTL adapter** (FTDI / CP2102 / CH340) wired directly to the
+   console UART header on the DVK (TX↔RX, RX↔TX, GND↔GND), bypassing the dead
+   Cypress bridge. This is the reliable fix.
+2. Sanity-check on a **different host PC** to confirm the bridge (not this PC) is
+   at fault — expected result: still output-only.
+3. Keep `ModemManager` disabled on any Linux host used for the console:
+   `sudo systemctl disable --now ModemManager` (it hijacks USB-serial devices).
+
+---
+
+## Getting into fastboot / U-Boot WITHOUT the serial console
+
+Because the console can't accept keystrokes, you can't tap a key to stop U-Boot
+autoboot. Instead, a **one-shot fastboot trigger** has been installed in the U-Boot
+environment (settable from Linux over SSH — no console needed). It is **armed and
+verified safe** (a normal-boot reboot test passed).
+
+### How it works
+`bootcmd` was wrapped so it enters fastboot only when a flag is set, then clears
+the flag before launching fastboot (so a power-cycle ALWAYS returns to normal Linux
+— it can never strand the board):
+
+```
+bootcmd = if test "${enter_fastboot}" = "1"; then \
+              setenv enter_fastboot 0; saveenv; \
+              echo ">>> LEXA one-shot: entering fastboot"; \
+              run bootcmd_mfg;            # = fastboot auto  (Digi's built-in)
+          fi; \
+          run bsp_bootcmd                 # = normal boot (original bootcmd)
+```
+Backup of the original is in `bootcmd_orig_lexa` (= `run bsp_bootcmd`).
+
+### To enter fastboot
+1. **Connect a USB cable from the host PC to the board's fastboot/UDC port** —
+   that is i.MX93 **USB1** (`4c100000.usb` / `ci_hdrc.0`). This is REQUIRED: that
+   port currently reads `state=not attached`, and `fastboot auto` blocks waiting
+   for a host, so without the cable the board just sits in fastboot until you
+   power-cycle it (which then returns it to normal Linux).
+2. Trigger it over SSH:
+   ```
+   ssh root@69.0.0.2 'fw_setenv enter_fastboot 1 && reboot'
+   ```
+3. On the host, talk to it (fastboot is installed at `~/.local/platform-tools/`):
+   ```
+   ~/.local/platform-tools/fastboot devices
+   ~/.local/platform-tools/fastboot getvar product
+   ```
+4. When done, return to normal Linux:
+   ```
+   ~/.local/platform-tools/fastboot reboot        # or just power-cycle
+   ```
+
+`fastboot_dev=mmc0`, so `fastboot flash <partition> <image>` targets the eMMC.
+
+### To remove the one-shot wrapper entirely
+```
+ssh root@69.0.0.2 'fw_setenv bootcmd "run bsp_bootcmd"'
+```
+
+### If U-Boot itself ever needs recovery (env hosed, won't boot)
+Use NXP's **UUU (mfgtools)** over the i.MX93 boot-ROM serial-download USB — it does
+not use the console UART or a working U-Boot at all. Set the DVK boot switch to
+serial-download mode and run `uuu`. This is the ultimate fallback.
+
+---
+
 ## Related docs
 
 - `~/projects/csip-tls-test/sim_gridsim.txt` — IEEE 2030.5 gridsim server on the desktop
