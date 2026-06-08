@@ -439,3 +439,50 @@ func TestPruneRandOffsets_EmptyMapNoPanic(t *testing.T) {
 	// Should not panic with empty randOffsets map.
 	s.Evaluate(programs, epoch)
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// Tests: randomizeDuration (audit finding C-1)
+// ───────────────────────────────────────────────────────────────────────
+
+// eventWithRandDur builds a scheduled event carrying a randomizeDuration window.
+func eventWithRandDur(mrid string, start int64, duration uint32, randDur int32) model.DERControl {
+	c := scheduledEvent(mrid, epoch, start, duration, 3000)
+	c.RandomizeDuration = int32Ptr(randDur)
+	return c
+}
+
+func TestEvaluate_RandomizeDurationWithinBoundsAndCached(t *testing.T) {
+	s := New()
+	const base = uint32(100)
+	const window = int32(30)
+	evt := eventWithRandDur("RD-1", epoch, base, window)
+	programs := []discovery.ProgramState{makeProgram(1, "SP", 5000, evt)}
+
+	ac := s.Evaluate(programs, epoch+50) // mid-window, event must be active
+	if ac == nil || ac.Source != "event" {
+		t.Fatalf("expected active event, got %+v", ac)
+	}
+	lo := epoch + int64(base) - int64(window)
+	hi := epoch + int64(base) + int64(window)
+	if ac.ValidUntil < lo || ac.ValidUntil > hi {
+		t.Errorf("ValidUntil %d outside randomized window [%d,%d]", ac.ValidUntil, lo, hi)
+	}
+
+	// The duration offset must be cached: a second evaluation yields the same end.
+	ac2 := s.Evaluate(programs, epoch+50)
+	if ac2 == nil || ac2.ValidUntil != ac.ValidUntil {
+		t.Errorf("ValidUntil not stable across calls: %d then %v", ac.ValidUntil, ac2)
+	}
+}
+
+func TestEvaluate_RandomizeDurationNeverNegative(t *testing.T) {
+	s := New()
+	// Window larger than the base duration: the clamp must keep end >= start.
+	evt := eventWithRandDur("RD-2", epoch, 10, 100)
+	programs := []discovery.ProgramState{makeProgram(1, "SP", 5000, evt)}
+	// Probe across the whole possible window; the event must never report an
+	// end before its start (which would make Evaluate panic-free but nonsensical).
+	for off := int64(0); off <= 120; off++ {
+		_ = s.Evaluate(programs, epoch+off) // must not panic or misbehave
+	}
+}

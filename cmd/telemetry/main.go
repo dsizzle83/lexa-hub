@@ -199,6 +199,20 @@ func registerMUP(fetcher *tlsclient.WolfSSLFetcher, lfdi, devName string, rateS 
 	return loc, nil
 }
 
+// quantity describes one measured value and how to encode it as a
+// self-describing IEEE 2030.5 MirrorMeterReading. A reading is only meaningful
+// to the server if its ReadingType declares the unit (uom) and scale
+// (powerOfTenMultiplier) — without them V×100 is just an opaque integer
+// (audit finding S-2).
+type quantity struct {
+	value      float64
+	scale      float64 // multiply the SI value by this before rounding to int
+	uom        uint8
+	kind       uint8
+	multiplier int8 // powerOfTenMultiplier: value = encoded × 10^multiplier
+	suffix     string
+}
+
 func postMeasurements(
 	fetcher *tlsclient.WolfSSLFetcher,
 	devName, mupPath string,
@@ -210,46 +224,50 @@ func postMeasurements(
 	dur := uint32(intervalS)
 	start := now - int64(dur)
 
-	var readings []model.Reading
-	if !math.IsNaN(m.W) {
-		readings = append(readings, model.Reading{
-			LocalID:    1,
-			Value:      int64(math.Round(m.W)),
-			TimePeriod: &model.DateTimeInterval{Start: start, Duration: dur},
-		})
-	}
-	if !math.IsNaN(m.V) {
-		readings = append(readings, model.Reading{
-			LocalID:    2,
-			Value:      int64(math.Round(m.V * 100)),
-			TimePeriod: &model.DateTimeInterval{Start: start, Duration: dur},
-		})
-	}
-	if !math.IsNaN(m.Hz) {
-		readings = append(readings, model.Reading{
-			LocalID:    3,
-			Value:      int64(math.Round(m.Hz * 100)),
-			TimePeriod: &model.DateTimeInterval{Start: start, Duration: dur},
-		})
-	}
-	if len(readings) == 0 {
-		return nil
+	// One MirrorMeterReading per quantity, each carrying its own ReadingType.
+	// V and Hz are scaled ×100 (multiplier −2); W is sent as whole watts.
+	quantities := []quantity{
+		{m.W, 1, model.UomWatts, model.KindPower, 0, "W"},
+		{m.V, 100, model.UomVolts, model.KindVoltage, -2, "V"},
+		{m.Hz, 100, model.UomHertz, model.KindFreq, -2, "Hz"},
 	}
 
-	mmr := model.MirrorMeterReading{
-		MirrorReadingSet: []model.MirrorReadingSet{{
-			StartTime: start,
-			Duration:  dur,
-			Reading:   readings,
-		}},
+	posted := 0
+	for _, q := range quantities {
+		if math.IsNaN(q.value) {
+			continue
+		}
+		mmr := model.MirrorMeterReading{
+			MRID:        devName + "-" + q.suffix,
+			Description: devName + " " + q.suffix,
+			ReadingType: &model.ReadingType{
+				DataQualifier:        model.DataQualifierAverage,
+				Kind:                 q.kind,
+				PowerOfTenMultiplier: q.multiplier,
+				Uom:                  q.uom,
+				IntervalLength:       dur,
+			},
+			MirrorReadingSet: []model.MirrorReadingSet{{
+				StartTime: start,
+				Duration:  dur,
+				Reading: []model.Reading{{
+					Value:      int64(math.Round(q.value * q.scale)),
+					TimePeriod: &model.DateTimeInterval{Start: start, Duration: dur},
+				}},
+			}},
+		}
+		body, err := xml.Marshal(&mmr)
+		if err != nil {
+			return err
+		}
+		if _, _, err = fetcher.Post(mupPath, body, "application/sep+xml"); err != nil {
+			log.Printf("lexa-telemetry: POST %s %s: %v", devName, q.suffix, err)
+			return err
+		}
+		posted++
 	}
-	body, err := xml.Marshal(&mmr)
-	if err != nil {
-		return err
-	}
-	if _, _, err = fetcher.Post(mupPath, body, "application/sep+xml"); err != nil {
-		log.Printf("lexa-telemetry: POST %s: %v", devName, err)
-		return err
+	if posted == 0 {
+		return nil
 	}
 	log.Printf("lexa-telemetry: posted %s W=%.0f V=%.1f Hz=%.2f", devName, m.W, m.V, m.Hz)
 	return nil

@@ -8,10 +8,21 @@
 //   - Superseded events — when event A carries potentiallySuperseded=true
 //     and event B covers the same time window with a later creationTime,
 //     B wins and A is skipped.
-//   - Randomized start — randomizeStart is applied once per event MRID and
-//     cached so subsequent calls produce the same effective start time.
+//   - Randomized start/duration — randomizeStart and randomizeDuration are
+//     applied once per event MRID and cached so subsequent calls produce the
+//     same effective start time and window length (IEEE 2030.5 §11.10.4.2).
 //   - Default fallback — when no event is active in the highest-priority
 //     program, the program's DefaultDERControl is returned.
+//
+// Cross-program precedence (absolute primacy). The hub resolves the active
+// control from the single highest-priority program (lowest primacy value,
+// mRID as tiebreak) and does NOT merge events across programs: that program's
+// active event — or, when it has none, its DefaultDERControl — is authoritative
+// and outranks anything in a lower-priority program (see
+// TestEvaluate_HighPriorityDefaultBeatsLowPriorityEvent). Superseding is
+// therefore resolved within the highest-priority program's own control list.
+// This is a deliberate interpretation of IEEE 2030.5 §10.10/§12.3; revisit it
+// only against the aggregator BASIC-021..026 matrix with a Test Server.
 //
 // Usage:
 //
@@ -61,6 +72,7 @@ type ActiveControl struct {
 type Scheduler struct {
 	mu          sync.Mutex
 	randOffsets map[string]int32 // MRID → cached start randomization (seconds)
+	randDurs    map[string]int32 // MRID → cached duration randomization (seconds)
 	rng         *rand.Rand
 }
 
@@ -68,6 +80,7 @@ type Scheduler struct {
 func New() *Scheduler {
 	return &Scheduler{
 		randOffsets: make(map[string]int32),
+		randDurs:    make(map[string]int32),
 		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
@@ -129,9 +142,9 @@ func (s *Scheduler) activeEvent(ps *discovery.ProgramState, serverNow int64) *Ac
 			continue
 		}
 
-		// Compute the effective start time (with randomization).
+		// Compute the effective start time and window length (with randomization).
 		start := s.randomizedStart(ctrl)
-		end := start + int64(ctrl.Interval.Duration)
+		end := start + s.randomizedDuration(ctrl)
 
 		// Check whether serverNow is within the event interval.
 		if serverNow < start || serverNow >= end {
@@ -164,7 +177,7 @@ func (s *Scheduler) activeEvent(ps *discovery.ProgramState, serverNow int64) *Ac
 		Base:       best.DERControlBase,
 		Source:     "event",
 		MRID:       best.MRID,
-		ValidUntil: effectiveStart + int64(best.Interval.Duration),
+		ValidUntil: effectiveStart + s.randomizedDuration(best),
 	}
 }
 
@@ -194,6 +207,64 @@ func (s *Scheduler) randomizedStart(ctrl *model.DERControl) int64 {
 	return base + int64(offset)
 }
 
+// randomizedDuration returns the effective window length for ctrl in seconds,
+// applying the randomizeDuration offset per IEEE 2030.5 §11.10.4.2. Like the
+// start offset, the per-MRID duration offset is computed once and cached so the
+// event window stays stable across successive Evaluate calls. The result is
+// clamped at zero so randomization can never produce a negative-length window.
+func (s *Scheduler) randomizedDuration(ctrl *model.DERControl) int64 {
+	base := int64(ctrl.Interval.Duration)
+	if ctrl.RandomizeDuration == nil || *ctrl.RandomizeDuration == 0 {
+		return base
+	}
+
+	s.mu.Lock()
+	offset, ok := s.randDurs[ctrl.MRID]
+	if !ok {
+		window := *ctrl.RandomizeDuration
+		if window < 0 {
+			window = -window // the value is the magnitude
+		}
+		offset = int32(s.rng.Int63n(int64(2*window+1))) - window
+		s.randDurs[ctrl.MRID] = offset
+	}
+	s.mu.Unlock()
+
+	if d := base + int64(offset); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// SupersededMRIDs returns the set of event mRIDs in the highest-priority
+// program that are superseded at serverNow: within their (randomized) window
+// but losing to an overlapping event with a later creationTime. Used by the
+// response state machine to emit status=7 (superseded) acknowledgements
+// (CORE-022 / CORE-023). Cancelled events (status=6) are not included here —
+// the caller reports those as status=6.
+func (s *Scheduler) SupersededMRIDs(programs []discovery.ProgramState, serverNow int64) map[string]bool {
+	hp := discovery.HighestPriorityProgram(programs)
+	if hp == nil || hp.Controls == nil {
+		return nil
+	}
+	out := make(map[string]bool)
+	for i := range hp.Controls.DERControl {
+		ctrl := &hp.Controls.DERControl[i]
+		if ctrl.EventStatus != nil && ctrl.EventStatus.CurrentStatus == 6 {
+			continue
+		}
+		start := s.randomizedStart(ctrl)
+		end := start + s.randomizedDuration(ctrl)
+		if serverNow < start || serverNow >= end {
+			continue
+		}
+		if s.isSuperseded(ctrl, hp.Controls.DERControl, serverNow) {
+			out[ctrl.MRID] = true
+		}
+	}
+	return out
+}
+
 // isSuperseded returns true when another event in controls overlaps ctrl's
 // interval at serverNow and has a later creationTime. This is the client-side
 // supersede check per IEEE 2030.5 §12.3.
@@ -207,7 +278,7 @@ func (s *Scheduler) isSuperseded(ctrl *model.DERControl, controls []model.DERCon
 			continue
 		}
 		otherStart := s.randomizedStart(other)
-		otherEnd := otherStart + int64(other.Interval.Duration)
+		otherEnd := otherStart + s.randomizedDuration(other)
 		if serverNow >= otherStart && serverNow < otherEnd && other.CreationTime > ctrl.CreationTime {
 			return true
 		}
@@ -221,7 +292,7 @@ func (s *Scheduler) pruneRandOffsets(programs []discovery.ProgramState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.randOffsets) == 0 {
+	if len(s.randOffsets) == 0 && len(s.randDurs) == 0 {
 		return
 	}
 
@@ -237,6 +308,11 @@ func (s *Scheduler) pruneRandOffsets(programs []discovery.ProgramState) {
 	for mrid := range s.randOffsets {
 		if _, ok := live[mrid]; !ok {
 			delete(s.randOffsets, mrid)
+		}
+	}
+	for mrid := range s.randDurs {
+		if _, ok := live[mrid]; !ok {
+			delete(s.randDurs, mrid)
 		}
 	}
 }

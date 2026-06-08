@@ -251,7 +251,7 @@ func runDiscovery(
 		len(tree.PricingProfiles), len(tree.BillingAccounts),
 		msg.Source, msg.MRID, tree.ClockOffset, len(der24h.Slots))
 
-	rt.update(tree, active)
+	rt.update(tree, active, sched.SupersededMRIDs(tree.Programs, serverNow))
 
 	// Pricing (§10.5): publish if we discovered any tariff profiles.
 	if len(tree.PricingProfiles) > 0 {
@@ -624,62 +624,124 @@ func lfdiFromCert(path string) (string, error) {
 
 // ── Response tracker (GEN.044 / CORE-022) ────────────────────────────────────
 
+// responsePoster is the subset of tlsclient.WolfSSLFetcher the response state
+// machine needs. Narrowing it to an interface keeps the CORE-022 logic unit
+// testable without a live TLS session.
+type responsePoster interface {
+	Post(path string, body []byte, contentType string) ([]byte, string, error)
+}
+
 type responseTracker struct {
-	fetcher         *tlsclient.WolfSSLFetcher
+	poster          responsePoster
 	lfdi            string
 	responseSetPath string
 	clockOffset     int64
-	received        map[string]bool
-	activeMRID      string
+	// posted records the last Response status sent for each event mRID, so we
+	// never re-post a transition and can tell whether an event has already
+	// reached a terminal state (Completed/Cancelled/Superseded).
+	posted     map[string]uint8
+	activeMRID string
 }
 
-func newResponseTracker(f *tlsclient.WolfSSLFetcher, lfdi, path string) *responseTracker {
+func newResponseTracker(p responsePoster, lfdi, path string) *responseTracker {
 	return &responseTracker{
-		fetcher:         f,
+		poster:          p,
 		lfdi:            lfdi,
 		responseSetPath: path,
-		received:        make(map[string]bool),
+		posted:          make(map[string]uint8),
 	}
 }
 
-func (rt *responseTracker) update(tree *discovery.ResourceTree, active *scheduler.ActiveControl) {
-	rt.clockOffset = tree.ClockOffset
+// terminalResponse reports whether a response status ends an event's lifecycle:
+// no further responses are sent for an mRID once it reaches one of these.
+func terminalResponse(status uint8) bool {
+	switch status {
+	case model.ResponseEventCompleted, model.ResponseEventCancelled, model.ResponseEventSuperseded:
+		return true
+	default:
+		return false
+	}
+}
 
+// update drives the GEN.044 / CORE-022 response state machine for one poll
+// cycle: Received(1) on first sighting, Started(2)/Completed(3) as the active
+// event begins/ends, Cancelled(6) when the server cancels a received event
+// (CORE-022 step 7), and Superseded(7) when an overlapping event wins
+// (CORE-023). superseded is the set of currently-superseded event mRIDs from
+// scheduler.SupersededMRIDs.
+func (rt *responseTracker) update(tree *discovery.ResourceTree, active *scheduler.ActiveControl, superseded map[string]bool) {
+	rt.clockOffset = tree.ClockOffset
+	serverNow := scheduler.ServerNow(tree.ClockOffset)
+
+	// Pass 1 — receipt, cancellation, and supersession for every event.
 	for _, ps := range tree.Programs {
 		if ps.Controls == nil {
 			continue
 		}
 		for _, ctrl := range ps.Controls.DERControl {
+			mrid := ctrl.MRID
+			last, seen := rt.posted[mrid]
+
 			if ctrl.EventStatus != nil && ctrl.EventStatus.CurrentStatus == 6 {
+				// Cancelled. Acknowledge only events we previously received;
+				// events that arrive already-cancelled are dropped silently.
+				if seen && !terminalResponse(last) {
+					rt.set(mrid, model.ResponseEventCancelled)
+					if rt.activeMRID == mrid {
+						rt.activeMRID = ""
+					}
+				}
 				continue
 			}
-			if !rt.received[ctrl.MRID] {
-				rt.postResponse(ctrl.MRID, model.ResponseEventReceived)
-				rt.received[ctrl.MRID] = true
+
+			if !seen {
+				rt.set(mrid, model.ResponseEventReceived)
+				last = model.ResponseEventReceived
+			}
+
+			if superseded[mrid] && !terminalResponse(last) {
+				rt.set(mrid, model.ResponseEventSuperseded)
+				if rt.activeMRID == mrid {
+					rt.activeMRID = ""
+				}
 			}
 		}
 	}
 
+	// Pass 2 — start/complete transitions for the active event.
 	if active == nil || active.Source == "default" {
-		if rt.activeMRID != "" {
-			rt.postResponse(rt.activeMRID, model.ResponseEventCompleted)
-			rt.activeMRID = ""
-		}
+		rt.completeActive()
 		return
 	}
 
 	if active.MRID != rt.activeMRID {
-		if rt.activeMRID != "" {
-			rt.postResponse(rt.activeMRID, model.ResponseEventCompleted)
-		}
-		rt.postResponse(active.MRID, model.ResponseEventStarted)
+		rt.completeActive()
+		rt.set(active.MRID, model.ResponseEventStarted)
 		rt.activeMRID = active.MRID
 	}
 
-	if active.ValidUntil > 0 && scheduler.ServerNow(tree.ClockOffset) >= active.ValidUntil {
-		rt.postResponse(active.MRID, model.ResponseEventCompleted)
-		rt.activeMRID = ""
+	if active.ValidUntil > 0 && serverNow >= active.ValidUntil {
+		rt.completeActive()
 	}
+}
+
+// completeActive posts Completed(3) for the current active event unless it has
+// already reached a terminal state (e.g. it was just cancelled or superseded),
+// then clears the active mRID.
+func (rt *responseTracker) completeActive() {
+	if rt.activeMRID == "" {
+		return
+	}
+	if !terminalResponse(rt.posted[rt.activeMRID]) {
+		rt.set(rt.activeMRID, model.ResponseEventCompleted)
+	}
+	rt.activeMRID = ""
+}
+
+// set posts a Response and records it as the latest status for mrid.
+func (rt *responseTracker) set(mrid string, status uint8) {
+	rt.postResponse(mrid, status)
+	rt.posted[mrid] = status
 }
 
 func (rt *responseTracker) postResponse(mrid string, status uint8) {
@@ -694,10 +756,10 @@ func (rt *responseTracker) postResponse(mrid string, status uint8) {
 		log.Printf("lexa-northbound: marshal Response: %v", err)
 		return
 	}
-	if _, _, err = rt.fetcher.Post(rt.responseSetPath, body, "application/sep+xml"); err != nil {
+	if _, _, err = rt.poster.Post(rt.responseSetPath, body, "application/sep+xml"); err != nil {
 		log.Printf("lexa-northbound: POST response (mrid=%s status=%d): %v", mrid, status, err)
 		return
 	}
-	names := map[uint8]string{1: "Received", 2: "Started", 3: "Completed"}
+	names := map[uint8]string{1: "Received", 2: "Started", 3: "Completed", 6: "Cancelled", 7: "Superseded"}
 	log.Printf("lexa-northbound: response posted: %s mrid=%s", names[status], mrid)
 }

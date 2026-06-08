@@ -438,11 +438,30 @@ type MirrorMeterReading struct {
 
 // Response status codes (IEEE 2030.5 table 27).
 const (
-	ResponseEventReceived  uint8 = 1 // event text received and understood
-	ResponseEventStarted   uint8 = 2 // event interval began
-	ResponseEventCompleted uint8 = 3 // event interval ended
-	ResponseOptIn          uint8 = 4 // client opted in (for opt-in programs)
-	ResponseOptOut         uint8 = 5 // client opted out
+	ResponseEventReceived   uint8 = 1 // event text received and understood
+	ResponseEventStarted    uint8 = 2 // event interval began
+	ResponseEventCompleted  uint8 = 3 // event interval ended
+	ResponseOptIn           uint8 = 4 // client opted in (for opt-in programs)
+	ResponseOptOut          uint8 = 5 // client opted out
+	ResponseEventCancelled  uint8 = 6 // event cancelled by the server (CORE-022)
+	ResponseEventSuperseded uint8 = 7 // event superseded by an overlapping event (CORE-023)
+)
+
+// IEEE 2030.5 UomType codes (Table for ReadingType.uom) used by MUP telemetry.
+const (
+	UomWatts uint8 = 38 // real power, W
+	UomVolts uint8 = 29 // voltage, V
+	UomHertz uint8 = 33 // frequency, Hz
+)
+
+// DataQualifier codes (ReadingType.dataQualifier).
+const DataQualifierAverage uint8 = 2
+
+// KindType codes (ReadingType.kind).
+const (
+	KindPower   uint8 = 37 // power (W)
+	KindVoltage uint8 = 12 // voltage
+	KindFreq    uint8 = 38 // frequency
 )
 
 // Response is posted by the client to the server's ResponseSetListLink
