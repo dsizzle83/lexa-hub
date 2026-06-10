@@ -58,6 +58,25 @@ func main() {
 	// Build the MQTT-backed system reader.
 	reader := newMQTTSystemReader(cfg.Devices)
 
+	// Build the optimizer and engine (before the subscriptions, which need to
+	// poke the engine on urgent controls).
+	opt := orchestrator.NewDefaultOptimizer()
+	opt.Debug = cfg.Debug
+	// The EV import cooldown is tick-denominated; size it to ~1 min of wall
+	// clock from the configured interval (the optimizer's default of 20 is
+	// calibrated for a 3 s demo tick and would mean 5 min at the 15 s default).
+	if cycles := int(time.Minute / cfg.EngineInterval()); cycles >= 4 {
+		opt.EVImportCooldownCycles = cycles
+	} else {
+		opt.EVImportCooldownCycles = 4
+	}
+
+	eng := orchestrator.New(reader, opt, orchestrator.Config{
+		Interval: cfg.EngineInterval(),
+		Debug:    cfg.Debug,
+		Planner:  cfg.Planner,
+	})
+
 	// Subscribe to all state topics.
 	if err := mqttutil.Subscribe(mc, bus.SubMeasurements, reader.onMeasurement); err != nil {
 		log.Fatalf("lexa-hub: subscribe measurements: %v", err)
@@ -65,22 +84,19 @@ func main() {
 	if err := mqttutil.Subscribe(mc, bus.SubBattMetrics, reader.onBattMetrics); err != nil {
 		log.Fatalf("lexa-hub: subscribe batt metrics: %v", err)
 	}
-	if err := mqttutil.Subscribe(mc, bus.TopicCSIPControl, reader.onCSIPControl); err != nil {
+	if err := mqttutil.Subscribe(mc, bus.TopicCSIPControl, func(topic string, msg bus.ActiveControl) {
+		reader.onCSIPControl(topic, msg)
+		// A disconnect order must not wait out the ticker interval: force an
+		// immediate tick so cease-to-energize is applied within MQTT latency.
+		if msg.Connect != nil && !*msg.Connect {
+			eng.Wake()
+		}
+	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe csip control: %v", err)
 	}
 	if err := mqttutil.Subscribe(mc, bus.SubEVSEState, reader.onEVSEState); err != nil {
 		log.Fatalf("lexa-hub: subscribe evse state: %v", err)
 	}
-
-	// Build the optimizer and engine.
-	opt := orchestrator.NewDefaultOptimizer()
-	opt.Debug = cfg.Debug
-
-	eng := orchestrator.New(reader, opt, orchestrator.Config{
-		Interval: cfg.EngineInterval(),
-		Debug:    cfg.Debug,
-		Planner:  cfg.Planner,
-	})
 
 	// Subscribe to northbound DER schedule → extract DER constraints for planner.
 	if err := mqttutil.Subscribe(mc, bus.TopicNorthboundSchedule, func(_ string, sched bus.DERScheduleMsg) {
@@ -193,6 +209,12 @@ func derConstraintsFromSchedule(sched bus.DERScheduleMsg) []orchestrator.StepCon
 // pricesFromPricingUpdate converts a PricingUpdate into per-step import and
 // export price arrays ($/kWh) for the daily planner.
 // Returns nil, nil when the update contains no usable pricing data.
+//
+// Steps not covered by any tariff interval are filled with the default TOU
+// rate for that time of day — never zero, which would tell the planner that
+// uncovered hours are free electricity and make it schedule grid charging
+// into them.  The export array is nil (no export remuneration data in the
+// tariff feed yet); the planner prices exports at zero when the slice is nil.
 func pricesFromPricingUpdate(pricing bus.PricingUpdate, now time.Time) (importPrices, exportPrices []float64) {
 	const planStepSec = int64(5 * 60)
 	const planSteps = 288
@@ -205,7 +227,11 @@ func pricesFromPricingUpdate(pricing bus.PricingUpdate, now time.Time) (importPr
 	ws := now.Unix() - (now.Unix() % planStepSec)
 
 	importPrices = make([]float64, planSteps)
-	exportPrices = make([]float64, planSteps)
+	fallback := orchestrator.DefaultTOUCostModel()
+	for i := range importPrices {
+		stepT := ws + int64(i)*planStepSec
+		importPrices[i] = fallback.CurrentRate(time.Unix(stepT, 0).Local())
+	}
 
 	for _, tp := range pricing.TariffProfiles {
 		mult := 1.0
@@ -217,12 +243,19 @@ func pricesFromPricingUpdate(pricing bus.PricingUpdate, now time.Time) (importPr
 		}
 
 		for _, rc := range tp.RateComponents {
-			allIntervals := append(rc.ActiveIntervals, rc.ScheduledIntervals...)
+			allIntervals := make([]bus.TimeTariffMsg, 0, len(rc.ActiveIntervals)+len(rc.ScheduledIntervals))
+			allIntervals = append(allIntervals, rc.ActiveIntervals...)
+			allIntervals = append(allIntervals, rc.ScheduledIntervals...)
 			for _, ti := range allIntervals {
 				if len(ti.Blocks) == 0 {
 					continue
 				}
-				pricePerKwh := float64(ti.Blocks[0].Price) * mult / 1000 // assume milli-currency
+				// TODO(conformance): verify the /1000 milli-currency assumption
+				// against the utility Test Server. IEEE 2030.5 encodes the price
+				// scale entirely in PricePowerOfTenMultiplier (already applied
+				// via mult); if the server's multiplier yields whole currency
+				// units, this extra /1000 understates every price 1000×.
+				pricePerKwh := float64(ti.Blocks[0].Price) * mult / 1000
 				tEnd := ti.IntervalStart + int64(ti.Duration)
 				for i := 0; i < planSteps; i++ {
 					stepT := ws + int64(i)*planStepSec
@@ -235,5 +268,5 @@ func pricesFromPricingUpdate(pricing bus.PricingUpdate, now time.Time) (importPr
 		break // first tariff profile only
 	}
 
-	return importPrices, exportPrices
+	return importPrices, nil
 }

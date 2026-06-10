@@ -81,7 +81,10 @@ type DefaultOptimizer struct {
 	// re-allowed after an import-limit event.  Negative grid (site exporting
 	// due to battery transient) resets the count, preventing the EV from
 	// resuming during the over-discharge settling period.
-	// Default 20 (≈ 1 min at a 3 s engine tick).
+	//
+	// This is tick-denominated: size it from the engine interval to a
+	// wall-clock target of ~1 min (cmd/hub derives it as 60s/interval).
+	// Default 20, which is ≈ 1 min only at a 3 s demo tick.
 	EVImportCooldownCycles int
 
 	// expGuard holds per-limit-session state for the export-limit rule.
@@ -132,7 +135,7 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	plan := Plan{Timestamp: now}
 
 	// Rule 1: CSIP disconnect — highest priority, always early-return.
-	if csipDisconnectRule(state.CSIPControl, state.Batteries, &plan) {
+	if csipDisconnectRule(state.CSIPControl, state, &plan) {
 		return plan
 	}
 
@@ -181,7 +184,24 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 		if isPeak {
 			peakReason = fmt.Sprintf("peak TOU hour (rate=%.3f/kWh)", o.CostModel.CurrentRate(serverNow))
 		}
-		batteries, surplusW = applyDemandResponseRule(batteries, surplusW, o.SOCReserve, false, isPeak, peakReason, &plan)
+		// An active export limit caps the discharge: the export-limit rule
+		// only corrects on the *next* tick, so an uncapped MaxDischargeW
+		// command could overshoot the CSIP limit for a full interval.
+		dischargeCapW := math.NaN()
+		if !math.IsNaN(limits.exportLimitW) {
+			margin := o.ExportMarginFrac
+			if margin <= 0 {
+				margin = 0.20
+			}
+			exportNowW := 0.0
+			if !math.IsNaN(state.Grid.NetW) {
+				exportNowW = math.Max(0, -state.Grid.NetW)
+			} else {
+				exportNowW = math.Max(0, surplusW)
+			}
+			dischargeCapW = math.Max(0, limits.exportLimitW*(1-margin)-exportNowW)
+		}
+		batteries, surplusW = applyDemandResponseRule(batteries, surplusW, o.SOCReserve, false, isPeak, peakReason, dischargeCapW, &plan)
 
 		// Rule 6: EV charging allocation.
 		cooldown := o.EVImportCooldownCycles
@@ -200,22 +220,54 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 
 // ── Rule functions ─────────────────────────────────────────────────────────────
 
-// csipDisconnectRule issues Connect=false commands when the utility sends
-// OpModConnect=false.  Returns true when Optimize should return immediately.
-func csipDisconnectRule(cc *CSIPControlState, batteries []BatteryState, plan *Plan) bool {
+// csipDisconnectRule ceases to energize all DERs when the utility sends
+// OpModConnect=false: batteries are disconnected, solar is curtailed to zero
+// output, and EVSE sessions are suspended.  Returns true when Optimize should
+// return immediately.
+//
+// Curtailing solar matters for compliance: cease-to-energize applies to the
+// DER as a whole, and a PV inverter exporting through a disconnect order is a
+// direct CSIP/IEEE 1547 violation.  EVSEs are load rather than DER, but
+// suspending charging during a grid event is the safe choice — and it also
+// prevents a session that starts mid-event from ramping unsupervised.
+func csipDisconnectRule(cc *CSIPControlState, state SystemState, plan *Plan) bool {
 	if cc == nil || cc.Base.OpModConnect == nil || *cc.Base.OpModConnect {
 		return false
 	}
 	f := false
-	for _, b := range batteries {
+	for _, b := range state.Batteries {
 		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
 			Name:    b.Name,
 			Connect: &f,
 		})
 	}
+	curtailed := 0
+	for _, sol := range state.Solar {
+		if !sol.Connected {
+			continue
+		}
+		plan.SolarCommands = append(plan.SolarCommands, SolarCommand{
+			Name:       sol.Name,
+			CurtailToW: 0,
+		})
+		curtailed++
+	}
+	suspended := 0
+	for _, ev := range state.EVSEs {
+		if !ev.Connected {
+			continue
+		}
+		plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+			StationID:   ev.StationID,
+			ConnectorID: ev.ConnectorID,
+			MaxCurrentA: 0,
+		})
+		suspended++
+	}
 	plan.AddDecision("csip/disconnect",
 		"OpModConnect=false received from utility",
-		fmt.Sprintf("disconnecting %d batteries", len(batteries)))
+		fmt.Sprintf("disconnecting %d batteries, curtailing %d solar, suspending %d EVSEs",
+			len(state.Batteries), curtailed, suspended))
 	return true
 }
 
@@ -287,7 +339,8 @@ func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSESta
 	}
 
 	// Distribute the planned setpoint across connected batteries proportionally
-	// to their nameplate capacity (or equally when capacity is unknown).
+	// to their combined charge+discharge power rating (or equally when the
+	// rating is unknown).
 	totalCap := 0.0
 	for _, b := range batteries {
 		if b.Connected {
@@ -321,19 +374,23 @@ func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSESta
 	}
 
 	// Set EV current from plan; only override EVSEs with active sessions.
+	// An idle charger gets no command — when a session starts, this rule
+	// applies the plan target on the next tick.
+	evCmds := 0
 	for _, ev := range evses {
-		if ev.Connected {
+		if ev.Connected && ev.SessionActive {
 			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
 				StationID:   ev.StationID,
 				ConnectorID: ev.ConnectorID,
 				MaxCurrentA: target.EVMaxCurrentA,
 			})
+			evCmds++
 		}
 	}
 
 	plan.AddDecision("plan/follow",
 		fmt.Sprintf("following 24h plan: battery=%.0fW ev=%.1fA", setW, target.EVMaxCurrentA),
-		fmt.Sprintf("set %d batteries, %d EVSEs", len(batteries), len(evses)))
+		fmt.Sprintf("set %d batteries, %d EVSEs", len(plan.BatteryCommands), evCmds))
 
 	// Zero surplusW so self-consumption and TOU rules don't fire after us.
 	return batteries, 0, true
@@ -538,10 +595,12 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		socTaperStart = 80.0 // begin SOC-driven battery taper here
 	)
 	// socStepEstimate is how much SOC is expected to climb per optimizer
-	// tick when the battery is charging at its full MaxChargeW.  At 20× demo
-	// speed with a 10 kWh / 5 kW pack and a 3 s tick, that's ≈ 0.83 %.  This
-	// only needs to be in the right ballpark; it gates the size of the EV
-	// feed-forward step.
+	// tick when the battery is charging at its full MaxChargeW.  Calibrated
+	// for the 20× demo (10 kWh / 5 kW pack, 3 s tick ≈ 0.83 %); at the 15 s
+	// production tick the true value is ~0.2 %, so this overestimates and
+	// the EV pre-positions slightly early.  That errs conservative (EV
+	// absorbs sooner than strictly needed) and self-corrects on the next
+	// tick, so a constant in the right ballpark is acceptable here.
 	const socStepEstimate = 1.0
 
 	batteryAbsorbW := 0.0          // commanded absorption this tick (positive watts)
@@ -605,6 +664,12 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	}
 	if batteryAbsorbW > 0 {
 		o.expGuard.batteryAbsorbW = batteryAbsorbW
+	} else {
+		// No battery command this tick (battery full, too small, or no need):
+		// the restore rule will idle it, so clear the guard.  Holding a stale
+		// value here would re-inflate unconstrainedExportW on the next tick
+		// with absorption that no longer exists.
+		o.expGuard.batteryAbsorbW = math.NaN()
 	}
 
 	// ── EV: trim the residual with a filtered P-controller ───────────────────
@@ -825,7 +890,11 @@ func applySelfConsumptionRule(batteries []BatteryState, surplusW, excessThreshol
 
 // applyDemandResponseRule discharges batteries during DR events or TOU peak hours.
 // Returns updated battery states and updated surplusW (discharge adds to surplus).
-func applyDemandResponseRule(batteries []BatteryState, surplusW, socReserve float64, isDR, isPeak bool, peakReason string, plan *Plan) ([]BatteryState, float64) {
+//
+// maxDischargeW caps the total discharge commanded across all batteries so
+// the rule cannot push site export over an active CSIP export limit while
+// waiting for the export-limit rule's next-tick correction.  NaN = uncapped.
+func applyDemandResponseRule(batteries []BatteryState, surplusW, socReserve float64, isDR, isPeak bool, peakReason string, maxDischargeW float64, plan *Plan) ([]BatteryState, float64) {
 	if !isDR && !isPeak {
 		return batteries, surplusW
 	}
@@ -833,6 +902,8 @@ func applyDemandResponseRule(batteries []BatteryState, surplusW, socReserve floa
 	if peakReason != "" {
 		reason = peakReason
 	}
+	capped := !math.IsNaN(maxDischargeW)
+	remainingW := maxDischargeW
 	for i, b := range batteries {
 		if !b.Connected || !b.Energized {
 			continue
@@ -847,16 +918,29 @@ func applyDemandResponseRule(batteries []BatteryState, surplusW, socReserve floa
 		if available < 50 {
 			continue
 		}
+		setpoint := b.MaxDischargeW
+		if capped {
+			if remainingW < 50 {
+				plan.AddDecision("demand-response",
+					fmt.Sprintf("battery %s discharge withheld: export-limit headroom exhausted", b.Name),
+					"skip discharge — protecting export limit")
+				continue
+			}
+			setpoint = math.Min(setpoint, remainingW)
+		}
 		if !hasBatteryCommand(plan.BatteryCommands, b.Name) {
 			plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
 				Name:      b.Name,
-				SetpointW: b.MaxDischargeW,
+				SetpointW: setpoint,
 			})
 			plan.AddDecision("demand-response",
 				reason,
-				fmt.Sprintf("discharging battery %s at %.0fW", b.Name, b.MaxDischargeW))
-			batteries[i].PowerW = b.MaxDischargeW
-			surplusW += available
+				fmt.Sprintf("discharging battery %s at %.0fW", b.Name, setpoint))
+			surplusW += setpoint - b.PowerW
+			batteries[i].PowerW = setpoint
+			if capped {
+				remainingW -= setpoint
+			}
 		}
 	}
 	return batteries, surplusW
@@ -1060,6 +1144,16 @@ func (o *DefaultOptimizer) applyImportLimitRule(batteries []BatteryState, limits
 	// New limit value → restart the guard fresh.
 	if limits.importLimitW != o.impGuard.activeLimitW {
 		o.impGuard = importGuard{dischargeW: math.NaN(), activeLimitW: limits.importLimitW}
+		// A limit that arrives while the site is already compliant must not
+		// suspend the EV: the cooldown gate exists for recovery after a
+		// violation, not for limit arrival.  Seed the resume gate as satisfied.
+		if !math.IsNaN(netW) && netW >= 0 && netW <= limits.importLimitW {
+			cooldown := o.EVImportCooldownCycles
+			if cooldown <= 0 {
+				cooldown = 20
+			}
+			o.impGuard.evSafeCount = cooldown
+		}
 	}
 
 	importW := 0.0

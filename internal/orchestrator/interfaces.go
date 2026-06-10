@@ -1,7 +1,11 @@
 package orchestrator
 
 // Optimizer computes a Plan from the current SystemState.
-// Implementations must be safe to call from multiple goroutines.
+//
+// Optimize is called from a single goroutine (the Engine's control loop), so
+// implementations may keep unsynchronized per-tick state across calls —
+// DefaultOptimizer does (export/import guard hysteresis).  Do not call
+// Optimize from multiple goroutines concurrently.
 type Optimizer interface {
 	Optimize(state SystemState) Plan
 }

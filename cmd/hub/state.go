@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"math"
 	"sync"
 	"time"
@@ -8,6 +9,21 @@ import (
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/northbound/model"
 	"lexa-hub/internal/orchestrator"
+)
+
+// Staleness windows: a snapshot older than this is treated as if the device
+// were disconnected, so the optimizer never acts on frozen data after a
+// publisher (lexa-modbus, lexa-ocpp) dies or the bus drops.
+const (
+	// measStaleAfter covers Modbus-polled devices (battery/solar/meter),
+	// which publish every few seconds; 60 s ≈ four missed engine ticks.
+	measStaleAfter = 60 * time.Second
+
+	// evseStaleAfter covers OCPP stations.  State republishes on every
+	// MeterValues (~10 s) during an active session, but only on status
+	// changes while idle — the longer window avoids flapping an idle-but-
+	// connected station, while a silent active session still expires.
+	evseStaleAfter = 90 * time.Second
 )
 
 // MQTTSystemReader implements orchestrator.SystemReader by maintaining a
@@ -22,7 +38,7 @@ type MQTTSystemReader struct {
 	lastBattMet map[string]bus.BattMetrics
 
 	// Per-station EVSE state (station ID → last state)
-	lastEVSE map[string]bus.EVSEState
+	lastEVSE map[string]evseSnapshot
 
 	// Last resolved CSIP active control from lexa-csip
 	lastCSIP     *bus.ActiveControl
@@ -37,13 +53,28 @@ type measSnapshot struct {
 	W  float64 // NaN if not received
 	V  float64
 	Hz float64
+	at time.Time // receive time of the last message; zero = never received
+}
+
+func (s measSnapshot) fresh(now time.Time) bool {
+	return !s.at.IsZero() && now.Sub(s.at) <= measStaleAfter
+}
+
+// evseSnapshot pairs the last EVSE state with its receive time.
+type evseSnapshot struct {
+	bus.EVSEState
+	at time.Time
+}
+
+func (s evseSnapshot) fresh(now time.Time) bool {
+	return now.Sub(s.at) <= evseStaleAfter
 }
 
 func newMQTTSystemReader(devices []DeviceConfig) *MQTTSystemReader {
 	r := &MQTTSystemReader{
 		lastMeas:    make(map[string]measSnapshot),
 		lastBattMet: make(map[string]bus.BattMetrics),
-		lastEVSE:    make(map[string]bus.EVSEState),
+		lastEVSE:    make(map[string]evseSnapshot),
 		devices:     devices,
 		devByName:   make(map[string]*DeviceConfig),
 	}
@@ -67,6 +98,7 @@ func (r *MQTTSystemReader) onMeasurement(_ string, msg bus.Measurement) {
 	if msg.Hz != nil {
 		snap.Hz = *msg.Hz
 	}
+	snap.at = time.Now()
 	r.lastMeas[msg.Device] = snap
 	r.mu.Unlock()
 }
@@ -86,17 +118,22 @@ func (r *MQTTSystemReader) onCSIPControl(_ string, msg bus.ActiveControl) {
 
 func (r *MQTTSystemReader) onEVSEState(_ string, msg bus.EVSEState) {
 	r.mu.Lock()
-	r.lastEVSE[msg.StationID] = msg
+	r.lastEVSE[msg.StationID] = evseSnapshot{EVSEState: msg, at: time.Now()}
 	r.mu.Unlock()
 }
 
 // ReadSystemState implements orchestrator.SystemReader.
+//
+// Takes the write lock (not RLock) because it may clear an expired CSIP
+// control; call frequency is one engine tick plus occasional replans, so the
+// extra contention is negligible.
 func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
+	now := time.Now()
 	state := orchestrator.SystemState{
-		Timestamp: time.Now(),
+		Timestamp: now,
 		Grid:      orchestrator.NewGridState(),
 	}
 
@@ -106,7 +143,7 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 		switch dc.Role {
 		case "battery":
 			b := orchestrator.NewBatteryState(dc.Name)
-			if !math.IsNaN(snap.W) {
+			if snap.fresh(now) && !math.IsNaN(snap.W) {
 				b.PowerW = snap.W
 				b.Connected = true
 				b.Energized = true
@@ -133,18 +170,25 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 			state.Batteries = append(state.Batteries, b)
 
 		case "inverter":
+			connected := snap.fresh(now) && !math.IsNaN(snap.W)
 			sol := orchestrator.SolarState{
 				Name:      dc.Name,
 				MaxW:      dc.MaxW,
-				Connected: !math.IsNaN(snap.W),
-				Energized: !math.IsNaN(snap.W),
+				Connected: connected,
+				Energized: connected,
 			}
-			if !math.IsNaN(snap.W) {
+			if connected {
 				sol.PowerW = math.Max(0, snap.W)
 			}
 			state.Solar = append(state.Solar, sol)
 
 		case "meter":
+			// A stale meter contributes nothing: Grid.NetW stays NaN, which
+			// makes the optimizer fall back to its computed power balance
+			// instead of "verifying" limits against a frozen reading.
+			if !snap.fresh(now) {
+				continue
+			}
 			if !math.IsNaN(snap.W) {
 				if math.IsNaN(state.Grid.NetW) {
 					state.Grid.NetW = snap.W
@@ -161,16 +205,48 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 		}
 	}
 
+	// Drop an expired control rather than enforcing it forever: the topic is
+	// retained, so if lexa-northbound dies after publishing, nothing else
+	// would ever clear it (and a stale OpModFixedW would keep dispatching).
+	// ValidUntil is in server time; compare against server-now.
+	if r.lastCSIP != nil && r.lastCSIP.ValidUntil > 0 &&
+		now.Unix()+r.clockOffset >= r.lastCSIP.ValidUntil {
+		log.Printf("[hub] CSIP control %s (source=%s) expired at %d and northbound has not refreshed it; dropping",
+			r.lastCSIP.MRID, r.lastCSIP.Source, r.lastCSIP.ValidUntil)
+		r.lastCSIP = nil
+	}
 	if r.lastCSIP != nil {
 		state.CSIPControl = busToCSIPControl(r.lastCSIP)
-		state.ClockOffset = r.clockOffset
 	}
+	state.ClockOffset = r.clockOffset
 
-	for _, evse := range r.lastEVSE {
-		state.EVSEs = append(state.EVSEs, busToEVSEState(evse))
+	for _, snap := range r.lastEVSE {
+		es := busToEVSEState(snap.EVSEState)
+		if !snap.fresh(now) {
+			// lexa-ocpp (or the charger) has gone silent: drop the phantom
+			// session so the optimizer stops budgeting power for a charger
+			// it can no longer command.
+			es.Connected = false
+			es.SessionActive = false
+		}
+		state.EVSEs = append(state.EVSEs, es)
 	}
 
 	return state, nil
+}
+
+// wattsToActivePower encodes w into an IEEE 2030.5 ActivePower, scaling the
+// multiplier up until the value fits in int16.  A bare int16 conversion is
+// implementation-defined for out-of-range floats, silently corrupting any
+// limit ≥ 32.768 kW.  Precision loss is bounded by half the final scale step
+// (e.g. ±5 W at multiplier 1), negligible for grid limits.
+func wattsToActivePower(w float64) *model.ActivePower {
+	mult := int8(0)
+	for (w > math.MaxInt16 || w < math.MinInt16) && mult < 9 {
+		w /= 10
+		mult++
+	}
+	return &model.ActivePower{Value: int16(math.Round(w)), Multiplier: mult}
 }
 
 // busToCSIPControl converts a bus.ActiveControl to an orchestrator.CSIPControlState.
@@ -185,20 +261,16 @@ func busToCSIPControl(msg *bus.ActiveControl) *orchestrator.CSIPControlState {
 	}
 	cs.Base.OpModConnect = msg.Connect
 	if msg.ExpLimW != nil {
-		v := int16(*msg.ExpLimW)
-		cs.Base.OpModExpLimW = &model.ActivePower{Value: v}
+		cs.Base.OpModExpLimW = wattsToActivePower(*msg.ExpLimW)
 	}
 	if msg.ImpLimW != nil {
-		v := int16(*msg.ImpLimW)
-		cs.Base.OpModImpLimW = &model.ActivePower{Value: v}
+		cs.Base.OpModImpLimW = wattsToActivePower(*msg.ImpLimW)
 	}
 	if msg.MaxLimW != nil {
-		v := int16(*msg.MaxLimW)
-		cs.Base.OpModMaxLimW = &model.ActivePower{Value: v}
+		cs.Base.OpModMaxLimW = wattsToActivePower(*msg.MaxLimW)
 	}
 	if msg.FixedW != nil {
-		v := int16(*msg.FixedW)
-		cs.Base.OpModFixedW = &model.ActivePower{Value: v}
+		cs.Base.OpModFixedW = wattsToActivePower(*msg.FixedW)
 	}
 	return cs
 }

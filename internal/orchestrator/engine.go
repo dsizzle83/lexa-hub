@@ -49,9 +49,10 @@ type Engine struct {
 	planner    *DailyPlanner
 	plannerCfg PlannerCfg
 
-	// planInMu guards plannerInput, updated via SetDERConstraints / SetPrices.
-	planInMu plannerInput
-	planInL  sync.RWMutex
+	// planIn holds the planner inputs, updated via SetDERConstraints /
+	// SetPrices; guarded by planInMu.
+	planIn   plannerInput
+	planInMu sync.RWMutex
 
 	// dailyPlan is the most recent planner output; guarded by dailyPlanMu.
 	dailyPlan    *DailyPlan
@@ -66,9 +67,10 @@ type Engine struct {
 	Debug bool
 
 	stop        chan struct{}
+	stopOnce    sync.Once // makes Stop idempotent
 	done        chan struct{}
 	plannerDone chan struct{} // closed when plannerLoop exits
-	urgentWake  chan struct{} // poked by SetCSIPPrograms on OpModConnect=false
+	urgentWake  chan struct{} // poked by Wake on urgent controls (OpModConnect=false)
 }
 
 // Config groups optional Engine tunables.
@@ -110,9 +112,9 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 // northbound 24-hour schedule.  Triggers an immediate re-plan.
 // Safe for concurrent use.
 func (e *Engine) SetDERConstraints(constraints []StepConstraint) {
-	e.planInL.Lock()
-	e.planInMu.derConstraints = constraints
-	e.planInL.Unlock()
+	e.planInMu.Lock()
+	e.planIn.derConstraints = constraints
+	e.planInMu.Unlock()
 	e.signalReplan()
 }
 
@@ -120,10 +122,10 @@ func (e *Engine) SetDERConstraints(constraints []StepConstraint) {
 // Both slices must have len == planSteps.  Triggers an immediate re-plan.
 // Safe for concurrent use.
 func (e *Engine) SetPrices(importPrices, exportPrices []float64) {
-	e.planInL.Lock()
-	e.planInMu.importPrices = importPrices
-	e.planInMu.exportPrices = exportPrices
-	e.planInL.Unlock()
+	e.planInMu.Lock()
+	e.planIn.importPrices = importPrices
+	e.planIn.exportPrices = exportPrices
+	e.planInMu.Unlock()
 	e.signalReplan()
 }
 
@@ -171,10 +173,18 @@ func (e *Engine) SetCSIPPrograms(programs []discovery.ProgramState, clockOffset 
 	e.csipMu.Unlock()
 
 	if hasDisconnectControl(programs) {
-		select {
-		case e.urgentWake <- struct{}{}:
-		default: // already pending; don't block
-		}
+		e.Wake()
+	}
+}
+
+// Wake forces an immediate optimization tick instead of waiting for the next
+// ticker interval.  Non-blocking and safe to call from any goroutine (e.g. an
+// MQTT handler that just received an urgent CSIP control such as
+// OpModConnect=false).
+func (e *Engine) Wake() {
+	select {
+	case e.urgentWake <- struct{}{}:
+	default: // wake already pending; don't block
 	}
 }
 
@@ -186,8 +196,9 @@ func (e *Engine) Start() {
 }
 
 // Stop signals both goroutines to exit and waits for them to finish.
+// Safe to call more than once.
 func (e *Engine) Stop() {
-	close(e.stop)
+	e.stopOnce.Do(func() { close(e.stop) })
 	<-e.done
 	<-e.plannerDone
 }
@@ -251,9 +262,9 @@ func (e *Engine) replan() {
 		return
 	}
 
-	e.planInL.RLock()
-	inp := e.planInMu
-	e.planInL.RUnlock()
+	e.planInMu.RLock()
+	inp := e.planIn
+	e.planInMu.RUnlock()
 
 	params := e.buildPlannerParams(state, inp)
 	plan := e.planner.Plan(params)
@@ -380,6 +391,13 @@ func (e *Engine) tick() {
 	}
 
 	// 2. Inject CSIP active control.
+	//
+	// Precedence: when programs have been provided via SetCSIPPrograms, the
+	// scheduler's evaluation OWNS state.CSIPControl — it overwrites whatever
+	// the reader supplied, including clearing it when no control is active.
+	// Wire a deployment to exactly one source: either SetCSIPPrograms (raw
+	// program walking) or a reader that fills CSIPControl (pre-resolved
+	// control from the bus, as cmd/hub does) — never both.
 	e.csipMu.RLock()
 	programs := e.programs
 	clockOffset := e.clockOffset

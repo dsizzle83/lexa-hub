@@ -157,8 +157,11 @@ func NewDailyPlanner() *DailyPlanner { return &DailyPlanner{} }
 //   - DER constraints (export/import/generation limits, forced disconnect, fixed dispatch)
 //   - Terminal constraint: final battery SOC ≥ initial (prevents artificial arbitrage)
 //
-// Complexity: O(planSteps × nBattLevels × nEVLevels × nBattPowers × nEVCurrents).
-// For a 10 kWh battery + 75 kWh EV at 0.5 kWh step this is ~50–100 ms on ARM64.
+// Complexity: O(planSteps × nBattLevels × nEVLevels × nBattPowers × nEVCurrents)
+// with O(1) per transition (SOC transitions are precomputed per (level, action)
+// pair before the time loop). For a 10 kWh battery + 75 kWh EV at 0.5 kWh step
+// this measures ~350 ms on a desktop x86 core (see BenchmarkDailyPlanner_Plan);
+// budget a low single-digit number of seconds on the ARM64 SOM.
 func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 	p = p.withDefaults()
 	ws := p.WindowStart - (p.WindowStart % planStepSec)
@@ -253,6 +256,56 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 		}
 	}
 
+	// ─── Precompute transition tables ─────────────────────────────────────────
+	// Destination SOC indices depend only on the (level, action) pair, never on
+	// the step, so resolve them once here.  Previously the innermost DP loop ran
+	// an O(n) nearest-level scan per transition — ~10^10 operations for a 75 kWh
+	// EV at the default step, i.e. seconds to minutes per plan.
+	voltV := p.EVVoltageV
+	evKwOf := make([]float64, len(evCurrents))
+	for ci, evA := range evCurrents {
+		evKwOf[ci] = evA * voltV / 1000
+	}
+
+	// battDest[i][bi] → destination battery level index, or −1 when the SOC
+	// transition leaves the allowed band.
+	battDest := make([][]int, nBatt)
+	for i := range battDest {
+		battDest[i] = make([]int, len(battPowers))
+		for bi, battKw := range battPowers {
+			newBSoc := battLevels[i]
+			if hasBatt {
+				if battKw > 0 {
+					newBSoc -= battKw * planStepHours / p.BattEfficiency
+				} else if battKw < 0 {
+					newBSoc += (-battKw) * planStepHours * p.BattEfficiency
+				}
+				if newBSoc < p.MinBattSocKwh-1e-6 || newBSoc > p.maxBattSoc()+1e-6 {
+					battDest[i][bi] = -1
+					continue
+				}
+			}
+			battDest[i][bi] = closestIdx(battLevels, newBSoc)
+		}
+	}
+
+	// evDest[j][ci] → destination EV level index, or −1 when the transition
+	// overshoots the pack.  ci=0 (no charging) always maps back to j, which
+	// also covers the evGone / no-EV cases where only ci=0 is iterated.
+	evDest := make([][]int, nEV)
+	for j := range evDest {
+		evDest[j] = make([]int, len(evCurrents))
+		for ci := range evCurrents {
+			newESoc := evLevels[j] + evKwOf[ci]*planStepHours*p.EVEfficiency
+			if newESoc < -1e-6 || newESoc > p.EVCapacityKwh+1e-6 {
+				evDest[j][ci] = -1
+				continue
+			}
+			newESoc = math.Max(0, math.Min(p.EVCapacityKwh, newESoc))
+			evDest[j][ci] = closestIdx(evLevels, newESoc)
+		}
+	}
+
 	// ─── Forward DP ───────────────────────────────────────────────────────────
 	for t := 0; t < planSteps; t++ {
 		clearDP2D(dpNext, inf)
@@ -260,7 +313,6 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 		c := planStepConstraint(p, t)
 		solarKw := planStepSolar(p, t)
 		loadKw := p.LoadForecastKw
-		voltV := p.EVVoltageV
 		stepT := ws + int64(t)*planStepSec
 		impPrice := planStepImportPrice(p, t, stepT)
 		expPrice := planStepExportPrice(p, t, stepT)
@@ -286,12 +338,22 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 					if fixedBI >= 0 && bi != fixedBI {
 						continue
 					}
+					// Battery SOC transition (precomputed); −1 = out of band.
+					ni := battDest[i][bi]
+					if ni < 0 {
+						continue
+					}
 
-					for ci, evA := range evCurrents {
+					for ci := range evCurrents {
 						if (evGone || !hasEV) && ci > 0 {
 							continue
 						}
-						evKw := evA * voltV / 1000
+						// EV SOC transition (precomputed); −1 = overshoots pack.
+						nj := evDest[j][ci]
+						if nj < 0 {
+							continue
+						}
+						evKw := evKwOf[ci]
 
 						// Grid balance: + = import, − = export.
 						// grid = load + ev_draw − solar − batt_net
@@ -314,29 +376,6 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 							}
 						}
 
-						// Compute new battery SOC.
-						newBSoc := battLevels[i]
-						if hasBatt {
-							if battKw > 0 {
-								newBSoc -= battKw * planStepHours / p.BattEfficiency
-							} else if battKw < 0 {
-								newBSoc += (-battKw) * planStepHours * p.BattEfficiency
-							}
-							if newBSoc < p.MinBattSocKwh-1e-6 || newBSoc > p.maxBattSoc()+1e-6 {
-								continue
-							}
-						}
-
-						// Compute new EV SOC.
-						newESoc := evLevels[j]
-						if hasEV && !evGone {
-							newESoc += evKw * planStepHours * p.EVEfficiency
-							if newESoc < -1e-6 || newESoc > p.EVCapacityKwh+1e-6 {
-								continue
-							}
-							newESoc = math.Max(0, math.Min(p.EVCapacityKwh, newESoc))
-						}
-
 						// Step cost.
 						var stepCost float64
 						if gridKw > 0 {
@@ -346,11 +385,6 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 						}
 
 						// Update next DP table.
-						ni := closestIdx(battLevels, newBSoc)
-						nj := 0
-						if hasEV {
-							nj = closestIdx(evLevels, newESoc)
-						}
 						if nc := cost0 + stepCost; nc < dpNext[ni][nj] {
 							dpNext[ni][nj] = nc
 							back[t][ni][nj] = backNode{

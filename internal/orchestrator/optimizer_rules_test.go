@@ -149,10 +149,14 @@ func TestComputePowerBalance_NoMeter(t *testing.T) {
 func TestCSIPDisconnectRule_DisconnectsOnFalse(t *testing.T) {
 	f := false
 	cc := &CSIPControlState{Base: model.DERControlBase{OpModConnect: &f}}
-	bats := []BatteryState{ruleBat("bat-0", 0, 50, 5000), ruleBat("bat-1", 0, 80, 5000)}
+	state := SystemState{
+		Batteries: []BatteryState{ruleBat("bat-0", 0, 50, 5000), ruleBat("bat-1", 0, 80, 5000)},
+		Solar:     []SolarState{ruleSol("pv", 8000)},
+		EVSEs:     []EVSEState{ruleEVSE("evse-0", true, 32, 230)},
+	}
 	plan := &Plan{}
 
-	stop := csipDisconnectRule(cc, bats, plan)
+	stop := csipDisconnectRule(cc, state, plan)
 
 	if !stop {
 		t.Fatal("expected stop=true when OpModConnect=false")
@@ -165,13 +169,50 @@ func TestCSIPDisconnectRule_DisconnectsOnFalse(t *testing.T) {
 			t.Errorf("battery %s: expected Connect=false", cmd.Name)
 		}
 	}
+	// Cease-to-energize applies to the whole DER: solar must be curtailed to
+	// zero, not left generating at the last setpoint.
+	if len(plan.SolarCommands) != 1 {
+		t.Fatalf("expected 1 solar curtailment command, got %d", len(plan.SolarCommands))
+	}
+	if plan.SolarCommands[0].CurtailToW != 0 {
+		t.Errorf("solar CurtailToW = %v, want 0", plan.SolarCommands[0].CurtailToW)
+	}
+	// Connected EVSEs are suspended for the duration of the event.
+	if len(plan.EVSECommands) != 1 {
+		t.Fatalf("expected 1 EVSE suspend command, got %d", len(plan.EVSECommands))
+	}
+	if plan.EVSECommands[0].MaxCurrentA != 0 {
+		t.Errorf("EVSE MaxCurrentA = %v, want 0 (suspend)", plan.EVSECommands[0].MaxCurrentA)
+	}
+}
+
+func TestCSIPDisconnectRule_SkipsDisconnectedDevices(t *testing.T) {
+	f := false
+	cc := &CSIPControlState{Base: model.DERControlBase{OpModConnect: &f}}
+	offlineSol := ruleSol("pv-off", 0)
+	offlineSol.Connected = false
+	offlineEVSE := ruleEVSE("evse-off", false, 32, 230)
+	offlineEVSE.Connected = false
+	state := SystemState{
+		Solar: []SolarState{offlineSol},
+		EVSEs: []EVSEState{offlineEVSE},
+	}
+	plan := &Plan{}
+
+	if !csipDisconnectRule(cc, state, plan) {
+		t.Fatal("expected stop=true when OpModConnect=false")
+	}
+	if len(plan.SolarCommands) != 0 || len(plan.EVSECommands) != 0 {
+		t.Errorf("expected no commands for disconnected devices, got %d solar / %d evse",
+			len(plan.SolarCommands), len(plan.EVSECommands))
+	}
 }
 
 func TestCSIPDisconnectRule_PassthroughOnTrue(t *testing.T) {
 	tr := true
 	cc := &CSIPControlState{Base: model.DERControlBase{OpModConnect: &tr}}
 	plan := &Plan{}
-	if csipDisconnectRule(cc, nil, plan) {
+	if csipDisconnectRule(cc, SystemState{}, plan) {
 		t.Error("expected stop=false when OpModConnect=true")
 	}
 	if len(plan.BatteryCommands) != 0 {
@@ -181,7 +222,7 @@ func TestCSIPDisconnectRule_PassthroughOnTrue(t *testing.T) {
 
 func TestCSIPDisconnectRule_PassthroughOnNilCSIP(t *testing.T) {
 	plan := &Plan{}
-	if csipDisconnectRule(nil, nil, plan) {
+	if csipDisconnectRule(nil, SystemState{}, plan) {
 		t.Error("expected stop=false with nil CSIP")
 	}
 }
@@ -406,7 +447,7 @@ func TestDemandResponseRule_DischargesWhenDR(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	plan := &Plan{}
 
-	updated, surplusW := applyDemandResponseRule(bats, 0, 20, true, false, "", plan)
+	updated, surplusW := applyDemandResponseRule(bats, 0, 20, true, false, "", math.NaN(), plan)
 
 	if len(plan.BatteryCommands) == 0 {
 		t.Fatal("expected discharge command during DR")
@@ -426,7 +467,7 @@ func TestDemandResponseRule_RespectsSOCReserve(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 15, 5000)} // SOC=15 < reserve=20
 	plan := &Plan{}
 
-	applyDemandResponseRule(bats, 0, 20, true, false, "", plan)
+	applyDemandResponseRule(bats, 0, 20, true, false, "", math.NaN(), plan)
 
 	for _, cmd := range plan.BatteryCommands {
 		if cmd.SetpointW > 0 {
@@ -439,7 +480,7 @@ func TestDemandResponseRule_NoActionWhenInactive(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	plan := &Plan{}
 
-	applyDemandResponseRule(bats, 0, 20, false, false, "", plan)
+	applyDemandResponseRule(bats, 0, 20, false, false, "", math.NaN(), plan)
 
 	if len(plan.BatteryCommands) != 0 {
 		t.Errorf("expected no commands when isDR=false isPeak=false, got %d", len(plan.BatteryCommands))
@@ -450,7 +491,7 @@ func TestDemandResponseRule_SkipsExistingCommand(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	plan := &Plan{BatteryCommands: []BatteryCommand{{Name: "bat", SetpointW: -2000}}}
 
-	applyDemandResponseRule(bats, 0, 20, true, false, "", plan)
+	applyDemandResponseRule(bats, 0, 20, true, false, "", math.NaN(), plan)
 
 	if len(plan.BatteryCommands) != 1 {
 		t.Errorf("expected 1 command (no duplicate), got %d", len(plan.BatteryCommands))
@@ -461,13 +502,92 @@ func TestDemandResponseRule_DischargesWhenPeak(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	plan := &Plan{}
 
-	applyDemandResponseRule(bats, 0, 20, false, true, "peak TOU hour", plan)
+	applyDemandResponseRule(bats, 0, 20, false, true, "peak TOU hour", math.NaN(), plan)
 
 	if len(plan.BatteryCommands) == 0 {
 		t.Fatal("expected discharge command during TOU peak")
 	}
 	if plan.BatteryCommands[0].SetpointW <= 0 {
 		t.Errorf("expected positive setpoint (discharge), got %.0f", plan.BatteryCommands[0].SetpointW)
+	}
+}
+
+func TestDemandResponseRule_CappedByExportHeadroom(t *testing.T) {
+	// 5 kW battery but only 1.2 kW of export headroom → setpoint must be
+	// capped, not MaxDischargeW (C6: no one-tick export-limit overshoot).
+	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
+	plan := &Plan{}
+
+	updated, _ := applyDemandResponseRule(bats, 0, 20, false, true, "peak TOU hour", 1200, plan)
+
+	if len(plan.BatteryCommands) != 1 {
+		t.Fatalf("expected 1 discharge command, got %d", len(plan.BatteryCommands))
+	}
+	if got := plan.BatteryCommands[0].SetpointW; got != 1200 {
+		t.Errorf("setpoint = %.0f, want 1200 (capped by export headroom)", got)
+	}
+	if updated[0].PowerW != 1200 {
+		t.Errorf("updated PowerW = %.0f, want 1200", updated[0].PowerW)
+	}
+}
+
+func TestDemandResponseRule_CapSharedAcrossBatteries(t *testing.T) {
+	// 3 kW total headroom over two 5 kW batteries: first takes 3 kW, second
+	// must be withheld entirely.
+	bats := []BatteryState{ruleBat("bat-0", 0, 80, 5000), ruleBat("bat-1", 0, 80, 5000)}
+	plan := &Plan{}
+
+	applyDemandResponseRule(bats, 0, 20, true, false, "", 3000, plan)
+
+	if len(plan.BatteryCommands) != 1 {
+		t.Fatalf("expected 1 discharge command (second withheld), got %d", len(plan.BatteryCommands))
+	}
+	if got := plan.BatteryCommands[0].SetpointW; got != 3000 {
+		t.Errorf("setpoint = %.0f, want 3000", got)
+	}
+}
+
+func TestDemandResponseRule_ZeroHeadroomNoDischarge(t *testing.T) {
+	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
+	plan := &Plan{}
+
+	applyDemandResponseRule(bats, 0, 20, false, true, "peak TOU hour", 0, plan)
+
+	if len(plan.BatteryCommands) != 0 {
+		t.Errorf("expected no discharge with zero export headroom, got %d commands", len(plan.BatteryCommands))
+	}
+}
+
+// ── applyImportLimitRule EV gate seeding ──────────────────────────────────────
+
+func TestImportLimitRule_FreshCompliantLimit_DoesNotGateEV(t *testing.T) {
+	// An import limit that arrives while the site is already under the cap
+	// must not trip the EV cooldown gate (it exists for post-violation
+	// recovery, not limit arrival).
+	o := NewDefaultOptimizer()
+	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
+	limits := gridConstraints{importLimitW: 3000, exportLimitW: math.NaN(), maxLimitW: math.NaN()}
+	plan := &Plan{}
+
+	o.applyImportLimitRule(bats, limits, 1000, 20, plan) // importing 1 kW, cap 3 kW
+
+	if o.impGuard.evSafeCount < o.EVImportCooldownCycles {
+		t.Errorf("evSafeCount = %d, want ≥ cooldown %d when limit arrives while compliant",
+			o.impGuard.evSafeCount, o.EVImportCooldownCycles)
+	}
+}
+
+func TestImportLimitRule_FreshViolatedLimit_GatesEV(t *testing.T) {
+	o := NewDefaultOptimizer()
+	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
+	limits := gridConstraints{importLimitW: 3000, exportLimitW: math.NaN(), maxLimitW: math.NaN()}
+	plan := &Plan{}
+
+	o.applyImportLimitRule(bats, limits, 4000, 20, plan) // importing 4 kW, over the 3 kW cap
+
+	if o.impGuard.evSafeCount >= o.EVImportCooldownCycles {
+		t.Errorf("evSafeCount = %d, want < cooldown %d when limit arrives in violation",
+			o.impGuard.evSafeCount, o.EVImportCooldownCycles)
 	}
 }
 
