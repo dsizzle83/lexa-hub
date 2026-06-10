@@ -50,36 +50,15 @@ func readMetricsFrom713(b *Battery, m *orchestrator.BatteryMetrics) error {
 		return fmt.Errorf("battery: read M713 for metrics: %w", err)
 	}
 
-	get := func(offset int) uint16 {
-		if offset < len(regs) {
-			return regs[offset]
-		}
-		return 0
+	s := sunspec.Parse713(regs)
+	if !math.IsNaN(s.SoC) && s.SoC >= 0 {
+		m.SOC = s.SoC
 	}
-	sf := func(sfOffset int) int16 { return int16(get(sfOffset)) }
-
-	// State of charge (M713_SoC @ 5, scale @ M713_SoC_SF @ 11).
-	if len(regs) > sunspec.M713_SoC {
-		soc := sunspec.ApplyScaleUint(get(sunspec.M713_SoC), sf(sunspec.M713_SoC_SF))
-		if !math.IsNaN(soc) && soc >= 0 {
-			m.SOC = soc
-		}
+	if !math.IsNaN(s.SoH) && s.SoH >= 0 {
+		m.SOH = s.SoH
 	}
-
-	// State of health (M713_SoH @ 6, scale @ M713_SoH_SF @ 12).
-	if len(regs) > sunspec.M713_SoH {
-		soh := sunspec.ApplyScaleUint(get(sunspec.M713_SoH), sf(sunspec.M713_SoH_SF))
-		if !math.IsNaN(soh) && soh >= 0 {
-			m.SOH = soh
-		}
-	}
-
-	// Rated energy in Wh (M713_WHRtg @ 0, scale @ M713_WHRtg_SF @ 9).
-	if len(regs) > sunspec.M713_WHRtg {
-		cap := sunspec.ApplyScaleUint(get(sunspec.M713_WHRtg), sf(sunspec.M713_WHRtg_SF))
-		if !math.IsNaN(cap) && cap > 0 {
-			m.CapacityWh = cap
-		}
+	if !math.IsNaN(s.WHRtg) && s.WHRtg > 0 {
+		m.CapacityWh = s.WHRtg
 	}
 
 	// M713 has no per-direction charge/discharge power rating — use WMax.

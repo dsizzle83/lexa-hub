@@ -11,6 +11,9 @@ modbus/    Transport wrapping simonvetter/modbus.
 sunspec/   Scan (model discovery, reads IDs only — no data burst).
            Reader: ReadModel(id) / WriteModel(id, offset, values), 0-based offsets within named block.
            scale.go: ApplyScaleSigned/Unsigned, RawFromScaleSigned/Unsigned. 0x8000 → NaN.
+           layout.go + derlayout.go: declarative point tables for the IEEE 1547-2018
+           DER models 701-714 (exact spec order/type). der1547.go: typed parse/encode.
+derbase/   Shared DER device logic + CSIP DERControlBase → SunSpec write mapping.
 inverter/  Inverter implements Device. Reads Model 103 (or 101/102 fallback), nameplate from 121, controls via 123.
 battery/   BatteryDevice implements Device. Model 103 AC + 802 Li-Ion battery state.
 meter/     MeterDevice for bi-directional smart meter. Model 201 (single-phase AC).
@@ -34,6 +37,21 @@ End sentinel: ModelID = `0xFFFF`
 | 123 (controls) | WMaxLimPct, _Ena, Conn, _SF | 0, 4, 16, 20 |
 | 201 (meter) | W, W_SF | 12, 28 |
 | 802 (Li-Ion) | SoC, SoH, DoD, ChaSt | 10, 11, 12, 16 |
+
+## IEEE 1547-2018 DER models (701-714)
+Defined declaratively in `sunspec/derlayout.go` as ordered point tables (`L701`,
+`L704`, `L705Hdr`/`L705Crv`, …) — **do not** hand-number offsets; add/edit the
+`Field` list and offsets/lengths follow. A `View` over a register slice gives
+typed, scale-factor-aware, sentinel-safe access (`Float`, `Enum`, `SetFloat`, …).
+Curve/trip/port repeating groups use the `CurveOffset*` / `SubCurveOffset*` /
+`PortOffset714` helpers. PF points carry the power factor directly (engineering
+value = raw × 10^SF); no ×100.
+
+**CSIP → SunSpec mapping** lives in `derbase.ApplyControl`: limits
+(Exp/Max/GenLimW) → 704 WMaxLimPct%; setpoints (FixedW) → 704 WSet; PF
+inject/absorb → 704 PFWInj/PFWAbs sync groups; FixedVar → 704 VarSet; energize →
+703 ES. Curve writers run the §3.1.2 adopt handshake (write staging curve →
+AdptCrvReq=2 → poll AdptCrvRslt → Ena=1).
 
 ## Simulator API summary
 All sims expose HTTP + WebSocket via `internal/simapi/`:

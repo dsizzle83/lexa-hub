@@ -1,948 +1,728 @@
-// Package sunspec — this file provides typed structs and parse/encode helpers
-// for the IEEE 1547-2018 SunSpec Modbus profile (models 701-713).
+// Package sunspec — typed parse/encode for the SunSpec DER Information Models
+// (701-714), built on the declarative layout engine (layout.go / derlayout.go).
 //
-// Each model is represented by a Go struct whose fields correspond 1:1 to the
-// SunSpec Modbus points listed in the profile specification. Values are already
-// scaled (watts, volts, Hz) unless otherwise noted — scale factor application
-// is handled in the parse helpers using ApplyScaleSigned / ApplyScaleUint.
-//
-// Curve models (705, 706, 707/708, 709/710, 712) have a fixed-size header
-// followed by variable per-curve data. The helpers CurveBase705 etc. compute
-// the register offset of a given curve within the model's data block.
+// Reads return rich structs with engineering-unit values (NaN where a point is
+// unimplemented on the device). Writes for single-function controls are done by
+// callers manipulating a layout View directly (see internal/southbound/derbase);
+// the curve models expose structured parse/encode here because their repeating
+// point groups are non-trivial.
 package sunspec
 
 import (
 	"fmt"
 	"math"
+	"strings"
 )
 
-// ── Common ────────────────────────────────────────────────────────────────────
-
-// AdptResult is the enumerated result of an adapt-curve/control request.
-type AdptResult uint16
-
+// Adopt-curve / adopt-control result (AdptCrvRslt / AdptCtlRslt).
 const (
-	AdptInProgress AdptResult = 0
-	AdptCompleted  AdptResult = 1
-	AdptFailed     AdptResult = 2
+	AdptInProgress = 0
+	AdptCompleted  = 1
+	AdptFailed     = 2
 )
 
-// ReadOnly indicates whether a curve or control set is writable.
-type ReadOnly uint16
-
-const (
-	ReadWrite ReadOnly = 0
-	ReadOnlyR ReadOnly = 1
-)
-
-// ── Model 701 (DERMeasureAC) ─────────────────────────────────────────────────
-
-// M701St is the operating state reported by DERMeasureAC.
-type M701St uint16
-
-const (
-	M701StOff         M701St = 0
-	M701StSleeping    M701St = 1
-	M701StStarting    M701St = 2
-	M701StOn          M701St = 3
-	M701StThrottled   M701St = 4
-	M701StShuttingDwn M701St = 5
-	M701StFault       M701St = 6
-	M701StStandby     M701St = 7
-)
-
-// DERMeasureAC holds the scaled AC electrical measurements from Model 701.
-// Fields requiring voltages that are not applicable should be NaN.
-type DERMeasureAC struct {
-	W      float64 // Active power (W); + export, - import
-	Var    float64 // Reactive power (VAr)
-	VA     float64 // Apparent power (VA)
-	PF     float64 // Power factor (-1 to +1)
-	A      float64 // AC current (A)
-	LLV    float64 // Average L-L voltage (V)
-	LNV    float64 // Average L-N voltage (V)
-	VL1L2  float64 // L1-L2 (V)
-	VL1    float64 // L1-N (V)
-	VL2L3  float64 // L2-L3 (V)
-	VL2    float64 // L2-N (V)
-	VL3L1  float64 // L3-L1 (V)
-	VL3    float64 // L3-N (V)
-	Hz     float64 // Frequency (Hz)
-	St     M701St  // Operating state
-	ConnSt bool    // true = connected to grid
-	Alrm   uint32  // Alarm bitfield
-}
-
-// ParseDERMeasureAC converts raw M701 register data into a DERMeasureAC.
-func ParseDERMeasureAC(regs []uint16) (DERMeasureAC, error) {
-	if len(regs) < M701_ConnSt+1 {
-		return DERMeasureAC{}, fmt.Errorf("sunspec: M701 too short (%d regs)", len(regs))
-	}
-	get := func(i int) uint16 {
-		if i < len(regs) {
-			return regs[i]
+// readString decodes a SunSpec fixed-length string field (2 chars/register,
+// NUL- or space-padded).
+func readString(regs []uint16, off, regLen int) string {
+	var b strings.Builder
+	for i := 0; i < regLen && off+i < len(regs); i++ {
+		r := regs[off+i]
+		if hi := byte(r >> 8); hi != 0 {
+			b.WriteByte(hi)
 		}
-		return 0
-	}
-	sf := func(i int) int16 { return int16(get(i)) }
-
-	vSF  := sf(M701_V_SF)
-	wSF  := sf(M701_W_SF)
-	varSF := sf(M701_Var_SF)
-	vaSF := sf(M701_VA_SF)
-	pfSF := sf(M701_PF_SF)
-	hzSF := sf(M701_Hz_SF)
-
-	m := DERMeasureAC{
-		W:     ApplyScaleSigned(get(M701_W), wSF),
-		Var:   ApplyScaleSigned(get(M701_Var), varSF),
-		VA:    ApplyScaleSigned(get(M701_VA), vaSF),
-		PF:    ApplyScaleSigned(get(M701_PF), pfSF) / 100.0,
-		A:     ApplyScaleSigned(get(M701_A), sf(M701_A_SF)),
-		LLV:   ApplyScaleSigned(get(M701_LLV), vSF),
-		LNV:   ApplyScaleSigned(get(M701_LNV), vSF),
-		VL1L2: ApplyScaleSigned(get(M701_VL1L2), vSF),
-		VL1:   ApplyScaleSigned(get(M701_VL1), vSF),
-		VL2L3: ApplyScaleSigned(get(M701_VL2L3), vSF),
-		VL2:   ApplyScaleSigned(get(M701_VL2), vSF),
-		VL3L1: ApplyScaleSigned(get(M701_VL3L1), vSF),
-		VL3:   ApplyScaleSigned(get(M701_VL3), vSF),
-		Hz:    ApplyScaleUint(get(M701_Hz), hzSF),
-		St:    M701St(get(M701_St)),
-		ConnSt: get(M701_ConnSt) == 1,
-	}
-	if len(regs) >= M701_Alrm+2 {
-		m.Alrm = uint32(get(M701_Alrm))<<16 | uint32(get(M701_Alrm+1))
-	}
-	return m, nil
-}
-
-// ── Model 702 (DERCapacity) ───────────────────────────────────────────────────
-
-// DERCapacity holds the nameplate and optional configuration data from M702.
-// Charge-rate fields (WChaRteMaxRtg, VAChaRteMaxRtg) are storage-specific.
-type DERCapacity struct {
-	// Required nameplate ratings
-	WMaxRtg         float64 // Active power max (W)
-	WOvrExtRtg      float64 // Over-excited active power (W)
-	WOvrExtRtgPF    float64 // Over-excited power factor
-	WUndExtRtg      float64 // Under-excited active power (W)
-	WUndExtRtgPF    float64 // Under-excited power factor
-	VAMaxRtg        float64 // Max apparent power (VA)
-	NorOpCatRtg     uint16  // Normal operating category: 0=A, 1=B
-	AbnOpCatRtg     uint16  // Abnormal operating category: 0=I, 1=II, 2=III
-	VarMaxInjRtg    float64 // Max reactive power injected (VAr)
-	VarMaxAbsRtg    float64 // Max reactive power absorbed (VAr)
-	WChaRteMaxRtg   float64 // Max charge rate (W); NaN if not storage
-	VAChaRteMaxRtg  float64 // Max charge apparent power (VA); NaN if not storage
-	VNomRtg         float64 // Nominal AC voltage (V)
-	VMaxRtg         float64 // Max AC voltage (V)
-	VMinRtg         float64 // Min AC voltage (V)
-	CtrlModes       uint32  // Supported control modes bitfield
-	ReactSusceptRtg float64 // Reactive susceptance (VAr)
-	// Optional configuration setpoints (NaN if not present)
-	WMax          float64 // Active power limit setpoint (W)
-	WMaxOvrExt    float64 // Over-excited power limit (W)
-	WOvrExtPF     float64 // Over-excited power factor setpoint
-	WMaxUndExt    float64 // Under-excited power limit (W)
-	WUndExtPF     float64 // Under-excited power factor setpoint
-	VAMax         float64 // Apparent power limit (VA)
-	VarMaxInj     float64 // Max reactive power inject setpoint (VAr)
-	VarMaxAbs     float64 // Max reactive power absorb setpoint (VAr)
-	WChaRteMax    float64 // Max charge rate setpoint (W)
-	VAChaRteMax   float64 // Max charge apparent setpoint (VA)
-	VNom          float64 // Nominal voltage setpoint (V)
-}
-
-// ParseDERCapacity converts raw M702 register data into a DERCapacity.
-func ParseDERCapacity(regs []uint16) (DERCapacity, error) {
-	if len(regs) < M702_V_SF+1 {
-		return DERCapacity{}, fmt.Errorf("sunspec: M702 too short (%d regs)", len(regs))
-	}
-	get := func(i int) uint16 {
-		if i < len(regs) {
-			return regs[i]
+		if lo := byte(r); lo != 0 {
+			b.WriteByte(lo)
 		}
-		return 0
 	}
-	wSF  := int16(get(M702_W_SF))
-	pfSF := int16(get(M702_PF_SF))
-	vaSF := int16(get(M702_VA_SF))
-	varSF := int16(get(M702_Var_SF))
-	vSF  := int16(get(M702_V_SF))
-
-	nan := math.NaN()
-	c := DERCapacity{
-		WMaxRtg:         ApplyScaleUint(get(M702_WMaxRtg), wSF),
-		WOvrExtRtg:      ApplyScaleUint(get(M702_WOvrExtRtg), wSF),
-		WOvrExtRtgPF:    ApplyScaleUint(get(M702_WOvrExtRtgPF), pfSF) / 100.0,
-		WUndExtRtg:      ApplyScaleUint(get(M702_WUndExtRtg), wSF),
-		WUndExtRtgPF:    ApplyScaleUint(get(M702_WUndExtRtgPF), pfSF) / 100.0,
-		VAMaxRtg:        ApplyScaleUint(get(M702_VAMaxRtg), vaSF),
-		NorOpCatRtg:     get(M702_NorOpCatRtg),
-		AbnOpCatRtg:     get(M702_AbnOpCatRtg),
-		VarMaxInjRtg:    ApplyScaleUint(get(M702_VarMaxInjRtg), varSF),
-		VarMaxAbsRtg:    ApplyScaleUint(get(M702_VarMaxAbsRtg), varSF),
-		WChaRteMaxRtg:   ApplyScaleUint(get(M702_WChaRteMaxRtg), wSF),
-		VAChaRteMaxRtg:  ApplyScaleUint(get(M702_VAChaRteMaxRtg), vaSF),
-		VNomRtg:         ApplyScaleUint(get(M702_VNomRtg), vSF),
-		VMaxRtg:         ApplyScaleUint(get(M702_VMaxRtg), vSF),
-		VMinRtg:         ApplyScaleUint(get(M702_VMinRtg), vSF),
-		CtrlModes:       uint32(get(M702_CtrlModes))<<16 | uint32(get(M702_CtrlModes+1)),
-		ReactSusceptRtg: ApplyScaleUint(get(M702_ReactSusceptRtg), varSF),
-		// Optional fields default to NaN; set below if registers are present.
-		WMax: nan, WMaxOvrExt: nan, WOvrExtPF: nan, WMaxUndExt: nan, WUndExtPF: nan,
-		VAMax: nan, VarMaxInj: nan, VarMaxAbs: nan, WChaRteMax: nan, VAChaRteMax: nan, VNom: nan,
-	}
-	if len(regs) > M702_WMax {
-		c.WMax       = ApplyScaleUint(get(M702_WMax), wSF)
-		c.WMaxOvrExt = ApplyScaleUint(get(M702_WMaxOvrExt), wSF)
-		c.WOvrExtPF  = ApplyScaleUint(get(M702_WOvrExtPF), pfSF) / 100.0
-		c.WMaxUndExt = ApplyScaleUint(get(M702_WMaxUndExt), wSF)
-		c.WUndExtPF  = ApplyScaleUint(get(M702_WUndExtPF), pfSF) / 100.0
-		c.VAMax      = ApplyScaleUint(get(M702_VAMax), vaSF)
-		c.VarMaxInj  = ApplyScaleUint(get(M702_VarMaxInj), varSF)
-		c.VarMaxAbs  = ApplyScaleUint(get(M702_VarMaxAbs), varSF)
-		c.WChaRteMax = ApplyScaleUint(get(M702_WChaRteMax), wSF)
-		c.VAChaRteMax= ApplyScaleUint(get(M702_VAChaRteMax), vaSF)
-		c.VNom       = ApplyScaleUint(get(M702_VNom), vSF)
-	}
-	return c, nil
+	return strings.TrimRight(b.String(), " \x00")
 }
 
-// ── Model 703 (DEREnterService) ───────────────────────────────────────────────
+// ── Model 701: DER AC Measurement ────────────────────────────────────────────
 
-// DEREnterServiceSettings holds the enter-service / cease-to-energize config.
-// Set Enabled=false to cease-to-energize the DER.
-type DEREnterServiceSettings struct {
-	Enabled    bool    // ES: false=cease-to-energize, true=permit service
-	VHi        float64 // Voltage high limit (V)
-	VLo        float64 // Voltage low limit (V)
-	HzHi       float64 // Frequency high limit (Hz)
-	HzLo       float64 // Frequency low limit (Hz)
-	DelayS     uint16  // Entry delay (seconds)
-	RampS      uint16  // Ramp time (seconds)
-	RandomDelayS uint16 // Randomized delay (seconds; 0 = not used)
+// ACMeasurement is the full decoded DER AC measurement (model 701).
+type ACMeasurement struct {
+	ACType  uint16  // 0=single, 1=split, 2=three-phase
+	St      uint16  // operating state (0=off,1=on)
+	InvSt   uint16  // inverter state (0..7)
+	ConnSt  uint16  // 0=disconnected, 1=connected
+	Alrm    uint32  // alarm bitfield
+	DERMode uint32  // operational characteristics bitfield
+	W, VA, Var, PF, A   float64
+	LLV, LNV, VL1, Hz   float64
+	TotWhInj, TotWhAbs       float64
+	TotVarhInj, TotVarhAbs   float64
+	TmpCab  float64
+	ThrotPct float64
+	ThrotSrc uint32
+	MnAlrmInfo string
 }
 
-// ParseDEREnterService converts raw M703 register data.
-func ParseDEREnterService(regs []uint16) (DEREnterServiceSettings, error) {
-	if len(regs) < M703_Hz_SF+1 {
-		return DEREnterServiceSettings{}, fmt.Errorf("sunspec: M703 too short (%d regs)", len(regs))
+// Parse701 decodes model 701 registers.
+func Parse701(regs []uint16) ACMeasurement {
+	v := L701.View(regs)
+	e := func(n string) uint16 { x, _ := v.Enum(n); return x }
+	return ACMeasurement{
+		ACType:  e("ACType"),
+		St:      e("St"),
+		InvSt:   e("InvSt"),
+		ConnSt:  e("ConnSt"),
+		Alrm:    v.Bitfield32("Alrm"),
+		DERMode: v.Bitfield32("DERMode"),
+		W:       v.Float("W"),
+		VA:      v.Float("VA"),
+		Var:     v.Float("Var"),
+		PF:      v.Float("PF"), // engineering value = power factor (raw × 10^SF)
+		A:       v.Float("A"),
+		LLV:     v.Float("LLV"),
+		LNV:     v.Float("LNV"),
+		VL1:     v.Float("VL1"),
+		Hz:      v.Float("Hz"),
+		TotWhInj:   v.Float("TotWhInj"),
+		TotWhAbs:   v.Float("TotWhAbs"),
+		TotVarhInj: v.Float("TotVarhInj"),
+		TotVarhAbs: v.Float("TotVarhAbs"),
+		TmpCab:     v.Float("TmpCab"),
+		ThrotPct:   v.Float("ThrotPct"),
+		ThrotSrc:   v.Bitfield32("ThrotSrc"),
+		MnAlrmInfo: readString(regs, L701.Offset("MnAlrmInfo"), 16),
 	}
-	get := func(i int) uint16 {
-		if i < len(regs) {
-			return regs[i]
-		}
-		return 0
-	}
-	vSF  := int16(get(M703_V_SF))
-	hzSF := int16(get(M703_Hz_SF))
-	return DEREnterServiceSettings{
-		Enabled:      get(M703_ES) == 1,
-		VHi:          ApplyScaleUint(get(M703_ESVHi), vSF),
-		VLo:          ApplyScaleUint(get(M703_ESVLo), vSF),
-		HzHi:         ApplyScaleUint(get(M703_ESHzHi), hzSF),
-		HzLo:         ApplyScaleUint(get(M703_ESHzLo), hzSF),
-		DelayS:       get(M703_ESDlyTms),
-		RampS:        get(M703_ESRmpTms),
-		RandomDelayS: get(M703_ESRndTms),
-	}, nil
 }
 
-// EncodeDEREnterService writes s into a pre-read register slice for M703.
-// Only the writable fields are touched; the scale factors are read from regs.
-// The caller must WriteModel the resulting slice.
-func EncodeDEREnterService(regs []uint16, s DEREnterServiceSettings) error {
-	if len(regs) < M703_Hz_SF+1 {
-		return fmt.Errorf("sunspec: M703 encode: slice too short (%d)", len(regs))
+// ── Model 702: DER Capacity ──────────────────────────────────────────────────
+
+// Capacity holds the model 702 nameplate ratings and configuration setpoints.
+// Setting fields are NaN when the device does not implement the optional block.
+type Capacity struct {
+	WMaxRtg, WOvrExtRtg, WOvrExtRtgPF, WUndExtRtg, WUndExtRtgPF float64
+	VAMaxRtg, VarMaxInjRtg, VarMaxAbsRtg                        float64
+	WChaRteMaxRtg, WDisChaRteMaxRtg, VAChaRteMaxRtg, VADisChaRteMaxRtg float64
+	VNomRtg, VMaxRtg, VMinRtg, AMaxRtg                          float64
+	PFOvrExtRtg, PFUndExtRtg, ReactSusceptRtg                   float64
+	NorOpCatRtg, AbnOpCatRtg uint16
+	CtrlModes        uint32
+	IntIslandCatRtg  uint16
+	// Settings (RW)
+	WMax, WMaxOvrExt, WOvrExtPF, WMaxUndExt, WUndExtPF float64
+	VAMax, VarMaxInj, VarMaxAbs                        float64
+	WChaRteMax, WDisChaRteMax, VAChaRteMax, VADisChaRteMax float64
+	VNom, VMax, VMin, AMax, PFOvrExt, PFUndExt         float64
+}
+
+// Parse702 decodes model 702 registers.
+func Parse702(regs []uint16) Capacity {
+	v := L702.View(regs)
+	pf := func(n string) float64 { return v.Float(n) }
+	e := func(n string) uint16 { x, _ := v.Enum(n); return x }
+	return Capacity{
+		WMaxRtg: v.Float("WMaxRtg"), WOvrExtRtg: v.Float("WOvrExtRtg"), WOvrExtRtgPF: pf("WOvrExtRtgPF"),
+		WUndExtRtg: v.Float("WUndExtRtg"), WUndExtRtgPF: pf("WUndExtRtgPF"),
+		VAMaxRtg: v.Float("VAMaxRtg"), VarMaxInjRtg: v.Float("VarMaxInjRtg"), VarMaxAbsRtg: v.Float("VarMaxAbsRtg"),
+		WChaRteMaxRtg: v.Float("WChaRteMaxRtg"), WDisChaRteMaxRtg: v.Float("WDisChaRteMaxRtg"),
+		VAChaRteMaxRtg: v.Float("VAChaRteMaxRtg"), VADisChaRteMaxRtg: v.Float("VADisChaRteMaxRtg"),
+		VNomRtg: v.Float("VNomRtg"), VMaxRtg: v.Float("VMaxRtg"), VMinRtg: v.Float("VMinRtg"), AMaxRtg: v.Float("AMaxRtg"),
+		PFOvrExtRtg: pf("PFOvrExtRtg"), PFUndExtRtg: pf("PFUndExtRtg"), ReactSusceptRtg: v.Float("ReactSusceptRtg"),
+		NorOpCatRtg: e("NorOpCatRtg"), AbnOpCatRtg: e("AbnOpCatRtg"),
+		CtrlModes: v.Bitfield32("CtrlModes"), IntIslandCatRtg: e("IntIslandCatRtg"),
+		WMax: v.Float("WMax"), WMaxOvrExt: v.Float("WMaxOvrExt"), WOvrExtPF: pf("WOvrExtPF"),
+		WMaxUndExt: v.Float("WMaxUndExt"), WUndExtPF: pf("WUndExtPF"), VAMax: v.Float("VAMax"),
+		VarMaxInj: v.Float("VarMaxInj"), VarMaxAbs: v.Float("VarMaxAbs"),
+		WChaRteMax: v.Float("WChaRteMax"), WDisChaRteMax: v.Float("WDisChaRteMax"),
+		VAChaRteMax: v.Float("VAChaRteMax"), VADisChaRteMax: v.Float("VADisChaRteMax"),
+		VNom: v.Float("VNom"), VMax: v.Float("VMax"), VMin: v.Float("VMin"), AMax: v.Float("AMax"),
+		PFOvrExt: pf("PFOvrExt"), PFUndExt: pf("PFUndExt"),
 	}
-	vSF  := int16(regs[M703_V_SF])
-	hzSF := int16(regs[M703_Hz_SF])
-	if s.Enabled {
-		regs[M703_ES] = 1
-	} else {
-		regs[M703_ES] = 0
+}
+
+// ── Model 703: DER Enter Service ─────────────────────────────────────────────
+
+// EnterService holds model 703 enter-service / cease-to-energize settings.
+type EnterService struct {
+	Enabled bool
+	VHi, VLo, HzHi, HzLo float64
+	DelayS, RandomS, RampS uint32
+	DelayRemS uint32
+}
+
+// Parse703 decodes model 703.
+func Parse703(regs []uint16) EnterService {
+	v := L703.View(regs)
+	u32 := func(n string) uint32 { x, _ := v.U32(n); return x }
+	return EnterService{
+		Enabled: v.Bool("ES"),
+		VHi:     v.Float("ESVHi"), VLo: v.Float("ESVLo"),
+		HzHi:    v.Float("ESHzHi"), HzLo: v.Float("ESHzLo"),
+		DelayS:  u32("ESDlyTms"), RandomS: u32("ESRndTms"), RampS: u32("ESRmpTms"),
+		DelayRemS: u32("ESDlyRemTms"),
 	}
-	regs[M703_ESVHi]    = RawFromScaleUint(s.VHi, vSF)
-	regs[M703_ESVLo]    = RawFromScaleUint(s.VLo, vSF)
-	regs[M703_ESHzHi]   = RawFromScaleUint(s.HzHi, hzSF)
-	regs[M703_ESHzLo]   = RawFromScaleUint(s.HzLo, hzSF)
-	regs[M703_ESDlyTms] = s.DelayS
-	regs[M703_ESRmpTms] = s.RampS
-	if len(regs) > M703_ESRndTms {
-		regs[M703_ESRndTms] = s.RandomDelayS
+}
+
+// Encode703 writes the writable model 703 fields into a freshly-read register
+// slice. Scale factors must already be present in regs (read the model first).
+func Encode703(regs []uint16, s EnterService) error {
+	if len(regs) < L703.Len() {
+		return fmt.Errorf("sunspec: M703 slice too short (%d < %d)", len(regs), L703.Len())
 	}
+	v := L703.View(regs)
+	v.SetBool("ES", s.Enabled)
+	v.SetFloat("ESVHi", s.VHi)
+	v.SetFloat("ESVLo", s.VLo)
+	v.SetFloat("ESHzHi", s.HzHi)
+	v.SetFloat("ESHzLo", s.HzLo)
+	v.SetU32("ESDlyTms", s.DelayS)
+	v.SetU32("ESRndTms", s.RandomS)
+	v.SetU32("ESRmpTms", s.RampS)
 	return nil
 }
 
-// ── Model 704 (DERCtlAC) ─────────────────────────────────────────────────────
+// ── Model 704: DER AC Controls ───────────────────────────────────────────────
 
-// DERCtlACSettings holds the constant PF, constant var, and power-limit
-// settings from Model 704. A nil pointer means "leave unchanged" when encoding.
-type DERCtlACSettings struct {
-	// Constant power factor (§2.5)
-	PFWInjEna  bool    // true=enabled
-	PFWInj_PF  float64 // Power factor (0-1; positive only, sign from Ext)
-	PFWInj_Ext bool    // true=injecting (over-excited), false=absorbing (under-excited)
-
-	// Constant reactive power (§2.8)
-	VarSetEna  bool    // true=enabled
-	VarSetMod  uint16  // 0=W_MAX_PCT, 1=VAR_MAX_PCT, 2=VA_MAX_PCT
-	VarSetPri  uint16  // 0=active_power, 1=reactive (spec requires REACTIVE)
-	VarSetPct  float64 // Reactive power setpoint % of WMax (signed; + inject, - absorb)
-
-	// Limit maximum active power (§2.16)
-	WMaxLimPctEna bool    // true=enabled
-	WMaxLimPct    float64 // Active power limit % of WMax (0-100)
+// ACControls is a read-back snapshot of model 704. Reversion-timer and ramp
+// fields are included for completeness/diagnostics.
+type ACControls struct {
+	PFWInjEna  bool
+	PFWInjPF   float64
+	PFWInjExt  uint16
+	PFWAbsEna  bool
+	PFWAbsPF   float64
+	PFWAbsExt  uint16
+	WMaxLimPctEna bool
+	WMaxLimPct float64
+	WSetEna    bool
+	WSetMod    uint16
+	WSet       float64 // watts
+	WSetPct    float64 // % of max
+	VarSetEna  bool
+	VarSetMod  uint16
+	VarSetPri  uint16
+	VarSet     float64
+	VarSetPct  float64
+	WRmp, VarRmp uint16
+	WRmpRef    uint16
+	AntiIslEna bool
 }
 
-// ParseDERCtlAC converts raw M704 registers into a DERCtlACSettings.
-func ParseDERCtlAC(regs []uint16) (DERCtlACSettings, error) {
-	if len(regs) < M704Len {
-		return DERCtlACSettings{}, fmt.Errorf("sunspec: M704 too short (%d regs)", len(regs))
+// Parse704 decodes model 704.
+func Parse704(regs []uint16) ACControls {
+	v := L704.View(regs)
+	e := func(n string) uint16 { x, _ := v.Enum(n); return x }
+	return ACControls{
+		PFWInjEna: v.Bool("PFWInjEna"), PFWInjPF: v.Float("PFWInj_PF"), PFWInjExt: e("PFWInj_Ext"),
+		PFWAbsEna: v.Bool("PFWAbsEna"), PFWAbsPF: v.Float("PFWAbs_PF"), PFWAbsExt: e("PFWAbs_Ext"),
+		WMaxLimPctEna: v.Bool("WMaxLimPctEna"), WMaxLimPct: v.Float("WMaxLimPct"),
+		WSetEna: v.Bool("WSetEna"), WSetMod: e("WSetMod"), WSet: v.Float("WSet"), WSetPct: v.Float("WSetPct"),
+		VarSetEna: v.Bool("VarSetEna"), VarSetMod: e("VarSetMod"), VarSetPri: e("VarSetPri"),
+		VarSet: v.Float("VarSet"), VarSetPct: v.Float("VarSetPct"),
+		WRmp: e("WRmp"), VarRmp: e("VarRmp"), WRmpRef: e("WRmpRef"), AntiIslEna: v.Bool("AntiIslEna"),
 	}
-	pfSF      := int16(regs[M704_PF_SF])
-	varPctSF  := int16(regs[M704_VarSetPct_SF])
-	wMaxPctSF := int16(regs[M704_WMaxLimPct_SF])
-	return DERCtlACSettings{
-		PFWInjEna:     regs[M704_PFWInjEna] == 1,
-		PFWInj_PF:     ApplyScaleSigned(regs[M704_PFWInj_PF], pfSF) / 100.0,
-		PFWInj_Ext:    regs[M704_PFWInj_Ext] == 1,
-		VarSetEna:     regs[M704_VarSetEna] == 1,
-		VarSetMod:     regs[M704_VarSetMod],
-		VarSetPri:     regs[M704_VarSetPri],
-		VarSetPct:     ApplyScaleSigned(regs[M704_VarSetPct], varPctSF),
-		WMaxLimPctEna: regs[M704_WMaxLimPctEna] == 1,
-		WMaxLimPct:    ApplyScaleUint(regs[M704_WMaxLimPct], wMaxPctSF),
-	}, nil
 }
 
-// EncodeDERCtlAC writes s into a pre-read M704 register slice.
-// The caller must WriteModel the result.
-func EncodeDERCtlAC(regs []uint16, s DERCtlACSettings) error {
-	if len(regs) < M704Len {
-		return fmt.Errorf("sunspec: M704 encode: slice too short (%d)", len(regs))
+// ── Curve helpers shared by 705/706/712 ──────────────────────────────────────
+
+func curveNPt(hdr *Layout, regs []uint16, maxNPt int) (int, error) {
+	if len(regs) < hdr.Len() {
+		return 0, fmt.Errorf("sunspec: curve model too short for header (%d < %d)", len(regs), hdr.Len())
 	}
-	pfSF      := int16(regs[M704_PF_SF])
-	varPctSF  := int16(regs[M704_VarSetPct_SF])
-	wMaxPctSF := int16(regs[M704_WMaxLimPct_SF])
-
-	if s.PFWInjEna {
-		regs[M704_PFWInjEna] = 1
-	} else {
-		regs[M704_PFWInjEna] = 0
+	npt := int(hdr.View(regs).reg(hdr.Offset("NPt")))
+	if npt == 0 || npt > maxNPt {
+		return 0, fmt.Errorf("sunspec: curve NPt=%d out of range", npt)
 	}
-	regs[M704_PFWInj_PF] = RawFromScaleSigned(s.PFWInj_PF*100.0, pfSF)
-	if s.PFWInj_Ext {
-		regs[M704_PFWInj_Ext] = 1
-	} else {
-		regs[M704_PFWInj_Ext] = 0
-	}
-	if s.VarSetEna {
-		regs[M704_VarSetEna] = 1
-	} else {
-		regs[M704_VarSetEna] = 0
-	}
-	regs[M704_VarSetMod] = s.VarSetMod
-	regs[M704_VarSetPri] = s.VarSetPri
-	regs[M704_VarSetPct] = RawFromScaleSigned(s.VarSetPct, varPctSF)
-	if s.WMaxLimPctEna {
-		regs[M704_WMaxLimPctEna] = 1
-	} else {
-		regs[M704_WMaxLimPctEna] = 0
-	}
-	regs[M704_WMaxLimPct] = RawFromScaleUint(s.WMaxLimPct, wMaxPctSF)
-	return nil
+	return npt, nil
 }
 
-// ── Curve model helpers ───────────────────────────────────────────────────────
+// ── Model 705: DER Volt-Var ──────────────────────────────────────────────────
 
-// CurveBase705 returns the register offset of curve curveIdx (0-based) within
-// a M705 (DERVoltVar) data block, given NPt points per curve.
-func CurveBase705(curveIdx, npt int) int {
-	return M705_CrvHdrSize + curveIdx*(M705_Crv_PtOffset+2*npt)
-}
+type VVPoint struct{ V, Var float64 }
 
-// CurveBase706 returns the register offset of curve curveIdx within M706 data.
-func CurveBase706(curveIdx, npt int) int {
-	return 8 + curveIdx*(M706_Crv_PtOffset+2*npt)
-}
-
-// CurveSetBase707 returns the offset of curve-set setIdx within M707/M708 data.
-// Each set has: ReadOnly(1) + MustTrip.ActPt(1) + NPt pairs + optional MomCess.
-// hasMomCess indicates whether optional momentary-cessation points are present.
-func CurveSetBase707(setIdx, npt int, hasMomCess bool) int {
-	momCessRegs := 0
-	if hasMomCess {
-		momCessRegs = 1 + 2 // ActPt + 1 point pair
-	}
-	setSize := 2 + 2*npt + momCessRegs
-	return 7 + setIdx*setSize // 7 = fixed header size
-}
-
-// CurveSetBase709 returns the offset of curve-set setIdx within M709/M710 data.
-// Same layout as 707/708 but Hz instead of V.
-func CurveSetBase709(setIdx, npt int, hasMomCess bool) int {
-	return CurveSetBase707(setIdx, npt, hasMomCess)
-}
-
-// CtlBase711 returns the register offset of control set ctlIdx within M711 data.
-func CtlBase711(ctlIdx int) int {
-	return M711_CtlStart + ctlIdx*M711_CtlSize
-}
-
-// CurveBase712 returns the register offset of curve curveIdx within M712 data.
-func CurveBase712(curveIdx, npt int) int {
-	return 7 + curveIdx*(M712_Crv_PtOffset+2*npt)
-}
-
-// ── Model 705 (DERVoltVar) curve types ────────────────────────────────────────
-
-// VoltVarPoint is a (voltage, reactive power) point in a Q(V) curve.
-// V is expressed as % of VRef; Var as % of WMax (or VAr or VA per DeptRef).
-type VoltVarPoint struct {
-	V   float64 // Voltage (%, scaled)
-	Var float64 // Reactive power (%, signed; + inject, - absorb)
-}
-
-// VoltVarCurve is a Q(V) curve as used by Model 705.
-// IEEE 1547-2018 requires exactly 4 active points (Pt[0]..Pt[3]).
 type VoltVarCurve struct {
-	DeptRef     uint16         // 0=W_MAX_PCT, 1=VAR_MAX_PCT, 2=VA_MAX_PCT
-	Pri         uint16         // 1=REACTIVE
-	VRef        float64        // Voltage reference (V, scaled)
-	VRefAutoEna bool           // Autonomous VRef adjustment
-	VRefAutoTms float64        // VRef time constant (s)
-	RspTms      float64        // Open loop response time (s)
-	Pts         []VoltVarPoint // Active points (4 for IEEE 1547-2018)
+	ReadOnly    bool
+	DeptRef     uint16
+	Pri         uint16
+	VRef        float64
+	VRefAutoEna bool
+	VRefAutoTms float64
+	RspTms      float64
+	Points      []VVPoint
 }
 
-// ParseVoltVarCurve reads one curve from an M705 register block.
-// curveIdx=0 is the read-only current-settings curve; curveIdx=1 is writable.
-func ParseVoltVarCurve(regs []uint16, curveIdx int) (VoltVarCurve, error) {
-	if len(regs) < M705_CrvHdrSize {
-		return VoltVarCurve{}, fmt.Errorf("sunspec: M705 too short for header")
+// Parse705Curve reads curve i (0=active read-only, 1+=staging) from a 705 block.
+func Parse705Curve(regs []uint16, i int) (VoltVarCurve, error) {
+	npt, err := curveNPt(L705Hdr, regs, 64)
+	if err != nil {
+		return VoltVarCurve{}, err
 	}
-	npt := int(regs[M705_NPt])
-	if npt == 0 || npt > 20 {
-		return VoltVarCurve{}, fmt.Errorf("sunspec: M705 NPt=%d out of range", npt)
+	h := L705Hdr.View(regs)
+	base := CurveOffset705(i, npt)
+	co := func(p string) int { return base + L705Crv.Offset(p) }
+	if base+L705Crv.Len()+2*npt > len(regs) {
+		return VoltVarCurve{}, fmt.Errorf("sunspec: M705 too short for curve %d", i)
 	}
-	base := CurveBase705(curveIdx, npt)
-	if len(regs) < base+M705_Crv_PtOffset+2*npt {
-		return VoltVarCurve{}, fmt.Errorf("sunspec: M705 too short for curve %d", curveIdx)
-	}
-	vSF      := int16(regs[M705_V_SF])
-	deptRefSF := int16(regs[M705_DeptRef_SF])
-	rspTmsSF  := int16(regs[M705_RspTms_SF])
-
-	actPt := int(regs[base+M705_Crv_ActPt])
+	actPt := int(h.U16At(co("ActPt")))
 	if actPt > npt {
 		actPt = npt
 	}
 	c := VoltVarCurve{
-		DeptRef:     regs[base+M705_Crv_DeptRef],
-		Pri:         regs[base+M705_Crv_Pri],
-		VRef:        ApplyScaleUint(regs[base+M705_Crv_VRef], vSF),
-		VRefAutoEna: regs[base+M705_Crv_VRefAutoEna] == 1,
-		VRefAutoTms: ApplyScaleUint(regs[base+M705_Crv_VRefAutoTms], rspTmsSF),
-		RspTms:      ApplyScaleUint(regs[base+M705_Crv_RspTms], rspTmsSF),
+		ReadOnly:    h.U16At(co("ReadOnly")) == 1,
+		DeptRef:     h.U16At(co("DeptRef")),
+		Pri:         h.U16At(co("Pri")),
+		VRef:        h.ScaleUintAt(co("VRef"), "V_SF"),
+		VRefAutoEna: h.U16At(co("VRefAutoEna")) == 1,
+		VRefAutoTms: float64(h.U16At(co("VRefAutoTms"))),
+		RspTms:      h.ScaleU32At(co("RspTms"), "RspTms_SF"),
+		Points:      make([]VVPoint, actPt),
 	}
-	ptBase := base + M705_Crv_PtOffset
-	c.Pts = make([]VoltVarPoint, actPt)
-	for i := 0; i < actPt; i++ {
-		c.Pts[i] = VoltVarPoint{
-			V:   ApplyScaleSigned(regs[ptBase+2*i], vSF),
-			Var: ApplyScaleSigned(regs[ptBase+2*i+1], deptRefSF),
-		}
+	for j := 0; j < actPt; j++ {
+		po := PointOffset705(i, j, npt)
+		c.Points[j] = VVPoint{V: h.ScaleUintAt(po, "V_SF"), Var: h.ScaleSignedAt(po+1, "DeptRef_SF")}
 	}
 	return c, nil
 }
 
-// EncodeVoltVarCurve writes c into the writable curve (curveIdx=1) of regs.
-// Returns the range of registers modified so the caller can WriteModel the
-// exact slice: [curveStart, curveStart+headerSize+2×len(c.Pts)).
-func EncodeVoltVarCurve(regs []uint16, c VoltVarCurve) (start, end int, err error) {
-	if len(regs) < M705_CrvHdrSize {
-		return 0, 0, fmt.Errorf("sunspec: M705 too short for header")
+// Encode705Curve writes c into staging curve index i (≥1) of regs, returning
+// the modified register range [start,end). SFs must already be in regs.
+func Encode705Curve(regs []uint16, i int, c VoltVarCurve) (start, end int, err error) {
+	npt, err := curveNPt(L705Hdr, regs, 64)
+	if err != nil {
+		return 0, 0, err
 	}
-	npt := int(regs[M705_NPt])
-	if npt == 0 {
-		return 0, 0, fmt.Errorf("sunspec: M705 NPt=0")
+	if len(c.Points) > npt {
+		return 0, 0, fmt.Errorf("sunspec: VoltVar curve has %d points, device NPt=%d", len(c.Points), npt)
 	}
-	if len(c.Pts) > npt {
-		return 0, 0, fmt.Errorf("sunspec: VoltVar curve has %d points but device NPt=%d", len(c.Pts), npt)
+	h := L705Hdr.View(regs)
+	base := CurveOffset705(i, npt)
+	if base+L705Crv.Len()+2*npt > len(regs) {
+		return 0, 0, fmt.Errorf("sunspec: M705 too short for curve %d", i)
 	}
-	vSF       := int16(regs[M705_V_SF])
-	deptRefSF := int16(regs[M705_DeptRef_SF])
-	rspTmsSF  := int16(regs[M705_RspTms_SF])
-	base := CurveBase705(1, npt) // always write to writable curve (index 1)
-	if len(regs) < base+M705_Crv_PtOffset+2*npt {
-		return 0, 0, fmt.Errorf("sunspec: M705 too short for writable curve")
-	}
-	regs[base+M705_Crv_ActPt]       = uint16(len(c.Pts))
-	regs[base+M705_Crv_DeptRef]     = c.DeptRef
-	regs[base+M705_Crv_Pri]         = c.Pri
-	regs[base+M705_Crv_VRef]        = RawFromScaleUint(c.VRef, vSF)
+	co := func(p string) int { return base + L705Crv.Offset(p) }
+	h.SetU16At(co("ActPt"), uint16(len(c.Points)))
+	h.SetU16At(co("DeptRef"), c.DeptRef)
+	h.SetU16At(co("Pri"), c.Pri)
+	h.SetScaledUintAt(co("VRef"), c.VRef, "V_SF")
 	if c.VRefAutoEna {
-		regs[base+M705_Crv_VRefAutoEna] = 1
+		h.SetU16At(co("VRefAutoEna"), 1)
 	} else {
-		regs[base+M705_Crv_VRefAutoEna] = 0
+		h.SetU16At(co("VRefAutoEna"), 0)
 	}
-	regs[base+M705_Crv_VRefAutoTms] = RawFromScaleUint(c.VRefAutoTms, rspTmsSF)
-	regs[base+M705_Crv_RspTms]      = RawFromScaleUint(c.RspTms, rspTmsSF)
-	regs[base+M705_Crv_ReadOnly]    = 0 // writable
-	ptBase := base + M705_Crv_PtOffset
-	for i, pt := range c.Pts {
-		regs[ptBase+2*i]   = RawFromScaleSigned(pt.V, vSF)
-		regs[ptBase+2*i+1] = RawFromScaleSigned(pt.Var, deptRefSF)
+	h.SetU16At(co("VRefAutoTms"), uint16(c.VRefAutoTms))
+	h.SetScaledU32At(co("RspTms"), c.RspTms, "RspTms_SF")
+	h.SetU16At(co("ReadOnly"), 0)
+	for j, p := range c.Points {
+		po := PointOffset705(i, j, npt)
+		h.SetScaledUintAt(po, p.V, "V_SF")
+		h.SetScaledSignedAt(po+1, p.Var, "DeptRef_SF")
 	}
-	return base, ptBase + 2*npt, nil
+	return base, base + L705Crv.Len() + 2*npt, nil
 }
 
-// ── Model 706 (DERVoltWatt) curve types ──────────────────────────────────────
+// ── Model 706: DER Volt-Watt ─────────────────────────────────────────────────
 
-// VoltWattPoint is a (voltage, active power) point in a P(V) curve.
-type VoltWattPoint struct {
-	V float64 // Voltage (%)
-	W float64 // Active power (% of WMax)
-}
+type VWPoint struct{ V, W float64 }
 
-// VoltWattCurve is a P(V) curve as used by Model 706.
-// IEEE 1547-2018 requires exactly 2 active points.
 type VoltWattCurve struct {
-	DeptRef uint16          // 0=W_MAX_PCT
-	RspTms  float64         // Open loop response time (s)
-	Pts     []VoltWattPoint // Active points (2 for IEEE 1547-2018)
+	ReadOnly bool
+	DeptRef  uint16
+	RspTms   float64
+	Points   []VWPoint
 }
 
-// ParseVoltWattCurve reads one curve from an M706 register block.
-func ParseVoltWattCurve(regs []uint16, curveIdx int) (VoltWattCurve, error) {
-	if len(regs) < 8 {
-		return VoltWattCurve{}, fmt.Errorf("sunspec: M706 too short for header")
+func Parse706Curve(regs []uint16, i int) (VoltWattCurve, error) {
+	npt, err := curveNPt(L706Hdr, regs, 64)
+	if err != nil {
+		return VoltWattCurve{}, err
 	}
-	npt := int(regs[M706_NPt])
-	if npt == 0 || npt > 20 {
-		return VoltWattCurve{}, fmt.Errorf("sunspec: M706 NPt=%d out of range", npt)
+	h := L706Hdr.View(regs)
+	base := CurveOffset706(i, npt)
+	if base+L706Crv.Len()+2*npt > len(regs) {
+		return VoltWattCurve{}, fmt.Errorf("sunspec: M706 too short for curve %d", i)
 	}
-	base := CurveBase706(curveIdx, npt)
-	if len(regs) < base+M706_Crv_PtOffset+2*npt {
-		return VoltWattCurve{}, fmt.Errorf("sunspec: M706 too short for curve %d", curveIdx)
-	}
-	vSF       := int16(regs[M706_V_SF])
-	deptRefSF := int16(regs[M706_DeptRef_SF])
-	rspTmsSF  := int16(regs[M706_RspTms_SF])
-	actPt := int(regs[base+M706_Crv_ActPt])
+	co := func(p string) int { return base + L706Crv.Offset(p) }
+	actPt := int(h.U16At(co("ActPt")))
 	if actPt > npt {
 		actPt = npt
 	}
 	c := VoltWattCurve{
-		DeptRef: regs[base+M706_Crv_DeptRef],
-		RspTms:  ApplyScaleUint(regs[base+M706_Crv_RspTms], rspTmsSF),
+		ReadOnly: h.U16At(co("ReadOnly")) == 1,
+		DeptRef:  h.U16At(co("DeptRef")),
+		RspTms:   h.ScaleU32At(co("RspTms"), "RspTms_SF"),
+		Points:   make([]VWPoint, actPt),
 	}
-	ptBase := base + M706_Crv_PtOffset
-	c.Pts = make([]VoltWattPoint, actPt)
-	for i := 0; i < actPt; i++ {
-		c.Pts[i] = VoltWattPoint{
-			V: ApplyScaleSigned(regs[ptBase+2*i], vSF),
-			W: ApplyScaleSigned(regs[ptBase+2*i+1], deptRefSF),
-		}
+	for j := 0; j < actPt; j++ {
+		po := PointOffset706(i, j, npt)
+		c.Points[j] = VWPoint{V: h.ScaleUintAt(po, "V_SF"), W: h.ScaleSignedAt(po+1, "DeptRef_SF")}
 	}
 	return c, nil
 }
 
-// EncodeVoltWattCurve writes c to the writable curve (index 1) of regs.
-func EncodeVoltWattCurve(regs []uint16, c VoltWattCurve) (start, end int, err error) {
-	if len(regs) < 8 {
-		return 0, 0, fmt.Errorf("sunspec: M706 too short for header")
+func Encode706Curve(regs []uint16, i int, c VoltWattCurve) (start, end int, err error) {
+	npt, err := curveNPt(L706Hdr, regs, 64)
+	if err != nil {
+		return 0, 0, err
 	}
-	npt := int(regs[M706_NPt])
-	if npt == 0 {
-		return 0, 0, fmt.Errorf("sunspec: M706 NPt=0")
+	if len(c.Points) > npt {
+		return 0, 0, fmt.Errorf("sunspec: VoltWatt curve has %d points, device NPt=%d", len(c.Points), npt)
 	}
-	if len(c.Pts) > npt {
-		return 0, 0, fmt.Errorf("sunspec: VoltWatt curve has %d points, device NPt=%d", len(c.Pts), npt)
+	h := L706Hdr.View(regs)
+	base := CurveOffset706(i, npt)
+	if base+L706Crv.Len()+2*npt > len(regs) {
+		return 0, 0, fmt.Errorf("sunspec: M706 too short for curve %d", i)
 	}
-	vSF       := int16(regs[M706_V_SF])
-	deptRefSF := int16(regs[M706_DeptRef_SF])
-	rspTmsSF  := int16(regs[M706_RspTms_SF])
-	base := CurveBase706(1, npt)
-	if len(regs) < base+M706_Crv_PtOffset+2*npt {
-		return 0, 0, fmt.Errorf("sunspec: M706 too short for writable curve")
+	co := func(p string) int { return base + L706Crv.Offset(p) }
+	h.SetU16At(co("ActPt"), uint16(len(c.Points)))
+	h.SetU16At(co("DeptRef"), c.DeptRef)
+	h.SetScaledU32At(co("RspTms"), c.RspTms, "RspTms_SF")
+	h.SetU16At(co("ReadOnly"), 0)
+	for j, p := range c.Points {
+		po := PointOffset706(i, j, npt)
+		h.SetScaledUintAt(po, p.V, "V_SF")
+		h.SetScaledSignedAt(po+1, p.W, "DeptRef_SF")
 	}
-	regs[base+M706_Crv_ActPt]    = uint16(len(c.Pts))
-	regs[base+M706_Crv_DeptRef]  = c.DeptRef
-	regs[base+M706_Crv_RspTms]   = RawFromScaleUint(c.RspTms, rspTmsSF)
-	regs[base+M706_Crv_ReadOnly] = 0
-	ptBase := base + M706_Crv_PtOffset
-	for i, pt := range c.Pts {
-		regs[ptBase+2*i]   = RawFromScaleSigned(pt.V, vSF)
-		regs[ptBase+2*i+1] = RawFromScaleSigned(pt.W, deptRefSF)
-	}
-	return base, ptBase + 2*npt, nil
+	return base, base + L706Crv.Len() + 2*npt, nil
 }
 
-// ── Models 707/708 (DERTripLV/HV) trip curve types ───────────────────────────
+// ── Models 707/708: Voltage trip (three curves per set) ──────────────────────
 
-// VoltageTripPoint is a (voltage, time) point on a must-trip or momentary-
-// cessation curve. V is in % of nominal; Tms is in seconds.
-type VoltageTripPoint struct {
-	V   float64 // Voltage threshold (%)
-	Tms float64 // Clearing / cessation time (s)
+type TripVPoint struct{ V, Tms float64 }
+
+// VoltageTripSet holds the must-trip, may-trip, and momentary-cessation curves
+// of one curve-set in model 707 (LV) or 708 (HV).
+type VoltageTripSet struct {
+	ReadOnly bool
+	MustTrip []TripVPoint
+	MayTrip  []TripVPoint
+	MomCess  []TripVPoint
 }
 
-// VoltageTripCurve holds the must-trip and optional momentary-cessation curves
-// from one curve-set in Model 707 (low-voltage) or 708 (high-voltage).
-// IEEE 1547-2018 requires 5 active points for MustTrip.
-type VoltageTripCurve struct {
-	MustTrip []VoltageTripPoint // Must-trip curve (5 points for IEEE 1547)
-	MomCess  []VoltageTripPoint // Momentary cessation curve (optional)
-}
-
-// ParseVoltageTripCurve reads curve-set setIdx from a M707/M708 register block.
-// setIdx=0 is read-only; setIdx=1 is writable.
-// hasMomCess must match whether the device populates optional MomCess points.
-func ParseVoltageTripCurve(regs []uint16, setIdx int, hasMomCess bool) (VoltageTripCurve, error) {
-	if len(regs) < 7 {
-		return VoltageTripCurve{}, fmt.Errorf("sunspec: M707/708 too short for header")
-	}
-	npt := int(regs[M707_NPt])
-	if npt == 0 || npt > 20 {
-		return VoltageTripCurve{}, fmt.Errorf("sunspec: M707/708 NPt=%d out of range", npt)
-	}
-	vSF   := int16(regs[M707_V_SF])
-	tmsSF := int16(regs[M707_Tms_SF])
-
-	base := CurveSetBase707(setIdx, npt, hasMomCess)
-	actPt := int(regs[base+M707_CrvSet_MustTripActPt])
+func parseTripVSub(h View, i, sub, npt int) []TripVPoint {
+	subOff := SubCurveOffset707(i, sub, npt)
+	actPt := int(h.U16At(subOff))
 	if actPt > npt {
 		actPt = npt
 	}
-	c := VoltageTripCurve{
-		MustTrip: make([]VoltageTripPoint, actPt),
+	pts := make([]TripVPoint, actPt)
+	for j := 0; j < actPt; j++ {
+		po := subOff + 1 + j*tripVPtRegs
+		pts[j] = TripVPoint{V: h.ScaleUintAt(po, "V_SF"), Tms: h.ScaleU32At(po+1, "Tms_SF")}
 	}
-	ptBase := base + M707_CrvSet_MustTripPtV
-	for i := 0; i < actPt; i++ {
-		c.MustTrip[i] = VoltageTripPoint{
-			V:   ApplyScaleSigned(regs[ptBase+2*i], vSF),
-			Tms: ApplyScaleSigned(regs[ptBase+2*i+1], tmsSF),
-		}
-	}
-	if hasMomCess {
-		mcBase := ptBase + 2*npt
-		if len(regs) > mcBase+2 {
-			mcActPt := int(regs[mcBase])
-			if mcActPt > 0 {
-				c.MomCess = make([]VoltageTripPoint, 1)
-				c.MomCess[0] = VoltageTripPoint{
-					V:   ApplyScaleSigned(regs[mcBase+1], vSF),
-					Tms: ApplyScaleSigned(regs[mcBase+2], tmsSF),
-				}
-			}
-		}
-	}
-	return c, nil
+	return pts
 }
 
-// EncodeVoltageTripCurve writes c to the writable curve-set (index 1) of regs.
-func EncodeVoltageTripCurve(regs []uint16, c VoltageTripCurve, hasMomCess bool) (start, end int, err error) {
-	if len(regs) < 7 {
-		return 0, 0, fmt.Errorf("sunspec: M707/708 too short for header")
+// Parse707Set reads curve-set i from a 707/708 register block.
+func Parse707Set(regs []uint16, i int) (VoltageTripSet, error) {
+	npt, err := curveNPt(L707Hdr, regs, 64)
+	if err != nil {
+		return VoltageTripSet{}, err
 	}
-	npt := int(regs[M707_NPt])
-	if npt == 0 {
-		return 0, 0, fmt.Errorf("sunspec: M707/708 NPt=0")
+	if TripVSetOffset(i, npt)+tripVSetSize(npt) > len(regs) {
+		return VoltageTripSet{}, fmt.Errorf("sunspec: M707/708 too short for set %d", i)
 	}
-	if len(c.MustTrip) > npt {
-		return 0, 0, fmt.Errorf("sunspec: VoltageTripCurve has %d points, device NPt=%d", len(c.MustTrip), npt)
-	}
-	vSF   := int16(regs[M707_V_SF])
-	tmsSF := int16(regs[M707_Tms_SF])
-	base  := CurveSetBase707(1, npt, hasMomCess)
-	regs[base+M707_CrvSet_ReadOnly]      = 0
-	regs[base+M707_CrvSet_MustTripActPt] = uint16(len(c.MustTrip))
-	ptBase := base + M707_CrvSet_MustTripPtV
-	for i, pt := range c.MustTrip {
-		regs[ptBase+2*i]   = RawFromScaleSigned(pt.V, vSF)
-		regs[ptBase+2*i+1] = RawFromScaleSigned(pt.Tms, tmsSF)
-	}
-	endOff := ptBase + 2*npt
-	if hasMomCess && len(c.MomCess) > 0 {
-		regs[endOff] = 1 // ActPt
-		regs[endOff+1] = RawFromScaleSigned(c.MomCess[0].V, vSF)
-		regs[endOff+2] = RawFromScaleSigned(c.MomCess[0].Tms, tmsSF)
-		endOff += 3
-	}
-	return base, endOff, nil
-}
-
-// ── Models 709/710 (DERTripLF/HF) frequency trip curve types ─────────────────
-
-// FreqTripPoint is a (frequency, time) point. Hz in cycles/s; Tms in seconds.
-type FreqTripPoint struct {
-	Hz  float64
-	Tms float64
-}
-
-// FreqTripCurve holds must-trip (and optional momentary-cessation) points for
-// one curve-set in Model 709 (low-frequency) or 710 (high-frequency).
-type FreqTripCurve struct {
-	MustTrip []FreqTripPoint
-	MomCess  []FreqTripPoint
-}
-
-// ParseFreqTripCurve reads curve-set setIdx from a M709/M710 register block.
-func ParseFreqTripCurve(regs []uint16, setIdx int, hasMomCess bool) (FreqTripCurve, error) {
-	if len(regs) < 7 {
-		return FreqTripCurve{}, fmt.Errorf("sunspec: M709/710 too short for header")
-	}
-	npt := int(regs[M709_NPt])
-	if npt == 0 || npt > 20 {
-		return FreqTripCurve{}, fmt.Errorf("sunspec: M709/710 NPt=%d out of range", npt)
-	}
-	hzSF  := int16(regs[M709_Hz_SF])
-	tmsSF := int16(regs[M709_Tms_SF])
-	base  := CurveSetBase709(setIdx, npt, hasMomCess)
-	actPt := int(regs[base+M709_CrvSet_MustTripActPt])
-	if actPt > npt {
-		actPt = npt
-	}
-	c := FreqTripCurve{MustTrip: make([]FreqTripPoint, actPt)}
-	ptBase := base + M709_CrvSet_MustTripPtHz
-	for i := 0; i < actPt; i++ {
-		c.MustTrip[i] = FreqTripPoint{
-			Hz:  ApplyScaleSigned(regs[ptBase+2*i], hzSF),
-			Tms: ApplyScaleSigned(regs[ptBase+2*i+1], tmsSF),
-		}
-	}
-	if hasMomCess {
-		mcBase := ptBase + 2*npt
-		if len(regs) > mcBase+2 {
-			if regs[mcBase] > 0 {
-				c.MomCess = []FreqTripPoint{{
-					Hz:  ApplyScaleSigned(regs[mcBase+1], hzSF),
-					Tms: ApplyScaleSigned(regs[mcBase+2], tmsSF),
-				}}
-			}
-		}
-	}
-	return c, nil
-}
-
-// EncodeFreqTripCurve writes c to the writable curve-set (index 1) of regs.
-func EncodeFreqTripCurve(regs []uint16, c FreqTripCurve, hasMomCess bool) (start, end int, err error) {
-	if len(regs) < 7 {
-		return 0, 0, fmt.Errorf("sunspec: M709/710 too short for header")
-	}
-	npt := int(regs[M709_NPt])
-	if npt == 0 {
-		return 0, 0, fmt.Errorf("sunspec: M709/710 NPt=0")
-	}
-	if len(c.MustTrip) > npt {
-		return 0, 0, fmt.Errorf("sunspec: FreqTripCurve has %d points, device NPt=%d", len(c.MustTrip), npt)
-	}
-	hzSF  := int16(regs[M709_Hz_SF])
-	tmsSF := int16(regs[M709_Tms_SF])
-	base  := CurveSetBase709(1, npt, hasMomCess)
-	regs[base+M709_CrvSet_ReadOnly]      = 0
-	regs[base+M709_CrvSet_MustTripActPt] = uint16(len(c.MustTrip))
-	ptBase := base + M709_CrvSet_MustTripPtHz
-	for i, pt := range c.MustTrip {
-		regs[ptBase+2*i]   = RawFromScaleSigned(pt.Hz, hzSF)
-		regs[ptBase+2*i+1] = RawFromScaleSigned(pt.Tms, tmsSF)
-	}
-	endOff := ptBase + 2*npt
-	if hasMomCess && len(c.MomCess) > 0 {
-		regs[endOff]   = 1
-		regs[endOff+1] = RawFromScaleSigned(c.MomCess[0].Hz, hzSF)
-		regs[endOff+2] = RawFromScaleSigned(c.MomCess[0].Tms, tmsSF)
-		endOff += 3
-	}
-	return base, endOff, nil
-}
-
-// ── Model 711 (DERFreqDroop) control set types ────────────────────────────────
-
-// FreqDroopCtl holds the frequency droop parameters from one control set.
-// IEEE 1547-2018 §2.13. DbOf / DbUf are deadbands in Hz; KOf / KUf are
-// dimensionless droop slopes (ΔP/ΔHz); RspTms is response time in seconds.
-type FreqDroopCtl struct {
-	DbOf   float64 // Over-frequency deadband (Hz)
-	DbUf   float64 // Under-frequency deadband (Hz)
-	KOf    float64 // Over-frequency droop gain
-	KUf    float64 // Under-frequency droop gain
-	RspTms float64 // Open loop response time (s)
-}
-
-// ParseFreqDroop reads control set ctlIdx from a M711 register block.
-// ctlIdx=0 is read-only; ctlIdx=1 is writable.
-func ParseFreqDroop(regs []uint16, ctlIdx int) (FreqDroopCtl, error) {
-	if len(regs) < M711_CtlStart {
-		return FreqDroopCtl{}, fmt.Errorf("sunspec: M711 too short for header")
-	}
-	dbSF     := int16(regs[M711_Db_SF])
-	kSF      := int16(regs[M711_K_SF])
-	rspTmsSF := int16(regs[M711_RspTms_SF])
-	base := CtlBase711(ctlIdx)
-	if len(regs) < base+M711_CtlSize {
-		return FreqDroopCtl{}, fmt.Errorf("sunspec: M711 too short for control set %d", ctlIdx)
-	}
-	return FreqDroopCtl{
-		DbOf:   ApplyScaleUint(regs[base+M711_Ctl_DbOf], dbSF),
-		DbUf:   ApplyScaleUint(regs[base+M711_Ctl_DbUf], dbSF),
-		KOf:    ApplyScaleSigned(regs[base+M711_Ctl_KOf], kSF),
-		KUf:    ApplyScaleSigned(regs[base+M711_Ctl_KUf], kSF),
-		RspTms: ApplyScaleUint(regs[base+M711_Ctl_RspTms], rspTmsSF),
+	h := L707Hdr.View(regs)
+	return VoltageTripSet{
+		ReadOnly: h.U16At(TripVSetOffset(i, npt)) == 1,
+		MustTrip: parseTripVSub(h, i, SubMustTrip, npt),
+		MayTrip:  parseTripVSub(h, i, SubMayTrip, npt),
+		MomCess:  parseTripVSub(h, i, SubMomCess, npt),
 	}, nil
 }
 
-// EncodeFreqDroop writes c to the writable control set (index 1) of regs.
-func EncodeFreqDroop(regs []uint16, c FreqDroopCtl) (start, end int, err error) {
-	if len(regs) < M711_CtlStart {
+func encodeTripVSub(h View, i, sub, npt int, pts []TripVPoint) {
+	subOff := SubCurveOffset707(i, sub, npt)
+	h.SetU16At(subOff, uint16(len(pts)))
+	for j, p := range pts {
+		po := subOff + 1 + j*tripVPtRegs
+		h.SetScaledUintAt(po, p.V, "V_SF")
+		h.SetScaledU32At(po+1, p.Tms, "Tms_SF")
+	}
+}
+
+// Encode707Set writes curve-set i into a 707/708 block.
+func Encode707Set(regs []uint16, i int, s VoltageTripSet) (start, end int, err error) {
+	npt, err := curveNPt(L707Hdr, regs, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, c := range [][]TripVPoint{s.MustTrip, s.MayTrip, s.MomCess} {
+		if len(c) > npt {
+			return 0, 0, fmt.Errorf("sunspec: trip curve has %d points, device NPt=%d", len(c), npt)
+		}
+	}
+	base := TripVSetOffset(i, npt)
+	if base+tripVSetSize(npt) > len(regs) {
+		return 0, 0, fmt.Errorf("sunspec: M707/708 too short for set %d", i)
+	}
+	h := L707Hdr.View(regs)
+	h.SetU16At(base, 0) // ReadOnly = RW
+	encodeTripVSub(h, i, SubMustTrip, npt, s.MustTrip)
+	encodeTripVSub(h, i, SubMayTrip, npt, s.MayTrip)
+	encodeTripVSub(h, i, SubMomCess, npt, s.MomCess)
+	return base, base + tripVSetSize(npt), nil
+}
+
+// ── Models 709/710: Frequency trip (three curves per set) ────────────────────
+
+type TripHzPoint struct{ Hz, Tms float64 }
+
+type FreqTripSet struct {
+	ReadOnly bool
+	MustTrip []TripHzPoint
+	MayTrip  []TripHzPoint
+	MomCess  []TripHzPoint
+}
+
+func parseTripHzSub(h View, i, sub, npt int) []TripHzPoint {
+	subOff := SubCurveOffset709(i, sub, npt)
+	actPt := int(h.U16At(subOff))
+	if actPt > npt {
+		actPt = npt
+	}
+	pts := make([]TripHzPoint, actPt)
+	for j := 0; j < actPt; j++ {
+		po := subOff + 1 + j*tripHzPtRegs
+		pts[j] = TripHzPoint{Hz: h.ScaleU32At(po, "Hz_SF"), Tms: h.ScaleU32At(po+2, "Tms_SF")}
+	}
+	return pts
+}
+
+func Parse709Set(regs []uint16, i int) (FreqTripSet, error) {
+	npt, err := curveNPt(L709Hdr, regs, 64)
+	if err != nil {
+		return FreqTripSet{}, err
+	}
+	if TripHzSetOffset(i, npt)+tripHzSetSize(npt) > len(regs) {
+		return FreqTripSet{}, fmt.Errorf("sunspec: M709/710 too short for set %d", i)
+	}
+	h := L709Hdr.View(regs)
+	return FreqTripSet{
+		ReadOnly: h.U16At(TripHzSetOffset(i, npt)) == 1,
+		MustTrip: parseTripHzSub(h, i, SubMustTrip, npt),
+		MayTrip:  parseTripHzSub(h, i, SubMayTrip, npt),
+		MomCess:  parseTripHzSub(h, i, SubMomCess, npt),
+	}, nil
+}
+
+func encodeTripHzSub(h View, i, sub, npt int, pts []TripHzPoint) {
+	subOff := SubCurveOffset709(i, sub, npt)
+	h.SetU16At(subOff, uint16(len(pts)))
+	for j, p := range pts {
+		po := subOff + 1 + j*tripHzPtRegs
+		h.SetScaledU32At(po, p.Hz, "Hz_SF")
+		h.SetScaledU32At(po+2, p.Tms, "Tms_SF")
+	}
+}
+
+func Encode709Set(regs []uint16, i int, s FreqTripSet) (start, end int, err error) {
+	npt, err := curveNPt(L709Hdr, regs, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, c := range [][]TripHzPoint{s.MustTrip, s.MayTrip, s.MomCess} {
+		if len(c) > npt {
+			return 0, 0, fmt.Errorf("sunspec: freq trip curve has %d points, device NPt=%d", len(c), npt)
+		}
+	}
+	base := TripHzSetOffset(i, npt)
+	if base+tripHzSetSize(npt) > len(regs) {
+		return 0, 0, fmt.Errorf("sunspec: M709/710 too short for set %d", i)
+	}
+	h := L709Hdr.View(regs)
+	h.SetU16At(base, 0)
+	encodeTripHzSub(h, i, SubMustTrip, npt, s.MustTrip)
+	encodeTripHzSub(h, i, SubMayTrip, npt, s.MayTrip)
+	encodeTripHzSub(h, i, SubMomCess, npt, s.MomCess)
+	return base, base + tripHzSetSize(npt), nil
+}
+
+// ── Model 711: DER Frequency Droop ───────────────────────────────────────────
+
+type FreqDroopCtl struct {
+	ReadOnly bool
+	DbOf, DbUf, KOf, KUf, RspTms float64
+	PMin float64
+}
+
+func Parse711Ctl(regs []uint16, i int) (FreqDroopCtl, error) {
+	if len(regs) < L711Hdr.Len() {
+		return FreqDroopCtl{}, fmt.Errorf("sunspec: M711 too short for header")
+	}
+	h := L711Hdr.View(regs)
+	base := CtlOffset711(i)
+	if base+L711Ctl.Len() > len(regs) {
+		return FreqDroopCtl{}, fmt.Errorf("sunspec: M711 too short for ctl %d", i)
+	}
+	co := func(p string) int { return base + L711Ctl.Offset(p) }
+	return FreqDroopCtl{
+		ReadOnly: h.U16At(co("ReadOnly")) == 1,
+		DbOf:     h.ScaleU32At(co("DbOf"), "Db_SF"), DbUf: h.ScaleU32At(co("DbUf"), "Db_SF"),
+		KOf:      h.ScaleUintAt(co("KOf"), "K_SF"), KUf: h.ScaleUintAt(co("KUf"), "K_SF"),
+		RspTms:   h.ScaleU32At(co("RspTms"), "RspTms_SF"),
+		PMin:     float64(h.I16At(co("PMin"))),
+	}, nil
+}
+
+func Encode711Ctl(regs []uint16, i int, c FreqDroopCtl) (start, end int, err error) {
+	if len(regs) < L711Hdr.Len() {
 		return 0, 0, fmt.Errorf("sunspec: M711 too short for header")
 	}
-	dbSF     := int16(regs[M711_Db_SF])
-	kSF      := int16(regs[M711_K_SF])
-	rspTmsSF := int16(regs[M711_RspTms_SF])
-	base := CtlBase711(1)
-	if len(regs) < base+M711_CtlSize {
-		return 0, 0, fmt.Errorf("sunspec: M711 too short for writable control set")
+	h := L711Hdr.View(regs)
+	base := CtlOffset711(i)
+	if base+L711Ctl.Len() > len(regs) {
+		return 0, 0, fmt.Errorf("sunspec: M711 too short for ctl %d", i)
 	}
-	regs[base+M711_Ctl_DbOf]     = RawFromScaleUint(c.DbOf, dbSF)
-	regs[base+M711_Ctl_DbUf]     = RawFromScaleUint(c.DbUf, dbSF)
-	regs[base+M711_Ctl_KOf]      = RawFromScaleSigned(c.KOf, kSF)
-	regs[base+M711_Ctl_KUf]      = RawFromScaleSigned(c.KUf, kSF)
-	regs[base+M711_Ctl_RspTms]   = RawFromScaleUint(c.RspTms, rspTmsSF)
-	regs[base+M711_Ctl_ReadOnly] = 0
-	return base, base + M711_CtlSize, nil
+	co := func(p string) int { return base + L711Ctl.Offset(p) }
+	h.SetScaledU32At(co("DbOf"), c.DbOf, "Db_SF")
+	h.SetScaledU32At(co("DbUf"), c.DbUf, "Db_SF")
+	h.SetScaledUintAt(co("KOf"), c.KOf, "K_SF")
+	h.SetScaledUintAt(co("KUf"), c.KUf, "K_SF")
+	h.SetScaledU32At(co("RspTms"), c.RspTms, "RspTms_SF")
+	h.SetU16At(co("PMin"), uint16(int16(c.PMin)))
+	h.SetU16At(co("ReadOnly"), 0)
+	return base, base + L711Ctl.Len(), nil
 }
 
-// ── Model 712 (DERWattVar) curve types ───────────────────────────────────────
+// ── Model 712: DER Watt-Var ──────────────────────────────────────────────────
 
-// WattVarPoint is a (active power, reactive power) point in a Q(P) curve.
-// Both values are expressed as percentages.
-type WattVarPoint struct {
-	W   float64 // Active power (% of WMax; may be negative for load operation)
-	Var float64 // Reactive power (%)
-}
+type WVPoint struct{ W, Var float64 }
 
-// WattVarCurve is a Q(P) curve as used by Model 712.
-// IEEE 1547-2018 requires exactly 6 points. Points 1-3 (index 0-2) cover
-// load operation (W<0) and may be zero if not used. Points 4-6 (index 3-5)
-// cover generation operation (W>0).
 type WattVarCurve struct {
-	DeptRef uint16         // 0=W_MAX_PCT, 1=VAR_MAX_PCT, 2=VA_MAX_PCT
-	Pri     uint16         // 1=REACTIVE
-	Pts     []WattVarPoint // 6 points for IEEE 1547-2018
+	ReadOnly bool
+	DeptRef  uint16
+	Pri      uint16
+	Points   []WVPoint
 }
 
-// ParseWattVarCurve reads one curve from a M712 register block.
-func ParseWattVarCurve(regs []uint16, curveIdx int) (WattVarCurve, error) {
-	if len(regs) < 7 {
-		return WattVarCurve{}, fmt.Errorf("sunspec: M712 too short for header")
+func Parse712Curve(regs []uint16, i int) (WattVarCurve, error) {
+	npt, err := curveNPt(L712Hdr, regs, 64)
+	if err != nil {
+		return WattVarCurve{}, err
 	}
-	npt := int(regs[M712_NPt])
-	if npt == 0 || npt > 20 {
-		return WattVarCurve{}, fmt.Errorf("sunspec: M712 NPt=%d out of range", npt)
+	h := L712Hdr.View(regs)
+	base := CurveOffset712(i, npt)
+	if base+L712Crv.Len()+2*npt > len(regs) {
+		return WattVarCurve{}, fmt.Errorf("sunspec: M712 too short for curve %d", i)
 	}
-	base := CurveBase712(curveIdx, npt)
-	if len(regs) < base+M712_Crv_PtOffset+2*npt {
-		return WattVarCurve{}, fmt.Errorf("sunspec: M712 too short for curve %d", curveIdx)
-	}
-	wSF       := int16(regs[M712_W_SF])
-	deptRefSF := int16(regs[M712_DeptRef_SF])
-	actPt := int(regs[base+M712_Crv_ActPt])
+	co := func(p string) int { return base + L712Crv.Offset(p) }
+	actPt := int(h.U16At(co("ActPt")))
 	if actPt > npt {
 		actPt = npt
 	}
 	c := WattVarCurve{
-		DeptRef: regs[base+M712_Crv_DeptRef],
-		Pri:     regs[base+M712_Crv_Pri],
-		Pts:     make([]WattVarPoint, actPt),
+		ReadOnly: h.U16At(co("ReadOnly")) == 1,
+		DeptRef:  h.U16At(co("DeptRef")),
+		Pri:      h.U16At(co("Pri")),
+		Points:   make([]WVPoint, actPt),
 	}
-	ptBase := base + M712_Crv_PtOffset
-	for i := 0; i < actPt; i++ {
-		c.Pts[i] = WattVarPoint{
-			W:   ApplyScaleSigned(regs[ptBase+2*i], wSF),
-			Var: ApplyScaleSigned(regs[ptBase+2*i+1], deptRefSF),
-		}
+	for j := 0; j < actPt; j++ {
+		po := PointOffset712(i, j, npt)
+		c.Points[j] = WVPoint{W: h.ScaleSignedAt(po, "W_SF"), Var: h.ScaleSignedAt(po+1, "DeptRef_SF")}
 	}
 	return c, nil
 }
 
-// EncodeWattVarCurve writes c to the writable curve (index 1) of regs.
-func EncodeWattVarCurve(regs []uint16, c WattVarCurve) (start, end int, err error) {
-	if len(regs) < 7 {
-		return 0, 0, fmt.Errorf("sunspec: M712 too short for header")
+func Encode712Curve(regs []uint16, i int, c WattVarCurve) (start, end int, err error) {
+	npt, err := curveNPt(L712Hdr, regs, 64)
+	if err != nil {
+		return 0, 0, err
 	}
-	npt := int(regs[M712_NPt])
-	if npt == 0 {
-		return 0, 0, fmt.Errorf("sunspec: M712 NPt=0")
+	if len(c.Points) > npt {
+		return 0, 0, fmt.Errorf("sunspec: WattVar curve has %d points, device NPt=%d", len(c.Points), npt)
 	}
-	if len(c.Pts) > npt {
-		return 0, 0, fmt.Errorf("sunspec: WattVar curve has %d points, device NPt=%d", len(c.Pts), npt)
+	h := L712Hdr.View(regs)
+	base := CurveOffset712(i, npt)
+	if base+L712Crv.Len()+2*npt > len(regs) {
+		return 0, 0, fmt.Errorf("sunspec: M712 too short for curve %d", i)
 	}
-	wSF       := int16(regs[M712_W_SF])
-	deptRefSF := int16(regs[M712_DeptRef_SF])
-	base := CurveBase712(1, npt)
-	if len(regs) < base+M712_Crv_PtOffset+2*npt {
-		return 0, 0, fmt.Errorf("sunspec: M712 too short for writable curve")
+	co := func(p string) int { return base + L712Crv.Offset(p) }
+	h.SetU16At(co("ActPt"), uint16(len(c.Points)))
+	h.SetU16At(co("DeptRef"), c.DeptRef)
+	h.SetU16At(co("Pri"), c.Pri)
+	h.SetU16At(co("ReadOnly"), 0)
+	for j, p := range c.Points {
+		po := PointOffset712(i, j, npt)
+		h.SetScaledSignedAt(po, p.W, "W_SF")
+		h.SetScaledSignedAt(po+1, p.Var, "DeptRef_SF")
 	}
-	regs[base+M712_Crv_ActPt]    = uint16(len(c.Pts))
-	regs[base+M712_Crv_DeptRef]  = c.DeptRef
-	regs[base+M712_Crv_Pri]      = c.Pri
-	regs[base+M712_Crv_ReadOnly] = 0
-	ptBase := base + M712_Crv_PtOffset
-	for i, pt := range c.Pts {
-		regs[ptBase+2*i]   = RawFromScaleSigned(pt.W, wSF)
-		regs[ptBase+2*i+1] = RawFromScaleSigned(pt.Var, deptRefSF)
-	}
-	return base, ptBase + 2*npt, nil
+	return base, base + L712Crv.Len() + 2*npt, nil
 }
 
-// ── Model 713 (DERStorageCapacity) ───────────────────────────────────────────
+// ── Model 713: DER Storage Capacity ──────────────────────────────────────────
 
-// DERStorageCapacity holds operational and nameplate storage data from M713.
-// SoC and SoH are percentages (0-100). NaN means not reported.
-type DERStorageCapacity struct {
-	WHRtg     float64 // Nameplate energy capacity (Wh)
-	AHRtg     float64 // Nameplate amp-hour capacity (Ah)
-	MaxChaSoC float64 // Max charge state of charge (%)
-	MinChaSoC float64 // Min charge state of charge (%)
-	MaxChaPct float64 // Max charge rate % of rated charge rate
-	SoC       float64 // State of charge (%)
-	SoH       float64 // State of health (%)
-	NCyc      uint32  // Lifetime cycle count
+// StorageCapacity is the model 713 operational state-of-charge snapshot
+// (spec Table 16).
+type StorageCapacity struct {
+	WHRtg   float64 // nameplate energy (Wh)
+	WHAvail float64 // available energy (Wh) = WHRtg × SoC × SoH
+	SoC     float64 // state of charge (%)
+	SoH     float64 // state of health (%)
+	Sta     uint16  // 0=OK, 1=warning, 2=error
 }
 
-// ParseDERStorageCapacity converts raw M713 register data.
-func ParseDERStorageCapacity(regs []uint16) (DERStorageCapacity, error) {
-	if len(regs) < M713_SoC+1 {
-		return DERStorageCapacity{}, fmt.Errorf("sunspec: M713 too short (%d regs)", len(regs))
+func Parse713(regs []uint16) StorageCapacity {
+	v := L713.View(regs)
+	sta, _ := v.Enum("Sta")
+	return StorageCapacity{
+		WHRtg: v.Float("WHRtg"), WHAvail: v.Float("WHAvail"),
+		SoC: v.Float("SoC"), SoH: v.Float("SoH"), Sta: sta,
 	}
-	get := func(i int) uint16 {
-		if i < len(regs) {
-			return regs[i]
+}
+
+// ── Model 714: DER DC Measurement ────────────────────────────────────────────
+
+type DCPort struct {
+	PrtTyp uint16 // 0=PV,1=ESS,2=EV,3=INJ,4=ABS,5=BIDIR,6=DC_DC
+	ID     uint16
+	IDStr  string
+	DCA, DCV, DCW    float64
+	DCWhInj, DCWhAbs float64
+	Tmp    float64
+	DCSta  uint16 // 0=off,1=on,2=warning,3=error
+	DCAlrm uint32
+}
+
+// DCMeasurement is the full model 714 decode (totals + per-port).
+type DCMeasurement struct {
+	PrtAlrms uint32
+	NPrt     uint16
+	DCA, DCW         float64
+	DCWhInj, DCWhAbs float64
+	Ports    []DCPort
+}
+
+func Parse714(regs []uint16) (DCMeasurement, error) {
+	if len(regs) < L714Hdr.Len() {
+		return DCMeasurement{}, fmt.Errorf("sunspec: M714 too short for header")
+	}
+	h := L714Hdr.View(regs)
+	nprt, _ := h.Enum("NPrt")
+	m := DCMeasurement{
+		PrtAlrms: h.Bitfield32("PrtAlrms"), NPrt: nprt,
+		DCA: h.Float("DCA"), DCW: h.Float("DCW"),
+		DCWhInj: h.Float("DCWhInj"), DCWhAbs: h.Float("DCWhAbs"),
+	}
+	for i := 0; i < int(nprt); i++ {
+		base := PortOffset714(i)
+		if base+L714Prt.Len() > len(regs) {
+			break
 		}
-		return 0
+		po := func(p string) int { return base + L714Prt.Offset(p) }
+		m.Ports = append(m.Ports, DCPort{
+			PrtTyp: h.U16At(po("PrtTyp")), ID: h.U16At(po("ID")),
+			IDStr:  readString(regs, po("IDStr"), 8),
+			DCA:    h.ScaleSignedAt(po("DCA"), "DCA_SF"),
+			DCV:    h.ScaleUintAt(po("DCV"), "DCV_SF"),
+			DCW:    h.ScaleSignedAt(po("DCW"), "DCW_SF"),
+			DCWhInj: scaleU64At(h, po("DCWhInj"), "DCWH_SF"),
+			DCWhAbs: scaleU64At(h, po("DCWhAbs"), "DCWH_SF"),
+			Tmp:    h.ScaleSignedAt(po("Tmp"), "Tmp_SF"),
+			DCSta:  h.U16At(po("DCSta")),
+			DCAlrm: h.U32At(po("DCAlrm")),
+		})
 	}
-	whSF  := int16(get(M713_WHRtg_SF))
-	ahSF  := int16(get(M713_AHRtg_SF))
-	socSF := int16(get(M713_SoC_SF))
-	sohSF := int16(get(M713_SoH_SF))
-	pctSF := int16(get(M713_Pct_SF))
+	return m, nil
+}
 
-	d := DERStorageCapacity{
-		WHRtg:     ApplyScaleUint(get(M713_WHRtg), whSF),
-		AHRtg:     ApplyScaleUint(get(M713_AHRtg), ahSF),
-		MaxChaSoC: ApplyScaleUint(get(M713_MaxChaSoC), socSF),
-		MinChaSoC: ApplyScaleUint(get(M713_MinChaSoC), socSF),
-		MaxChaPct: ApplyScaleUint(get(M713_MaxChaPct), pctSF),
-		SoC:       ApplyScaleUint(get(M713_SoC), socSF),
-		SoH:       ApplyScaleUint(get(M713_SoH), sohSF),
+// scaleU64At reads a uint64 at an absolute offset and applies the named SF.
+func scaleU64At(v View, o int, sf string) float64 {
+	s, ok := v.SF(sf)
+	if !ok {
+		return math.NaN()
 	}
-	if len(regs) > M713_NCyc+1 {
-		d.NCyc = uint32(get(M713_NCyc))<<16 | uint32(get(M713_NCyc+1))
-	}
-	return d, nil
+	return float64(v.U64At(o)) * math.Pow10(int(s))
 }

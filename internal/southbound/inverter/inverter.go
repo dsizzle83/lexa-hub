@@ -77,13 +77,11 @@ func (inv *Inverter) Status() (device.DeviceStatus, error) {
 		return device.DeviceStatus{}, fmt.Errorf("inverter: read status: %w", err)
 	}
 	if inv.MeasModel == sunspec.ModelDERMeasureAC {
-		if len(regs) <= sunspec.M701_ConnSt {
-			return device.DeviceStatus{}, fmt.Errorf("inverter: M701 too short for St/ConnSt")
-		}
-		st := sunspec.M701St(regs[sunspec.M701_St])
+		m := sunspec.Parse701(regs)
+		// 701 InvSt: 2=starting, 3=running, 4=throttled (energized).
 		return device.DeviceStatus{
-			Connected: regs[sunspec.M701_ConnSt] == 1,
-			Energized: st == sunspec.M701StOn || st == sunspec.M701StThrottled || st == sunspec.M701StStarting,
+			Connected: m.ConnSt == 1,
+			Energized: m.InvSt == 2 || m.InvSt == 3 || m.InvSt == 4,
 		}, nil
 	}
 	if len(regs) <= sunspec.M103_St {
@@ -102,19 +100,16 @@ func (inv *Inverter) ApplyControl(ctrl model.DERControlBase) error {
 
 // ── Delegated IEEE 1547-2018 methods ─────────────────────────────────────────
 
-func (inv *Inverter) SetEnterService(s sunspec.DEREnterServiceSettings) error {
+func (inv *Inverter) SetEnterService(s sunspec.EnterService) error {
 	return inv.Base.SetEnterService(s, tag)
 }
-func (inv *Inverter) ReadEnterService() (sunspec.DEREnterServiceSettings, error) {
+func (inv *Inverter) ReadEnterService() (sunspec.EnterService, error) {
 	return inv.Base.ReadEnterService(tag)
 }
-func (inv *Inverter) SetDERCtlAC(s sunspec.DERCtlACSettings) error {
-	return inv.Base.SetDERCtlAC(s, tag)
-}
-func (inv *Inverter) ReadDERCtlAC() (sunspec.DERCtlACSettings, error) {
+func (inv *Inverter) ReadDERCtlAC() (sunspec.ACControls, error) {
 	return inv.Base.ReadDERCtlAC(tag)
 }
-func (inv *Inverter) ReadDERCapacity() (sunspec.DERCapacity, error) {
+func (inv *Inverter) ReadDERCapacity() (sunspec.Capacity, error) {
 	return inv.Base.ReadDERCapacity(tag)
 }
 func (inv *Inverter) ReadVoltVar() (sunspec.VoltVarCurve, error) {
@@ -129,28 +124,28 @@ func (inv *Inverter) ReadVoltWatt() (sunspec.VoltWattCurve, error) {
 func (inv *Inverter) WriteVoltWatt(c sunspec.VoltWattCurve) error {
 	return inv.Base.WriteVoltWatt(c, tag)
 }
-func (inv *Inverter) ReadVoltageTripLV() (sunspec.VoltageTripCurve, error) {
+func (inv *Inverter) ReadVoltageTripLV() (sunspec.VoltageTripSet, error) {
 	return inv.Base.ReadVoltageTripLV(tag)
 }
-func (inv *Inverter) WriteVoltageTripLV(c sunspec.VoltageTripCurve) error {
+func (inv *Inverter) WriteVoltageTripLV(c sunspec.VoltageTripSet) error {
 	return inv.Base.WriteVoltageTripLV(c, tag)
 }
-func (inv *Inverter) ReadVoltageTripHV() (sunspec.VoltageTripCurve, error) {
+func (inv *Inverter) ReadVoltageTripHV() (sunspec.VoltageTripSet, error) {
 	return inv.Base.ReadVoltageTripHV(tag)
 }
-func (inv *Inverter) WriteVoltageTripHV(c sunspec.VoltageTripCurve) error {
+func (inv *Inverter) WriteVoltageTripHV(c sunspec.VoltageTripSet) error {
 	return inv.Base.WriteVoltageTripHV(c, tag)
 }
-func (inv *Inverter) ReadFreqTripLF() (sunspec.FreqTripCurve, error) {
+func (inv *Inverter) ReadFreqTripLF() (sunspec.FreqTripSet, error) {
 	return inv.Base.ReadFreqTripLF(tag)
 }
-func (inv *Inverter) WriteFreqTripLF(c sunspec.FreqTripCurve) error {
+func (inv *Inverter) WriteFreqTripLF(c sunspec.FreqTripSet) error {
 	return inv.Base.WriteFreqTripLF(c, tag)
 }
-func (inv *Inverter) ReadFreqTripHF() (sunspec.FreqTripCurve, error) {
+func (inv *Inverter) ReadFreqTripHF() (sunspec.FreqTripSet, error) {
 	return inv.Base.ReadFreqTripHF(tag)
 }
-func (inv *Inverter) WriteFreqTripHF(c sunspec.FreqTripCurve) error {
+func (inv *Inverter) WriteFreqTripHF(c sunspec.FreqTripSet) error {
 	return inv.Base.WriteFreqTripHF(c, tag)
 }
 func (inv *Inverter) ReadFreqDroop() (sunspec.FreqDroopCtl, error) {
@@ -164,4 +159,7 @@ func (inv *Inverter) ReadWattVar() (sunspec.WattVarCurve, error) {
 }
 func (inv *Inverter) WriteWattVar(c sunspec.WattVarCurve) error {
 	return inv.Base.WriteWattVar(c, tag)
+}
+func (inv *Inverter) ReadDCMeasurement() (sunspec.DCMeasurement, error) {
+	return inv.Base.ReadDCMeasurement(tag)
 }
