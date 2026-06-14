@@ -62,6 +62,11 @@ func main() {
 	// poke the engine on urgent controls).
 	opt := orchestrator.NewDefaultOptimizer()
 	opt.Debug = cfg.Debug
+	// Activate the reactive TOU peak-discharge rule as a fallback. The daily
+	// planner is the primary battery dispatcher; this rule only fires when no
+	// plan target is available for the current interval (startup, or a gap in
+	// the plan window), so the battery still shaves peak instead of idling.
+	opt.CostModel = orchestrator.DefaultTOUCostModel()
 	// The EV import cooldown is tick-denominated; size it to ~1 min of wall
 	// clock from the configured interval (the optimizer's default of 20 is
 	// calibrated for a 3 s demo tick and would mean 5 min at the 15 s default).

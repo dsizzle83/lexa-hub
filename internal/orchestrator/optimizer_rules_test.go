@@ -83,8 +83,10 @@ func TestDeriveGridConstraints_GridTighterThanCSIP(t *testing.T) {
 	}
 }
 
-func TestDeriveGridConstraints_MaxLimConstrainsExport(t *testing.T) {
-	// MaxLimW (absolute generation cap) must also appear as an export limit.
+func TestDeriveGridConstraints_MaxLimIsGenCap(t *testing.T) {
+	// MaxLimW (absolute generation cap) is enforced by curtailing the inverter
+	// (applyGenLimitRule), NOT folded into the export limit — folding it made the
+	// hub absorb into the battery while generation stayed over the cap.
 	cc := &CSIPControlState{Base: model.DERControlBase{
 		OpModMaxLimW: &model.ActivePower{Value: 3000},
 	}}
@@ -92,8 +94,8 @@ func TestDeriveGridConstraints_MaxLimConstrainsExport(t *testing.T) {
 	if c.maxLimitW != 3000 {
 		t.Errorf("maxLimitW = %.0f, want 3000", c.maxLimitW)
 	}
-	if c.exportLimitW != 3000 {
-		t.Errorf("exportLimitW = %.0f, want 3000 (derived from MaxLimW)", c.exportLimitW)
+	if !math.IsNaN(c.exportLimitW) {
+		t.Errorf("exportLimitW = %.0f, want NaN (gen cap enforced by curtailment, not export absorption)", c.exportLimitW)
 	}
 }
 
@@ -309,6 +311,56 @@ func TestExportLimitRule_NoActionWhenUnconstrained(t *testing.T) {
 
 	if len(plan.BatteryCommands) != 0 || len(plan.SolarCommands) != 0 {
 		t.Error("expected no commands with NaN export limit")
+	}
+}
+
+// ── applyGenLimitRule (generation cap) ────────────────────────────────────────
+
+func TestGenLimitRule_CurtailsToGenCap(t *testing.T) {
+	// 6 kW total generation, 3.2 kW cap → curtail to 3.2 kW total, proportionally.
+	solar := []SolarState{ruleSol("pv1", 4000), ruleSol("pv2", 2000)}
+	plan := &Plan{}
+	applyGenLimitRule(solar, 3200, plan)
+
+	if len(plan.SolarCommands) != 2 {
+		t.Fatalf("expected 2 solar commands, got %d", len(plan.SolarCommands))
+	}
+	total := 0.0
+	for _, c := range plan.SolarCommands {
+		total += c.CurtailToW
+	}
+	if math.Abs(total-3200) > 1 {
+		t.Errorf("curtailed total = %.0fW, want 3200W (generation capped)", total)
+	}
+	if want := 3200 * 4.0 / 6.0; math.Abs(plan.SolarCommands[0].CurtailToW-want) > 1 {
+		t.Errorf("pv1 curtailTo = %.0fW, want %.0fW (proportional)", plan.SolarCommands[0].CurtailToW, want)
+	}
+}
+
+func TestGenLimitRule_NoActionWithinCapOrNaN(t *testing.T) {
+	plan := &Plan{}
+	applyGenLimitRule([]SolarState{ruleSol("pv", 2000)}, 3000, plan)
+	if len(plan.SolarCommands) != 0 {
+		t.Errorf("generation within cap should not curtail, got %d", len(plan.SolarCommands))
+	}
+	applyGenLimitRule([]SolarState{ruleSol("pv", 9000)}, math.NaN(), plan)
+	if len(plan.SolarCommands) != 0 {
+		t.Errorf("NaN cap must be a no-op, got %d", len(plan.SolarCommands))
+	}
+}
+
+func TestGenLimitRule_KeepsTighterExistingCurtailment(t *testing.T) {
+	// The export-limit rule already curtailed pv to 1000 W; the gen cap (3200 W)
+	// is looser, so the tighter existing curtailment must be preserved.
+	solar := []SolarState{ruleSol("pv", 6000)}
+	plan := &Plan{SolarCommands: []SolarCommand{{Name: "pv", CurtailToW: 1000}}}
+	applyGenLimitRule(solar, 3200, plan)
+
+	if len(plan.SolarCommands) != 1 {
+		t.Fatalf("expected 1 command, got %d", len(plan.SolarCommands))
+	}
+	if plan.SolarCommands[0].CurtailToW != 1000 {
+		t.Errorf("curtailTo = %.0fW, want 1000W (tighter export curtailment kept)", plan.SolarCommands[0].CurtailToW)
 	}
 }
 

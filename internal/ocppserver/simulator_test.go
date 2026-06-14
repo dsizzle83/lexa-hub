@@ -9,6 +9,7 @@ import (
 	ocpp2 "github.com/lorenzodonini/ocpp-go/ocpp2.0.1"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/availability"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/provisioning"
+	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/transactions"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types"
 
 	"lexa-hub/internal/ocppserver"
@@ -122,4 +123,64 @@ func TestSimulator_BootAndHeartbeat(t *testing.T) {
 	t.Logf("Heartbeat:        serverTime=%s drift=%v", hbResp.CurrentTime.FormatTimestamp(), drift)
 
 	srv.Stop()
+}
+
+// TestSimulator_TransactionEventLifecycle verifies the CSMS accepts the full
+// OCPP 2.0.1 transaction sequence (Started → Updated → Ended) — regression
+// for audit finding OCPP-1 (TransactionEvent previously unhandled, so the
+// station received CallErrors).
+func TestSimulator_TransactionEventLifecycle(t *testing.T) {
+	port := freePort(t)
+
+	srv := ocppserver.New(ocppserver.Config{Port: port})
+	go srv.Start()
+	defer srv.Stop()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 50*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cs := ocpp2.NewChargingStation("test-cs-002", nil, nil)
+	noop := noopCSHandler{}
+	cs.SetProvisioningHandler(noop)
+	cs.SetAvailabilityHandler(noop)
+
+	if err := cs.Start(fmt.Sprintf("ws://127.0.0.1:%d/ocpp", port)); err != nil {
+		t.Fatalf("charging station Start: %v", err)
+	}
+	defer cs.Stop()
+
+	if _, err := cs.BootNotification(provisioning.BootReasonPowerUp, "TestModel", "TestVendor"); err != nil {
+		t.Fatalf("BootNotification: %v", err)
+	}
+
+	const txID = "test-tx-0001"
+	connectorID := 1
+	send := func(event transactions.TransactionEvent, trigger transactions.TriggerReason, seq int, info transactions.Transaction) {
+		t.Helper()
+		resp, err := cs.TransactionEvent(event, types.NewDateTime(time.Now()), trigger, seq, info,
+			func(req *transactions.TransactionEventRequest) {
+				req.Evse = &types.EVSE{ID: 1, ConnectorID: &connectorID}
+			})
+		if err != nil {
+			t.Fatalf("TransactionEvent %s seq=%d: %v", event, seq, err)
+		}
+		if resp == nil {
+			t.Fatalf("TransactionEvent %s seq=%d: nil response", event, seq)
+		}
+	}
+
+	send(transactions.TransactionEventStarted, transactions.TriggerReasonCablePluggedIn, 0,
+		transactions.Transaction{TransactionID: txID, ChargingState: transactions.ChargingStateCharging})
+	send(transactions.TransactionEventUpdated, transactions.TriggerReasonMeterValuePeriodic, 1,
+		transactions.Transaction{TransactionID: txID, ChargingState: transactions.ChargingStateCharging})
+	send(transactions.TransactionEventEnded, transactions.TriggerReasonChargingStateChanged, 2,
+		transactions.Transaction{TransactionID: txID, ChargingState: transactions.ChargingStateIdle,
+			StoppedReason: transactions.ReasonLocal})
 }

@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	planSteps     = 288            // 24 h / 5-min intervals
+	planSteps     = 288           // 24 h / 5-min intervals
 	planStepSec   = int64(5 * 60) // seconds per interval
 	planStepHours = 5.0 / 60.0    // hours per interval
 )
@@ -29,6 +29,14 @@ type PlannerParams struct {
 	InitialBattSocKwh  float64
 	MinBattSocKwh      float64 // operating floor; 0 → 10% of capacity
 	MaxBattSocKwh      float64 // operating ceiling; 0 → BattCapacityKwh
+
+	// TerminalSocKwh is the target final battery SOC for the end-of-horizon
+	// penalty. 0 → defaults to InitialBattSocKwh (no net daily discharge). Set it
+	// below initial to let the battery run down to a reserve across an expensive
+	// evening; with receding-horizon replanning the end-of-window dump never
+	// actually executes (the present action is always near the start of a fresh
+	// 24 h window).
+	TerminalSocKwh float64
 
 	// EV asset. EVCapacityKwh == 0 → no EV modelled.
 	EVCapacityKwh   float64
@@ -135,6 +143,16 @@ type PlannerCfg struct {
 	BattMaxDischargeKw float64 `json:"batt_max_discharge_kw"`
 	BattEfficiency     float64 `json:"batt_efficiency"` // default 0.96
 
+	// TerminalReservePct is the end-of-horizon target SOC as a percent of
+	// capacity. It lets the battery net-discharge down to a reserve across an
+	// expensive evening instead of being pinned at its starting SOC. 0 → 20.
+	TerminalReservePct float64 `json:"terminal_reserve_pct"`
+
+	// SolarPeakKw seeds the diurnal solar forecast (clear-sky PV peak, kW) before
+	// any live generation is observed — e.g. the first overnight replan. 0 → rely
+	// on the running high-water estimate derived from observed generation.
+	SolarPeakKw float64 `json:"solar_peak_kw"`
+
 	// DP discretisation (0 = default 0.5 kWh).
 	SOCStepKwh float64 `json:"soc_step_kwh"`
 
@@ -155,7 +173,7 @@ func NewDailyPlanner() *DailyPlanner { return &DailyPlanner{} }
 //   - Battery SOC bounds and charge/discharge power limits
 //   - EV SOC bounds, IEC 61851 current steps, and departure-time target
 //   - DER constraints (export/import/generation limits, forced disconnect, fixed dispatch)
-//   - Terminal constraint: final battery SOC ≥ initial (prevents artificial arbitrage)
+//   - Terminal constraint: final battery SOC ≥ TerminalSocKwh (default: initial)
 //
 // Complexity: O(planSteps × nBattLevels × nEVLevels × nBattPowers × nEVCurrents)
 // with O(1) per transition (SOC transitions are precomputed per (level, action)
@@ -269,9 +287,17 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 
 	// battDest[i][bi] → destination battery level index, or −1 when the SOC
 	// transition leaves the allowed band.
+	// battEffKw[i][bi] → the effective AC power implied by the *snapped*
+	// destination level (+ discharge, − charge). Cost and grid balance use this
+	// rather than the commanded power so the DP can never gain energy that the
+	// SOC state didn't actually move: a command whose SOC change rounds to zero
+	// level has zero effective power, which removes the "phantom free discharge"
+	// the DP would otherwise exploit at coarse SOC steps.
 	battDest := make([][]int, nBatt)
+	battEffKw := make([][]float64, nBatt)
 	for i := range battDest {
 		battDest[i] = make([]int, len(battPowers))
+		battEffKw[i] = make([]float64, len(battPowers))
 		for bi, battKw := range battPowers {
 			newBSoc := battLevels[i]
 			if hasBatt {
@@ -285,7 +311,22 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 					continue
 				}
 			}
-			battDest[i][bi] = closestIdx(battLevels, newBSoc)
+			ni := closestIdx(battLevels, newBSoc)
+			battDest[i][bi] = ni
+			if hasBatt {
+				// Invert the SOC↔AC relation on the snapped level delta:
+				// discharge AC out = SoC drop × efficiency; charge AC in =
+				// SoC rise ÷ efficiency. Clamp to the device power range so a
+				// rounding overshoot can't imply a setpoint beyond the rating.
+				dSoc := battLevels[ni] - battLevels[i] // + charged, − discharged
+				var eff float64
+				if dSoc < 0 {
+					eff = (-dSoc) * p.BattEfficiency / planStepHours
+				} else if dSoc > 0 {
+					eff = -(dSoc / p.BattEfficiency) / planStepHours
+				}
+				battEffKw[i][bi] = math.Max(-p.BattMaxChargeKw, math.Min(p.BattMaxDischargeKw, eff))
+			}
 		}
 	}
 
@@ -343,6 +384,10 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 					if ni < 0 {
 						continue
 					}
+					// Effective battery AC power for this transition (tracks the
+					// snapped SOC change, not the raw command) drives the grid
+					// balance, constraints, and cost.
+					battKwEff := battEffKw[i][bi]
 
 					for ci := range evCurrents {
 						if (evGone || !hasEV) && ci > 0 {
@@ -357,7 +402,7 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 
 						// Grid balance: + = import, − = export.
 						// grid = load + ev_draw − solar − batt_net
-						gridKw := loadKw + evKw - solarKw - battKw
+						gridKw := loadKw + evKw - solarKw - battKwEff
 
 						// Apply DER constraints.
 						if !math.IsNaN(c.ExpLimW) && -gridKw > c.ExpLimW/1000+1e-6 {
@@ -368,8 +413,8 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 						}
 						if !math.IsNaN(c.MaxLimW) {
 							gen := solarKw
-							if battKw > 0 {
-								gen += battKw
+							if battKwEff > 0 {
+								gen += battKwEff
 							}
 							if gen > c.MaxLimW/1000+1e-6 {
 								continue
@@ -401,9 +446,15 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 	}
 
 	// ─── Find best terminal state ─────────────────────────────────────────────
-	// Terminal constraint: battery must not end below its initial SOC.
-	// Soft penalty rather than hard filter so the solver always has a feasible
-	// answer even when the 24h window has no cheap charging window.
+	// Terminal constraint: battery should not end below a target SOC.
+	// The target defaults to the initial SOC (no net daily discharge), but a
+	// caller can lower it (TerminalSocKwh) to a reserve floor so the battery may
+	// run down across an expensive evening. Soft penalty rather than a hard
+	// filter so the solver always has a feasible answer.
+	terminalTarget := p.TerminalSocKwh
+	if terminalTarget <= 0 {
+		terminalTarget = p.InitialBattSocKwh
+	}
 	bestCost := inf
 	bestBatt, bestEV := iBatt0, iEV0
 	for i := 0; i < nBatt; i++ {
@@ -414,9 +465,9 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 			}
 			// Add a penalty proportional to the SOC shortfall (100 $/kWh is
 			// much larger than any realistic energy price, so the solver will
-			// avoid ending below initial SOC unless it has no choice).
-			if hasBatt && battLevels[i] < p.InitialBattSocKwh-1e-6 {
-				c += 100.0 * (p.InitialBattSocKwh - battLevels[i])
+			// avoid ending below the target SOC unless it has no choice).
+			if hasBatt && battLevels[i] < terminalTarget-1e-6 {
+				c += 100.0 * (terminalTarget - battLevels[i])
 			}
 			if c < bestCost {
 				bestCost = c
@@ -445,11 +496,13 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 	for t := planSteps - 1; t >= 0; t-- {
 		node := back[t][bi][ej]
 
-		// battW stays NaN when there is no battery asset.
+		// battW stays NaN when there is no battery asset. Use the effective power
+		// implied by the snapped SOC change (consistent with the DP cost), not
+		// the raw command, so the setpoint moves only the energy the plan booked.
 		battW := math.NaN()
 		var evA float64
 		if hasBatt && node.src[0] >= 0 {
-			battW = battPowers[node.cmd[0]] * 1000
+			battW = battEffKw[node.src[0]][node.cmd[0]] * 1000
 		}
 		if node.src[0] >= 0 {
 			evA = evCurrents[node.cmd[1]]
@@ -532,6 +585,47 @@ func planStepSolar(p PlannerParams, t int) float64 {
 		return p.SolarForecastKw[t]
 	}
 	return 0
+}
+
+// Daylight window for the clear-sky forecast shape (local hours).
+const (
+	solarSunriseHr = 6.0
+	solarSunsetHr  = 20.0
+)
+
+// clearSkyShape returns the normalised clear-sky PV factor [0,1] at a local
+// hour-of-day: a half-sine that is zero outside [sunrise,sunset] and peaks at
+// solar noon. Multiply by an estimated peak kW to get a generation forecast.
+func clearSkyShape(hour float64) float64 {
+	if hour <= solarSunriseHr || hour >= solarSunsetHr {
+		return 0
+	}
+	return math.Sin(math.Pi * (hour - solarSunriseHr) / (solarSunsetHr - solarSunriseHr))
+}
+
+// localHourOf returns the local hour-of-day (with fractional minutes) of a Unix
+// time. The forecast must use the same clock the optimizer evaluates TOU on, so
+// callers pass server (offset-adjusted) Unix seconds.
+func localHourOf(unix int64) float64 {
+	lt := time.Unix(unix, 0).Local()
+	return float64(lt.Hour()) + float64(lt.Minute())/60
+}
+
+// diurnalSolarForecast builds a per-step (5-min) solar generation forecast (kW)
+// over the 24 h horizon starting at baseUnix, shaping a clear-sky bell curve to
+// the given peak. Returns nil when peakKw <= 0 (no information — same as the old
+// zero forecast). This replaces a flat-from-current forecast that assumed
+// constant sun all day and, worse, zero sun for the whole horizon on any replan
+// after sunset.
+func diurnalSolarForecast(baseUnix int64, peakKw float64) []float64 {
+	if peakKw <= 0 {
+		return nil
+	}
+	out := make([]float64, planSteps)
+	for t := range out {
+		out[t] = peakKw * clearSkyShape(localHourOf(baseUnix+int64(t)*planStepSec))
+	}
+	return out
 }
 
 func planStepImportPrice(p PlannerParams, t int, unixT int64) float64 {

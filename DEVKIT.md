@@ -116,6 +116,23 @@ automatically** — no redeploy needed.
 Services and their dependency order: `mosquitto` → `lexa-modbus`, `lexa-ocpp`,
 `lexa-api`, `lexa-northbound`, `lexa-telemetry` → `lexa-hub`.
 
+### Enabling OCPP Security Profile 2 (wss:// + Basic Auth)
+
+By default `lexa-ocpp` listens on plain `ws://:8887` with no auth (dev only).
+To enable TLS + Basic Auth on the EV charger link:
+
+1. On the desktop, in `csip-tls-test/`, issue the CSMS cert (signed by the
+   demo CA, SAN includes the dev kit's LAN IP):
+   `bash scripts/gen-ev-cert.sh 69.0.0.2`
+2. Copy `certs/ev-server-cert.pem` and `certs/vault/ev-server-key.pem` to the
+   dev kit as `/etc/lexa/certs/ev-server-{cert,key}.pem` (key mode 600).
+3. In `/etc/lexa/ocpp.json` set `"cert_path"`, `"key_path"`, and
+   `"basic_auth_user"` / `"basic_auth_pass"`, then
+   `systemctl restart lexa-ocpp`.
+4. Point evsim at the secure endpoint (on ev-pi):
+   `evsim -csms wss://69.0.0.2:8887/ocpp -tls-ca certs/ca-cert.pem \
+          -auth-user <user> -auth-pass <pass>`
+
 ---
 
 ## Service operations

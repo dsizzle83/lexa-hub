@@ -117,6 +117,13 @@ func (s *stateStore) onEVSEState(_ string, e bus.EVSEState) {
 	defer s.mu.Unlock()
 	key := evseKey(e.StationID, e.ConnectorID)
 	s.evses[key] = &evseSnap{State: e, UpdatedAt: time.Now()}
+	// The ocpp service publishes a synthetic connector-0 entry while a station
+	// has no connectors yet (pre-StatusNotification). Once a real connector
+	// reports, drop the placeholder so /status doesn't carry a phantom idle
+	// EVSE forever (the dashboard was rendering it as "EV idle, 0 W").
+	if e.ConnectorID > 0 {
+		delete(s.evses, evseKey(e.StationID, 0))
+	}
 }
 
 func (s *stateStore) onSchedule(_ string, sched bus.DERScheduleMsg) {

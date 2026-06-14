@@ -97,10 +97,10 @@ type DefaultOptimizer struct {
 // NewDefaultOptimizer returns an optimizer with sensible defaults.
 func NewDefaultOptimizer() *DefaultOptimizer {
 	return &DefaultOptimizer{
-		SOCReserve:           20.0,
-		SOCFullThreshold:     95.0,
-		ExcessSolarThreshold: 100.0,
-		ExportMarginFrac:     0.20,
+		SOCReserve:             20.0,
+		SOCFullThreshold:       95.0,
+		ExcessSolarThreshold:   100.0,
+		ExportMarginFrac:       0.20,
 		ExportRelaxCycles:      5,
 		ImportMarginFrac:       0.20,
 		EVImportCooldownCycles: 20,
@@ -162,12 +162,16 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// rules (3 & 3.5) still run to enforce live CSIP constraints.
 	planFollowed := false
 	if state.CSIPControl == nil || state.CSIPControl.Base.OpModFixedW == nil {
-		batteries, surplusW, planFollowed = applyPlanRule(state.DailyPlanTarget, batteries, state.EVSEs, surplusW, &plan)
+		batteries, surplusW, planFollowed = applyPlanRule(state.DailyPlanTarget, batteries, state.EVSEs, o.SOCReserve, o.SOCFullThreshold, surplusW, &plan)
 	}
 
 	// Rule 3: Export/import limit — absorb excess into EVSEs, battery, then curtail solar.
 	// Always runs (CSIP compliance cannot be skipped).
 	batteries, surplusW = o.applyExportLimitRule(state.Solar, state.EVSEs, evseW, limits, state.Grid.NetW, o.SOCFullThreshold, surplusW, batteries, &plan)
+
+	// Rule 3.1: Generation limit — curtail inverters so total output ≤ MaxLimW.
+	// Always runs (CSIP compliance cannot be skipped).
+	applyGenLimitRule(state.Solar, limits.maxLimitW, &plan)
 
 	// Rule 3.5: Import limit enforcement — discharge battery to reduce grid import.
 	batteries = o.applyImportLimitRule(batteries, limits, state.Grid.NetW, o.SOCReserve, &plan)
@@ -290,10 +294,10 @@ func deriveGridConstraints(grid GridState, cc *CSIPControlState) gridConstraints
 			c.importLimitW = nanMin(c.importLimitW, apW(lim))
 		}
 	}
-	// MaxLimW is an absolute generation cap that also constrains exports.
-	if !math.IsNaN(c.maxLimitW) {
-		c.exportLimitW = nanMin(c.exportLimitW, c.maxLimitW)
-	}
+	// MaxLimW (absolute generation cap) is enforced by curtailing the inverter
+	// output (applyGenLimitRule), NOT by folding it into the export limit: a
+	// generation cap limits what the DER produces, and battery absorption keeps
+	// the meter export low while generation stays over the cap — a violation.
 	return c
 }
 
@@ -329,7 +333,7 @@ func computePowerBalance(state SystemState) (solarW, batteryW, evseW, surplusW f
 //
 // The plan setpoint is a guidance value; the export/import limit rules still
 // run after this to enforce live CSIP compliance.
-func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSEState, surplusW float64, plan *Plan) ([]BatteryState, float64, bool) {
+func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSEState, socReserve, socFull, surplusW float64, plan *Plan) ([]BatteryState, float64, bool) {
 	if target == nil {
 		return batteries, surplusW, false
 	}
@@ -366,6 +370,18 @@ func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSESta
 		share := setW * cap / totalCap
 		// Clamp to device limits.
 		share = math.Max(-b.MaxChargeW, math.Min(b.MaxDischargeW, share))
+		// Live-SOC safety clamp: the plan setpoint is computed from a forecast
+		// SOC trajectory and can lag reality, so never discharge below the
+		// reserve or charge above the full threshold based on the measured SOC.
+		// Without this, a stale plan can drive a battery flat (and the device
+		// would report phantom power it can't deliver).
+		if !math.IsNaN(b.SOC) {
+			if share > 0 && b.SOC <= socReserve {
+				share = 0
+			} else if share < 0 && b.SOC >= socFull {
+				share = 0
+			}
+		}
 		batteries[i].PowerW = share
 		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
 			Name:      b.Name,
@@ -802,6 +818,51 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	}
 
 	return batteries, surplusW
+}
+
+// applyGenLimitRule enforces an absolute generation cap (CSIP OpModMaxLimW) by
+// curtailing the inverters so total solar output stays at or below the limit.
+//
+// A generation cap limits inverter OUTPUT; only curtailing the inverter can
+// satisfy it (battery absorption merely hides the over-generation behind a
+// lower meter export). Runs every tick — CSIP compliance cannot be skipped —
+// and reconciles with any curtailment the export-limit rule already issued by
+// keeping the tighter of the two.
+func applyGenLimitRule(solar []SolarState, maxLimitW float64, plan *Plan) {
+	if math.IsNaN(maxLimitW) {
+		return
+	}
+	totalSolarW := 0.0
+	for _, sol := range solar {
+		if sol.Connected {
+			totalSolarW += sol.PowerW
+		}
+	}
+	if totalSolarW <= maxLimitW+1 {
+		return // generation already within the cap
+	}
+
+	// Curtail every inverter by the same fraction so the total lands on the cap.
+	fraction := (totalSolarW - maxLimitW) / totalSolarW
+	curtailed := 0
+	for _, sol := range solar {
+		if !sol.Connected {
+			continue
+		}
+		curtailTo := sol.PowerW * (1 - fraction)
+		if i := solarCommandIndex(plan.SolarCommands, sol.Name); i >= 0 {
+			// Already curtailed (e.g. for an export limit): keep the tighter cap.
+			if math.IsNaN(plan.SolarCommands[i].CurtailToW) || curtailTo < plan.SolarCommands[i].CurtailToW {
+				plan.SolarCommands[i].CurtailToW = curtailTo
+			}
+		} else {
+			plan.SolarCommands = append(plan.SolarCommands, SolarCommand{Name: sol.Name, CurtailToW: curtailTo})
+		}
+		curtailed++
+	}
+	plan.AddDecision("csip/gen-limit",
+		fmt.Sprintf("generation cap %.0fW; total solar %.0fW exceeds it", maxLimitW, totalSolarW),
+		fmt.Sprintf("curtailing %d inverters to ≤ %.0fW total", curtailed, maxLimitW))
 }
 
 // applySelfConsumptionRule routes solar surplus into connected batteries.
@@ -1329,12 +1390,17 @@ func hasBatteryCommand(cmds []BatteryCommand, name string) bool {
 }
 
 func hasSolarCommand(cmds []SolarCommand, name string) bool {
-	for _, c := range cmds {
-		if c.Name == name {
-			return true
+	return solarCommandIndex(cmds, name) >= 0
+}
+
+// solarCommandIndex returns the index of the command for name, or −1 if absent.
+func solarCommandIndex(cmds []SolarCommand, name string) int {
+	for i := range cmds {
+		if cmds[i].Name == name {
+			return i
 		}
 	}
-	return false
+	return -1
 }
 
 func hasEVSECommand(cmds []EVSECommand, stationID string, connectorID int) bool {

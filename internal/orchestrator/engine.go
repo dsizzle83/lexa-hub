@@ -49,15 +49,20 @@ type Engine struct {
 	planner    *DailyPlanner
 	plannerCfg PlannerCfg
 
+	// lastSolarPeakKw is a running high-water estimate of the clear-sky PV peak,
+	// used to seed the diurnal solar forecast after dark. Touched only by the
+	// planner goroutine (buildPlannerParams), so it needs no lock.
+	lastSolarPeakKw float64
+
 	// planIn holds the planner inputs, updated via SetDERConstraints /
 	// SetPrices; guarded by planInMu.
 	planIn   plannerInput
 	planInMu sync.RWMutex
 
 	// dailyPlan is the most recent planner output; guarded by dailyPlanMu.
-	dailyPlan    *DailyPlan
-	dailyPlanMu  sync.RWMutex
-	plannerWake  chan struct{} // buffered(1): signals the planner goroutine
+	dailyPlan   *DailyPlan
+	dailyPlanMu sync.RWMutex
+	plannerWake chan struct{} // buffered(1): signals the planner goroutine
 
 	// Last plan — updated after every tick; readable from any goroutine.
 	planMu   sync.RWMutex
@@ -287,6 +292,11 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 	if now.IsZero() {
 		now = time.Now()
 	}
+	// Plan in CSIP server time. The optimizer evaluates TOU at
+	// Timestamp+ClockOffset and tick() queries CurrentTarget there too, so the
+	// plan window must use the same clock or the planned intervals never line up
+	// with the live tick (notably under a replay that warps the utility clock).
+	now = now.Add(time.Duration(state.ClockOffset) * time.Second)
 
 	p := PlannerParams{
 		Now:               now,
@@ -298,14 +308,23 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 		SOCStepKwh:        cfg.SOCStepKwh,
 	}
 
-	// Solar forecast: flat from current generation.
-	if solarW := state.TotalSolarW(); solarW > 0 {
-		flatKw := solarW / 1000
-		p.SolarForecastKw = make([]float64, planSteps)
-		for i := range p.SolarForecastKw {
-			p.SolarForecastKw[i] = flatKw
+	// Solar forecast: a clear-sky diurnal bell curve scaled to a peak estimate,
+	// rather than a flat hold of the current reading (which assumed constant sun
+	// all day and zero sun for the whole horizon on any post-sunset replan).
+	// Back out the clear-sky peak from the live generation and the time of day,
+	// and keep a high-water mark so a replan after dark still forecasts tomorrow.
+	if curKw := state.TotalSolarW() / 1000; curKw > 0 {
+		if shape := clearSkyShape(localHourOf(now.Unix())); shape > 0.15 {
+			if est := curKw / shape; est > e.lastSolarPeakKw {
+				e.lastSolarPeakKw = est
+			}
 		}
 	}
+	peakKw := e.lastSolarPeakKw
+	if cfg.SolarPeakKw > peakKw {
+		peakKw = cfg.SolarPeakKw
+	}
+	p.SolarForecastKw = diurnalSolarForecast(p.WindowStart, peakKw)
 
 	// Fallback TOU if no live pricing.
 	if p.ImportPricePerKwh == nil {
@@ -338,6 +357,14 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 		p.BattMaxDischargeKw = maxDKw
 		p.BattEfficiency = cfg.BattEfficiency
 		p.InitialBattSocKwh = initSocKwh
+		// Allow net daily discharge down to a reserve floor (instead of pinning
+		// the terminal SOC at the starting SOC), so the battery can shave the
+		// evening peak and overnight import rather than hoarding charge.
+		reservePct := cfg.TerminalReservePct
+		if reservePct <= 0 {
+			reservePct = 20
+		}
+		p.TerminalSocKwh = reservePct / 100 * capKwh
 		break // use first connected battery
 	}
 
@@ -403,18 +430,30 @@ func (e *Engine) tick() {
 	clockOffset := e.clockOffset
 	e.csipMu.RUnlock()
 
-	state.ClockOffset = clockOffset
+	// Only the SetCSIPPrograms path owns the clock offset and active control.
+	// In a bus-driven deployment (cmd/hub) programs is empty and the reader has
+	// already populated state.ClockOffset / state.CSIPControl from MQTT; do NOT
+	// overwrite the reader's offset with the engine's unused zero, or the
+	// optimizer's serverNow (= Timestamp+ClockOffset) collapses to local time and
+	// TOU evaluation / event timing break — e.g. a replay that warps the utility
+	// clock would no longer shift the hub's peak window.
 	if len(programs) > 0 {
+		state.ClockOffset = clockOffset
 		serverNow := scheduler.ServerNow(clockOffset)
 		active := e.sched.Evaluate(programs, serverNow)
 		state.CSIPControl = FromActiveControl(active)
 	}
 
 	// 3. Inject daily plan target for the current 5-min interval.
+	// Query the plan at CSIP server time so a clock offset selects the same
+	// interval the planner built its window around (and the optimizer evaluates
+	// TOU at). Without this the planned dispatch never lines up with the live
+	// tick under a warped clock.
 	e.dailyPlanMu.RLock()
 	dp := e.dailyPlan
 	e.dailyPlanMu.RUnlock()
-	state.DailyPlanTarget = dp.CurrentTarget(state.Timestamp)
+	serverTime := state.Timestamp.Add(time.Duration(state.ClockOffset) * time.Second)
+	state.DailyPlanTarget = dp.CurrentTarget(serverTime)
 
 	// 4. Optimize.
 	plan := e.optimizer.Optimize(state)

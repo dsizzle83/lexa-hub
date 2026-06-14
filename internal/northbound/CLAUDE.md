@@ -12,7 +12,7 @@ dnssd/      mDNS browse for _ieee2030._tls._tcp. TXT "path=X" overrides /dcap de
 ## Fetcher interface
 `discovery.Fetcher`: `Get(path) ([]byte, error)` only. Keeps discovery decoupled from TLS.
 - `WolfSSLFetcher` (tlsclient/): persistent TLS session, sync.Mutex, auto-redial on error.
-- `httpclient.Fetcher`: net/http, used in gridsim integration tests (`go test ./tests/`).
+- Conformance/integration tests against gridsim live in the **harness repo** (`~/projects/csip-tls-test`, `go test ./tests/` there) — this repo has unit tests only (`make test`).
 
 ## Walker traversal order
 `/dcap` → Time (→ ClockOffset) → EndDeviceList (find self by LFDI) → DERList → FSAList → DERPrograms → DERControlList + DefaultDERControl → MUPList

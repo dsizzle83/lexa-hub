@@ -56,6 +56,9 @@ type Measurements struct {
 
 	// Thermal
 	TmpCab float64 // cabinet temperature (°C); NaN if not reported
+
+	// Storage (batteries only; NaN if not applicable)
+	SOC float64 // state of charge (0–100 %)
 }
 
 // DeviceStatus describes the current operational state of a DER.

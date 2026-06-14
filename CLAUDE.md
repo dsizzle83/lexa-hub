@@ -4,6 +4,11 @@ DERMS hub for IEEE 2030.5 / CSIP compliance on a Digi SOM (ARM64 embedded Linux)
 Bridges utility grid management (northbound, wolfSSL mTLS) to DER assets — solar PV,
 battery storage, smart meter, EVSE (OCPP 2.0.1) — via an MQTT message bus.
 
+**This is the product.** Its test bench (grid/device/EV simulators, conformance suites,
+dashboard) lives in `~/projects/csip-tls-test`. Two packages are duplicated across the
+repos and must change in lockstep: `internal/southbound/sunspec` register maps (audit
+MTR-4 — a lone change misreads real hardware) and `internal/ocppserver`.
+
 ## Architecture: separate systemd services
 
 Each concern runs as its own process and communicates only via Mosquitto MQTT:
@@ -61,8 +66,18 @@ configs/     Example JSON configs for each service
 ```bash
 go mod tidy                  # fetch dependencies (first time)
 make build                   # builds all 6 binaries into bin/
-make test                    # runs internal package unit tests
+make test                    # go test -race ./internal/...
+make wolfssl-arm64           # rebuild arm64 wolfSSL sysroot (/tmp — wiped on reboot!)
+make build-arm64             # cross-compile all 6 binaries → bin/arm64/
 ```
+
+## Current bench deployment
+
+The ConnectCore dev kit (69.0.0.2) is offline; the hub runs on **hub-pi `dhpi4` at
+69.0.0.1** (root systemd units, passwordless sudo, SSH `dmitri@`). Deploy with
+`scripts/deploy-hub-pi.sh 69.0.0.1 dmitri` (needs `make build-arm64` first; stages client
+certs from `../csip-tls-test/certs/client-staging/`). Full topology:
+`../csip-tls-test/docs/BENCH.md`. Dev-kit runbook for when it returns: `DEVKIT.md`.
 
 ## Install on the Digi SOM
 

@@ -8,6 +8,7 @@
 package ocppserver
 
 import (
+	"crypto/subtle"
 	"crypto/tls"
 	"log"
 
@@ -62,11 +63,14 @@ func New(cfg Config) *Server {
 
 	if cfg.BasicAuthUser != "" {
 		wsServer.SetBasicAuthHandler(func(user, pass string) bool {
-			ok := user == cfg.BasicAuthUser && pass == cfg.BasicAuthPass
-			if !ok {
+			// Constant-time comparison so credential checking leaks no
+			// timing signal (& to avoid short-circuiting between the two).
+			ok := subtle.ConstantTimeCompare([]byte(user), []byte(cfg.BasicAuthUser)) &
+				subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.BasicAuthPass))
+			if ok != 1 {
 				log.Printf("[ocpp] basic-auth rejected user=%q", user)
 			}
-			return ok
+			return ok == 1
 		})
 	}
 
@@ -75,6 +79,7 @@ func New(cfg Config) *Server {
 	h := &handler{}
 	csms.SetProvisioningHandler(h)
 	csms.SetAvailabilityHandler(h)
+	csms.SetTransactionsHandler(h)
 
 	csms.SetNewChargingStationHandler(func(cs ocpp2.ChargingStationConnection) {
 		log.Printf("[ocpp] charging station connected  id=%s addr=%s", cs.ID(), cs.RemoteAddr())

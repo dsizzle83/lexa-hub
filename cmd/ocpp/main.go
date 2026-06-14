@@ -29,6 +29,7 @@ import (
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/meter"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/remotecontrol"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/smartcharging"
+	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/transactions"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -163,6 +164,7 @@ func newMQTTBridge(mc mqtt.Client, csms ocpp2.CSMS) *mqttBridge {
 
 	csms.SetAvailabilityHandler(&availForwarder{bridge: b})
 	csms.SetMeterHandler(&meterForwarder{bridge: b})
+	csms.SetTransactionsHandler(&txForwarder{bridge: b})
 
 	return b
 }
@@ -325,10 +327,10 @@ func (h *availForwarder) OnStatusNotification(csID string, req *availability.Sta
 
 type meterForwarder struct{ bridge *mqttBridge }
 
-func (h *meterForwarder) OnMeterValues(csID string, req *meter.MeterValuesRequest) (*meter.MeterValuesResponse, error) {
-	h.bridge.mu.Lock()
-	s := h.bridge.getOrCreateLocked(csID)
-	for _, mv := range req.MeterValue {
+// applySamplesLocked folds OCPP sampled values into the station state.
+// Caller must hold bridge.mu for writing.
+func applySamplesLocked(s *stationState, meterValues []types.MeterValue) {
+	for _, mv := range meterValues {
 		for _, sv := range mv.SampledValue {
 			v := sv.Value
 			switch sv.Measurand {
@@ -352,10 +354,38 @@ func (h *meterForwarder) OnMeterValues(csID string, req *meter.MeterValuesReques
 			}
 		}
 	}
+}
+
+func (h *meterForwarder) OnMeterValues(csID string, req *meter.MeterValuesRequest) (*meter.MeterValuesResponse, error) {
+	h.bridge.mu.Lock()
+	s := h.bridge.getOrCreateLocked(csID)
+	applySamplesLocked(s, req.MeterValue)
 	currentA, soc, energyWh := s.currentA, s.soc, s.energyWh
 	h.bridge.mu.Unlock()
 	log.Printf("[ocpp] MeterValues cs=%s evse=%d current=%.1fA soc=%.1f%% energy=%.0fWh",
 		csID, req.EvseID, currentA, soc, energyWh)
 	h.bridge.publishAll(csID)
 	return meter.NewMeterValuesResponse(), nil
+}
+
+type txForwarder struct{ bridge *mqttBridge }
+
+// OnTransactionEvent consumes the spec-correct carrier for in-transaction
+// meter data (the station also sends legacy bare MeterValues during the
+// transition). Ended events zero the current so site power drops immediately
+// instead of holding the last sample.
+func (h *txForwarder) OnTransactionEvent(csID string, req *transactions.TransactionEventRequest) (*transactions.TransactionEventResponse, error) {
+	h.bridge.mu.Lock()
+	s := h.bridge.getOrCreateLocked(csID)
+	applySamplesLocked(s, req.MeterValue)
+	if req.EventType == transactions.TransactionEventEnded {
+		s.currentA = 0
+	}
+	currentA, soc, energyWh := s.currentA, s.soc, s.energyWh
+	h.bridge.mu.Unlock()
+	log.Printf("[ocpp] TransactionEvent cs=%s type=%s tx=%s seq=%d trigger=%s state=%s current=%.1fA soc=%.1f%% energy=%.0fWh",
+		csID, req.EventType, req.TransactionInfo.TransactionID, req.SequenceNo,
+		req.TriggerReason, req.TransactionInfo.ChargingState, currentA, soc, energyWh)
+	h.bridge.publishAll(csID)
+	return transactions.NewTransactionEventResponse(), nil
 }

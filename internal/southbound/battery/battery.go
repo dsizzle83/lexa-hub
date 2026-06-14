@@ -69,10 +69,18 @@ func (b *Battery) ReadMeasurements() (device.Measurements, error) {
 	if err != nil {
 		return device.Measurements{}, fmt.Errorf("battery: read model %d: %w", b.MeasModel, err)
 	}
+	var m device.Measurements
 	if b.MeasModel == sunspec.ModelDERMeasureAC {
-		return derbase.ReadMeasurementsM701(regs), nil
+		m = derbase.ReadMeasurementsM701(regs)
+	} else {
+		m = derbase.ReadMeasurementsACModel(regs)
 	}
-	return derbase.ReadMeasurementsACModel(regs), nil
+	// Attach state of charge so it rides the measurement bus to the API and
+	// dashboard. Best-effort: a metrics read failure leaves SOC as NaN.
+	if bm, err := b.ReadBatteryMetrics(); err == nil {
+		m.SOC = bm.SOC
+	}
+	return m, nil
 }
 
 // Status reads the battery connection state.

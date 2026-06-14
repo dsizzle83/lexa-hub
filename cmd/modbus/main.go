@@ -27,8 +27,8 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
-	"lexa-hub/internal/northbound/model"
 	"lexa-hub/internal/mqttutil"
+	"lexa-hub/internal/northbound/model"
 	"lexa-hub/internal/southbound/battery"
 	"lexa-hub/internal/southbound/device"
 	"lexa-hub/internal/southbound/inverter"
@@ -122,9 +122,17 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 		if !math.IsNaN(m.Hz) {
 			msg.Hz = &m.Hz
 		}
-
 		if err := mqttutil.PublishJSON(mc, bus.MeasurementTopic(upd.Name), msg); err != nil {
 			log.Printf("lexa-modbus: publish measurement %s: %v", upd.Name, err)
+		}
+
+		// Batteries also publish on the metrics topic, which feeds both the
+		// API's SoC display and the optimizer's storage model.
+		if deviceRole[upd.Name] == "battery" && !math.IsNaN(m.SOC) {
+			bm := bus.BattMetrics{Device: upd.Name, SOC: &m.SOC, Ts: now}
+			if err := mqttutil.PublishJSON(mc, bus.BattMetricsTopic(upd.Name), bm); err != nil {
+				log.Printf("lexa-modbus: publish battery metrics %s: %v", upd.Name, err)
+			}
 		}
 	}
 }
@@ -190,8 +198,11 @@ func battCommandToControl(cmd bus.BattCommand) model.DERControlBase {
 // Nil CurtailToW restores full nameplate generation.
 func solarCommandToControl(cmd bus.SolarCommand) model.DERControlBase {
 	if cmd.CurtailToW == nil {
-		// NaN sentinel in the SunSpec layer means "restore max".
-		return model.DERControlBase{}
+		// Restore: command the ceiling to full nameplate. The device clamps the
+		// value to WMax, so WMaxLimPct → 100% (no effective curtailment). An
+		// EMPTY control would be a silent no-op — Base.ApplyControl only ever
+		// *sets* the ceiling — leaving the inverter stuck at its last curtailment.
+		return model.DERControlBase{OpModMaxLimW: &model.ActivePower{Value: math.MaxInt16, Multiplier: 0}}
 	}
 	v := clamp16(math.Max(0, *cmd.CurtailToW))
 	return model.DERControlBase{

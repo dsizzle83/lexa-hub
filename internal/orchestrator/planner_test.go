@@ -166,17 +166,32 @@ func TestPlan_Battery_ChargesAtNight_DischargesdAtPeak(t *testing.T) {
 
 func TestPlan_ExportLimit_Respected(t *testing.T) {
 	p := plannerTestBase()
+	// Fine SOC step so the battery can actually represent the sub-kWh-per-step
+	// charging needed to absorb export. (At the coarse 1 kWh default a 5-min
+	// charge rounds to zero SOC change; before the energy-accumulation fix that
+	// rounding was hidden as phantom absorption — an infinite sink with frozen
+	// SOC — which let an all-day 5 kW surplus be "held" by a 10 kWh battery.)
+	p.SOCStepKwh = 0.1
 	p.BattCapacityKwh = 10
 	p.BattMaxChargeKw = 5
 	p.BattMaxDischargeKw = 5
-	p.InitialBattSocKwh = 5
+	p.InitialBattSocKwh = 2 // room to absorb the midday surplus
 	p.LoadForecastKw = 0.5
+
+	// A bounded 2-hour midday solar burst (12:00–14:00) that would export ~4.5 kW
+	// uncontrolled. The battery must charge to hold export under the 1 kW cap.
+	// It's bounded because a 10 kWh pack can absorb a 2-hour burst but NOT an
+	// all-day one — the planner has no solar-curtailment lever (that's the
+	// optimizer's job), so a sustained over-cap surplus is genuinely infeasible.
 	p.SolarForecastKw = make([]float64, planSteps)
+	ws := p.WindowStart - (p.WindowStart % planStepSec)
 	for i := range p.SolarForecastKw {
-		p.SolarForecastKw[i] = 5.0 // 5 kW solar
+		if h := time.Unix(ws+int64(i)*planStepSec, 0).UTC().Hour(); h >= 12 && h < 14 {
+			p.SolarForecastKw[i] = 5.0
+		}
 	}
 
-	// Constrain export to 1 kW for all steps
+	// Constrain export to 1 kW for all steps.
 	p.DERConstraints = make([]StepConstraint, planSteps)
 	for i := range p.DERConstraints {
 		p.DERConstraints[i] = StepConstraint{
@@ -189,11 +204,19 @@ func TestPlan_ExportLimit_Respected(t *testing.T) {
 
 	plan := NewDailyPlanner().Plan(p)
 
-	// At any step, expected grid export should not exceed 1 kW
+	// Export must never exceed 1 kW, and the battery must actually charge during
+	// the burst (proves it's a feasible plan, not the degenerate infeasible one).
+	charged := false
 	for i, iv := range plan.Intervals {
 		if iv.ExpectedGridW < -(1000 + 50) { // allow 50W tolerance for discretisation
 			t.Errorf("step %d: export %.0fW exceeds limit of 1000W (gridW=%.0f)", i, -iv.ExpectedGridW, iv.ExpectedGridW)
 		}
+		if !math.IsNaN(iv.BattSetpointW) && iv.BattSetpointW < -100 {
+			charged = true
+		}
+	}
+	if !charged {
+		t.Error("battery never charged — plan is infeasible/degenerate, not actually holding the cap")
 	}
 }
 
@@ -207,8 +230,8 @@ func TestPlan_EV_MeetsTargetByDeparture(t *testing.T) {
 	// Small EV (15 kWh) needing to go from 5 to 12 kWh in 6 hours.
 	p.EVCapacityKwh = 15
 	p.EVMaxChargeKw = 7.2
-	p.InitialEVSocKwh = 5   // 33%
-	p.EVTargetSocKwh = 12   // 80%
+	p.InitialEVSocKwh = 5 // 33%
+	p.EVTargetSocKwh = 12 // 80%
 	p.EVVoltageV = 240
 	p.LoadForecastKw = 0.5
 
@@ -339,5 +362,103 @@ func TestPlan_Disconnect_ForcesZero(t *testing.T) {
 		if !math.IsNaN(iv.BattSetpointW) && math.Abs(iv.BattSetpointW) > 1 {
 			t.Errorf("step %d: battery setpoint = %.0fW despite Disconnect=true", i, iv.BattSetpointW)
 		}
+	}
+}
+
+// sumBattSetpointW totals the per-step battery setpoints (+discharge, −charge),
+// a proxy for net energy moved over the window.
+func sumBattSetpointW(plan *DailyPlan) float64 {
+	var s float64
+	for _, iv := range plan.Intervals {
+		if !math.IsNaN(iv.BattSetpointW) {
+			s += iv.BattSetpointW
+		}
+	}
+	return s
+}
+
+// TestPlan_TerminalReserve_AllowsNetDischarge checks that lowering the terminal
+// SOC target below the initial SOC lets the planner net-discharge across an
+// expensive evening instead of being pinned at its starting charge.
+func TestPlan_TerminalReserve_AllowsNetDischarge(t *testing.T) {
+	base := plannerTestBase()
+	base.SOCStepKwh = 0.1 // fine enough that 3 kW moves SOC within a 5-min step
+	base.BattCapacityKwh = 3
+	base.BattMaxChargeKw = 3
+	base.BattMaxDischargeKw = 3
+	base.InitialBattSocKwh = 2.7 // 90% — nearly full
+	base.LoadForecastKw = 1.0
+	// Strong peak so discharging stored energy in the evening clearly pays.
+	base.FallbackTOU = nil
+	base.ImportPricePerKwh = make([]float64, planSteps)
+	base.ExportPricePerKwh = make([]float64, planSteps)
+	ws := base.WindowStart - (base.WindowStart % planStepSec)
+	for i := 0; i < planSteps; i++ {
+		h := time.Unix(ws+int64(i)*planStepSec, 0).UTC().Hour()
+		if h >= 16 && h < 21 {
+			base.ImportPricePerKwh[i] = 1.00
+		} else {
+			base.ImportPricePerKwh[i] = 0.10
+		}
+	}
+
+	// Default terminal target (== initial SOC): no net daily discharge.
+	planDefault := NewDailyPlanner().Plan(base)
+
+	// Reserve floor at 20% of capacity: net discharge down to 0.6 kWh allowed.
+	aggr := base
+	aggr.TerminalSocKwh = 0.6
+	planAggr := NewDailyPlanner().Plan(aggr)
+
+	netDefault := sumBattSetpointW(planDefault)
+	netAggr := sumBattSetpointW(planAggr)
+
+	if netAggr <= netDefault {
+		t.Errorf("reserve plan should net-discharge more: netAggr=%.0fW netDefault=%.0fW", netAggr, netDefault)
+	}
+	if netAggr <= 0 {
+		t.Errorf("reserve plan should be net-discharging over the window, got Σsetpoint=%.0fW", netAggr)
+	}
+}
+
+func TestClearSkyShape(t *testing.T) {
+	if got := clearSkyShape(3); got != 0 {
+		t.Errorf("pre-dawn shape(3) = %v, want 0", got)
+	}
+	if got := clearSkyShape(22); got != 0 {
+		t.Errorf("post-dusk shape(22) = %v, want 0", got)
+	}
+	if got := clearSkyShape(solarSunriseHr); got != 0 {
+		t.Errorf("sunrise shape = %v, want 0", got)
+	}
+	// Solar noon is the midpoint of [sunrise,sunset] = 13:00 → peak of 1.
+	if got := clearSkyShape(13); math.Abs(got-1) > 1e-9 {
+		t.Errorf("solar-noon shape(13) = %v, want 1", got)
+	}
+	if got := clearSkyShape(12); got <= 0.9 || got > 1 {
+		t.Errorf("midday shape(12) = %v, want ~0.97", got)
+	}
+}
+
+func TestDiurnalSolarForecast(t *testing.T) {
+	if diurnalSolarForecast(0, 0) != nil {
+		t.Error("peakKw<=0 should yield a nil forecast")
+	}
+	// Base at local midnight so step indices map cleanly to local hours.
+	base := time.Date(2026, 5, 18, 0, 0, 0, 0, time.Local).Unix()
+	const peak = 7.0
+	fc := diurnalSolarForecast(base, peak)
+	if len(fc) != planSteps {
+		t.Fatalf("len = %d, want %d", len(fc), planSteps)
+	}
+	stepsPerHour := int(3600 / planStepSec)
+	if v := fc[3*stepsPerHour]; v != 0 { // 03:00
+		t.Errorf("03:00 forecast = %v, want 0 (dark)", v)
+	}
+	if v := fc[22*stepsPerHour]; v != 0 { // 22:00
+		t.Errorf("22:00 forecast = %v, want 0 (dark)", v)
+	}
+	if v := fc[13*stepsPerHour]; math.Abs(v-peak) > 1e-9 { // 13:00 solar noon
+		t.Errorf("solar-noon forecast = %v, want %v", v, peak)
 	}
 }

@@ -201,77 +201,87 @@ const (
 	ModelMeterThreePh  = uint16(203) // three-phase wye AC meter
 )
 
-// Model 201 (Single-Phase AC Meter) — 105 data registers.
-// Source: SunSpec Alliance smdx_00201.xml
+// Models 201 (single-phase), 202 (split-phase), and 203 (three-phase wye)
+// share the SunSpec "common meter" layout: identical point lists and offsets,
+// 105 data registers each (verified against the published sunspec/models
+// model_201/202/203.json). They differ only in wiring type. Audit finding
+// MTR-4: earlier revisions used invented compressed offsets; these now match
+// the published models, so a real SunSpec meter drops in unmodified.
 const (
-	M201Len    = 105
-	M201_A     = 0  // Total AC current (int16, A_SF)
-	M201_AphA  = 1  // Phase A current (int16, A_SF)
-	M201_A_SF  = 2  // Current scale factor (int16)
-	M201_PhV   = 3  // Average L-N voltage (int16, V_SF)
-	M201_PhVphA = 4 // Phase A L-N voltage (int16, V_SF)
-	M201_V_SF  = 5  // Voltage scale factor (int16)
-	M201_Hz    = 6  // AC frequency (int16, Hz_SF)
-	M201_Hz_SF = 7  // Frequency scale factor (int16)
-	M201_W     = 8  // Total real power (int16, W_SF); +import −export
-	M201_W_SF  = 9  // Power scale factor (int16)
-	M201_VA    = 10 // Apparent power (int16, VA_SF)
-	M201_VA_SF = 11
-	M201_VAR   = 12 // Reactive power (int16, VAR_SF)
-	M201_VAR_SF = 13
-	M201_PF    = 14 // Avg power factor ×100 (int16, PF_SF)
-	M201_PF_SF = 15
+	M201Len       = 105
+	M201_A        = 0  // Total AC current (int16, A_SF)
+	M201_AphA     = 1  // Phase A current (int16, A_SF)
+	M201_AphB     = 2  // Phase B current (int16, A_SF)
+	M201_AphC     = 3  // Phase C current (int16, A_SF)
+	M201_A_SF     = 4  // Current scale factor (int16)
+	M201_PhV      = 5  // Average L-N voltage (int16, V_SF)
+	M201_PhVphA   = 6  // Phase A L-N voltage (int16, V_SF)
+	M201_PhVphB   = 7  // Phase B L-N voltage (int16, V_SF)
+	M201_PhVphC   = 8  // Phase C L-N voltage (int16, V_SF)
+	M201_PPV      = 9  // Average L-L voltage (int16, V_SF)
+	M201_V_SF     = 13 // Voltage scale factor (int16)
+	M201_Hz       = 14 // AC frequency (int16, Hz_SF)
+	M201_Hz_SF    = 15 // Frequency scale factor (int16)
+	M201_W        = 16 // Total real power (int16, W_SF); +import −export
+	M201_W_SF     = 20 // Power scale factor (int16)
+	M201_VA       = 21 // Apparent power (int16, VA_SF)
+	M201_VA_SF    = 25 // Apparent power scale factor (int16)
+	M201_VAR      = 26 // Reactive power (int16, VAR_SF)
+	M201_VAR_SF   = 30 // Reactive power scale factor (int16)
+	M201_PF       = 31 // Avg power factor ×100 (int16, PF_SF)
+	M201_PF_SF    = 35 // Power factor scale factor (int16)
+	M201_TotWhExp = 36 // Total exported energy (acc32, regs 36-37, TotWh_SF)
+	M201_TotWhImp = 44 // Total imported energy (acc32, regs 44-45, TotWh_SF)
+	M201_TotWh_SF = 52 // Energy scale factor (int16)
 )
 
-// Model 202 (Split-Phase AC Meter) — 106 data registers.
+// Model 202 (Split-Phase AC Meter) — same common-meter offsets as M201.
 const (
-	M202Len     = 106
-	M202_A      = 0  // Total AC current (int16, A_SF)
+	M202Len     = 105
+	M202_A      = 0
 	M202_AphA   = 1
 	M202_AphB   = 2
-	M202_A_SF   = 3
-	M202_PhVphA = 4  // Phase A L-N voltage (int16, V_SF)
-	M202_PhVphB = 5
-	M202_V_SF   = 6
-	M202_PPVphAB = 7 // Phase A-B L-L voltage (int16, PPV_SF)
-	M202_PPV_SF = 8
-	M202_Hz     = 9
-	M202_Hz_SF  = 10
-	M202_W      = 11 // Total real power (int16, W_SF); +import −export
-	M202_W_SF   = 12
+	M202_A_SF   = 4
+	M202_PhV    = 5
+	M202_PhVphA = 6
+	M202_PhVphB = 7
+	M202_V_SF   = 13
+	M202_Hz     = 14
+	M202_Hz_SF  = 15
+	M202_W      = 16
+	M202_W_SF   = 20
 )
 
-// Model 203 (Three-Phase Wye AC Meter) — 105 data registers.
+// Model 203 (Three-Phase Wye AC Meter) — same common-meter offsets as M201.
 const (
 	M203Len      = 105
-	M203_A       = 0  // Total AC current (int16, A_SF)
+	M203_A       = 0
 	M203_AphA    = 1
 	M203_AphB    = 2
 	M203_AphC    = 3
 	M203_A_SF    = 4
-	M203_PhV     = 5  // Average L-N voltage (int16, V_SF)
+	M203_PhV     = 5 // Average L-N voltage (int16, V_SF)
 	M203_PhVphA  = 6
 	M203_PhVphB  = 7
 	M203_PhVphC  = 8
-	M203_V_SF    = 9
-	M203_PPV     = 10 // Average L-L voltage (int16, PPV_SF)
-	M203_PPVphAB = 11
-	M203_PPVphBC = 12
-	M203_PPVphCA = 13
-	M203_PPV_SF  = 14
-	M203_Hz      = 15
-	M203_Hz_SF   = 16
-	M203_W       = 17 // Total real power (int16, W_SF); +import −export
-	M203_W_SF    = 18
-	M203_WphA    = 19
-	M203_WphB    = 20
-	M203_WphC    = 21
-	M203_VA      = 22 // Apparent power (int16, VA_SF)
-	M203_VA_SF   = 23
-	M203_VAR     = 24 // Reactive power (int16, VAR_SF)
-	M203_VAR_SF  = 25
-	M203_PF      = 26 // Avg power factor ×100 (int16, PF_SF)
-	M203_PF_SF   = 27
+	M203_PPV     = 9  // Average L-L voltage (int16, V_SF)
+	M203_PPVphAB = 10 // L-L phase voltages (int16, V_SF)
+	M203_PPVphBC = 11
+	M203_PPVphCA = 12
+	M203_V_SF    = 13
+	M203_Hz      = 14
+	M203_Hz_SF   = 15
+	M203_W       = 16 // Total real power (int16, W_SF); +import −export
+	M203_WphA    = 17
+	M203_WphB    = 18
+	M203_WphC    = 19
+	M203_W_SF    = 20
+	M203_VA      = 21 // Apparent power (int16, VA_SF)
+	M203_VA_SF   = 25
+	M203_VAR     = 26 // Reactive power (int16, VAR_SF)
+	M203_VAR_SF  = 30
+	M203_PF      = 31 // Avg power factor ×100 (int16, PF_SF)
+	M203_PF_SF   = 35
 )
 
 // ── Model 123 (Immediate Controls) register offsets ───────────────────────────

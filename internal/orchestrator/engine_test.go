@@ -202,7 +202,7 @@ func TestEngine_SetCSIPPrograms_InjectedIntoState(t *testing.T) {
 		{
 			Program: model.DERProgram{MRID: "prog-1", Primacy: 1},
 			DefaultControl: &model.DefaultDERControl{
-				MRID: "ddc-1",
+				MRID:           "ddc-1",
 				DERControlBase: model.DERControlBase{OpModConnect: &tr},
 			},
 			Controls: &model.DERControlList{
@@ -258,6 +258,33 @@ func TestEngine_SetCSIPPrograms_ConcurrentSafe(t *testing.T) {
 		<-done
 	}
 	eng.Stop()
+}
+
+// TestEngine_PreservesReaderClockOffset is a regression test for the bug where
+// tick() overwrote the reader-supplied CSIP clock offset with the engine's
+// unused zero. Only the SetCSIPPrograms path owns the offset; a bus-driven
+// deployment (no programs) carries the real offset in the state it reads, and
+// the optimizer must see it so serverNow = Timestamp+ClockOffset follows utility
+// (or replayed) time instead of collapsing to local time and killing TOU
+// peak-shaving.
+func TestEngine_PreservesReaderClockOffset(t *testing.T) {
+	st := state0()
+	st.Timestamp = time.Now()
+	const offset = int64(7 * 3600) // e.g. a replay clock warp
+	st.ClockOffset = offset
+	reader := &mockReader{state: st}
+	opt := &captureStateOptimizer{}
+
+	eng := orchestrator.New(reader, opt, orchestrator.Config{Interval: 10 * time.Second})
+	// No SetCSIPPrograms call: programs are empty, so the reader's offset must
+	// survive into the optimizer untouched.
+	eng.Start()
+	time.Sleep(30 * time.Millisecond)
+	eng.Stop()
+
+	if got := opt.lastState.ClockOffset; got != offset {
+		t.Fatalf("optimizer saw ClockOffset=%d, want %d — reader offset was clobbered", got, offset)
+	}
 }
 
 // ── captureStateOptimizer ─────────────────────────────────────────────────────

@@ -6,11 +6,13 @@ import (
 
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/availability"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/provisioning"
+	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/transactions"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types"
 )
 
-// handler implements provisioning.CSMSHandler and availability.CSMSHandler.
-// It logs every incoming message and returns the minimal accepted response.
+// handler implements the provisioning, availability, and transactions CSMS
+// handler interfaces. It logs every incoming message and returns the minimal
+// accepted response.
 type handler struct{}
 
 // ── provisioning.CSMSHandler ─────────────────────────────────────────────────
@@ -51,4 +53,15 @@ func (h *handler) OnStatusNotification(
 	log.Printf("[ocpp] StatusNotification cs=%s evse=%d connector=%d status=%s",
 		csID, req.EvseID, req.ConnectorID, req.ConnectorStatus)
 	return &availability.StatusNotificationResponse{}, nil
+}
+
+// ── transactions.CSMSHandler ─────────────────────────────────────────────────
+
+func (h *handler) OnTransactionEvent(
+	csID string, req *transactions.TransactionEventRequest,
+) (*transactions.TransactionEventResponse, error) {
+	log.Printf("[ocpp] TransactionEvent cs=%s type=%s tx=%s seq=%d trigger=%s state=%s",
+		csID, req.EventType, req.TransactionInfo.TransactionID, req.SequenceNo,
+		req.TriggerReason, req.TransactionInfo.ChargingState)
+	return transactions.NewTransactionEventResponse(), nil
 }

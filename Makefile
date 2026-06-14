@@ -27,6 +27,15 @@ GOARM64 := GOARCH=arm64 GOOS=linux CGO_ENABLED=0 go build
 
 # CGo services (wolfSSL mTLS):
 WOLFSSL_SYSROOT ?= /tmp/wolfssl-arm64-sysroot
+
+# Host (amd64) wolfSSL sysroot so `make test`/`make build` work on machines
+# without a system-wide wolfSSL (the desktop). No-op where the dir is absent.
+# The static libwolfssl.a needs -lm (pow/log in dh.c).
+WOLFSSL_SYSROOT_HOST ?= $(HOME)/.local/wolfssl-amd64
+ifneq ($(wildcard $(WOLFSSL_SYSROOT_HOST)/include),)
+export CGO_CFLAGS  += -I$(WOLFSSL_SYSROOT_HOST)/include
+export CGO_LDFLAGS += -L$(WOLFSSL_SYSROOT_HOST)/lib -lm
+endif
 GOARM64_CGO := CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
 	CC=aarch64-linux-gnu-gcc \
 	CGO_CFLAGS="-I$(WOLFSSL_SYSROOT)/include" \

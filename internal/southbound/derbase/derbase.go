@@ -110,7 +110,7 @@ func ReadMeasurementsM701(regs []uint16) device.Measurements {
 	if math.IsNaN(v) {
 		v = m.VL1
 	}
-	return device.Measurements{W: m.W, V: v, Hz: m.Hz, VA: m.VA, Var: m.Var, PF: m.PF, TmpCab: m.TmpCab}
+	return device.Measurements{W: m.W, V: v, Hz: m.Hz, VA: m.VA, Var: m.Var, PF: m.PF, TmpCab: m.TmpCab, SOC: math.NaN()}
 }
 
 // ReadMeasurementsACModel parses legacy Model 10x (101/102/103).
@@ -122,7 +122,7 @@ func ReadMeasurementsACModel(regs []uint16) device.Measurements {
 		return 0
 	}
 	sf := func(off int) int16 { return int16(get(off)) }
-	m := device.Measurements{TmpCab: math.NaN()}
+	m := device.Measurements{TmpCab: math.NaN(), SOC: math.NaN()}
 	if len(regs) > sunspec.M103_W_SF {
 		m.W = sunspec.ApplyScaleSigned(get(sunspec.M103_W), sf(sunspec.M103_W_SF))
 	}
