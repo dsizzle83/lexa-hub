@@ -289,7 +289,12 @@ func TestExportLimitRule_CurtailsProportionally(t *testing.T) {
 	}
 }
 
-func TestExportLimitRule_NoActionWithinLimit(t *testing.T) {
+func TestExportLimitRule_NoCurtailWithinLimit(t *testing.T) {
+	// Export (1 kW) well within the 5 kW limit.  The rule is a sticky controller:
+	// it issues a no-op generation ceiling at nameplate every tick while the limit
+	// window is active (so it stays engaged and can re-curtail instantly if export
+	// climbs), but it must take no battery action and must not actually curtail
+	// the inverter below its output.
 	solar := []SolarState{ruleSol("pv", 1000)}
 	bats := []BatteryState{ruleBat("bat", 0, 50, 5000)}
 	limits := gridConstraints{exportLimitW: 5000, importLimitW: math.NaN(), maxLimitW: math.NaN()}
@@ -297,8 +302,16 @@ func TestExportLimitRule_NoActionWithinLimit(t *testing.T) {
 
 	applyExportLimitRule(solar, nil, 0, limits, -1000, 95, 1000, bats, plan)
 
-	if len(plan.BatteryCommands) != 0 || len(plan.SolarCommands) != 0 {
-		t.Error("expected no commands when export is within limit")
+	if len(plan.BatteryCommands) != 0 {
+		t.Errorf("expected no battery command when export is within limit, got %d", len(plan.BatteryCommands))
+	}
+	// A ceiling at or above the inverter's output is a harmless no-op; anything
+	// below would be a spurious curtailment.
+	for _, sc := range plan.SolarCommands {
+		if !math.IsNaN(sc.CurtailToW) && sc.CurtailToW < solar[0].PowerW {
+			t.Errorf("solar curtailed to %.0fW below output %.0fW; should not curtail within limit",
+				sc.CurtailToW, solar[0].PowerW)
+		}
 	}
 }
 
@@ -337,15 +350,43 @@ func TestGenLimitRule_CurtailsToGenCap(t *testing.T) {
 	}
 }
 
-func TestGenLimitRule_NoActionWithinCapOrNaN(t *testing.T) {
+func TestGenLimitRule_WithinCapIssuesNoOpCeiling(t *testing.T) {
+	// Sticky: the rule re-issues the ceiling every tick so the restore rule can't
+	// un-curtail the inverter between ticks (the cause of the every-tick
+	// oscillation across the cap).  When generation is within the cap, that
+	// ceiling is at/above current output — a no-op the device clamps away.
 	plan := &Plan{}
 	applyGenLimitRule([]SolarState{ruleSol("pv", 2000)}, 3000, plan)
-	if len(plan.SolarCommands) != 0 {
-		t.Errorf("generation within cap should not curtail, got %d", len(plan.SolarCommands))
+	if len(plan.SolarCommands) != 1 {
+		t.Fatalf("sticky gen-limit must re-issue the ceiling, got %d commands", len(plan.SolarCommands))
 	}
+	if plan.SolarCommands[0].CurtailToW < 2000 {
+		t.Errorf("ceiling %.0fW is below generation 2000W — would curtail within the cap",
+			plan.SolarCommands[0].CurtailToW)
+	}
+}
+
+func TestGenLimitRule_NaNIsNoOp(t *testing.T) {
+	plan := &Plan{}
 	applyGenLimitRule([]SolarState{ruleSol("pv", 9000)}, math.NaN(), plan)
 	if len(plan.SolarCommands) != 0 {
 		t.Errorf("NaN cap must be a no-op, got %d", len(plan.SolarCommands))
+	}
+}
+
+// TestGenLimitRule_Sticky_HoldsCeilingAcrossTicks guards the oscillation fix: an
+// inverter whose live reading is already AT the cap (because we curtailed it last
+// tick) must still receive the ceiling command, so the restore rule doesn't
+// un-curtail it and let generation jump back to full nameplate.
+func TestGenLimitRule_Sticky_HoldsCeilingAcrossTicks(t *testing.T) {
+	atCap := SolarState{Name: "pv", PowerW: 4300, MaxW: 5000, Connected: true, Energized: true}
+	plan := &Plan{}
+	applyGenLimitRule([]SolarState{atCap}, 4300, plan)
+	if len(plan.SolarCommands) != 1 {
+		t.Fatalf("expected a held ceiling command, got %d", len(plan.SolarCommands))
+	}
+	if plan.SolarCommands[0].CurtailToW > 4300+1 {
+		t.Errorf("ceiling = %.0fW, want ≤ 4300W (held at the cap)", plan.SolarCommands[0].CurtailToW)
 	}
 }
 
@@ -784,14 +825,23 @@ func TestRestoreRule_RestoresBattery(t *testing.T) {
 	}
 }
 
-func TestRestoreRule_SkipsBatteryBelowSOCReserve(t *testing.T) {
-	bats := []BatteryState{ruleBat("bat", 0, 15, 5000)} // SOC=15 <= reserve=20
+func TestRestoreRule_IdlesLatchedDischargeBelowSOCReserve(t *testing.T) {
+	// Regression for the 92-day replay reserve drain: a battery left discharging
+	// (latched setpoint) at or below the SOC reserve, with no command issued by
+	// any other rule this tick, MUST be idled to 0 W.  Skipping it (the old
+	// behavior) left the device running its latched discharge and drained the
+	// pack straight through the reserve to 0%.
+	bats := []BatteryState{ruleBat("bat", 2000, 15, 5000)} // discharging 2 kW at SOC=15 (≤ reserve=20)
 	plan := &Plan{}
 
 	applyRestoreRule(nil, bats, 20, plan)
 
-	if len(plan.BatteryCommands) != 0 {
-		t.Errorf("must not restore battery below SOC reserve, got %d commands", len(plan.BatteryCommands))
+	if len(plan.BatteryCommands) != 1 {
+		t.Fatalf("expected an idle command to stop discharge below reserve, got %d", len(plan.BatteryCommands))
+	}
+	if plan.BatteryCommands[0].SetpointW != 0 {
+		t.Errorf("must idle a below-reserve battery to 0W to protect the reserve, got %.0fW",
+			plan.BatteryCommands[0].SetpointW)
 	}
 }
 

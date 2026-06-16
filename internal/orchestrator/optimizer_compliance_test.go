@@ -1,0 +1,245 @@
+package orchestrator
+
+import (
+	"math"
+	"testing"
+
+	"lexa-hub/internal/northbound/model"
+)
+
+// TestExportLimit_PhantomEVCredit_StillCurtails guards Bug E: the export-limit
+// curtailment fallback must not credit commanded EV current the EV isn't
+// actually drawing.  A plugged-in-but-full EV (commanded ~22.6 A but drawing
+// ~0 W) used to make the rule believe ~5.2 kW was being absorbed, collapsing
+// the computed excess to ~0 so solar was never curtailed — and the export cap
+// was violated.  The measured-export backstop must curtail regardless.
+func TestExportLimit_PhantomEVCredit_StillCurtails(t *testing.T) {
+	o := NewDefaultOptimizer()
+	expLim := &model.ActivePower{Value: 1000, Multiplier: 0}
+	const (
+		potential = 6000.0 // panel potential
+		loadW     = 500.0  // site load
+		nameW     = 8000.0 // inverter nameplate
+	)
+	// Closed-loop: feed the curtail ceiling back as next tick's generation, the
+	// way the real inverter would, and check the controller converges to hold
+	// the export cap.  Battery is full and the EV is plugged in but full
+	// (drawing ~0 while commanded high) — so neither can absorb; curtailment is
+	// the only remedy.  This would fail on the old ratchet (solar collapses to
+	// 0) and on the phantom-EV bug (no curtailment at all).
+	solarOut := potential
+	var finalExport float64
+	for i := 0; i < 10; i++ {
+		export := solarOut - loadW
+		st := SystemState{
+			Solar: []SolarState{{Name: "pv", PowerW: solarOut, MaxW: nameW, Connected: true, Energized: true}},
+			Batteries: []BatteryState{{
+				Name: "bat", PowerW: 0, SOC: 100, MaxChargeW: 5000, MaxDischargeW: 5000,
+				Connected: true, Energized: true,
+			}},
+			EVSEs: []EVSEState{{
+				StationID: "evse-001", ConnectorID: 1, Connected: true, SessionActive: true,
+				MaxCurrentA: 32, VoltageV: 240, PowerW: 7, SOC: 100,
+			}},
+			Grid: GridState{
+				NetW: -export, ExportLimitW: math.NaN(), ImportLimitW: math.NaN(), MaxLimitW: math.NaN(),
+			},
+			CSIPControl: &CSIPControlState{Source: "event", Base: model.DERControlBase{OpModExpLimW: expLim}},
+		}
+		plan := o.Optimize(st)
+		ceiling := math.NaN()
+		for _, sc := range plan.SolarCommands {
+			if sc.Name == "pv" {
+				ceiling = sc.CurtailToW
+			}
+		}
+		if math.IsNaN(ceiling) {
+			solarOut = potential // released → back to full potential
+		} else {
+			solarOut = math.Min(potential, ceiling) // device clamps to ceiling
+		}
+		finalExport = solarOut - loadW
+	}
+	if finalExport > 1000+complianceMarginW {
+		t.Errorf("after convergence, export = %.0fW exceeds the 1000W cap (curtailment failed to hold)", finalExport)
+	}
+	if solarOut < 200 {
+		t.Errorf("generation collapsed to %.0fW — over-curtailed (ratchet bug); cap only needs export ≤ 1000W", solarOut)
+	}
+}
+
+// complianceMarginW mirrors the dashboard replay's ±150 W compliance tolerance.
+const complianceMarginW = 150.0
+
+// TestExportLimit_StickyCurtailment_NoRelease guards the oscillation fix: once
+// solar is curtailed to hold the export cap, the rule must KEEP issuing the
+// curtail command even when the meter momentarily reads compliant — otherwise
+// the restore rule un-curtails, generation jumps back to full, and the cap is
+// breached every other tick.  A phantom EV (commanded high, drawing nothing)
+// must not trick the rule into releasing.
+func TestExportLimit_StickyCurtailment_NoRelease(t *testing.T) {
+	o := NewDefaultOptimizer()
+	// Already mid-episode: solar curtailed to ~1300 W, meter sitting at the
+	// conservative target (~800 W export), EV commanded high but drawing ~0.
+	o.expGuard = exportGuard{
+		evSetpointA:     22.6,
+		evCmdW:          22.6 * 240,
+		batteryAbsorbW:  math.NaN(),
+		activeLimitW:    1000,
+		filteredExportW: 800, // meter currently compliant thanks to curtailment
+		solarCeilingW:   1300,
+		safeCount:       10,
+	}
+	expLim := &model.ActivePower{Value: 1000, Multiplier: 0}
+	st := SystemState{
+		Solar: []SolarState{{Name: "pv", PowerW: 1300, MaxW: 8000, Connected: true, Energized: true}},
+		Batteries: []BatteryState{{
+			Name: "bat", PowerW: 0, SOC: 100, MaxChargeW: 5000, MaxDischargeW: 5000,
+			Connected: true, Energized: true,
+		}},
+		EVSEs: []EVSEState{{
+			StationID: "evse-001", ConnectorID: 1, Connected: true, SessionActive: true,
+			MaxCurrentA: 32, VoltageV: 240, PowerW: 7, SOC: 100,
+		}},
+		Grid: GridState{
+			NetW: -800, ExportLimitW: math.NaN(), ImportLimitW: math.NaN(), MaxLimitW: math.NaN(),
+		},
+		CSIPControl: &CSIPControlState{Source: "event", Base: model.DERControlBase{OpModExpLimW: expLim}},
+	}
+	plan := o.Optimize(st)
+
+	var curtailed bool
+	for _, sc := range plan.SolarCommands {
+		if sc.Name == "pv" && !math.IsNaN(sc.CurtailToW) && sc.CurtailToW < 7000 {
+			curtailed = true
+		}
+	}
+	if !curtailed {
+		t.Error("curtailment was released while compliant only BECAUSE of curtailment — will oscillate and breach the cap")
+	}
+}
+
+// TestImportLimit_RaisesPlanBatterySetpoint guards Bug F: when the cost plan has
+// already set a soft battery discharge, the import-limit rule must be able to
+// RAISE it to defend a CSIP import cap, rather than skipping the battery and
+// leaving import over the limit.
+func TestImportLimit_RaisesPlanBatterySetpoint(t *testing.T) {
+	o := NewDefaultOptimizer()
+	impLim := &model.ActivePower{Value: 1600, Multiplier: 0}
+	st := SystemState{
+		Batteries: []BatteryState{{
+			Name: "bat", PowerW: 249, SOC: 66, MaxChargeW: 5000, MaxDischargeW: 5000,
+			Connected: true, Energized: true,
+		}},
+		Grid: GridState{
+			NetW: 2300, ExportLimitW: math.NaN(), ImportLimitW: math.NaN(), MaxLimitW: math.NaN(),
+		},
+		CSIPControl:     &CSIPControlState{Source: "event", Base: model.DERControlBase{OpModImpLimW: impLim}},
+		DailyPlanTarget: &PlanTarget{BattSetpointW: 249, EVMaxCurrentA: 0},
+	}
+	plan := o.Optimize(st)
+
+	var setpoint float64 = math.NaN()
+	for _, bc := range plan.BatteryCommands {
+		if bc.Name == "bat" {
+			setpoint = bc.SetpointW
+		}
+	}
+	if math.IsNaN(setpoint) {
+		t.Fatal("no battery command issued")
+	}
+	// Import 2300 W over a 1600 W cap with 66% SOC available: the battery must
+	// discharge well above the plan's soft 249 W (target ≈ 1269 W to reach the
+	// conservative limit).
+	if setpoint < 1000 {
+		t.Errorf("battery setpoint = %.0fW; want > 1000W to defend the 1600W import cap (plan was 249W)", setpoint)
+	}
+}
+
+// TestExportLimit_NoReleaseWhenBatteryCreditCancelsExport guards the dominant
+// export-cap failure in the 92-day replay: the controller must stay ENGAGED
+// (sticky), never releasing the generation ceiling to free-running nameplate,
+// even on a tick where this tick's battery-absorption credit makes the implied
+// export momentarily land on the target so no real curtailment is computed.
+//
+// Setup mirrors the replay's failing midday: PV potential well above the 5 kW
+// inverter nameplate and a tiny load, so free-running generation pins at
+// nameplate and the site over-exports 4.7 kW.  The battery is idle this instant
+// (measured ~0) but at 82% SOC has the headroom to be commanded ~3.1 kW of
+// absorption.  Crediting that commanded-but-not-yet-delivered absorption drives
+// the computed ceiling to exactly nameplate.  The OLD rule released the guard
+// (solarCeilingW = NaN) here; with the meter lagging, the credit stayed inflated
+// the next tick too, so it never re-curtailed and the inverter ran free at
+// nameplate for the whole episode.  The fix must keep the guard engaged (clamped
+// at nameplate as a no-op this tick) so the very next tick re-evaluates against
+// fresh measured export and curtails the instant the credit illusion clears.
+func TestExportLimit_NoReleaseWhenBatteryCreditCancelsExport(t *testing.T) {
+	o := NewDefaultOptimizer()
+	expLim := &model.ActivePower{Value: 2000, Multiplier: 0}
+	st := SystemState{
+		// Inverter at nameplate (potential is higher; the device clamps to 5 kW).
+		Solar: []SolarState{{Name: "pv", PowerW: 5000, MaxW: 5000, Connected: true, Energized: true}},
+		// Idle now (measured ~0) but 82% SOC → can be commanded ~3.1 kW absorption.
+		Batteries: []BatteryState{{
+			Name: "bat", PowerW: 0, SOC: 82, MaxChargeW: 5000, MaxDischargeW: 5000,
+			Connected: true, Energized: true,
+		}},
+		// Exporting 4.7 kW against a 2 kW cap (tiny ~0.3 kW load).
+		Grid: GridState{
+			NetW: -4700, ExportLimitW: math.NaN(), ImportLimitW: math.NaN(), MaxLimitW: math.NaN(),
+		},
+		CSIPControl: &CSIPControlState{Source: "event", Base: model.DERControlBase{OpModExpLimW: expLim}},
+	}
+
+	o.Optimize(st)
+
+	// The guard must NOT be released: a NaN ceiling here is the bug — it drops the
+	// inverter to free-running nameplate and (with the lagged credit) never
+	// re-engages, sustaining the over-export for the rest of the episode.
+	if math.IsNaN(o.expGuard.solarCeilingW) {
+		t.Error("export guard released to NaN (free-running nameplate) on a battery-credit tick; " +
+			"must stay engaged so it re-curtails next tick when the credit illusion clears")
+	}
+}
+
+// TestExportLimit_CeilingSlewLimited guards the tight-cap anti-hunting slew:
+// after the controller has curtailed, the bench's linked meter keeps reporting
+// the old (higher) export for ~1 tick, so the raw integrator error stays large.
+// Without a slew limit the ceiling slams toward 0 W (over-curtail), then flings
+// back up into a re-violation — the 5.0→0→climb→over hunt seen on seed 99 day-0.
+// One tick must not drop the ceiling by more than the slew cap (1.5 kW).
+func TestExportLimit_CeilingSlewLimited(t *testing.T) {
+	o := NewDefaultOptimizer()
+	// Mid-episode: already curtailed to a 4 kW ceiling.
+	o.expGuard = exportGuard{
+		evSetpointA: math.NaN(), evCmdW: math.NaN(), batteryAbsorbW: math.NaN(),
+		activeLimitW: 2000, filteredExportW: 5000, solarCeilingW: 4000,
+	}
+	expLim := &model.ActivePower{Value: 2000, Multiplier: 0}
+	st := SystemState{
+		Solar: []SolarState{{Name: "pv", PowerW: 4000, MaxW: 5000, Connected: true, Energized: true}},
+		// Battery full — no absorption credit, so the ceiling carries the load.
+		Batteries: []BatteryState{{
+			Name: "bat", PowerW: 0, SOC: 100, MaxChargeW: 5000, MaxDischargeW: 5000,
+			Connected: true, Energized: true,
+		}},
+		// Stale-high export reading (5 kW) — raw integrator wants a >1.5 kW drop.
+		Grid: GridState{
+			NetW: -5000, ExportLimitW: math.NaN(), ImportLimitW: math.NaN(), MaxLimitW: math.NaN(),
+		},
+		CSIPControl: &CSIPControlState{Source: "event", Base: model.DERControlBase{OpModExpLimW: expLim}},
+	}
+
+	o.Optimize(st)
+
+	// Prior ceiling 4000 W; the slew cap is 1.5 kW/tick, so the new ceiling must
+	// not fall below 2500 W on this single tick (it must still curtail, just not
+	// crater to 0).
+	if o.expGuard.solarCeilingW < 2500 {
+		t.Errorf("ceiling dropped to %.0fW in one tick (prev 4000W); slew limit (1.5kW) should hold it ≥2500W — would over-curtail toward 0 and hunt",
+			o.expGuard.solarCeilingW)
+	}
+	if o.expGuard.solarCeilingW >= 4000 {
+		t.Errorf("ceiling = %.0fW did not tighten at all while over the cap", o.expGuard.solarCeilingW)
+	}
+}

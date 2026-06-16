@@ -17,6 +17,7 @@ type exportGuard struct {
 	safeCount       int     // consecutive ticks where actual export ≤ conservative target
 	activeLimitW    float64 // limit value when guard was reset; NaN = no active limit
 	filteredExportW float64 // low-pass-filtered actual export, used by the controller
+	solarCeilingW   float64 // sticky generation ceiling commanded; NaN = uncurtailed
 }
 
 // importGuard carries state across ticks for the conservative import-limit rule.
@@ -110,6 +111,7 @@ func NewDefaultOptimizer() *DefaultOptimizer {
 			batteryAbsorbW:  math.NaN(),
 			activeLimitW:    math.NaN(),
 			filteredExportW: math.NaN(),
+			solarCeilingW:   math.NaN(),
 		},
 		impGuard: importGuard{
 			dischargeW:   math.NaN(),
@@ -486,13 +488,13 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	batteries []BatteryState, plan *Plan,
 ) ([]BatteryState, float64) {
 	if math.IsNaN(limits.exportLimitW) {
-		o.expGuard = exportGuard{evSetpointA: math.NaN(), evCmdW: math.NaN(), batteryAbsorbW: math.NaN(), activeLimitW: math.NaN(), filteredExportW: math.NaN()}
+		o.expGuard = exportGuard{evSetpointA: math.NaN(), evCmdW: math.NaN(), batteryAbsorbW: math.NaN(), activeLimitW: math.NaN(), filteredExportW: math.NaN(), solarCeilingW: math.NaN()}
 		return batteries, surplusW
 	}
 
 	// New limit value → start the guard fresh.
 	if limits.exportLimitW != o.expGuard.activeLimitW {
-		o.expGuard = exportGuard{evSetpointA: math.NaN(), evCmdW: math.NaN(), batteryAbsorbW: math.NaN(), activeLimitW: limits.exportLimitW, filteredExportW: math.NaN()}
+		o.expGuard = exportGuard{evSetpointA: math.NaN(), evCmdW: math.NaN(), batteryAbsorbW: math.NaN(), activeLimitW: limits.exportLimitW, filteredExportW: math.NaN(), solarCeilingW: math.NaN()}
 	}
 
 	margin := o.ExportMarginFrac
@@ -783,37 +785,124 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		surplusW -= newCurrentA * voltage
 	}
 
-	// ── Solar curtailment: last resort, only when the limit is still exceeded ─
-	// Curtailment is a hard-fault safety net, not a control variable, so it
-	// reads the unfiltered measured export.  EV-driven absorption uses the
-	// commanded setpoint (predicted steady-state) so we don't double-curtail
-	// while the OCPP MeterValues / Modbus polls are still catching up.
-	commandedEvW := evseW
-	if ev != nil && !math.IsNaN(o.expGuard.evSetpointA) {
-		voltage := ev.VoltageV
-		if voltage <= 0 {
-			voltage = 230.0
+	// ── Solar curtailment: sticky integrating controller on MEASURED export ──
+	// Curtailment is the only remedy a full battery / full EV can't undermine,
+	// so it is driven purely by the measured export — never by commanded EV
+	// absorption a full or throttled EV may not actually draw.  Crediting
+	// commanded-but-undrawn EV power is what let a plugged-in-but-full EV mask an
+	// over-export and defeat curtailment entirely.
+	//
+	// The commanded generation ceiling is held in the guard and re-issued every
+	// tick while curtailment is active, so the restore rule can't un-curtail it
+	// between ticks.  Each tick the ceiling is set to the value that lands
+	// measured export on the conservative target:
+	//
+	//	ceiling = currentGeneration + (target − effectiveExport)
+	//
+	// It reads the RAW measured export (actualExportW), not the low-passed value:
+	// the filter's lag under the bench's measurement delay made the controller
+	// under-curtail (settling well above the cap) on a falling load.  Raw export
+	// and the directly-read generation come from the same state snapshot, so the
+	// ceiling converges in ~1 tick. effectiveExport credits only the *additional*
+	// battery absorption commanded this tick (a reliable single Modbus write); the
+	// EV is never credited here — crediting commanded-but-undrawn EV power is what
+	// let a full EV mask an over-export.
+	newBatteryAbsorbW := math.Max(0, batteryAbsorbW-measuredBatteryAbsorbW)
+	effectiveExportW := actualExportW - newBatteryAbsorbW
+
+	totalNameplateW := 0.0
+	for _, sol := range solar {
+		if sol.Connected {
+			totalNameplateW += sol.MaxW
 		}
-		commandedEvW = o.expGuard.evSetpointA * voltage
 	}
-	finalExcessW := math.Max(0, unconstrainedExportW-conservativeW-batteryAbsorbW-commandedEvW)
-	if finalExcessW > 1 {
-		if totalSolarW > 0 {
-			fraction := math.Min(1.0, finalExcessW/totalSolarW)
-			for _, sol := range solar {
-				if !sol.Connected {
-					continue
-				}
-				curtailTo := sol.PowerW * (1 - fraction)
-				plan.SolarCommands = append(plan.SolarCommands, SolarCommand{
-					Name:       sol.Name,
-					CurtailToW: curtailTo,
-				})
-				plan.AddDecision("csip/export-limit",
-					fmt.Sprintf("curtailing solar %s to %.0fW (hard limit %.0fW still exceeded)",
-						sol.Name, curtailTo, limits.exportLimitW),
-					fmt.Sprintf("solar %s %.0fW → %.0fW", sol.Name, sol.PowerW, curtailTo))
+
+	// Ceiling controller.
+	//
+	// First tick of an episode (no prior ceiling): the generation read and the
+	// export are both still in pre-curtailment steady state, so they are mutually
+	// consistent — take a full one-step correction to the target for immediate
+	// compliance:  ceiling = generation + (target − export) = target + load.
+	//
+	// Subsequent ticks: integrate from our own PREVIOUSLY COMMANDED ceiling, not
+	// the current generation read, with gain < 1.  The bench's grid meter derives
+	// net from an independent, lagged solar fetch, so the hub's directly-read
+	// generation drops to a new ceiling several seconds before the meter reflects
+	// it; a generation-anchored loop subtracts the still-high (stale) export from
+	// the already-lowered generation, drives the ceiling negative, and collapses
+	// output to zero.  Anchoring on our own last command — which the meter
+	// eventually catches up to — and damping keeps it stable.
+	const ceilGain = 0.5
+	prevCeilingW := o.expGuard.solarCeilingW
+	var desiredCeilingW float64
+	if math.IsNaN(prevCeilingW) {
+		desiredCeilingW = totalSolarW + (conservativeW - effectiveExportW)
+	} else {
+		desiredCeilingW = prevCeilingW + ceilGain*(conservativeW-effectiveExportW)
+	}
+	if desiredCeilingW < 0 {
+		desiredCeilingW = 0
+	}
+
+	// Slew-limit the ceiling change to damp hunting under the bench meter's
+	// ~1-tick lag.  After we curtail, the linked metersim keeps reporting the old
+	// (higher) export for a tick, so the raw error stays large and the integrator
+	// would slam the ceiling to 0 W (over-curtail) and then, once the meter
+	// catches up and momentarily under-reports, fling it back up into a
+	// re-violation — the 5.0→0→climb→over hunt observed on tight caps (seed 99
+	// day-0, 1.5 kW cap).  Tightening is allowed faster than relaxing: defend the
+	// cap quickly, give generation back slowly.  Skipped on the first tick of an
+	// episode (NaN prev) so onset still takes the full one-step correction.
+	if !math.IsNaN(prevCeilingW) {
+		const maxDropW = 1500.0 // tighten ≤1.5 kW/tick
+		const maxRiseW = 500.0  // relax ≤0.5 kW/tick
+		if desiredCeilingW < prevCeilingW-maxDropW {
+			desiredCeilingW = prevCeilingW - maxDropW
+		} else if desiredCeilingW > prevCeilingW+maxRiseW {
+			desiredCeilingW = prevCeilingW + maxRiseW
+		}
+		if desiredCeilingW < 0 {
+			desiredCeilingW = 0
+		}
+	}
+
+	// Sticky ceiling, never released to free-running mid-episode.  When the loop
+	// computes a ceiling at or above nameplate it means no real curtailment is
+	// needed this tick — but we CLAMP to nameplate and stay engaged rather than
+	// releasing the guard (NaN).  Releasing dropped the inverter back to
+	// free-running nameplate, and because the battery credit can hold
+	// effectiveExport at/under the target while the pack absorbs, the re-engage
+	// test then kept computing a ceiling ≥ nameplate and never re-curtailed — so
+	// the inverter ran free at nameplate and the site over-exported by 1-2 kW for
+	// the whole episode (the sustained midday violations in the 92-day replay).
+	// Staying engaged means the NEXT tick integrates from nameplate against fresh
+	// measured export and curtails immediately if still over cap.  A ceiling at
+	// nameplate is a harmless no-op (the inverter clamps to min(potential,
+	// ceiling)), so battery-first is preserved: when the battery absorbs the whole
+	// surplus the ceiling sits at nameplate and solar runs full.  The guard is
+	// reset to NaN only when the export limit itself clears (top of this func).
+	if totalNameplateW > 0 {
+		if desiredCeilingW > totalNameplateW {
+			desiredCeilingW = totalNameplateW
+		}
+		o.expGuard.solarCeilingW = desiredCeilingW
+		for _, sol := range solar {
+			if !sol.Connected {
+				continue
 			}
+			// Absolute per-inverter ceiling (share of nameplate).  Commanding an
+			// absolute ceiling lets the inverter both RAISE and lower output; a
+			// fraction of *current* output is a one-way ratchet that collapses
+			// generation to zero and can never recover.
+			curtailTo := desiredCeilingW * (sol.MaxW / totalNameplateW)
+			plan.SolarCommands = append(plan.SolarCommands, SolarCommand{
+				Name:       sol.Name,
+				CurtailToW: curtailTo,
+			})
+			plan.AddDecision("csip/export-limit",
+				fmt.Sprintf("holding generation ≤ %.0fW to keep export ≤ %.0fW (measured %.0fW)",
+					desiredCeilingW, limits.exportLimitW, actualExportW),
+				fmt.Sprintf("solar %s %.0fW → %.0fW", sol.Name, sol.PowerW, curtailTo))
 		}
 	}
 
@@ -828,28 +917,36 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 // lower meter export). Runs every tick — CSIP compliance cannot be skipped —
 // and reconciles with any curtailment the export-limit rule already issued by
 // keeping the tighter of the two.
+//
+// The ceiling is an ABSOLUTE value (maxLimitW, distributed by nameplate) and is
+// re-issued every tick while the cap is active — even when the live reading is
+// already within the cap.  It must be sticky: if we only curtailed when the
+// reading exceeds the cap, the restore rule would un-curtail the inverter on the
+// next tick (reading now at the cap), generation would jump back to full
+// nameplate, and output would oscillate across the cap every tick — ~50% of
+// gen-limit ticks violating.  The inverter clamps output to min(potential,
+// ceiling), so commanding the ceiling can never push generation up; when
+// potential is below the cap the command is a harmless no-op.
 func applyGenLimitRule(solar []SolarState, maxLimitW float64, plan *Plan) {
 	if math.IsNaN(maxLimitW) {
 		return
 	}
-	totalSolarW := 0.0
+	totalNameplateW := 0.0
 	for _, sol := range solar {
 		if sol.Connected {
-			totalSolarW += sol.PowerW
+			totalNameplateW += sol.MaxW
 		}
 	}
-	if totalSolarW <= maxLimitW+1 {
-		return // generation already within the cap
+	if totalNameplateW <= 0 {
+		return
 	}
 
-	// Curtail every inverter by the same fraction so the total lands on the cap.
-	fraction := (totalSolarW - maxLimitW) / totalSolarW
 	curtailed := 0
 	for _, sol := range solar {
 		if !sol.Connected {
 			continue
 		}
-		curtailTo := sol.PowerW * (1 - fraction)
+		curtailTo := maxLimitW * (sol.MaxW / totalNameplateW)
 		if i := solarCommandIndex(plan.SolarCommands, sol.Name); i >= 0 {
 			// Already curtailed (e.g. for an export limit): keep the tighter cap.
 			if math.IsNaN(plan.SolarCommands[i].CurtailToW) || curtailTo < plan.SolarCommands[i].CurtailToW {
@@ -861,8 +958,8 @@ func applyGenLimitRule(solar []SolarState, maxLimitW float64, plan *Plan) {
 		curtailed++
 	}
 	plan.AddDecision("csip/gen-limit",
-		fmt.Sprintf("generation cap %.0fW; total solar %.0fW exceeds it", maxLimitW, totalSolarW),
-		fmt.Sprintf("curtailing %d inverters to ≤ %.0fW total", curtailed, maxLimitW))
+		fmt.Sprintf("generation cap %.0fW (held continuously)", maxLimitW),
+		fmt.Sprintf("ceiling %d inverters to ≤ %.0fW total", curtailed, maxLimitW))
 }
 
 // applySelfConsumptionRule routes solar surplus into connected batteries.
@@ -1297,34 +1394,80 @@ func (o *DefaultOptimizer) applyImportLimitRule(batteries []BatteryState, limits
 
 	result := make([]BatteryState, len(batteries))
 	copy(result, batteries)
-	remaining := commandedDischargeW
-	totalCommanded := 0.0
+
+	// Stop any commanded battery CHARGING while defending the cap.  Charging
+	// draws from the grid, so a cost-plan charge during an import breach directly
+	// causes the violation — and a battery too drained to discharge (below the
+	// SOC reserve) can still at least stop charging.  Neutralise negative
+	// setpoints to idle before assigning discharge.
+	for i := range plan.BatteryCommands {
+		if plan.BatteryCommands[i].SetpointW < 0 {
+			name := plan.BatteryCommands[i].Name
+			plan.BatteryCommands[i].SetpointW = 0
+			for j := range result {
+				if result[j].Name == name {
+					result[j].PowerW = 0
+				}
+			}
+			plan.AddDecision("csip/import-limit",
+				fmt.Sprintf("import %.0fW over limit %.0fW; halting battery %s charge",
+					importW, limits.importLimitW, name),
+				fmt.Sprintf("%s charge → 0W (was draining grid into the cap)", name))
+		}
+	}
+
+	// Discharge already committed by prior rules (e.g. the 24-hour cost plan).
+	// The import-limit rule must be able to RAISE these setpoints — defending a
+	// CSIP import cap overrides the cost-optimal dispatch — so account for what
+	// is already committed and add only the shortfall.  Previously the loop
+	// SKIPPED any battery the plan had commanded (hasBatteryCommand), so a soft
+	// plan setpoint (e.g. 249 W at 66 % SOC) was left in place while grid import
+	// breached the cap; the rule could never discharge harder to hold the limit.
+	committedDischargeW := 0.0
+	for _, c := range plan.BatteryCommands {
+		if c.SetpointW > 0 {
+			committedDischargeW += c.SetpointW
+		}
+	}
+	remaining := math.Max(0, commandedDischargeW-committedDischargeW)
+	totalCommanded := committedDischargeW
 
 	for i, b := range result {
 		if remaining < 1 {
 			break
 		}
-		if !b.Connected || hasBatteryCommand(plan.BatteryCommands, b.Name) {
+		if !b.Connected {
 			continue
 		}
 		if !math.IsNaN(b.SOC) && b.SOC <= socReserve {
 			continue
 		}
-		discharge := math.Min(b.AvailableDischargeW(), remaining)
-		if discharge <= 0 {
+		// AvailableDischargeW is the headroom from the current setpoint (which a
+		// prior rule may already have raised) up to MaxDischargeW.
+		add := math.Min(b.AvailableDischargeW(), remaining)
+		if add <= 0 {
 			continue
 		}
-		result[i].PowerW = discharge
-		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
-			Name:      b.Name,
-			SetpointW: discharge,
-		})
+		base := 0.0
+		if j := batteryCommandIndex(plan.BatteryCommands, b.Name); j >= 0 && plan.BatteryCommands[j].SetpointW > 0 {
+			base = plan.BatteryCommands[j].SetpointW
+		}
+		newSetpoint := base + add
+		if j := batteryCommandIndex(plan.BatteryCommands, b.Name); j >= 0 {
+			plan.BatteryCommands[j].SetpointW = newSetpoint
+		} else {
+			plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+				Name:      b.Name,
+				SetpointW: newSetpoint,
+			})
+		}
+		result[i].PowerW = newSetpoint
 		plan.AddDecision("csip/import-limit",
 			fmt.Sprintf("import %.0fW vs limit %.0fW (target ≤%.0fW); unconstrained %.0fW; %s discharges %.0fW",
-				importW, limits.importLimitW, conservativeLimitW, unconstrainedImportW, b.Name, discharge),
-			fmt.Sprintf("%s → %.0fW discharge", b.Name, discharge))
-		remaining -= discharge
-		totalCommanded += discharge
+				importW, limits.importLimitW, conservativeLimitW, unconstrainedImportW, b.Name, newSetpoint),
+			fmt.Sprintf("%s → %.0fW discharge", b.Name, newSetpoint))
+		remaining -= add
+		totalCommanded += add
 	}
 
 	if totalCommanded > 0 {
@@ -1353,13 +1496,23 @@ func applyRestoreRule(solar []SolarState, batteries []BatteryState, socReserve f
 	reconnect := true
 	for _, b := range batteries {
 		if b.Connected && !hasBatteryCommand(plan.BatteryCommands, b.Name) && b.MaxDischargeW > 0 {
-			if math.IsNaN(b.SOC) || b.SOC > socReserve {
-				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
-					Name:      b.Name,
-					SetpointW: 0,          // idle: clear any stale setpoint
-					Connect:   &reconnect, // re-assert Conn=1 each tick
-				})
-			}
+			// Always idle an uncommanded battery to 0 W — regardless of SOC.
+			//
+			// This previously only fired when SOC > socReserve, which silently
+			// drained the pack to empty: once SOC fell to the reserve, every
+			// discharge rule correctly STOPPED issuing a discharge (they skip at
+			// the reserve), so no command was sent — and the device kept running
+			// the last discharge setpoint latched in its Modbus registers.  In the
+			// 92-day replay this sailed the battery straight through the 20%
+			// reserve to 0% during peak (e.g. 42%→0% in ~3 h), defeating the whole
+			// point of the reserve and leaving nothing for evening import caps or
+			// emergencies.  Idling to 0 W can never breach the reserve — it is the
+			// command that ENFORCES it — so it must be sent at any SOC.
+			plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+				Name:      b.Name,
+				SetpointW: 0,          // idle: clear any stale (e.g. discharge) setpoint
+				Connect:   &reconnect, // re-assert Conn=1 each tick
+			})
 		}
 	}
 }
@@ -1381,12 +1534,17 @@ func nanMin(a, b float64) float64 {
 }
 
 func hasBatteryCommand(cmds []BatteryCommand, name string) bool {
-	for _, c := range cmds {
-		if c.Name == name {
-			return true
+	return batteryCommandIndex(cmds, name) >= 0
+}
+
+// batteryCommandIndex returns the index of the command for name, or −1 if absent.
+func batteryCommandIndex(cmds []BatteryCommand, name string) int {
+	for i := range cmds {
+		if cmds[i].Name == name {
+			return i
 		}
 	}
-	return false
+	return -1
 }
 
 func hasSolarCommand(cmds []SolarCommand, name string) bool {
