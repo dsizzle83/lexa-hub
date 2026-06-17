@@ -29,13 +29,28 @@ type ActiveControl struct {
 	Source      string   `json:"source"`
 	MRID        string   `json:"mrid,omitempty"`
 	Connect     *bool    `json:"connect,omitempty"`
-	ExpLimW     *float64 `json:"exp_lim_w,omitempty"` // export limit (W)
-	ImpLimW     *float64 `json:"imp_lim_w,omitempty"` // import limit (W)
-	MaxLimW     *float64 `json:"max_lim_w,omitempty"` // generation cap (W)
-	FixedW      *float64 `json:"fixed_w,omitempty"`   // fixed dispatch (W)
-	ClockOffset int64    `json:"clock_offset"`         // server_time − local_time (s)
+	ExpLimW     *float64 `json:"exp_lim_w,omitempty"`   // export limit (W)
+	ImpLimW     *float64 `json:"imp_lim_w,omitempty"`   // import limit (W)
+	MaxLimW     *float64 `json:"max_lim_w,omitempty"`   // generation cap (W)
+	FixedW      *float64 `json:"fixed_w,omitempty"`     // fixed dispatch (W)
+	ClockOffset int64    `json:"clock_offset"`          // server_time − local_time (s)
 	ValidUntil  int64    `json:"valid_until,omitempty"` // Unix seconds; 0 = no expiry
 	Ts          int64    `json:"ts"`
+}
+
+// ComplianceAlert is published by the hub (orchestrator) on
+// TopicCSIPComplianceAlert when it cannot meet an active CSIP control limit.
+// Active distinguishes the onset (true) from the clear (false) of a breach so
+// the northbound service posts exactly one CannotComply Response per episode.
+type ComplianceAlert struct {
+	MRID       string  `json:"mrid"`        // active DERControl that cannot be met
+	LimitType  string  `json:"limit_type"`  // "import" | "export" | "generation"
+	LimitW     float64 `json:"limit_w"`     // commanded limit (W)
+	MeasuredW  float64 `json:"measured_w"`  // actual net/generation at the meter (W)
+	ShortfallW float64 `json:"shortfall_w"` // how far over the limit (W)
+	Reason     string  `json:"reason"`      // human-readable cause
+	Active     bool    `json:"active"`      // true = breach onset, false = cleared
+	Ts         int64   `json:"ts"`          // Unix seconds
 }
 
 // BattCommand is published by the hub (orchestrator) to the modbus service.
@@ -92,33 +107,33 @@ type PricingUpdate struct {
 
 // TariffProfileMsg is the per-profile slice of PricingUpdate.
 type TariffProfileMsg struct {
-	MRID                      string           `json:"mrid"`
-	Description               string           `json:"description,omitempty"`
-	Currency                  uint16           `json:"currency,omitempty"`          // ISO 4217
-	PricePowerOfTenMultiplier int8             `json:"price_power_of_ten_mult"`     // apply to Price values
-	Primacy                   uint8            `json:"primacy"`
-	RateCode                  string           `json:"rate_code,omitempty"`
+	MRID                      string             `json:"mrid"`
+	Description               string             `json:"description,omitempty"`
+	Currency                  uint16             `json:"currency,omitempty"`      // ISO 4217
+	PricePowerOfTenMultiplier int8               `json:"price_power_of_ten_mult"` // apply to Price values
+	Primacy                   uint8              `json:"primacy"`
+	RateCode                  string             `json:"rate_code,omitempty"`
 	RateComponents            []RateComponentMsg `json:"rate_components,omitempty"`
 }
 
 // RateComponentMsg carries the upcoming price schedule for one rate direction.
 type RateComponentMsg struct {
-	MRID                string              `json:"mrid"`
-	Description         string              `json:"description,omitempty"`
-	NumberOfTouTiers    uint8               `json:"num_tou_tiers,omitempty"`
-	ActiveIntervals     []TimeTariffMsg     `json:"active_intervals,omitempty"`
-	ScheduledIntervals  []TimeTariffMsg     `json:"scheduled_intervals,omitempty"`
+	MRID               string          `json:"mrid"`
+	Description        string          `json:"description,omitempty"`
+	NumberOfTouTiers   uint8           `json:"num_tou_tiers,omitempty"`
+	ActiveIntervals    []TimeTariffMsg `json:"active_intervals,omitempty"`
+	ScheduledIntervals []TimeTariffMsg `json:"scheduled_intervals,omitempty"`
 }
 
 // TimeTariffMsg is one pricing interval with its consumption tier prices.
 // Price values are in units determined by TariffProfileMsg.PricePowerOfTenMultiplier.
 type TimeTariffMsg struct {
-	MRID         string          `json:"mrid"`
-	Description  string          `json:"description,omitempty"`
-	TouTier      uint8           `json:"tou_tier"`
-	IntervalStart int64          `json:"interval_start"` // Unix seconds
-	Duration     uint32          `json:"duration"`        // seconds
-	Blocks       []PriceBlockMsg `json:"blocks,omitempty"`
+	MRID          string          `json:"mrid"`
+	Description   string          `json:"description,omitempty"`
+	TouTier       uint8           `json:"tou_tier"`
+	IntervalStart int64           `json:"interval_start"` // Unix seconds
+	Duration      uint32          `json:"duration"`       // seconds
+	Blocks        []PriceBlockMsg `json:"blocks,omitempty"`
 }
 
 // PriceBlockMsg is one consumption block within a TimeTariffMsg.
@@ -134,14 +149,14 @@ type PriceBlockMsg struct {
 // It carries the current billing period summary for each customer agreement.
 type BillingUpdate struct {
 	CustomerAccounts []CustomerAccountMsg `json:"customer_accounts"`
-	Ts               int64               `json:"ts"`
+	Ts               int64                `json:"ts"`
 }
 
 // CustomerAccountMsg is the per-account slice of BillingUpdate.
 type CustomerAccountMsg struct {
-	MRID         string               `json:"mrid"`
-	CustomerName string               `json:"customer_name,omitempty"`
-	Currency     uint16               `json:"currency,omitempty"`
+	MRID         string                 `json:"mrid"`
+	CustomerName string                 `json:"customer_name,omitempty"`
+	Currency     uint16                 `json:"currency,omitempty"`
 	Agreements   []CustomerAgreementMsg `json:"agreements,omitempty"`
 }
 
@@ -196,11 +211,11 @@ type FlowReservationStatusMsg struct {
 
 // ReservationMsg is one granted (or cancelled/superseded) flow reservation.
 type ReservationMsg struct {
-	MRID          string  `json:"mrid"`
-	Subject       string  `json:"subject"`         // mRID of the FlowReservationRequest
-	CurrentStatus uint8   `json:"current_status"`  // 0=scheduled, 1=active, 2=cancelled, 3=superseded
-	IntervalStart int64   `json:"interval_start"`
-	Duration      uint32  `json:"duration"`
+	MRID          string   `json:"mrid"`
+	Subject       string   `json:"subject"`        // mRID of the FlowReservationRequest
+	CurrentStatus uint8    `json:"current_status"` // 0=scheduled, 1=active, 2=cancelled, 3=superseded
+	IntervalStart int64    `json:"interval_start"`
+	Duration      uint32   `json:"duration"`
 	EnergyAvailWh *float64 `json:"energy_avail_wh,omitempty"`
 	PowerAvailW   *float64 `json:"power_avail_w,omitempty"`
 }
@@ -222,28 +237,28 @@ type DERScheduleMsg struct {
 
 // DERScheduleSlot is one time-contiguous segment of the 24-hour plan.
 type DERScheduleSlot struct {
-	Start       int64  `json:"start"`        // Unix seconds
+	Start       int64  `json:"start"` // Unix seconds
 	End         int64  `json:"end"`
-	Source      string `json:"source"`       // "event", "default", or "none"
+	Source      string `json:"source"` // "event", "default", or "none"
 	MRID        string `json:"mrid,omitempty"`
 	Description string `json:"description,omitempty"`
 	ProgramMRID string `json:"program_mrid,omitempty"`
 	Primacy     uint8  `json:"primacy,omitempty"`
 
 	// Scalar operating modes — nil means not controlled in this slot.
-	Connect      *bool    `json:"connect,omitempty"`
-	Energize     *bool    `json:"energize,omitempty"`
-	MaxLimW      *float64 `json:"max_lim_w,omitempty"`       // W
-	FixedW       *float64 `json:"fixed_w,omitempty"`         // W (+ inject, − absorb)
-	ExpLimW      *float64 `json:"exp_lim_w,omitempty"`       // W
-	ImpLimW      *float64 `json:"imp_lim_w,omitempty"`       // W
-	GenLimW      *float64 `json:"gen_lim_w,omitempty"`       // W
-	LoadLimW     *float64 `json:"load_lim_w,omitempty"`      // W
-	TargetW      *float64 `json:"target_w,omitempty"`        // W
-	FixedVarPct  *float64 `json:"fixed_var_pct,omitempty"`   // % of rated VAr
+	Connect       *bool    `json:"connect,omitempty"`
+	Energize      *bool    `json:"energize,omitempty"`
+	MaxLimW       *float64 `json:"max_lim_w,omitempty"`       // W
+	FixedW        *float64 `json:"fixed_w,omitempty"`         // W (+ inject, − absorb)
+	ExpLimW       *float64 `json:"exp_lim_w,omitempty"`       // W
+	ImpLimW       *float64 `json:"imp_lim_w,omitempty"`       // W
+	GenLimW       *float64 `json:"gen_lim_w,omitempty"`       // W
+	LoadLimW      *float64 `json:"load_lim_w,omitempty"`      // W
+	TargetW       *float64 `json:"target_w,omitempty"`        // W
+	FixedVarPct   *float64 `json:"fixed_var_pct,omitempty"`   // % of rated VAr
 	FixedPFAbsorb *float64 `json:"fixed_pf_absorb,omitempty"` // power factor × 100
 	FixedPFInject *float64 `json:"fixed_pf_inject,omitempty"` // power factor × 100
-	RampTms      *uint16  `json:"ramp_tms,omitempty"`        // hundredths of a second
+	RampTms       *uint16  `json:"ramp_tms,omitempty"`        // hundredths of a second
 
 	// Curve-linked modes — curves are summarized inline (not raw XML breakpoints).
 	VoltVar  *DERCurveSummary `json:"volt_var,omitempty"`
@@ -269,12 +284,12 @@ type DERScheduleSlot struct {
 
 // DERCurveSummary carries the key fields of a resolved DERCurve.
 type DERCurveSummary struct {
-	MRID        string          `json:"mrid,omitempty"`
-	Description string          `json:"description,omitempty"`
-	CurveType   uint16          `json:"curve_type"`
-	XMultiplier int8            `json:"x_mult,omitempty"`
-	YMultiplier int8            `json:"y_mult,omitempty"`
-	Points      []CurvePoint    `json:"points,omitempty"`
+	MRID        string       `json:"mrid,omitempty"`
+	Description string       `json:"description,omitempty"`
+	CurveType   uint16       `json:"curve_type"`
+	XMultiplier int8         `json:"x_mult,omitempty"`
+	YMultiplier int8         `json:"y_mult,omitempty"`
+	Points      []CurvePoint `json:"points,omitempty"`
 }
 
 // CurvePoint is one (x, y) breakpoint in a DERCurveSummary.
@@ -285,21 +300,21 @@ type CurvePoint struct {
 
 // FreqDroopMsg carries the inline frequency droop parameters from opModFreqDroop.
 type FreqDroopMsg struct {
-	DBuf        uint16 `json:"d_buf_mhz"`   // dead-band width (mHz)
-	DF          uint16 `json:"d_f_mhz"`     // full-response deviation (mHz)
-	DP          uint16 `json:"d_p"`         // W/Hz × 100
+	DBuf        uint16 `json:"d_buf_mhz"`     // dead-band width (mHz)
+	DF          uint16 `json:"d_f_mhz"`       // full-response deviation (mHz)
+	DP          uint16 `json:"d_p"`           // W/Hz × 100
 	OpenLoopTms uint16 `json:"open_loop_tms"` // hundredths of a second
-	TResponse   uint16 `json:"t_response"`  // hundredths of a second
+	TResponse   uint16 `json:"t_response"`    // hundredths of a second
 }
 
 // DERStatusSummary carries the last-known operational status of one DER device.
 type DERStatusSummary struct {
-	DERHref              string  `json:"der_href,omitempty"`
-	GenConnectStatus     *uint8  `json:"gen_connect_status,omitempty"`
-	InverterStatus       *uint8  `json:"inverter_status,omitempty"`
-	OperationalMode      *uint8  `json:"operational_mode,omitempty"`
-	StorageMode          *uint8  `json:"storage_mode,omitempty"`
-	StateOfChargePct     *float64 `json:"soc_pct,omitempty"`
-	EstimatedWAvail      *float64 `json:"estimated_w_avail,omitempty"`
-	ModesSupported       uint32   `json:"modes_supported,omitempty"`
+	DERHref          string   `json:"der_href,omitempty"`
+	GenConnectStatus *uint8   `json:"gen_connect_status,omitempty"`
+	InverterStatus   *uint8   `json:"inverter_status,omitempty"`
+	OperationalMode  *uint8   `json:"operational_mode,omitempty"`
+	StorageMode      *uint8   `json:"storage_mode,omitempty"`
+	StateOfChargePct *float64 `json:"soc_pct,omitempty"`
+	EstimatedWAvail  *float64 `json:"estimated_w_avail,omitempty"`
+	ModesSupported   uint32   `json:"modes_supported,omitempty"`
 }

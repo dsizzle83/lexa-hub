@@ -243,3 +243,71 @@ func TestExportLimit_CeilingSlewLimited(t *testing.T) {
 		t.Errorf("ceiling = %.0fW did not tighten at all while over the cap", o.expGuard.solarCeilingW)
 	}
 }
+
+// TestImportLimit_BatteryFloored_ReportsBreach guards the CannotComply alert
+// path: when an import cap is active and the battery is at its SOC reserve (no
+// discharge headroom), the cap is physically unmeetable — the optimizer cannot
+// offset the load — and it must flag plan.Breach so the hub reports the miss
+// upstream as a 2030.5 CannotComply Response rather than failing silently.
+func TestImportLimit_BatteryFloored_ReportsBreach(t *testing.T) {
+	o := NewDefaultOptimizer()
+	impLim := &model.ActivePower{Value: 1700, Multiplier: 0}
+	st := SystemState{
+		// Night: no solar, battery drained to the reserve floor (20%).
+		Solar: []SolarState{{Name: "pv", PowerW: 0, MaxW: 8000, Connected: true, Energized: true}},
+		Batteries: []BatteryState{{
+			Name: "bat", PowerW: 0, SOC: 20, MaxChargeW: 5000, MaxDischargeW: 5000,
+			Connected: true, Energized: true,
+		}},
+		Grid: GridState{
+			NetW: 2500, ExportLimitW: math.NaN(), ImportLimitW: math.NaN(), MaxLimitW: math.NaN(),
+		},
+		CSIPControl: &CSIPControlState{
+			Source: "event", MRID: "EVT-IMP-1",
+			Base: model.DERControlBase{OpModImpLimW: impLim},
+		},
+	}
+
+	plan := o.Optimize(st)
+
+	if plan.Breach == nil {
+		t.Fatal("expected a compliance breach (import cap unmeetable with battery at reserve), got none")
+	}
+	if plan.Breach.LimitType != "import" {
+		t.Errorf("breach LimitType = %q, want \"import\"", plan.Breach.LimitType)
+	}
+	if plan.Breach.MRID != "EVT-IMP-1" {
+		t.Errorf("breach MRID = %q, want the active control's mRID", plan.Breach.MRID)
+	}
+	if plan.Breach.ShortfallW <= 0 {
+		t.Errorf("breach ShortfallW = %.0f, want > 0 (import %.0f over limit %.0f)",
+			plan.Breach.ShortfallW, plan.Breach.MeasuredW, plan.Breach.LimitW)
+	}
+}
+
+// TestImportLimit_BatteryHasHeadroom_NoBreach is the negative case: with charge
+// in the battery the rule discharges to hold the cap, so no breach is reported.
+func TestImportLimit_BatteryHasHeadroom_NoBreach(t *testing.T) {
+	o := NewDefaultOptimizer()
+	impLim := &model.ActivePower{Value: 1700, Multiplier: 0}
+	st := SystemState{
+		Solar: []SolarState{{Name: "pv", PowerW: 0, MaxW: 8000, Connected: true, Energized: true}},
+		Batteries: []BatteryState{{
+			Name: "bat", PowerW: 0, SOC: 80, MaxChargeW: 5000, MaxDischargeW: 5000,
+			Connected: true, Energized: true,
+		}},
+		Grid: GridState{
+			NetW: 2500, ExportLimitW: math.NaN(), ImportLimitW: math.NaN(), MaxLimitW: math.NaN(),
+		},
+		CSIPControl: &CSIPControlState{
+			Source: "event", MRID: "EVT-IMP-2",
+			Base: model.DERControlBase{OpModImpLimW: impLim},
+		},
+	}
+
+	plan := o.Optimize(st)
+
+	if plan.Breach != nil {
+		t.Errorf("unexpected breach: %+v (battery had discharge headroom to meet the cap)", plan.Breach)
+	}
+}

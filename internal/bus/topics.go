@@ -29,6 +29,13 @@ func BattMetricsTopic(device string) string {
 
 const TopicCSIPControl = "lexa/csip/control"
 
+// TopicCSIPComplianceAlert is published by the hub (orchestrator) when the
+// optimizer cannot meet an active CSIP control limit after exhausting every
+// lever (e.g. an import cap with the battery at its SOC reserve). The
+// northbound service consumes it and POSTs a 2030.5 CannotComply Response so
+// the grid server is told the DER is resource-limited.
+const TopicCSIPComplianceAlert = "lexa/csip/compliance/alert"
+
 // Pricing, billing, and flow reservation topics (IEEE 2030.5 §10.5/10.7/10.9).
 const (
 	TopicCSIPPricing   = "lexa/csip/pricing"

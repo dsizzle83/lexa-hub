@@ -283,6 +283,21 @@ type Decision struct {
 	Impact string // what it changes
 }
 
+// ComplianceBreach reports a CSIP control limit the optimizer could not honour
+// this tick after exhausting every lever — e.g. an import cap that would need
+// the battery to discharge below its SOC reserve, or an export/generation cap
+// the inverters cannot curtail far enough. It is informational: the limit is
+// still violated, but the hub reports it upstream as a 2030.5 CannotComply
+// Response so the grid server knows the DER is resource-limited, not faulty.
+type ComplianceBreach struct {
+	MRID       string  // active DERControl that cannot be met
+	LimitType  string  // "import" | "export" | "generation"
+	LimitW     float64 // commanded limit (W)
+	MeasuredW  float64 // actual net/generation at the meter (W)
+	ShortfallW float64 // how far over the limit, after all levers (W)
+	Reason     string  // human-readable cause, e.g. "battery at SOC reserve"
+}
+
 // Plan is the optimizer's output: a set of commands plus a decision trace.
 type Plan struct {
 	Timestamp time.Time
@@ -293,6 +308,9 @@ type Plan struct {
 
 	// Decisions records why each command was issued, for observability.
 	Decisions []Decision
+
+	// Breach, when non-nil, flags a CSIP limit that could not be met this tick.
+	Breach *ComplianceBreach
 }
 
 // AddDecision appends a Decision to the plan's trace.

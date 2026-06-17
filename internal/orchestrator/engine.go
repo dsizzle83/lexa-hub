@@ -68,6 +68,9 @@ type Engine struct {
 	planMu   sync.RWMutex
 	lastPlan Plan
 
+	// planObserver, when non-nil, is called with every Plan after it is computed.
+	planObserver func(Plan)
+
 	// Debug mode: print full decision trace on every tick.
 	Debug bool
 
@@ -86,6 +89,10 @@ type Config struct {
 	Debug bool
 	// Planner holds the daily-planner asset and scheduling configuration.
 	Planner PlannerCfg
+	// PlanObserver, when set, is called with every Plan right after it is
+	// computed (before actuation). Used by cmd/hub to forward compliance
+	// breaches to the northbound service. Must not block.
+	PlanObserver func(Plan)
 }
 
 // New creates an Engine.  Call RegisterBatteryActuator, RegisterSolarActuator,
@@ -105,6 +112,7 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 		planner:        NewDailyPlanner(),
 		plannerCfg:     cfg.Planner,
 		plannerWake:    make(chan struct{}, 1),
+		planObserver:   cfg.PlanObserver,
 		Debug:          cfg.Debug,
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
@@ -458,7 +466,11 @@ func (e *Engine) tick() {
 	// 4. Optimize.
 	plan := e.optimizer.Optimize(state)
 
-	// 5. Execute plan.
+	// 5. Notify any observer (e.g. compliance-breach forwarding) before
+	// actuation, then execute the plan.
+	if e.planObserver != nil {
+		e.planObserver(plan)
+	}
 	e.executePlan(plan)
 
 	// 6. Store plan for external inspection (e.g. /status endpoint).

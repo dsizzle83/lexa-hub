@@ -195,6 +195,23 @@ func main() {
 		log.Printf("lexa-northbound: subscribe flowreservation/request: %v", token.Error())
 	}
 
+	// Subscribe to compliance-breach alerts from the hub. On the onset of a
+	// breach the hub cannot meet an active control limit (e.g. an import cap
+	// with the battery drained); post a CannotComply Response so the grid
+	// server knows the DER is resource-limited. On clear, reset the episode
+	// guard so a future breach re-alerts.
+	if err := mqttutil.Subscribe(mc, bus.TopicCSIPComplianceAlert, func(_ string, alert bus.ComplianceAlert) {
+		if alert.Active {
+			log.Printf("lexa-northbound: compliance breach %s limit=%.0fW measured=%.0fW (%s) → CannotComply mrid=%s",
+				alert.LimitType, alert.LimitW, alert.MeasuredW, alert.Reason, alert.MRID)
+			respTracker.alertCannotComply(alert.MRID)
+		} else {
+			respTracker.clearAlerts()
+		}
+	}); err != nil {
+		log.Printf("lexa-northbound: subscribe compliance alert: %v", err)
+	}
+
 	// Run the first discovery immediately, then loop.
 	go func() {
 		runDiscovery(mc, fetcherDisc, lfdi, sched, respTracker, frManager, cfg)
@@ -641,6 +658,13 @@ type responseTracker struct {
 	// reached a terminal state (Completed/Cancelled/Superseded).
 	posted     map[string]uint8
 	activeMRID string
+	// alerted records mRIDs for which a CannotComply Response has been posted
+	// in the current breach episode, so a redelivered MQTT alert does not
+	// double-post. Cleared when the hub signals the breach has cleared.
+	alerted map[string]bool
+	// mu guards the tracker: update() runs on the discovery goroutine while
+	// alertCannotComply()/clearAlerts() run on the MQTT subscription goroutine.
+	mu sync.Mutex
 }
 
 func newResponseTracker(p responsePoster, lfdi, path string) *responseTracker {
@@ -649,7 +673,28 @@ func newResponseTracker(p responsePoster, lfdi, path string) *responseTracker {
 		lfdi:            lfdi,
 		responseSetPath: path,
 		posted:          make(map[string]uint8),
+		alerted:         make(map[string]bool),
 	}
+}
+
+// alertCannotComply posts a single CannotComply Response for mrid per breach
+// episode. The hub already edge-triggers the alert, but the per-mRID guard
+// makes a redelivered MQTT message idempotent.
+func (rt *responseTracker) alertCannotComply(mrid string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.alerted[mrid] {
+		return
+	}
+	rt.alerted[mrid] = true
+	rt.postResponse(mrid, model.ResponseCannotComply)
+}
+
+// clearAlerts ends the current breach episode so a future breach re-alerts.
+func (rt *responseTracker) clearAlerts() {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.alerted = make(map[string]bool)
 }
 
 // terminalResponse reports whether a response status ends an event's lifecycle:
@@ -670,6 +715,8 @@ func terminalResponse(status uint8) bool {
 // (CORE-023). superseded is the set of currently-superseded event mRIDs from
 // scheduler.SupersededMRIDs.
 func (rt *responseTracker) update(tree *discovery.ResourceTree, active *scheduler.ActiveControl, superseded map[string]bool) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	rt.clockOffset = tree.ClockOffset
 	serverNow := scheduler.ServerNow(tree.ClockOffset)
 
@@ -760,6 +807,10 @@ func (rt *responseTracker) postResponse(mrid string, status uint8) {
 		log.Printf("lexa-northbound: POST response (mrid=%s status=%d): %v", mrid, status, err)
 		return
 	}
-	names := map[uint8]string{1: "Received", 2: "Started", 3: "Completed", 6: "Cancelled", 7: "Superseded"}
-	log.Printf("lexa-northbound: response posted: %s mrid=%s", names[status], mrid)
+	names := map[uint8]string{1: "Received", 2: "Started", 3: "Completed", 6: "Cancelled", 7: "Superseded", model.ResponseCannotComply: "CannotComply"}
+	name := names[status]
+	if name == "" {
+		name = fmt.Sprintf("status=%d", status)
+	}
+	log.Printf("lexa-northbound: response posted: %s mrid=%s", name, mrid)
 }

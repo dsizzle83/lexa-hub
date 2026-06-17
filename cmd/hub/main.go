@@ -76,10 +76,43 @@ func main() {
 		opt.EVImportCooldownCycles = 4
 	}
 
+	// Compliance-breach alerter. The optimizer flags limits it cannot meet
+	// (e.g. an import cap with the battery at its SOC reserve) on plan.Breach.
+	// Publish one ComplianceAlert on the onset of a breach and one on the clear,
+	// edge-triggered, so the northbound service POSTs exactly one CannotComply
+	// Response per episode rather than spamming one per tick.
+	breachActive := false
+	planObserver := func(plan orchestrator.Plan) {
+		now := time.Now().Unix()
+		switch {
+		case plan.Breach != nil && !breachActive:
+			breachActive = true
+			b := plan.Breach
+			log.Printf("lexa-hub: COMPLIANCE BREACH %s limit=%.0fW measured=%.0fW shortfall=%.0fW (%s) mrid=%s",
+				b.LimitType, b.LimitW, b.MeasuredW, b.ShortfallW, b.Reason, b.MRID)
+			if err := mqttutil.PublishJSON(mc, bus.TopicCSIPComplianceAlert, bus.ComplianceAlert{
+				MRID: b.MRID, LimitType: b.LimitType, LimitW: b.LimitW,
+				MeasuredW: b.MeasuredW, ShortfallW: b.ShortfallW, Reason: b.Reason,
+				Active: true, Ts: now,
+			}); err != nil {
+				log.Printf("lexa-hub: publish compliance alert: %v", err)
+			}
+		case plan.Breach == nil && breachActive:
+			breachActive = false
+			log.Printf("lexa-hub: compliance breach cleared")
+			if err := mqttutil.PublishJSON(mc, bus.TopicCSIPComplianceAlert, bus.ComplianceAlert{
+				Active: false, Ts: now,
+			}); err != nil {
+				log.Printf("lexa-hub: publish compliance clear: %v", err)
+			}
+		}
+	}
+
 	eng := orchestrator.New(reader, opt, orchestrator.Config{
-		Interval: cfg.EngineInterval(),
-		Debug:    cfg.Debug,
-		Planner:  cfg.Planner,
+		Interval:     cfg.EngineInterval(),
+		Debug:        cfg.Debug,
+		Planner:      cfg.Planner,
+		PlanObserver: planObserver,
 	})
 
 	// Subscribe to all state topics.

@@ -221,6 +221,12 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// Final: restore unconstrained devices so prior setpoints don't persist.
 	applyRestoreRule(state.Solar, batteries, o.SOCReserve, &plan)
 
+	// Stamp the active control's mRID onto any breach so the northbound service
+	// can address the CannotComply Response to the right event.
+	if plan.Breach != nil && state.CSIPControl != nil {
+		plan.Breach.MRID = state.CSIPControl.MRID
+	}
+
 	return plan
 }
 
@@ -844,6 +850,32 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		desiredCeilingW = 0
 	}
 
+	// Feed-forward proactive curtailment as the battery weans off near full SOC.
+	// The feedback controller above only reacts to export it has already
+	// measured, so when the battery's SOC taper (or saturation) removes its
+	// absorption, generation overshoots the cap and the controller chases it
+	// down a tick or more late — the sustained midday export violations in the
+	// 92-day replay. While the battery is winding down (predicted next-tick
+	// absorption below this tick's), lead the curtailment: bound the ceiling by
+	// the sinks that will actually exist next tick — home load + the battery's
+	// PREDICTED tapered absorption + commanded EV draw + the conservative export
+	// headroom. This only ever tightens the ceiling and engages only during the
+	// taper, so the tuned steady-state feedback path is unchanged.
+	if predictedBatteryAbsorbW < batteryAbsorbW {
+		homeSinkW := totalSolarW - actualExportW - measuredBatteryAbsorbW - evseW
+		if homeSinkW < 0 {
+			homeSinkW = 0
+		}
+		evCmdW := 0.0
+		if !math.IsNaN(o.expGuard.evCmdW) {
+			evCmdW = o.expGuard.evCmdW
+		}
+		feedForwardCeilingW := homeSinkW + predictedBatteryAbsorbW + evCmdW + conservativeW
+		if feedForwardCeilingW < desiredCeilingW {
+			desiredCeilingW = math.Max(0, feedForwardCeilingW)
+		}
+	}
+
 	// Slew-limit the ceiling change to damp hunting under the bench meter's
 	// ~1-tick lag.  After we curtail, the linked metersim keeps reporting the old
 	// (higher) export for a tick, so the raw error stays large and the integrator
@@ -904,6 +936,20 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 					desiredCeilingW, limits.exportLimitW, actualExportW),
 				fmt.Sprintf("solar %s %.0fW → %.0fW", sol.Name, sol.PowerW, curtailTo))
 		}
+	}
+
+	// Compliance breach: generation is curtailed essentially to zero yet the
+	// site still exports over the hard limit (e.g. an islanded surplus with no
+	// load and a full battery). Curtailing to zero is the last lever, so report
+	// it upstream rather than silently missing the cap.
+	if actualExportW > limits.exportLimitW+complianceBreachW && desiredCeilingW <= complianceBreachW {
+		o.recordBreach(plan, &ComplianceBreach{
+			LimitType:  "export",
+			LimitW:     limits.exportLimitW,
+			MeasuredW:  actualExportW,
+			ShortfallW: actualExportW - limits.exportLimitW,
+			Reason:     "generation curtailed to minimum; battery and EV cannot absorb the surplus",
+		})
 	}
 
 	return batteries, surplusW
@@ -1477,7 +1523,52 @@ func (o *DefaultOptimizer) applyImportLimitRule(batteries []BatteryState, limits
 		// guard so we don't carry a phantom setpoint.
 		o.impGuard.dischargeW = math.NaN()
 	}
+
+	// Compliance breach: the site is over the hard import limit and the battery
+	// has no discharge headroom left to close the gap (all packs at/below the
+	// SOC reserve, or already maxed). This is a physically unavoidable miss —
+	// with no stored energy the hub cannot offset the load — but the grid server
+	// must be told the cap is not being met. `remaining` is the discharge we
+	// still needed but could not command.
+	if importW > limits.importLimitW && remaining > complianceBreachW {
+		o.recordBreach(plan, &ComplianceBreach{
+			LimitType:  "import",
+			LimitW:     limits.importLimitW,
+			MeasuredW:  importW,
+			ShortfallW: importW - limits.importLimitW,
+			Reason:     batteryHeadroomReason(result, socReserve),
+		})
+	}
 	return result
+}
+
+// complianceBreachW is the discharge/curtailment shortfall (W) below which a
+// limit miss is treated as measurement noise rather than a reportable breach.
+const complianceBreachW = 100.0
+
+// recordBreach attaches a breach to the plan, keeping the worst (largest
+// shortfall) when more than one rule reports one in the same tick.
+func (o *DefaultOptimizer) recordBreach(plan *Plan, b *ComplianceBreach) {
+	if plan.Breach == nil || b.ShortfallW > plan.Breach.ShortfallW {
+		plan.Breach = b
+	}
+}
+
+// batteryHeadroomReason describes why the battery could not discharge further.
+func batteryHeadroomReason(batteries []BatteryState, socReserve float64) string {
+	lowest := math.NaN()
+	for _, b := range batteries {
+		if !b.Connected {
+			continue
+		}
+		if math.IsNaN(lowest) || b.SOC < lowest {
+			lowest = b.SOC
+		}
+	}
+	if !math.IsNaN(lowest) && lowest <= socReserve {
+		return fmt.Sprintf("battery at SOC reserve (%.0f%% ≤ %.0f%%); no discharge headroom", lowest, socReserve)
+	}
+	return "battery discharge headroom exhausted (at MaxDischargeW)"
 }
 
 // applyRestoreRule sends restore commands for devices that received no command this
