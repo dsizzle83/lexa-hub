@@ -202,15 +202,19 @@ func TestExportLimit_NoReleaseWhenBatteryCreditCancelsExport(t *testing.T) {
 	}
 }
 
-// TestExportLimit_CeilingSlewLimited guards the tight-cap anti-hunting slew:
-// after the controller has curtailed, the bench's linked meter keeps reporting
-// the old (higher) export for ~1 tick, so the raw integrator error stays large.
-// Without a slew limit the ceiling slams toward 0 W (over-curtail), then flings
-// back up into a re-violation — the 5.0→0→climb→over hunt seen on seed 99 day-0.
-// One tick must not drop the ceiling by more than the slew cap (1.5 kW).
-func TestExportLimit_CeilingSlewLimited(t *testing.T) {
+// TestExportLimit_FeedForwardSaturationCurtail guards the feed-forward fix for
+// battery saturation. Mid-episode the ceiling has relaxed back toward nameplate
+// while the battery absorbed; the instant the pack hits full SOC it stops
+// absorbing and — under the bench meter's ~1 tick lag — the slew-limited
+// feedback alone keeps generation high for a tick or more, over-exporting (the
+// dominant remaining exportCap misses in the 92-day replay). The feed-forward
+// term must lead this: drop the ceiling to the load + conservative-export target
+// in ONE tick, bypassing the down-slew (a saturation-driven drop is
+// deterministic, not meter-lag noise), yet floored at the conservative target so
+// a stale-high export reading cannot crater it toward 0 and hunt.
+func TestExportLimit_FeedForwardSaturationCurtail(t *testing.T) {
 	o := NewDefaultOptimizer()
-	// Mid-episode: already curtailed to a 4 kW ceiling.
+	// Mid-episode: already relaxed up to a 4 kW ceiling while the battery absorbed.
 	o.expGuard = exportGuard{
 		evSetpointA: math.NaN(), evCmdW: math.NaN(), batteryAbsorbW: math.NaN(),
 		activeLimitW: 2000, filteredExportW: 5000, solarCeilingW: 4000,
@@ -232,15 +236,22 @@ func TestExportLimit_CeilingSlewLimited(t *testing.T) {
 
 	o.Optimize(st)
 
-	// Prior ceiling 4000 W; the slew cap is 1.5 kW/tick, so the new ceiling must
-	// not fall below 2500 W on this single tick (it must still curtail, just not
-	// crater to 0).
-	if o.expGuard.solarCeilingW < 2500 {
-		t.Errorf("ceiling dropped to %.0fW in one tick (prev 4000W); slew limit (1.5kW) should hold it ≥2500W — would over-curtail toward 0 and hunt",
+	// Battery full → no absorption, so the compliant ceiling is load + the
+	// conservative-export target ≈ 0 + 1600 W. The feed-forward reaches it in one
+	// tick, bypassing the 1.5 kW/tick slew that would otherwise hold it at 2500 W
+	// — itself a 2500 W export over the 2000 W cap. Without the fix (gate
+	// `predicted < commanded` = 0 < 0 for a full battery) the ceiling would sit at
+	// the slew-limited 2500 W and over-export.
+	if o.expGuard.solarCeilingW > 2000 {
+		t.Errorf("ceiling = %.0fW exceeds the 2000W cap — feed-forward did not curtail a full battery's surplus (slew-limited stall)",
 			o.expGuard.solarCeilingW)
 	}
-	if o.expGuard.solarCeilingW >= 4000 {
-		t.Errorf("ceiling = %.0fW did not tighten at all while over the cap", o.expGuard.solarCeilingW)
+	// But it must NOT crater toward 0: the feed-forward is floored at the
+	// conservative export target, so the stale-high 5 kW export reading cannot
+	// collapse the ceiling and hunt.
+	if o.expGuard.solarCeilingW < 1400 {
+		t.Errorf("ceiling cratered to %.0fW — feed-forward must floor near the conservative target (~1600W), not collapse toward 0",
+			o.expGuard.solarCeilingW)
 	}
 }
 

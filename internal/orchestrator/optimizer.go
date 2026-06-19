@@ -850,41 +850,17 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		desiredCeilingW = 0
 	}
 
-	// Feed-forward proactive curtailment as the battery weans off near full SOC.
-	// The feedback controller above only reacts to export it has already
-	// measured, so when the battery's SOC taper (or saturation) removes its
-	// absorption, generation overshoots the cap and the controller chases it
-	// down a tick or more late — the sustained midday export violations in the
-	// 92-day replay. While the battery is winding down (predicted next-tick
-	// absorption below this tick's), lead the curtailment: bound the ceiling by
-	// the sinks that will actually exist next tick — home load + the battery's
-	// PREDICTED tapered absorption + commanded EV draw + the conservative export
-	// headroom. This only ever tightens the ceiling and engages only during the
-	// taper, so the tuned steady-state feedback path is unchanged.
-	if predictedBatteryAbsorbW < batteryAbsorbW {
-		homeSinkW := totalSolarW - actualExportW - measuredBatteryAbsorbW - evseW
-		if homeSinkW < 0 {
-			homeSinkW = 0
-		}
-		evCmdW := 0.0
-		if !math.IsNaN(o.expGuard.evCmdW) {
-			evCmdW = o.expGuard.evCmdW
-		}
-		feedForwardCeilingW := homeSinkW + predictedBatteryAbsorbW + evCmdW + conservativeW
-		if feedForwardCeilingW < desiredCeilingW {
-			desiredCeilingW = math.Max(0, feedForwardCeilingW)
-		}
-	}
-
-	// Slew-limit the ceiling change to damp hunting under the bench meter's
-	// ~1-tick lag.  After we curtail, the linked metersim keeps reporting the old
-	// (higher) export for a tick, so the raw error stays large and the integrator
-	// would slam the ceiling to 0 W (over-curtail) and then, once the meter
-	// catches up and momentarily under-reports, fling it back up into a
+	// Slew-limit the FEEDBACK ceiling change to damp hunting under the bench
+	// meter's ~1-tick lag.  After we curtail, the linked metersim keeps reporting
+	// the old (higher) export for a tick, so the raw error stays large and the
+	// integrator would slam the ceiling to 0 W (over-curtail) and then, once the
+	// meter catches up and momentarily under-reports, fling it back up into a
 	// re-violation — the 5.0→0→climb→over hunt observed on tight caps (seed 99
 	// day-0, 1.5 kW cap).  Tightening is allowed faster than relaxing: defend the
 	// cap quickly, give generation back slowly.  Skipped on the first tick of an
 	// episode (NaN prev) so onset still takes the full one-step correction.
+	// The feed-forward term below is applied AFTER this and deliberately bypasses
+	// the down-slew (see there).
 	if !math.IsNaN(prevCeilingW) {
 		const maxDropW = 1500.0 // tighten ≤1.5 kW/tick
 		const maxRiseW = 500.0  // relax ≤0.5 kW/tick
@@ -896,6 +872,38 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		if desiredCeilingW < 0 {
 			desiredCeilingW = 0
 		}
+	}
+
+	// Feed-forward proactive curtailment. The feedback controller above only
+	// reacts to export it has already measured, so when the battery stops
+	// absorbing — whether tapering near full SOC or fully saturated — generation
+	// overshoots the cap and the slew-limited feedback chases it down a tick or
+	// more late (the sustained midday export violations in the 92-day replay,
+	// worst at the instant the pack hits SOCFullThreshold). Lead the curtailment:
+	// bound the ceiling by the sinks that will actually exist next tick — home
+	// load + the battery's PREDICTED absorption + commanded EV draw + the
+	// conservative export headroom.
+	//
+	// Always applied, with NO gate: when the battery is ramping up its absorption
+	// the predicted term is large so this evaluates to ≈ nameplate and never
+	// bites (the tuned charging path is unchanged); it only tightens when the
+	// battery won't absorb the surplus — including when it is already full, where
+	// the battery loop has set the commanded absorption to 0 (the case a
+	// "predicted < commanded" gate used to miss entirely). It also BYPASSES the
+	// down-slew above: a saturation/taper-driven drop is deterministic, not
+	// measured-feedback noise, so it is safe to apply in one tick — the same
+	// reasoning the battery-absorb ratchet uses to let taper-driven drops through.
+	homeSinkW := totalSolarW - actualExportW - measuredBatteryAbsorbW - evseW
+	if homeSinkW < 0 {
+		homeSinkW = 0
+	}
+	evCmdW := 0.0
+	if !math.IsNaN(o.expGuard.evCmdW) {
+		evCmdW = o.expGuard.evCmdW
+	}
+	feedForwardCeilingW := homeSinkW + predictedBatteryAbsorbW + evCmdW + conservativeW
+	if feedForwardCeilingW < desiredCeilingW {
+		desiredCeilingW = math.Max(0, feedForwardCeilingW)
 	}
 
 	// Sticky ceiling, never released to free-running mid-episode.  When the loop
