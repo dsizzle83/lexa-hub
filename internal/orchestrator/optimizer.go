@@ -34,6 +34,25 @@ type importGuard struct {
 	activeLimitW float64 // limit value when guard was reset; NaN = no active limit
 }
 
+// genGuard carries state across ticks for the generation-limit rule's
+// closed-loop convergence check. Curtailing an inverter to a generation cap is
+// a fire-and-forget Modbus write; a device can ACK the write but lag or reject
+// the actual output change. Without verifying the measured effect the hub would
+// assert a compliance the meter contradicts. overCount counts consecutive ticks
+// the measured generation has stayed over the cap *after* curtailment was
+// commanded, so a sustained non-convergence is told apart from the normal
+// one-or-two-tick ramp-down.
+type genGuard struct {
+	activeLimitW float64 // cap value when guard was reset; NaN = no active cap
+	overCount    int     // consecutive ticks measured generation stayed over the cap
+}
+
+// genBreachTicks is how many consecutive ticks measured generation may stay over
+// the cap (after curtailment is commanded) before the hub reports a CannotComply.
+// Long enough to ride out a normal inverter ramp-down, short enough to surface a
+// device that ACKed the command but is not acting on it.
+const genBreachTicks = 5
+
 // DefaultOptimizer is a rule-based + heuristic optimizer.
 //
 // Priority order:
@@ -93,6 +112,10 @@ type DefaultOptimizer struct {
 
 	// impGuard holds per-limit-session state for the import-limit rule.
 	impGuard importGuard
+
+	// genGuard holds per-cap-session state for the generation-limit rule's
+	// measured-effect convergence check.
+	genGuard genGuard
 }
 
 // NewDefaultOptimizer returns an optimizer with sensible defaults.
@@ -117,6 +140,7 @@ func NewDefaultOptimizer() *DefaultOptimizer {
 			dischargeW:   math.NaN(),
 			activeLimitW: math.NaN(),
 		},
+		genGuard: genGuard{activeLimitW: math.NaN()},
 	}
 }
 
@@ -174,6 +198,8 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// Rule 3.1: Generation limit — curtail inverters so total output ≤ MaxLimW.
 	// Always runs (CSIP compliance cannot be skipped).
 	applyGenLimitRule(state.Solar, limits.maxLimitW, &plan)
+	// Closed-loop check: verify the inverters actually converged to the cap.
+	o.checkGenLimitConvergence(state.Solar, limits.maxLimitW, &plan)
 
 	// Rule 3.5: Import limit enforcement — discharge battery to reduce grid import.
 	batteries = o.applyImportLimitRule(batteries, limits, state.Grid.NetW, o.SOCReserve, &plan)
@@ -1014,6 +1040,55 @@ func applyGenLimitRule(solar []SolarState, maxLimitW float64, plan *Plan) {
 	plan.AddDecision("csip/gen-limit",
 		fmt.Sprintf("generation cap %.0fW (held continuously)", maxLimitW),
 		fmt.Sprintf("ceiling %d inverters to ≤ %.0fW total", curtailed, maxLimitW))
+}
+
+// checkGenLimitConvergence verifies the inverters actually honoured the
+// generation cap that applyGenLimitRule just commanded. Commanding the ceiling
+// is the only lever for a generation limit, so if the MEASURED output stays
+// over the cap for genBreachTicks consecutive ticks, the command is not taking
+// effect at the device — it ACKed the Modbus write but did not act on it, or
+// rejected it. Rather than asserting a compliance the meter contradicts, record
+// a breach so the hub POSTs a 2030.5 CannotComply. This is the measured-effect
+// half of closed-loop actuation: applyGenLimitRule issues the command, this
+// confirms the device converged.
+//
+// A short overage is normal (the inverter ramps down over a tick or two), so the
+// breach is gated on a sustained miss. The guard resets when the cap changes or
+// clears.
+func (o *DefaultOptimizer) checkGenLimitConvergence(solar []SolarState, maxLimitW float64, plan *Plan) {
+	if math.IsNaN(maxLimitW) {
+		o.genGuard = genGuard{activeLimitW: math.NaN()} // cap cleared — reset
+		return
+	}
+	if maxLimitW != o.genGuard.activeLimitW {
+		o.genGuard = genGuard{activeLimitW: maxLimitW} // new cap session — reset
+	}
+
+	measuredGenW := 0.0
+	for _, sol := range solar {
+		if sol.Connected && sol.PowerW > 0 {
+			measuredGenW += sol.PowerW
+		}
+	}
+
+	if measuredGenW > maxLimitW+complianceBreachW {
+		o.genGuard.overCount++
+	} else {
+		o.genGuard.overCount = 0
+	}
+
+	if o.genGuard.overCount >= genBreachTicks {
+		o.recordBreach(plan, &ComplianceBreach{
+			LimitType:  "generation",
+			LimitW:     maxLimitW,
+			MeasuredW:  measuredGenW,
+			ShortfallW: measuredGenW - maxLimitW,
+			Reason:     "inverter output remains above the generation cap after curtailment was commanded — the device is not honouring the command",
+		})
+		plan.AddDecision("csip/gen-limit",
+			fmt.Sprintf("generation %.0fW still over cap %.0fW after %d ticks", measuredGenW, maxLimitW, o.genGuard.overCount),
+			"reporting CannotComply — inverter not converging to the commanded ceiling")
+	}
 }
 
 // applySelfConsumptionRule routes solar surplus into connected batteries.

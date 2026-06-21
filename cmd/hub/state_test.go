@@ -79,8 +79,10 @@ func TestBusToCSIPControlLargeLimits(t *testing.T) {
 }
 
 // TestReadSystemState_ExpiredCSIPControlDropped is the C5 regression: the
-// retained CSIP control must not be enforced past its ValidUntil when
-// lexa-northbound stops refreshing it.
+// retained CSIP control must eventually stop being enforced past its ValidUntil
+// when lexa-northbound stops refreshing it — but only after the expiry is
+// confirmed sustained (expiryConfirmTicks), so a transient clock jump can't drop
+// a still-valid control (see TestReadSystemState_ClockLurchKeepsControl).
 func TestReadSystemState_ExpiredCSIPControlDropped(t *testing.T) {
 	r := newMQTTSystemReader(nil)
 	expLim := 5000.0
@@ -88,23 +90,61 @@ func TestReadSystemState_ExpiredCSIPControlDropped(t *testing.T) {
 		Source:     "event",
 		MRID:       "expired-evt",
 		ExpLimW:    &expLim,
-		ValidUntil: time.Now().Unix() - 10, // already past
+		ValidUntil: time.Now().Unix() - 10, // already past in server time
 	})
 
-	state, err := r.ReadSystemState()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.CSIPControl != nil {
-		t.Errorf("expected expired CSIP control to be dropped, got source=%s mrid=%s",
-			state.CSIPControl.Source, state.CSIPControl.MRID)
+	// During the confirm window the cap is STILL enforced — a sustained expiry,
+	// not a single excursion, is what drops it.
+	for i := 0; i < expiryConfirmTicks-1; i++ {
+		state, err := r.ReadSystemState()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.CSIPControl == nil {
+			t.Fatalf("control dropped on tick %d; it must persist through the confirm window", i+1)
+		}
 	}
 
-	// The stored value is cleared, so subsequent reads stay clean (and the
-	// expiry is logged once, not every tick).
+	// The tick that confirms sustained expiry drops it.
+	state, _ := r.ReadSystemState()
+	if state.CSIPControl != nil {
+		t.Errorf("expected sustained-expired control to be dropped after %d ticks, got mrid=%s",
+			expiryConfirmTicks, state.CSIPControl.MRID)
+	}
+	// Stays gone.
 	state, _ = r.ReadSystemState()
 	if state.CSIPControl != nil {
-		t.Error("expected CSIP control to stay nil on subsequent reads")
+		t.Error("expected CSIP control to stay nil after drop")
+	}
+}
+
+// TestReadSystemState_ClockLurchKeepsControl is the clock-lurch regression: a
+// non-monotonic server clock that repeatedly jumps past ValidUntil and back must
+// NOT drop a control that is still valid once the clock settles. Before the fix,
+// the first forward excursion deleted the control and the back-jump could not
+// restore it, so the hub silently stopped enforcing the cap.
+func TestReadSystemState_ClockLurchKeepsControl(t *testing.T) {
+	r := newMQTTSystemReader(nil)
+	expLim := 5000.0
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
+		Source:     "event",
+		MRID:       "lurch-evt",
+		ExpLimW:    &expLim,
+		ValidUntil: time.Now().Unix() + 300, // 5 min out in server time
+	})
+
+	// Alternate a +2h offset (server-now past ValidUntil) with a normal offset,
+	// many times. The control must be enforced on every tick.
+	for i := 0; i < 12; i++ {
+		if i%2 == 0 {
+			r.clockOffset = 7200 // lurch forward, past ValidUntil
+		} else {
+			r.clockOffset = 0 // settled, well inside the window
+		}
+		state, _ := r.ReadSystemState()
+		if state.CSIPControl == nil {
+			t.Fatalf("control dropped during clock lurch (tick %d) — the cap must stay enforced", i)
+		}
 	}
 }
 
@@ -137,5 +177,31 @@ func TestReadSystemState_ActiveCSIPControlKept(t *testing.T) {
 				t.Errorf("MRID = %s, want live-evt", state.CSIPControl.MRID)
 			}
 		})
+	}
+}
+
+// TestNoteStaleness_EdgeTriggers verifies the staleness tracker flips state only
+// on transitions: never-received is not stale, an old snapshot goes stale, and a
+// fresh one recovers. (The log lines are the operator-visible surfacing; here we
+// assert the underlying state the logging is gated on.)
+func TestNoteStaleness_EdgeTriggers(t *testing.T) {
+	r := newMQTTSystemReader([]DeviceConfig{{Name: "meter-0", Role: "meter"}})
+	now := time.Now()
+
+	r.noteStaleness("meter-0", measSnapshot{at: time.Time{}}, now)
+	if r.stale["meter-0"] {
+		t.Fatal("a never-received source must not be marked stale (startup, not a transition)")
+	}
+	r.noteStaleness("meter-0", measSnapshot{at: now.Add(-time.Second)}, now)
+	if r.stale["meter-0"] {
+		t.Fatal("a fresh source must not be stale")
+	}
+	r.noteStaleness("meter-0", measSnapshot{at: now.Add(-measStaleAfter - time.Second)}, now)
+	if !r.stale["meter-0"] {
+		t.Fatal("a source older than measStaleAfter must be marked stale")
+	}
+	r.noteStaleness("meter-0", measSnapshot{at: now}, now)
+	if r.stale["meter-0"] {
+		t.Fatal("a recovered source must clear stale")
 	}
 }

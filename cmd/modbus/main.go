@@ -16,11 +16,14 @@
 package main
 
 import (
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"math"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -56,11 +59,20 @@ func main() {
 	// Open each device; log failures but continue so other devices still poll.
 	for _, dc := range cfg.Devices {
 		dev, err := openDevice(dc)
-		if err != nil {
-			log.Printf("lexa-modbus: device %s (%s): %v — will retry", dc.Name, dc.URL, err)
-			dev = &retryDevice{cfg: dc}
+		if errors.Is(err, errUnknownRole) {
+			log.Printf("lexa-modbus: device %s: %v — skipping", dc.Name, err)
+			continue
 		}
-		reg.Add(&registry.Entry{Name: dc.Name, Addr: dc.URL, Device: dev})
+		// Wrap EVERY device so a mid-session drop reconnects, not just ones that
+		// failed the initial open. A device that opened cleanly and later lost its
+		// session would otherwise error forever.
+		rd := &retryDevice{cfg: dc}
+		if err != nil {
+			log.Printf("lexa-modbus: device %s (%s): %v — will reconnect on next poll", dc.Name, dc.URL, err)
+		} else {
+			rd.live = dev
+		}
+		reg.Add(&registry.Entry{Name: dc.Name, Addr: dc.URL, Device: rd})
 		log.Printf("lexa-modbus: registered device %s role=%s url=%s", dc.Name, dc.Role, dc.URL)
 	}
 
@@ -82,6 +94,11 @@ func main() {
 	log.Println("lexa-modbus: shutting down")
 }
 
+// errUnknownRole marks a device whose role is not recognized. It is a
+// permanent configuration error, so the caller skips the device rather
+// than wrapping it in a retry loop.
+var errUnknownRole = errors.New("unknown device role")
+
 // openDevice creates a live device connection based on role.
 func openDevice(dc DeviceConfig) (device.Device, error) {
 	switch dc.Role {
@@ -92,7 +109,7 @@ func openDevice(dc DeviceConfig) (device.Device, error) {
 	case "meter":
 		return meter.New(dc.URL, 5*time.Second, dc.UnitID)
 	default:
-		return nil, nil // unknown role, will be skipped
+		return nil, fmt.Errorf("%w %q for device %q (want inverter|battery|meter)", errUnknownRole, dc.Role, dc.Name)
 	}
 }
 
@@ -185,11 +202,11 @@ func battCommandToControl(cmd bus.BattCommand) model.DERControlBase {
 	}
 	w := *cmd.SetpointW
 	if w >= 0 {
-		v := clamp16(w)
-		ctrl.OpModExpLimW = &model.ActivePower{Value: v, Multiplier: 0}
+		ap := activePowerFromWatts(w)
+		ctrl.OpModExpLimW = &ap
 	} else {
-		v := clamp16(-w)
-		ctrl.OpModImpLimW = &model.ActivePower{Value: v, Multiplier: 0}
+		ap := activePowerFromWatts(-w)
+		ctrl.OpModImpLimW = &ap
 	}
 	return ctrl
 }
@@ -198,69 +215,136 @@ func battCommandToControl(cmd bus.BattCommand) model.DERControlBase {
 // Nil CurtailToW restores full nameplate generation.
 func solarCommandToControl(cmd bus.SolarCommand) model.DERControlBase {
 	if cmd.CurtailToW == nil {
-		// Restore: command the ceiling to full nameplate. The device clamps the
-		// value to WMax, so WMaxLimPct → 100% (no effective curtailment). An
+		// Restore: command the ceiling far above any nameplate. The device clamps
+		// the value to WMax, so WMaxLimPct → 100% (no effective curtailment). An
 		// EMPTY control would be a silent no-op — Base.ApplyControl only ever
 		// *sets* the ceiling — leaving the inverter stuck at its last curtailment.
-		return model.DERControlBase{OpModMaxLimW: &model.ActivePower{Value: math.MaxInt16, Multiplier: 0}}
+		// Encoded via the multiplier so it stays above WMax even for systems
+		// larger than the int16 watt range (a raw 32767 W ceiling would itself
+		// curtail anything above 32.7 kW).
+		ap := activePowerFromWatts(restoreCeilingW)
+		return model.DERControlBase{OpModMaxLimW: &ap}
 	}
-	v := clamp16(math.Max(0, *cmd.CurtailToW))
-	return model.DERControlBase{
-		OpModMaxLimW: &model.ActivePower{Value: v, Multiplier: 0},
+	ap := activePowerFromWatts(math.Max(0, *cmd.CurtailToW))
+	return model.DERControlBase{OpModMaxLimW: &ap}
+}
+
+// restoreCeilingW is the "no curtailment" ceiling — far above any
+// residential/commercial nameplate so the device clamps it to WMax.
+const restoreCeilingW = 1e9
+
+// activePowerFromWatts encodes a watt value as a SunSpec ActivePower,
+// scaling into the decimal multiplier so values above the int16 range
+// (> 32.767 kW) are represented faithfully instead of being clipped
+// (audit GS-1/MTR-1: scale into the multiplier, never raw-cast).
+func activePowerFromWatts(w float64) model.ActivePower {
+	if w < 0 {
+		w = 0
+	}
+	mult := int8(0)
+	for w > math.MaxInt16 && mult < 9 {
+		w /= 10
+		mult++
+	}
+	if w > math.MaxInt16 {
+		w = math.MaxInt16 // still over range at multiplier cap: clamp
+	}
+	return model.ActivePower{
+		Value:      int16(math.Round(w)),
+		Multiplier: mult,
 	}
 }
 
-func clamp16(v float64) int16 {
-	if v > 32767 {
-		return 32767
-	}
-	if v < 0 {
-		return 0
-	}
-	return int16(v)
-}
-
-// retryDevice is a placeholder that auto-retries open on every ReadMeasurements call.
+// retryDevice wraps a Modbus device so a connection that breaks mid-session
+// (the device rebooted, the TCP session was severed, a poll timed out) is closed
+// and reopened on the next poll, instead of erroring forever. EVERY device is
+// wrapped — not just ones that failed to open at startup — because the common
+// case is a device that opened fine and later dropped (e.g. a sim restart left
+// the old session emitting "write: broken pipe" on every poll).
+//
+// The mutex serializes all operations on the single Modbus connection: the
+// registry polls ReadMeasurements/Status on its poll goroutine while control
+// writes arrive on the MQTT callback goroutine, and the simonvetter client is
+// not safe for concurrent use — interleaved requests corrupt the stream (itself
+// a likely source of broken-pipe errors).
 type retryDevice struct {
-	cfg  DeviceConfig
+	cfg DeviceConfig
+	// open reconnects the device; nil means use the package openDevice(cfg).
+	// Overridden in tests to inject a fake transport.
+	open func() (device.Device, error)
+	mu   sync.Mutex
 	live device.Device
 }
 
+// reopen establishes a fresh device connection.
+func (r *retryDevice) reopen() (device.Device, error) {
+	if r.open != nil {
+		return r.open()
+	}
+	return openDevice(r.cfg)
+}
+
 func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.live == nil {
-		dev, err := openDevice(r.cfg)
+		dev, err := r.reopen()
 		if err != nil || dev == nil {
-			return device.Measurements{W: math.NaN(), V: math.NaN(), Hz: math.NaN()},
-				err
+			return device.Measurements{W: math.NaN(), V: math.NaN(), Hz: math.NaN()}, err
 		}
 		r.live = dev
 		log.Printf("lexa-modbus: reconnected device %s", r.cfg.Name)
 	}
 	m, err := r.live.ReadMeasurements()
 	if err != nil {
-		_ = r.live.Close() // release fd before clearing the reference
-		r.live = nil       // reset so next poll reconnects
+		r.dropLocked() // drop the dead session so the next poll reconnects
 	}
 	return m, err
 }
 
 func (r *retryDevice) ApplyControl(ctrl model.DERControlBase) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.live == nil {
-		return nil
+		return nil // disconnected; the next ReadMeasurements poll reconnects, then controls resume
 	}
-	return r.live.ApplyControl(ctrl)
+	err := r.live.ApplyControl(ctrl)
+	if err != nil {
+		r.dropLocked()
+	}
+	return err
 }
 
 func (r *retryDevice) Status() (device.DeviceStatus, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.live == nil {
 		return device.DeviceStatus{}, nil
 	}
-	return r.live.Status()
+	st, err := r.live.Status()
+	if err != nil {
+		r.dropLocked()
+	}
+	return st, err
 }
 
 func (r *retryDevice) Close() error {
-	if r.live != nil {
-		return r.live.Close()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.live == nil {
+		return nil
 	}
-	return nil
+	err := r.live.Close()
+	r.live = nil
+	return err
+}
+
+// dropLocked closes and clears the live device so the next poll reconnects.
+// Caller must hold r.mu.
+func (r *retryDevice) dropLocked() {
+	if r.live != nil {
+		_ = r.live.Close() // release the fd before clearing the reference
+		r.live = nil
+		log.Printf("lexa-modbus: device %s session dropped — will reconnect on next poll", r.cfg.Name)
+	}
 }

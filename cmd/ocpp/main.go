@@ -16,6 +16,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"math"
 	"os"
@@ -275,24 +276,40 @@ func (b *mqttBridge) applyCommand(cmd bus.EVSECommand) error {
 		types.ChargingProfileKindAbsolute,
 		[]types.ChargingSchedule{*schedule},
 	)
-	errCh := make(chan error, 1)
+	type spResult struct {
+		status smartcharging.ChargingProfileStatus
+		err    error
+	}
+	resCh := make(chan spResult, 1)
 	callErr := b.csms.SetChargingProfile(
 		cmd.StationID,
 		func(resp *smartcharging.SetChargingProfileResponse, err error) {
-			errCh <- err
+			r := spResult{err: err}
+			if resp != nil {
+				r.status = resp.Status
+			}
+			resCh <- r
 		},
 		evseID, profile,
 	)
 	if callErr != nil {
-		return callErr
+		return fmt.Errorf("SetChargingProfile %s evse=%d call failed: %w", cmd.StationID, evseID, callErr)
 	}
 	t := time.NewTimer(10 * time.Second)
 	defer t.Stop()
 	select {
-	case err := <-errCh:
-		return err
-	case <-t.C:
+	case r := <-resCh:
+		if r.err != nil {
+			return fmt.Errorf("SetChargingProfile %s evse=%d failed: %w", cmd.StationID, evseID, r.err)
+		}
+		// A delivered-but-rejected profile is a failure, not success: the EVSE
+		// kept its previous limit. Surface it instead of assuming convergence.
+		if r.status != smartcharging.ChargingProfileStatusAccepted {
+			return fmt.Errorf("SetChargingProfile %s evse=%d rejected: status=%q", cmd.StationID, evseID, r.status)
+		}
 		return nil
+	case <-t.C:
+		return fmt.Errorf("SetChargingProfile %s evse=%d timed out after 10s", cmd.StationID, evseID)
 	}
 }
 

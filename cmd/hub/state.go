@@ -24,6 +24,13 @@ const (
 	// changes while idle — the longer window avoids flapping an idle-but-
 	// connected station, while a silent active session still expires.
 	evseStaleAfter = 90 * time.Second
+
+	// expiryConfirmTicks is how many consecutive ticks an active CSIP control
+	// must read as past its ValidUntil (in server time) before it is dropped.
+	// It rides out a non-monotonic clock step / lurch (a transient forward jump
+	// past ValidUntil) while still clearing a genuinely-expired control whose
+	// publisher has died within a few ticks.
+	expiryConfirmTicks = 3
 )
 
 // MQTTSystemReader implements orchestrator.SystemReader by maintaining a
@@ -41,11 +48,20 @@ type MQTTSystemReader struct {
 	lastEVSE map[string]evseSnapshot
 
 	// Last resolved CSIP active control from lexa-csip
-	lastCSIP     *bus.ActiveControl
-	clockOffset  int64
+	lastCSIP    *bus.ActiveControl
+	clockOffset int64
+	// csipExpiredTicks counts consecutive ticks lastCSIP has been past its
+	// validity window, so a transient (non-monotonic) clock excursion does not
+	// drop a still-valid control. Reset whenever it is back inside the window.
+	csipExpiredTicks int
+
+	// stale tracks which measurement sources are currently stale, so staleness
+	// is surfaced edge-triggered (one log on going stale, one on recovery)
+	// instead of being silently absorbed by the computed-balance fallback.
+	stale map[string]bool
 
 	// Device configuration for role/capacity lookup
-	devices  []DeviceConfig
+	devices   []DeviceConfig
 	devByName map[string]*DeviceConfig
 }
 
@@ -77,6 +93,7 @@ func newMQTTSystemReader(devices []DeviceConfig) *MQTTSystemReader {
 		lastEVSE:    make(map[string]evseSnapshot),
 		devices:     devices,
 		devByName:   make(map[string]*DeviceConfig),
+		stale:       make(map[string]bool),
 	}
 	for i := range devices {
 		d := &devices[i]
@@ -122,6 +139,33 @@ func (r *MQTTSystemReader) onEVSEState(_ string, msg bus.EVSEState) {
 	r.mu.Unlock()
 }
 
+// noteStaleness edge-triggers a warning when a measurement source goes stale
+// (its publisher died or the bus dropped) and a notice when it recovers. The
+// optimizer already fails safe on stale data — this makes that condition
+// visible instead of silent. A source that has never reported is not warned
+// about (that's startup, not a transition). Caller holds r.mu.
+//
+// Note: this catches a source that stops UPDATING. It cannot catch a sensor
+// that keeps answering with a frozen value (no time-based signal distinguishes
+// that from a genuinely steady reading); detecting that safely needs value-churn
+// analysis that would false-positive against noise-free sims and is left to the
+// telemetry layer.
+func (r *MQTTSystemReader) noteStaleness(name string, snap measSnapshot, now time.Time) {
+	if snap.at.IsZero() {
+		return // never received — not a stale transition
+	}
+	stale := now.Sub(snap.at) > measStaleAfter
+	switch {
+	case stale && !r.stale[name]:
+		r.stale[name] = true
+		log.Printf("[hub] measurement source %q STALE — no update for %s; optimizer now running on estimated values for it",
+			name, now.Sub(snap.at).Round(time.Second))
+	case !stale && r.stale[name]:
+		r.stale[name] = false
+		log.Printf("[hub] measurement source %q recovered (fresh again)", name)
+	}
+}
+
 // ReadSystemState implements orchestrator.SystemReader.
 //
 // Takes the write lock (not RLock) because it may clear an expired CSIP
@@ -139,6 +183,7 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 
 	for _, dc := range r.devices {
 		snap := r.lastMeas[dc.Name]
+		r.noteStaleness(dc.Name, snap, now)
 
 		switch dc.Role {
 		case "battery":
@@ -205,15 +250,29 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 		}
 	}
 
-	// Drop an expired control rather than enforcing it forever: the topic is
-	// retained, so if lexa-northbound dies after publishing, nothing else
-	// would ever clear it (and a stale OpModFixedW would keep dispatching).
-	// ValidUntil is in server time; compare against server-now.
+	// Expire a control whose validity window has passed in SERVER time — the
+	// topic is retained, so if lexa-northbound dies after publishing, nothing
+	// else would clear it (and a stale OpModFixedW would keep dispatching).
+	//
+	// But the server clock (now+clockOffset) is not guaranteed monotonic: an NTP
+	// step or a flapping grid-server clock can momentarily push server-now past
+	// ValidUntil. Dropping the control on that single excursion would stop
+	// enforcing a cap that is still valid once the clock settles — and the
+	// retained control would not come back on the clock's return. So require the
+	// expiry to PERSIST for expiryConfirmTicks consecutive ticks before dropping,
+	// and keep enforcing the control in the meantime (a cap is conservative, so
+	// holding it across a transient clock jump is the safe choice).
 	if r.lastCSIP != nil && r.lastCSIP.ValidUntil > 0 &&
 		now.Unix()+r.clockOffset >= r.lastCSIP.ValidUntil {
-		log.Printf("[hub] CSIP control %s (source=%s) expired at %d and northbound has not refreshed it; dropping",
-			r.lastCSIP.MRID, r.lastCSIP.Source, r.lastCSIP.ValidUntil)
-		r.lastCSIP = nil
+		r.csipExpiredTicks++
+		if r.csipExpiredTicks >= expiryConfirmTicks {
+			log.Printf("[hub] CSIP control %s (source=%s) expired at %d (server-now %d) for %d ticks; dropping",
+				r.lastCSIP.MRID, r.lastCSIP.Source, r.lastCSIP.ValidUntil, now.Unix()+r.clockOffset, r.csipExpiredTicks)
+			r.lastCSIP = nil
+			r.csipExpiredTicks = 0
+		}
+	} else {
+		r.csipExpiredTicks = 0
 	}
 	if r.lastCSIP != nil {
 		state.CSIPControl = busToCSIPControl(r.lastCSIP)

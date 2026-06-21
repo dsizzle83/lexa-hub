@@ -405,6 +405,90 @@ func TestGenLimitRule_KeepsTighterExistingCurtailment(t *testing.T) {
 	}
 }
 
+// ── checkGenLimitConvergence (closed-loop actuation) ──────────────────────────
+
+// TestGenLimitConvergence_SustainedOverageBreaches is the regression for the
+// mayhem "ack-before-effect" FAIL: the inverter ACKs the curtailment but its
+// output stays over the cap. After genBreachTicks sustained ticks the hub must
+// record a generation breach (→ CannotComply) instead of asserting compliance.
+func TestGenLimitConvergence_SustainedOverageBreaches(t *testing.T) {
+	o := NewDefaultOptimizer()
+	stuck := []SolarState{ruleSol("pv", 4650)} // output stuck at 4650W under a 1000W cap
+
+	var plan *Plan
+	for i := 0; i < genBreachTicks; i++ {
+		plan = &Plan{}
+		o.checkGenLimitConvergence(stuck, 1000, plan)
+		if i < genBreachTicks-1 && plan.Breach != nil {
+			t.Fatalf("breached early on tick %d (want a sustained gate)", i)
+		}
+	}
+	if plan.Breach == nil {
+		t.Fatal("expected a generation breach after sustained overage")
+	}
+	if plan.Breach.LimitType != "generation" {
+		t.Errorf("LimitType = %q, want generation", plan.Breach.LimitType)
+	}
+	if plan.Breach.LimitW != 1000 || plan.Breach.MeasuredW != 4650 {
+		t.Errorf("breach limit=%.0f measured=%.0f, want 1000/4650", plan.Breach.LimitW, plan.Breach.MeasuredW)
+	}
+	if math.Abs(plan.Breach.ShortfallW-3650) > 1 {
+		t.Errorf("shortfall = %.0fW, want 3650W", plan.Breach.ShortfallW)
+	}
+}
+
+// TestGenLimitConvergence_ConvergedNeverBreaches: an inverter that actually
+// honours the cap must never trip the breach, no matter how long it's held.
+func TestGenLimitConvergence_ConvergedNeverBreaches(t *testing.T) {
+	o := NewDefaultOptimizer()
+	ok := []SolarState{ruleSol("pv", 950)} // within the 1000W cap
+	for i := 0; i < genBreachTicks+3; i++ {
+		plan := &Plan{}
+		o.checkGenLimitConvergence(ok, 1000, plan)
+		if plan.Breach != nil {
+			t.Fatalf("converged output must not breach (tick %d)", i)
+		}
+	}
+}
+
+// TestGenLimitConvergence_TransientRampResets: a normal ramp-down that spends a
+// few ticks over the cap then converges must NOT breach — the over-count resets
+// on convergence, so a later single over-tick can't immediately fire.
+func TestGenLimitConvergence_TransientRampResets(t *testing.T) {
+	o := NewDefaultOptimizer()
+	over := []SolarState{ruleSol("pv", 4650)}
+	under := []SolarState{ruleSol("pv", 900)}
+
+	for i := 0; i < genBreachTicks-1; i++ { // a few ticks over (normal ramp), not yet a breach
+		o.checkGenLimitConvergence(over, 1000, &Plan{})
+	}
+	converged := &Plan{}
+	o.checkGenLimitConvergence(under, 1000, converged)
+	if converged.Breach != nil {
+		t.Fatal("a transient overage that converged must not breach")
+	}
+	next := &Plan{}
+	o.checkGenLimitConvergence(over, 1000, next)
+	if next.Breach != nil {
+		t.Fatal("over-count must reset after convergence — one later over-tick should not breach")
+	}
+}
+
+// TestGenLimitConvergence_NewCapResetsGuard: changing the cap starts a fresh
+// convergence session, so a backlog of over-ticks from the old cap doesn't carry.
+func TestGenLimitConvergence_NewCapResetsGuard(t *testing.T) {
+	o := NewDefaultOptimizer()
+	over := []SolarState{ruleSol("pv", 4650)}
+	for i := 0; i < genBreachTicks-1; i++ {
+		o.checkGenLimitConvergence(over, 1000, &Plan{})
+	}
+	plan := &Plan{}
+	o.checkGenLimitConvergence(over, 2000, plan) // a different cap → guard resets
+	if plan.Breach != nil {
+		t.Fatal("a new cap must reset the convergence guard")
+	}
+}
+
 func TestExportLimitRule_UpdatesBatteryPowerW(t *testing.T) {
 	// Verify the returned slice has updated PowerW so later rules see residual headroom.
 	solar := []SolarState{ruleSol("pv", 5000)}
