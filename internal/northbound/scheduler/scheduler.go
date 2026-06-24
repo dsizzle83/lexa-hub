@@ -35,6 +35,7 @@
 package scheduler
 
 import (
+	"math"
 	"math/rand"
 	"sync"
 	"time"
@@ -60,6 +61,13 @@ type ActiveControl struct {
 	// 0 means no expiry (DefaultDERControl stays in effect until superseded
 	// by an event).
 	ValidUntil int64
+
+	// Held is true when this control is being re-served as last-known-good
+	// because the current discovery cycle resolved no valid control (empty or
+	// malformed resource) while this control had not yet expired. It lets the
+	// caller surface the fail-closed hold without changing Source (which the
+	// Response/MRID addressing depends on).
+	Held bool
 }
 
 // Scheduler tracks per-event randomization state and evaluates the active
@@ -74,7 +82,20 @@ type Scheduler struct {
 	randOffsets map[string]int32 // MRID → cached start randomization (seconds)
 	randDurs    map[string]int32 // MRID → cached duration randomization (seconds)
 	rng         *rand.Rand
+
+	// lastGood is the most recent validly-resolved control, retained so a
+	// transient empty/malformed discovery cycle fails CLOSED to it rather than
+	// dropping an unexpired safety control (see Evaluate / failClosed).
+	lastGood *ActiveControl
 }
+
+// maxPlausibleLimitW bounds an adopted CSIP power limit. It sits far above any
+// real residential or small-commercial DER site (1 GW) yet well below the
+// overflow values a malformed resource can encode — OpModXxxLimW is an
+// ActivePower{value int16, multiplier int8}, so value×10^multiplier can reach
+// ~3.3e13 (32767×10^9) or +Inf (multiplier up to 127). A limit beyond this is
+// treated as malformed and not adopted (audit: malform-huge-activepower).
+const maxPlausibleLimitW = 1e9
 
 // New creates a new Scheduler with a random seed.
 func New() *Scheduler {
@@ -102,9 +123,21 @@ func ServerNow(clockOffset int64) int64 {
 //     latest creationTime wins; MRID is the tiebreaker (lexicographic).
 //  4. If no event is active, return the program's DefaultDERControl.
 //
-// Returns nil if programs is empty or the highest-priority program has
-// neither an active event nor a DefaultDERControl.
+// Fail-closed: a discovery cycle that resolves no control (empty/missing
+// programs) or a malformed one (an implausible OpModXxxLimW) does NOT drop an
+// already-adopted control — Evaluate re-serves the last-known-good control
+// (marked Held) until that control's own ValidUntil expires. This prevents a
+// transient or hostile resource from unseating a live safety cap (audit:
+// malform-empty-program, malform-huge-activepower). Returns nil only when there
+// is neither a valid current control nor an unexpired last-known-good.
 func (s *Scheduler) Evaluate(programs []discovery.ProgramState, serverNow int64) *ActiveControl {
+	return s.failClosed(s.resolve(programs, serverNow), serverNow)
+}
+
+// resolve performs the pure §12.3 precedence resolution, with no fail-closed
+// retention. Returns nil when no control is active in the highest-priority
+// program (or there is no program at all).
+func (s *Scheduler) resolve(programs []discovery.ProgramState, serverNow int64) *ActiveControl {
 	hp := discovery.HighestPriorityProgram(programs)
 	if hp == nil {
 		return nil
@@ -128,6 +161,60 @@ func (s *Scheduler) Evaluate(programs []discovery.ProgramState, serverNow int64)
 	}
 
 	return nil
+}
+
+// failClosed adopts a freshly-resolved control when it is valid, otherwise
+// re-serves the last-known-good control until it expires. A malformed control
+// (implausible limit) is never adopted and never stored as last-known-good.
+func (s *Scheduler) failClosed(resolved *ActiveControl, serverNow int64) *ActiveControl {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if resolved != nil && plausibleControl(resolved) {
+		stored := *resolved
+		s.lastGood = &stored
+		return resolved
+	}
+
+	// Either nothing resolved (empty/missing programs) or the resolved control
+	// is malformed: hold the last-known-good control rather than failing open.
+	if s.lastGood != nil && !controlExpired(s.lastGood, serverNow) {
+		held := *s.lastGood
+		held.Held = true
+		return &held
+	}
+
+	// No safe control to fall back to — release (and forget an expired one).
+	s.lastGood = nil
+	return nil
+}
+
+// controlExpired reports whether ac is past its ValidUntil at serverNow.
+// A control with ValidUntil==0 (a DefaultDERControl) never expires on its own.
+func controlExpired(ac *ActiveControl, serverNow int64) bool {
+	return ac.ValidUntil != 0 && serverNow >= ac.ValidUntil
+}
+
+// plausibleControl reports whether every active-power limit on the control
+// decodes to a finite, physically-plausible magnitude (≤ maxPlausibleLimitW).
+// A malformed/overflow value (audit: malform-huge-activepower) makes this false
+// so the control is rejected rather than adopted as an effectively-infinite cap.
+func plausibleControl(ac *ActiveControl) bool {
+	b := ac.Base
+	return plausibleLimit(b.OpModExpLimW) &&
+		plausibleLimit(b.OpModMaxLimW) &&
+		plausibleLimit(b.OpModImpLimW) &&
+		plausibleLimit(b.OpModFixedW)
+}
+
+// plausibleLimit reports whether ap (when present) decodes to a finite watt
+// value within maxPlausibleLimitW. A nil field imposes no limit and is plausible.
+func plausibleLimit(ap *model.ActivePower) bool {
+	if ap == nil {
+		return true
+	}
+	w := float64(ap.Value) * math.Pow10(int(ap.Multiplier))
+	return !math.IsNaN(w) && !math.IsInf(w, 0) && math.Abs(w) <= maxPlausibleLimitW
 }
 
 // activeEvent finds the active DERControl in ps at serverNow, if any.

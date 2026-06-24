@@ -346,12 +346,38 @@ type meterForwarder struct{ bridge *mqttBridge }
 
 // applySamplesLocked folds OCPP sampled values into the station state.
 // Caller must hold bridge.mu for writing.
+// evCurrentTolerance bounds a MeterValues current against the station's rated
+// max. A real charging current cannot exceed the hardware rating by more than
+// transient/measurement slack; a value beyond this is a mislabeled or corrupt
+// reading (audit: ev-wrong-units — mA reported under an "A" label is ≈1000× the
+// truth) and must not be ingested, or the optimizer plans against a fabricated
+// site load.
+const evCurrentTolerance = 1.25
+
+// implausibleCurrent reports whether measuredA cannot be a real charging current
+// for a station rated at maxA. A non-finite value is always implausible; an
+// unknown rating (maxA ≤ 0) cannot be judged, so it is accepted.
+func implausibleCurrent(measuredA, maxA float64) bool {
+	if math.IsNaN(measuredA) || math.IsInf(measuredA, 0) {
+		return true
+	}
+	if maxA <= 0 {
+		return false
+	}
+	return math.Abs(measuredA) > maxA*evCurrentTolerance
+}
+
 func applySamplesLocked(s *stationState, meterValues []types.MeterValue) {
 	for _, mv := range meterValues {
 		for _, sv := range mv.SampledValue {
 			v := sv.Value
 			switch sv.Measurand {
 			case types.MeasurandCurrentImport:
+				if implausibleCurrent(v, s.maxCurrentA) {
+					log.Printf("[ocpp] REJECT implausible MeterValues current %.1fA on %s (station max %.1fA) — keeping last good %.1fA",
+						v, s.id, s.maxCurrentA, s.currentA)
+					continue
+				}
 				s.currentA = v
 			case types.MeasurandSoC:
 				s.soc = v

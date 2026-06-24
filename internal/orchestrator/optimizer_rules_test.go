@@ -418,7 +418,7 @@ func TestGenLimitConvergence_SustainedOverageBreaches(t *testing.T) {
 	var plan *Plan
 	for i := 0; i < genBreachTicks; i++ {
 		plan = &Plan{}
-		o.checkGenLimitConvergence(stuck, 1000, plan)
+		o.checkGenLimitConvergence(stuck, nil, math.NaN(), 1000, plan)
 		if i < genBreachTicks-1 && plan.Breach != nil {
 			t.Fatalf("breached early on tick %d (want a sustained gate)", i)
 		}
@@ -444,7 +444,7 @@ func TestGenLimitConvergence_ConvergedNeverBreaches(t *testing.T) {
 	ok := []SolarState{ruleSol("pv", 950)} // within the 1000W cap
 	for i := 0; i < genBreachTicks+3; i++ {
 		plan := &Plan{}
-		o.checkGenLimitConvergence(ok, 1000, plan)
+		o.checkGenLimitConvergence(ok, nil, math.NaN(), 1000, plan)
 		if plan.Breach != nil {
 			t.Fatalf("converged output must not breach (tick %d)", i)
 		}
@@ -460,15 +460,15 @@ func TestGenLimitConvergence_TransientRampResets(t *testing.T) {
 	under := []SolarState{ruleSol("pv", 900)}
 
 	for i := 0; i < genBreachTicks-1; i++ { // a few ticks over (normal ramp), not yet a breach
-		o.checkGenLimitConvergence(over, 1000, &Plan{})
+		o.checkGenLimitConvergence(over, nil, math.NaN(), 1000, &Plan{})
 	}
 	converged := &Plan{}
-	o.checkGenLimitConvergence(under, 1000, converged)
+	o.checkGenLimitConvergence(under, nil, math.NaN(), 1000, converged)
 	if converged.Breach != nil {
 		t.Fatal("a transient overage that converged must not breach")
 	}
 	next := &Plan{}
-	o.checkGenLimitConvergence(over, 1000, next)
+	o.checkGenLimitConvergence(over, nil, math.NaN(), 1000, next)
 	if next.Breach != nil {
 		t.Fatal("over-count must reset after convergence — one later over-tick should not breach")
 	}
@@ -480,10 +480,10 @@ func TestGenLimitConvergence_NewCapResetsGuard(t *testing.T) {
 	o := NewDefaultOptimizer()
 	over := []SolarState{ruleSol("pv", 4650)}
 	for i := 0; i < genBreachTicks-1; i++ {
-		o.checkGenLimitConvergence(over, 1000, &Plan{})
+		o.checkGenLimitConvergence(over, nil, math.NaN(), 1000, &Plan{})
 	}
 	plan := &Plan{}
-	o.checkGenLimitConvergence(over, 2000, plan) // a different cap → guard resets
+	o.checkGenLimitConvergence(over, nil, math.NaN(), 2000, plan) // a different cap → guard resets
 	if plan.Breach != nil {
 		t.Fatal("a new cap must reset the convergence guard")
 	}

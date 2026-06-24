@@ -25,6 +25,12 @@ dnssd/      mDNS browse for _ieee2030._tls._tcp. TXT "path=X" overrides /dcap de
 3. Randomized start: apply rand offset to startTime once per MRID; cache result.
 4. Primacy: lower number wins (program primacy 1 beats 5 beats 10).
 5. Default fallback: no active event in highest-priority program → use `DefaultDERControl`.
+6. **Fail closed** (audit: malform-empty-program / malform-huge-activepower): a cycle that
+   resolves *no* control (empty/missing programs) or a *malformed* one (an `OpModXxxLimW`
+   that decodes non-finite or > `maxPlausibleLimitW` = 1 GW) does NOT drop an adopted
+   control. `Evaluate` re-serves the last-known-good control (with `ActiveControl.Held=true`)
+   until its own `ValidUntil` expires; a malformed control is never adopted nor stored as
+   last-known-good. Only an actually-expired (or never-set) last-known-good yields `nil`.
 
 ## MirrorUsagePoint telemetry flow
 1. `POST /mup` → 201 + Location header (e.g. `/mup/0`). Save location.

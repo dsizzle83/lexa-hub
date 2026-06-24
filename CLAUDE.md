@@ -122,6 +122,25 @@ All configs live in `/etc/lexa/`. Edit the copies created by `make install-confi
   are ARM64-only on the SOM). Build on target or with a proper cross toolchain.
   The other three services are `CGO_ENABLED=0` cross-compilable.
 
+## Defensive fault-handling (do not strip — each backs a mayhem-QA finding)
+
+Hostile-QA (`csip-tls-test` mayhem suite) surfaced fault classes the optimizer must
+survive; the guards below are deliberate, not redundant. Keep them when refactoring.
+
+- **Trust measurement, not the command** (closed-loop convergence, `internal/orchestrator`):
+  a device can ACK a write and ignore it. `checkGenLimitConvergence` (cross-checked against an
+  independent meter floor `gen ≥ export − batteryDischarge`), `checkImportConvergence`, and the
+  export rule's battery-absorption guard all compare commanded vs MEASURED effect and, on a
+  sustained gap, curtail another lever or post a 2030.5 CannotComply.
+- **Fail closed on bad CSIP**: the scheduler holds last-known-good on an empty/malformed
+  resource (see `internal/northbound/CLAUDE.md` rule 6).
+- **Plausibility-gate ingested telemetry**: `cmd/modbus` withholds power over nameplate
+  (suspect scale factor); `cmd/ocpp` rejects MeterValues current over the station rating.
+- **Battery reserve safety**: `checkBatterySafety` force-disconnects a pack measured
+  discharging at/below its SOC reserve (a device inverting its setpoint).
+- These hold the cap / surface the fault; the matching regression tests are
+  `*_test.go` next to each (`convergence_test.go`, `failclosed_test.go`, etc.).
+
 ## Stack
 
 Go 1.21 · wolfSSL CGo (northbound + telemetry only) · eclipse/paho.mqtt.golang ·

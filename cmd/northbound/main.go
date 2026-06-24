@@ -254,6 +254,11 @@ func runDiscovery(
 	serverNow := scheduler.ServerNow(tree.ClockOffset)
 	active := sched.Evaluate(tree.Programs, serverNow)
 
+	if active != nil && active.Held {
+		log.Printf("lexa-northbound: WARNING discovery resolved no valid control (empty/malformed resource); holding last-known-good mrid=%s until validUntil=%d (fail-closed)",
+			active.MRID, active.ValidUntil)
+	}
+
 	msg := toActiveControl(active, tree.ClockOffset)
 	if err := mqttutil.PublishJSONRetained(mc, bus.TopicCSIPControl, msg); err != nil {
 		log.Printf("lexa-northbound: publish control: %v", err)

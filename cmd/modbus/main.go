@@ -117,8 +117,10 @@ func openDevice(dc DeviceConfig) (device.Device, error) {
 // measurements (and battery metrics) to MQTT.
 func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.MeasurementUpdate) {
 	deviceRole := map[string]string{}
+	nameplate := map[string]float64{}
 	for _, dc := range cfg.Devices {
 		deviceRole[dc.Name] = dc.Role
+		nameplate[dc.Name] = dc.MaxW
 	}
 
 	for upd := range updates {
@@ -131,7 +133,17 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 
 		msg := bus.Measurement{Device: upd.Name, Ts: now}
 		if !math.IsNaN(m.W) {
-			msg.W = &m.W
+			// Sanity-check decoded power against the nameplate before publishing.
+			// A corrupted SunSpec scale factor (audit GS-1/MTR-1: solar-bad-scale)
+			// decodes power ~10× the truth; withholding the suspect W leaves the
+			// hub on its last-known-good rather than optimising against a value the
+			// device physically cannot produce. Other fields (V/Hz) still flow.
+			if plausibleW(m.W, nameplate[upd.Name]) {
+				msg.W = &m.W
+			} else {
+				log.Printf("lexa-modbus: REJECT implausible %s power %.0fW (nameplate %.0fW) — withholding W (suspect scale factor)",
+					upd.Name, m.W, nameplate[upd.Name])
+			}
 		}
 		if !math.IsNaN(m.V) {
 			msg.V = &m.V
@@ -232,6 +244,25 @@ func solarCommandToControl(cmd bus.SolarCommand) model.DERControlBase {
 // restoreCeilingW is the "no curtailment" ceiling — far above any
 // residential/commercial nameplate so the device clamps it to WMax.
 const restoreCeilingW = 1e9
+
+// nameplateToleranceW is how far a decoded power reading may exceed the device
+// nameplate before it is treated as a transport/scale-factor fault rather than a
+// real measurement. Real inverters/meters do not sustain output meaningfully
+// above their rating; a corrupted scale factor (solar-bad-scale) lands ~10× over.
+const nameplateToleranceW = 1.2
+
+// plausibleW reports whether a decoded power reading is physically plausible for
+// a device of the given nameplate. A non-finite reading is never plausible; an
+// unknown nameplate (≤ 0, not configured) cannot be judged and is accepted.
+func plausibleW(w, maxW float64) bool {
+	if math.IsNaN(w) || math.IsInf(w, 0) {
+		return false
+	}
+	if maxW <= 0 {
+		return true
+	}
+	return math.Abs(w) <= maxW*nameplateToleranceW
+}
 
 // activePowerFromWatts encodes a watt value as a SunSpec ActivePower,
 // scaling into the decimal multiplier so values above the int16 range

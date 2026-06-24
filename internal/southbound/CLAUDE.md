@@ -1,6 +1,12 @@
 # Southbound Stack (Modbus / SunSpec)
 
-Pure Go — zero cgo. Implements `Device` interface consumed by `internal/bridge/`.
+Pure Go — zero cgo. Implements the `Device` interface, polled by the `registry` and
+driven by the `cmd/modbus` service (which publishes measurements / applies controls
+over MQTT). `cmd/modbus` also withholds a decoded `W` that exceeds the configured
+nameplate (`DeviceConfig.MaxW × 1.2`) before publishing — a corrupted SunSpec scale
+factor decodes ~10× over, and the hub must not optimise against it (audit GS-1/MTR-1:
+solar-bad-scale). This is a service-layer plausibility guard, NOT a register-map change,
+so it does **not** require the southbound lockstep with the harness repo.
 
 ## Package map
 ```
