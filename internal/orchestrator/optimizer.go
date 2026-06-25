@@ -49,11 +49,14 @@ type genGuard struct {
 	overCount    int     // consecutive ticks measured generation stayed over the cap
 }
 
-// genBreachTicks is how many consecutive ticks measured generation may stay over
-// the cap (after curtailment is commanded) before the hub reports a CannotComply.
-// Long enough to ride out a normal inverter ramp-down, short enough to surface a
-// device that ACKed the command but is not acting on it.
-const genBreachTicks = 5
+// genBreachTicks is how many ticks measured generation may stay over the cap
+// (after curtailment is commanded) before the hub reports a CannotComply. Long
+// enough to ride out a normal inverter ramp-down (1–2 ticks, further softened by
+// the leaky counter below), short enough that the breach is detected AND the
+// downstream alert→northbound→gridsim CannotComply chain completes inside a tight
+// compliance window — at 3 (≈9 s) detection no longer races the ~20 s window the
+// way 5 (≈15 s) did, which was the reject-write/enable-gate-curtail flakiness.
+const genBreachTicks = 3
 
 // battConvergeFrac / battBreachTicks gate the export rule's closed-loop
 // battery-absorption check: measured absorption must reach at least

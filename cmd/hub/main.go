@@ -78,33 +78,34 @@ func main() {
 
 	// Compliance-breach alerter. The optimizer flags limits it cannot meet
 	// (e.g. an import cap with the battery at its SOC reserve) on plan.Breach.
-	// Publish one ComplianceAlert on the onset of a breach and one on the clear,
-	// edge-triggered, so the northbound service POSTs exactly one CannotComply
-	// Response per episode rather than spamming one per tick.
-	breachActive := false
+	// Publish one ComplianceAlert when a control's breach begins and one when it
+	// clears, so the northbound service POSTs one CannotComply Response per episode
+	// rather than spamming one per tick.
+	//
+	// Keyed on the breaching mRID, NOT a single active flag: when one control is
+	// already breaching and a DIFFERENT control then breaches without an
+	// intervening clear (a higher-primacy event supersedes an unmeetable one, or a
+	// held last-known-good control overlaps a fresh cap), an mRID-agnostic flag
+	// stays latched and the new control's breach is never reported. That was the
+	// reject-write/enable-gate-curtail flakiness: a prior episode's breach kept the
+	// alerter latched, so a fresh gen-cap breach published no alert and gridsim
+	// never saw the CannotComply.
+	activeBreachMRID := "" // "" = no breach currently active
 	planObserver := func(plan orchestrator.Plan) {
-		now := time.Now().Unix()
-		switch {
-		case plan.Breach != nil && !breachActive:
-			breachActive = true
-			b := plan.Breach
+		alert, newMRID := breachAlert(activeBreachMRID, plan)
+		activeBreachMRID = newMRID
+		if alert == nil {
+			return // no edge this tick
+		}
+		alert.Ts = time.Now().Unix()
+		if alert.Active {
 			log.Printf("lexa-hub: COMPLIANCE BREACH %s limit=%.0fW measured=%.0fW shortfall=%.0fW (%s) mrid=%s",
-				b.LimitType, b.LimitW, b.MeasuredW, b.ShortfallW, b.Reason, b.MRID)
-			if err := mqttutil.PublishJSON(mc, bus.TopicCSIPComplianceAlert, bus.ComplianceAlert{
-				MRID: b.MRID, LimitType: b.LimitType, LimitW: b.LimitW,
-				MeasuredW: b.MeasuredW, ShortfallW: b.ShortfallW, Reason: b.Reason,
-				Active: true, Ts: now,
-			}); err != nil {
-				log.Printf("lexa-hub: publish compliance alert: %v", err)
-			}
-		case plan.Breach == nil && breachActive:
-			breachActive = false
+				alert.LimitType, alert.LimitW, alert.MeasuredW, alert.ShortfallW, alert.Reason, alert.MRID)
+		} else {
 			log.Printf("lexa-hub: compliance breach cleared")
-			if err := mqttutil.PublishJSON(mc, bus.TopicCSIPComplianceAlert, bus.ComplianceAlert{
-				Active: false, Ts: now,
-			}); err != nil {
-				log.Printf("lexa-hub: publish compliance clear: %v", err)
-			}
+		}
+		if err := mqttutil.PublishJSON(mc, bus.TopicCSIPComplianceAlert, *alert); err != nil {
+			log.Printf("lexa-hub: publish compliance alert: %v", err)
 		}
 	}
 
@@ -178,6 +179,30 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("lexa-hub: shutting down")
+}
+
+// breachAlert is the per-control compliance-alert edge logic, extracted from the
+// plan observer so it is unit-testable. Given the mRID whose breach is currently
+// being reported (prevMRID, "" if none) and the latest plan, it returns the alert
+// to publish — Active when a control's breach begins OR the breaching control
+// changes to a new mRID, !Active when the breach clears — or nil when nothing
+// changed (so the same episode is reported once, not per tick). The returned
+// string is the new active-breach mRID for the caller to carry forward. Ts is set
+// by the caller.
+func breachAlert(prevMRID string, plan orchestrator.Plan) (*bus.ComplianceAlert, string) {
+	switch {
+	case plan.Breach != nil && plan.Breach.MRID != prevMRID:
+		b := plan.Breach
+		return &bus.ComplianceAlert{
+			MRID: b.MRID, LimitType: b.LimitType, LimitW: b.LimitW,
+			MeasuredW: b.MeasuredW, ShortfallW: b.ShortfallW, Reason: b.Reason,
+			Active: true,
+		}, b.MRID
+	case plan.Breach == nil && prevMRID != "":
+		return &bus.ComplianceAlert{Active: false}, ""
+	default:
+		return nil, prevMRID
+	}
 }
 
 // derConstraintsFromSchedule converts a DERScheduleMsg into per-step
