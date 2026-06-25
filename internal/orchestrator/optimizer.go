@@ -1114,8 +1114,16 @@ func (o *DefaultOptimizer) checkGenLimitConvergence(solar []SolarState, batterie
 		o.genGuard = genGuard{activeLimitW: math.NaN()} // cap cleared — reset
 		return
 	}
-	if maxLimitW != o.genGuard.activeLimitW {
+	// Reset the breach counter only when the cap changes MEANINGFULLY. The decoded
+	// cap can vary by a hair tick-to-tick (the watts→ActivePower value×10^mult
+	// round-trip through the bus), and resetting on a bit-exact inequality zeroed
+	// overCount every tick so a sustained breach never reached genBreachTicks —
+	// part of the reject-write/enable-gate-curtail nondeterminism. Track the cap
+	// session by a tolerance band and follow minor drift instead.
+	if math.IsNaN(o.genGuard.activeLimitW) || math.Abs(maxLimitW-o.genGuard.activeLimitW) > complianceBreachW {
 		o.genGuard = genGuard{activeLimitW: maxLimitW} // new cap session — reset
+	} else {
+		o.genGuard.activeLimitW = maxLimitW // same session; track sub-threshold drift
 	}
 
 	measuredGenW := 0.0
@@ -1147,10 +1155,24 @@ func (o *DefaultOptimizer) checkGenLimitConvergence(solar []SolarState, batterie
 		}
 	}
 
+	// Leaky counter, not a hard consecutive run: a single sub-threshold sample —
+	// an HIL meter blip, a momentary inverter dip — must not zero a climbing breach
+	// and force the whole genBreachTicks count to restart (the marginal-timing half
+	// of the reject-write/enable-gate-curtail nondeterminism, where the breach
+	// window barely affords genBreachTicks consecutive ticks). Decrement on an
+	// under-cap tick so a sustained breach with occasional noise still escalates,
+	// while a genuine convergence still drains the counter to zero within a few ticks.
 	if measuredGenW > maxLimitW+complianceBreachW {
-		o.genGuard.overCount++
-	} else {
-		o.genGuard.overCount = 0
+		if o.genGuard.overCount < genBreachTicks {
+			o.genGuard.overCount++ // cap at the threshold so it drains fast on recovery
+		}
+	} else if o.genGuard.overCount > 0 {
+		o.genGuard.overCount--
+	}
+
+	if o.Debug {
+		log.Printf("[optimizer] gen-converge: cap=%.0f measuredGen=%.0f overCount=%d/%d",
+			maxLimitW, measuredGenW, o.genGuard.overCount, genBreachTicks)
 	}
 
 	if o.genGuard.overCount >= genBreachTicks {

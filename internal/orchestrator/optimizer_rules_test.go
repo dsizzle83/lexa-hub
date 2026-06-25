@@ -452,8 +452,8 @@ func TestGenLimitConvergence_ConvergedNeverBreaches(t *testing.T) {
 }
 
 // TestGenLimitConvergence_TransientRampResets: a normal ramp-down that spends a
-// few ticks over the cap then converges must NOT breach — the over-count resets
-// on convergence, so a later single over-tick can't immediately fire.
+// few ticks over the cap then converges must NOT breach — the over-count leaks
+// back down on convergence, so a later single over-tick can't immediately fire.
 func TestGenLimitConvergence_TransientRampResets(t *testing.T) {
 	o := NewDefaultOptimizer()
 	over := []SolarState{ruleSol("pv", 4650)}
@@ -486,6 +486,50 @@ func TestGenLimitConvergence_NewCapResetsGuard(t *testing.T) {
 	o.checkGenLimitConvergence(over, nil, math.NaN(), 2000, plan) // a different cap → guard resets
 	if plan.Breach != nil {
 		t.Fatal("a new cap must reset the convergence guard")
+	}
+}
+
+// TestGenLimitConvergence_ToleratesBlip is the regression for the
+// reject-write/enable-gate-curtail nondeterminism: a sustained over-cap breach
+// with a single sub-threshold sample mid-run (an HIL meter blip) must still
+// escalate. The leaky counter decrements on the blip instead of resetting, so the
+// breach is only delayed, not lost.
+func TestGenLimitConvergence_ToleratesBlip(t *testing.T) {
+	o := NewDefaultOptimizer()
+	over := []SolarState{ruleSol("pv", 4650)}
+	under := []SolarState{ruleSol("pv", 900)}
+
+	// over×4 → count 4; one blip → 3; then over until it reaches genBreachTicks.
+	seq := []bool{true, true, true, true, false, true, true, true}
+	var last *Plan
+	for _, isOver := range seq {
+		last = &Plan{}
+		s := over
+		if !isOver {
+			s = under
+		}
+		o.checkGenLimitConvergence(s, nil, math.NaN(), 1000, last)
+	}
+	if last.Breach == nil {
+		t.Fatal("a sustained breach with one sub-threshold blip must still escalate (leaky counter)")
+	}
+}
+
+// TestGenLimitConvergence_ToleratesCapJitter: a cap value that jitters within the
+// noise band tick-to-tick (watts→ActivePower round-trip) must not reset the guard
+// — otherwise overCount never reaches genBreachTicks. With bit-exact reset this
+// breach was silently lost (the other half of the nondeterminism).
+func TestGenLimitConvergence_ToleratesCapJitter(t *testing.T) {
+	o := NewDefaultOptimizer()
+	over := []SolarState{ruleSol("pv", 4650)}
+	jitter := []float64{1000.0, 1000.04, 999.97, 1000.02, 999.99, 1000.01}
+	var last *Plan
+	for _, cap := range jitter {
+		last = &Plan{}
+		o.checkGenLimitConvergence(over, nil, math.NaN(), cap, last)
+	}
+	if last.Breach == nil {
+		t.Fatal("a sustained breach under a jittering cap must still escalate (tolerance-band guard reset)")
 	}
 }
 
