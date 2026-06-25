@@ -54,6 +54,32 @@ func TestExportLimit_BatteryStallCurtailsSolar(t *testing.T) {
 	}
 }
 
+// A refusing pack with a single mid-run blip (one tick where it momentarily
+// absorbs) must still trip the stall guard — the leaky counter decrements on the
+// blip instead of resetting, so the curtail is only delayed, not lost. (audit:
+// battery-charge-disabled flakiness)
+func TestExportLimit_BatteryStallToleratesBlip(t *testing.T) {
+	o := NewDefaultOptimizer()
+	limits := gridConstraints{exportLimitW: 0, importLimitW: math.NaN(), maxLimitW: math.NaN()}
+
+	// refuse, refuse, blip(absorb), refuse, refuse, refuse — should still curtail.
+	blips := []bool{false, false, true, false, false, false}
+	var last *Plan
+	for _, absorb := range blips {
+		batPower, netW, surplus := 0.0, -4400.0, 4400.0
+		if absorb { // the pack briefly charges ~half the surplus this tick
+			batPower, netW, surplus = -2400, -2000, 2000
+		}
+		bats := []BatteryState{ruleBat("bat", batPower, 50, 5000)}
+		sol := []SolarState{ruleSol("pv", 4800)}
+		last = &Plan{}
+		o.applyExportLimitRule(sol, nil, 0, limits, netW, 95, surplus, bats, last)
+	}
+	if !hasDecisionContaining(last, "battery not absorbing") {
+		t.Errorf("a stall with one absorb-blip must still curtail (leaky counter); decisions=%+v", last.Decisions)
+	}
+}
+
 // A battery that DOES absorb the commanded charge (measured tracks command) must
 // never trip the stall guard — solar stays uncurtailed (battery-first).
 func TestExportLimit_BatteryAbsorbingDoesNotTrip(t *testing.T) {

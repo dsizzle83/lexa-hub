@@ -60,13 +60,16 @@ const genBreachTicks = 3
 
 // battConvergeFrac / battBreachTicks gate the export rule's closed-loop
 // battery-absorption check: measured absorption must reach at least
-// battConvergeFrac of the commanded charge, else after battBreachTicks
-// consecutive ticks the commanded (phantom) absorption is no longer credited and
-// the inverter is curtailed instead (audit: battery-charge-disabled). A normal
-// charge ramp closes the gap within a tick or two, so these ride it out.
+// battConvergeFrac of the commanded charge, else after battBreachTicks ticks the
+// commanded (phantom) absorption is no longer credited and the inverter is
+// curtailed instead (audit: battery-charge-disabled). A normal charge ramp closes
+// the gap within a tick or two (further softened by the leaky counter), so these
+// ride it out. battBreachTicks is 3 (≈9 s) so the curtail engages inside a tight
+// export-cap window rather than racing it (the battery-charge-disabled flakiness,
+// the export-lever twin of the gen-limit genBreachTicks fix).
 const (
 	battConvergeFrac = 0.5
-	battBreachTicks  = 5
+	battBreachTicks  = 3
 )
 
 // DefaultOptimizer is a rule-based + heuristic optimizer.
@@ -766,10 +769,17 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	// compliance — not a CannotComply.  A normal charge ramp closes the gap within
 	// a tick or two (measured rises to the setpoint), so battBreachTicks rides it
 	// out; only a battery that will not absorb trips the discredit.
+	// Leaky counter (mirrors checkGenLimitConvergence): a single noisy tick where
+	// measured absorption momentarily catches up must not zero a climbing stall and
+	// force the whole battBreachTicks count to restart, or the curtail never engages
+	// before the breach window ends. Decrement instead, capped at the threshold so
+	// the credit is restored quickly once the pack genuinely starts absorbing.
 	if batteryAbsorbW > complianceBreachW && measuredBatteryAbsorbW < batteryAbsorbW*battConvergeFrac {
-		o.expGuard.battStallTicks++
-	} else {
-		o.expGuard.battStallTicks = 0
+		if o.expGuard.battStallTicks < battBreachTicks {
+			o.expGuard.battStallTicks++
+		}
+	} else if o.expGuard.battStallTicks > 0 {
+		o.expGuard.battStallTicks--
 	}
 	if o.expGuard.battStallTicks >= battBreachTicks {
 		predictedBatteryAbsorbW = measuredBatteryAbsorbW
