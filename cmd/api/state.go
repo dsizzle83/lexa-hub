@@ -18,6 +18,11 @@ type deviceSnap struct {
 	Hz        *float64
 	SOC       *float64 // batteries only
 	UpdatedAt time.Time
+	// WChangedAt is when W last took a NEW value. Messages keep arriving (so
+	// UpdatedAt stays fresh) even when a device's reading is frozen — a hung meter
+	// serving a cached register, the INV-STALE hazard — so value-freshness needs
+	// this separate from arrival-freshness.
+	WChangedAt time.Time
 }
 
 // evseSnap is the per-EVSE state aggregated from MQTT.
@@ -73,6 +78,9 @@ func (s *stateStore) onMeasurement(_ string, m bus.Measurement) {
 	d := s.deviceLocked(m.Device)
 	if m.W != nil {
 		v := *m.W
+		if d.W == nil || *d.W != v {
+			d.WChangedAt = time.Now()
+		}
 		d.W = &v
 	}
 	if m.V != nil {
@@ -144,7 +152,7 @@ func (s *stateStore) onSchedule(_ string, sched bus.DERScheduleMsg) {
 // snapshot returns a deep-copy view safe to render without holding the lock.
 type snapshot struct {
 	devices      map[string]deviceSnap
-	evses        []bus.EVSEState
+	evses        []evseSnap
 	csipControl  *bus.ActiveControl
 	csipPrograms int
 	clockOffsetS int64
@@ -176,9 +184,61 @@ func (s *stateStore) snapshot() snapshot {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		out.evses = append(out.evses, s.evses[k].State)
+		out.evses = append(out.evses, *s.evses[k])
 	}
 	return out
+}
+
+// Staleness windows for surfacing a frozen/silent source in /status (INV-STALE /
+// INV-EVBLIND). These detect what arrival-time freshness alone cannot: a hung
+// device still answering with a cached value, or a charger whose session is open
+// but whose telemetry has gone silent.
+const (
+	// meterFrozenAfter: a meter still receiving fresh publishes but whose W has not
+	// changed for this long is suspect — but only flagged WHILE the world is
+	// demonstrably moving (solarMovingWindow), so a legitimately steady grid is not
+	// a false alarm. (Load is unmeasured, so a pure energy-balance check cannot tell
+	// frozen from a real load swing; this cross-sensor gate is the safe compromise.)
+	meterFrozenAfter  = 18 * time.Second
+	solarMovingWindow = 15 * time.Second
+	// activeEvseStaleAfter: an EVSE with an active session whose state has not
+	// updated for this long has gone silent (MeterValues stopped) — the hub is
+	// blind to that charger even though the session reads "active".
+	activeEvseStaleAfter = 30 * time.Second
+)
+
+// staleMeters returns the names of meter sources whose reading appears frozen:
+// fresh arrivals (the publisher is alive) but a W unchanged for meterFrozenAfter
+// while some inverter's W changed within solarMovingWindow.
+func (s snapshot) staleMeters() []string {
+	worldMoving := false
+	for _, d := range s.devices {
+		if d.Role == "inverter" && !d.WChangedAt.IsZero() && s.now.Sub(d.WChangedAt) < solarMovingWindow {
+			worldMoving = true
+			break
+		}
+	}
+	if !worldMoving {
+		return nil
+	}
+	var out []string
+	for name, d := range s.devices {
+		if d.Role != "meter" || d.W == nil {
+			continue
+		}
+		freshArrival := !d.UpdatedAt.IsZero() && s.now.Sub(d.UpdatedAt) <= s.staleAfter
+		valueFrozen := !d.WChangedAt.IsZero() && s.now.Sub(d.WChangedAt) > meterFrozenAfter
+		if freshArrival && valueFrozen {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// stale reports whether an EVSE with an active session has gone silent (its
+// MeterValues/Updated stopped, so the published state stopped refreshing).
+func (e evseSnap) stale(now time.Time) bool {
+	return e.State.SessionActive && !e.UpdatedAt.IsZero() && now.Sub(e.UpdatedAt) > activeEvseStaleAfter
 }
 
 func evseKey(stationID string, connectorID int) string {

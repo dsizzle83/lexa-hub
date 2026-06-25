@@ -19,6 +19,10 @@ type statusResp struct {
 	Power        powerSummary          `json:"power"`
 	LastPlan     planJSON              `json:"last_plan"`
 	EVSEs        []evseJSON            `json:"evse_stations,omitempty"`
+	// StaleSources names measurement sources the hub has detected as frozen/silent
+	// (a hung meter serving a cached value, or a silent charger) — surfaced so the
+	// fault is visible, not silently trusted (INV-STALE / INV-EVBLIND).
+	StaleSources []string `json:"stale_sources,omitempty"`
 }
 
 type deviceInfo struct {
@@ -76,6 +80,9 @@ type evseJSON struct {
 	PowerW        float64  `json:"power_W"`
 	SOC           *float64 `json:"soc_pct,omitempty"`
 	EnergyWh      float64  `json:"energy_Wh,omitempty"`
+	// Stale is true when an active session's telemetry went silent (MeterValues
+	// stopped) — the reported power is a frozen last value, not live (INV-EVBLIND).
+	Stale bool `json:"stale,omitempty"`
 }
 
 // buildStatus reduces the aggregated snapshot into the dashboard-facing JSON.
@@ -154,13 +161,15 @@ func buildStatus(snap snapshot) statusResp {
 	// Site load = solar + battery + grid_import − ev_charging  (≥ 0).
 	loadW := solarW + batteryW + gridW
 	var evW float64
-	for _, e := range snap.evses {
+	for _, es := range snap.evses {
+		e := es.State
 		ej := evseJSON{
 			StationID:     e.StationID,
 			ConnectorID:   e.ConnectorID,
 			Connected:     e.Connected,
 			SessionActive: e.SessionActive,
 			Status:        e.Status,
+			Stale:         es.stale(snap.now),
 		}
 		if e.CurrentA != nil {
 			ej.CurrentA = *e.CurrentA
@@ -182,12 +191,17 @@ func buildStatus(snap snapshot) statusResp {
 			soc := *e.SOC
 			ej.SOC = &soc
 		}
+		if ej.Stale {
+			resp.StaleSources = append(resp.StaleSources, "evse:"+e.StationID)
+		}
 		resp.EVSEs = append(resp.EVSEs, ej)
 	}
 	loadW -= evW
 	if loadW < 0 {
 		loadW = 0
 	}
+
+	resp.StaleSources = append(resp.StaleSources, snap.staleMeters()...)
 
 	resp.Power = powerSummary{
 		SolarW:   solarW,
