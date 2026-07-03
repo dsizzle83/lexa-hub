@@ -311,6 +311,13 @@ type Plan struct {
 
 	// Breach, when non-nil, flags a CSIP limit that could not be met this tick.
 	Breach *ComplianceBreach
+
+	// Safety marks a fast-protection-loop plan (EvaluateSafety). Safety plans
+	// never evaluate CSIP limits, so Breach==nil on them means "not assessed",
+	// not "compliant" — consumers tracking breach begin/clear edges (the
+	// CannotComply alerter) must skip them or an inter-tick safety action
+	// would publish a spurious breach-clear mid-episode.
+	Safety bool
 }
 
 // AddDecision appends a Decision to the plan's trace.

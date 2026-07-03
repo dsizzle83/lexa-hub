@@ -16,6 +16,24 @@ type SystemReader interface {
 	ReadSystemState() (SystemState, error)
 }
 
+// SafetyEvaluator is an OPTIONAL extension of Optimizer. When the Engine's
+// optimizer implements it (and the reader implements SafetyReader), the Engine
+// runs a fast protection loop between economic ticks that calls EvaluateSafety and
+// actuates only its protective commands. EvaluateSafety must be stateless enough
+// to run at a high cadence and must share the optimizer's control goroutine (no
+// concurrent use with Optimize). See ADR-0001 (two-loop control hierarchy).
+type SafetyEvaluator interface {
+	EvaluateSafety(state SystemState) Plan
+}
+
+// SafetyReader is an OPTIONAL extension of SystemReader that returns a cheap,
+// side-effect-free snapshot (battery/grid only) for the fast protection loop, so
+// polling it at a high cadence does not perturb the full reader's per-tick state
+// (e.g. CSIP-control expiry counting).
+type SafetyReader interface {
+	ReadSafetyState() (SystemState, error)
+}
+
 // BatteryActuator applies a BatteryCommand to a physical or simulated battery.
 type BatteryActuator interface {
 	ApplyBatteryCommand(cmd BatteryCommand) error

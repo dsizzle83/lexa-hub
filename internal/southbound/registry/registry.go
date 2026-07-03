@@ -181,11 +181,24 @@ func (reg *Registry) poll() {
 	copy(entries, reg.entries)
 	reg.mu.RUnlock()
 
+	// Poll devices concurrently. ReadMeasurements carries a per-device deadline
+	// (5 s), and a serial loop let one slow or timing-out device stall the
+	// freshness of every other device for the whole cycle — which becomes a hard
+	// floor on the poll interval (a 2 s safety poll can't tolerate a 5 s stall in
+	// series). Each device owns an independent Modbus session, so cross-device
+	// reads are safe in parallel; poll-vs-control serialization on the SAME device
+	// is handled inside the device/registry entry. publish is concurrency-safe
+	// (RLock + non-blocking sends + atomic drop counter).
+	var wg sync.WaitGroup
+	wg.Add(len(entries))
 	for _, e := range entries {
-		m, err := e.Device.ReadMeasurements()
-		upd := MeasurementUpdate{Name: e.Name, Measurements: m, Err: err}
-		reg.publish(upd)
+		go func(e *Entry) {
+			defer wg.Done()
+			m, err := e.Device.ReadMeasurements()
+			reg.publish(MeasurementUpdate{Name: e.Name, Measurements: m, Err: err})
+		}(e)
 	}
+	wg.Wait()
 }
 
 func (reg *Registry) publish(upd MeasurementUpdate) {

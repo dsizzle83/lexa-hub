@@ -10,18 +10,21 @@ import (
 // DeviceConfig describes one southbound Modbus/SunSpec device.
 type DeviceConfig struct {
 	Name   string  `json:"name"`
-	URL    string  `json:"url"`    // e.g. "tcp://192.168.1.10:5020"
+	URL    string  `json:"url"` // e.g. "tcp://192.168.1.10:5020"
 	UnitID uint8   `json:"unit_id"`
 	Role   string  `json:"role"`  // "inverter" | "battery" | "meter"
 	MaxW   float64 `json:"max_w"` // nameplate capacity (W)
+	// SOCReservePct is the battery SOC reserve floor (%) used by the Tier-0 edge
+	// safety interlock. 0 ⇒ default (20%). Only meaningful for battery devices.
+	SOCReservePct float64 `json:"soc_reserve_pct"`
 }
 
 // Config is the JSON configuration for lexa-modbus.
 type Config struct {
-	MQTTBroker   string         `json:"mqtt_broker"`    // e.g. "tcp://localhost:1883"
-	MQTTClientID string         `json:"mqtt_client_id"` // default "lexa-modbus"
-	PollIntervalS int           `json:"poll_interval_s"` // default 10
-	Devices      []DeviceConfig `json:"devices"`
+	MQTTBroker    string         `json:"mqtt_broker"`     // e.g. "tcp://localhost:1883"
+	MQTTClientID  string         `json:"mqtt_client_id"`  // default "lexa-modbus"
+	PollIntervalS int            `json:"poll_interval_s"` // default 10
+	Devices       []DeviceConfig `json:"devices"`
 }
 
 func loadConfig(path string) (*Config, error) {

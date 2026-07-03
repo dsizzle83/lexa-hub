@@ -67,6 +67,86 @@ func (m *mockEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECommand) error 
 	return nil
 }
 
+// safetyMockOptimizer implements both Optimizer and SafetyEvaluator so the engine
+// wires the fast protection loop.
+type safetyMockOptimizer struct {
+	optimizeCalls atomic.Int32
+	safetyCalls   atomic.Int32
+}
+
+func (m *safetyMockOptimizer) Optimize(_ orchestrator.SystemState) orchestrator.Plan {
+	m.optimizeCalls.Add(1)
+	return orchestrator.Plan{}
+}
+
+func (m *safetyMockOptimizer) EvaluateSafety(_ orchestrator.SystemState) orchestrator.Plan {
+	m.safetyCalls.Add(1)
+	return orchestrator.Plan{}
+}
+
+// safetyMockReader implements both SystemReader and SafetyReader.
+type safetyMockReader struct {
+	full   atomic.Int32
+	safety atomic.Int32
+}
+
+func (m *safetyMockReader) ReadSystemState() (orchestrator.SystemState, error) {
+	m.full.Add(1)
+	return orchestrator.SystemState{Timestamp: time.Now()}, nil
+}
+
+func (m *safetyMockReader) ReadSafetyState() (orchestrator.SystemState, error) {
+	m.safety.Add(1)
+	return orchestrator.SystemState{Timestamp: time.Now()}, nil
+}
+
+// TestEngine_FastProtectionLoop verifies that when the optimizer implements
+// SafetyEvaluator and the reader implements SafetyReader, the engine runs the fast
+// safety pass more often than the economic pass (ADR-0001 two-loop hierarchy).
+func TestEngine_FastProtectionLoop(t *testing.T) {
+	opt := &safetyMockOptimizer{}
+	reader := &safetyMockReader{}
+	eng := orchestrator.New(reader, opt, orchestrator.Config{
+		Interval:       100 * time.Millisecond,
+		SafetyInterval: 20 * time.Millisecond, // econEvery = 5
+	})
+	eng.Start()
+	time.Sleep(260 * time.Millisecond)
+	eng.Stop()
+
+	safety := opt.safetyCalls.Load()
+	econ := opt.optimizeCalls.Load()
+	if safety <= econ {
+		t.Errorf("expected more fast safety passes than economic; safety=%d economic=%d", safety, econ)
+	}
+	if econ < 2 {
+		t.Errorf("expected the economic pass to keep running; economic=%d", econ)
+	}
+	if reader.safety.Load() == 0 {
+		t.Error("fast loop never called ReadSafetyState")
+	}
+}
+
+// TestEngine_NoFastLoopWithoutInterfaces verifies the engine degrades to a single
+// economic ticker when the optimizer/reader do not implement the safety
+// interfaces (the mockOptimizer/mockReader case).
+func TestEngine_NoFastLoopWithoutInterfaces(t *testing.T) {
+	reader := &mockReader{state: state0()}
+	opt := &mockOptimizer{}
+	eng := orchestrator.New(reader, opt, orchestrator.Config{
+		Interval:       30 * time.Millisecond,
+		SafetyInterval: 5 * time.Millisecond, // ignored: mocks lack the interfaces
+	})
+	eng.Start()
+	time.Sleep(120 * time.Millisecond)
+	eng.Stop()
+	// With no fast loop, every tick is an economic tick: calls track the 30ms
+	// cadence (~4), nowhere near the 5ms fast cadence (~24).
+	if c := opt.calls.Load(); c > 10 {
+		t.Errorf("economic optimizer ran %d times — fast loop should be disabled without the interfaces", c)
+	}
+}
+
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 func TestEngine_StartStop(t *testing.T) {

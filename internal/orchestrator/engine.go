@@ -32,6 +32,12 @@ type Engine struct {
 	optimizer Optimizer
 	interval  time.Duration
 
+	// Fast protection loop (ADR-0001, Tier 1). Non-nil only when the optimizer and
+	// reader implement the optional SafetyEvaluator / SafetyReader interfaces.
+	safety         SafetyEvaluator
+	safetyReader   SafetyReader
+	safetyInterval time.Duration
+
 	// Actuators — keyed by device name.  Protected by actuMu so Register* can
 	// be called after Start (e.g. hot-plug EVSE).
 	actuMu         sync.RWMutex
@@ -85,6 +91,12 @@ type Engine struct {
 type Config struct {
 	// Interval is how often the optimization loop runs.  Default: 15s.
 	Interval time.Duration
+	// SafetyInterval is the cadence of the fast protection loop (ADR-0001). When
+	// > 0 and < Interval, AND the optimizer implements SafetyEvaluator and the
+	// reader implements SafetyReader, the Engine runs EvaluateSafety on this
+	// cadence between economic ticks. 0 disables it (safety runs only on the
+	// economic tick, inside Optimize).
+	SafetyInterval time.Duration
 	// Debug enables step-by-step decision tracing.
 	Debug bool
 	// Planner holds the daily-planner asset and scheduling configuration.
@@ -101,10 +113,11 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 15 * time.Second
 	}
-	return &Engine{
+	e := &Engine{
 		reader:         reader,
 		optimizer:      optimizer,
 		interval:       cfg.Interval,
+		safetyInterval: cfg.SafetyInterval,
 		battActuators:  make(map[string]BatteryActuator),
 		solarActuators: make(map[string]SolarActuator),
 		evseActuators:  make(map[string]EVSEActuator),
@@ -119,6 +132,15 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 		plannerDone:    make(chan struct{}),
 		urgentWake:     make(chan struct{}, 1),
 	}
+	// Wire the fast protection loop only if BOTH the optimizer and reader support
+	// it; otherwise safety runs on the economic tick (inside Optimize) as before.
+	if se, ok := optimizer.(SafetyEvaluator); ok {
+		e.safety = se
+	}
+	if sr, ok := reader.(SafetyReader); ok {
+		e.safetyReader = sr
+	}
+	return e
 }
 
 // SetDERConstraints stores per-step DER operating constraints derived from the
@@ -216,26 +238,80 @@ func (e *Engine) Stop() {
 	<-e.plannerDone
 }
 
-// run is the main control loop.
+// run is the main control loop (ADR-0001 two-loop hierarchy).
+//
+// When a fast protection loop is wired (safety + safetyReader present and
+// safetyInterval in (0, interval)), the loop ticks at safetyInterval: every tick
+// runs the fast safety pass, and every econEvery-th tick ALSO runs the full
+// economic pass. Both run on this one goroutine, so the optimizer needs no locking.
+// Otherwise it degenerates to the original single economic ticker.
 func (e *Engine) run() {
 	defer close(e.done)
 
-	ticker := time.NewTicker(e.interval)
+	base := e.interval
+	econEvery := 1
+	fastLoop := e.safety != nil && e.safetyReader != nil &&
+		e.safetyInterval > 0 && e.safetyInterval < e.interval
+	if fastLoop {
+		base = e.safetyInterval
+		econEvery = int(math.Round(float64(e.interval) / float64(e.safetyInterval)))
+		if econEvery < 1 {
+			econEvery = 1
+		}
+	}
+
+	ticker := time.NewTicker(base)
 	defer ticker.Stop()
 
 	// Evaluate immediately so devices get their first control without waiting.
 	e.tick()
 
+	n := 0
 	for {
 		select {
 		case <-e.stop:
 			return
 		case <-e.urgentWake:
 			e.tick()
-			ticker.Reset(e.interval) // skip the tick that would fire after the forced one
+			ticker.Reset(base) // skip the tick that would fire after the forced one
+			n = 0
 		case <-ticker.C:
-			e.tick()
+			n++
+			if !fastLoop || n >= econEvery {
+				n = 0
+				e.tick()
+			} else {
+				e.safetyTick()
+			}
 		}
+	}
+}
+
+// safetyTick is the fast protection pass: read the cheap safety snapshot, evaluate
+// the immediate protective reflexes, and actuate only their commands. It never
+// touches the economic plan, planner, or CSIP scheduler. Runs between economic
+// ticks on the same goroutine as tick().
+func (e *Engine) safetyTick() {
+	state, err := e.safetyReader.ReadSafetyState()
+	if err != nil {
+		log.Printf("[orchestrator] safety: read state error: %v", err)
+		return
+	}
+	plan := e.safety.EvaluateSafety(state)
+	if len(plan.BatteryCommands) == 0 && len(plan.SolarCommands) == 0 && len(plan.EVSECommands) == 0 {
+		return // nothing to protect against this tick
+	}
+	// Notify the observer: a fast-loop protective action (e.g. a wrong-sign
+	// disconnect) must reach the bus plan log like any economic decision, or
+	// the most safety-critical actions the hub takes are exactly the ones
+	// /status never shows. Safety plans carry no Breach, so the observer's
+	// breach-alert edge logic is untouched.
+	if e.planObserver != nil {
+		e.planObserver(plan)
+	}
+	e.executePlan(plan)
+	if len(plan.Decisions) > 0 {
+		e.logPlan(state, plan)
 	}
 }
 

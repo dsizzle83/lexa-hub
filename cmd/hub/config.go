@@ -29,6 +29,7 @@ type Config struct {
 	MQTTClientID string `json:"mqtt_client_id"`
 
 	EngineIntervalS int  `json:"engine_interval_s"` // default 15
+	SafetyIntervalS int  `json:"safety_interval_s"` // fast protection loop; default 1, 0 disables
 	Debug           bool `json:"debug"`
 
 	Devices  []DeviceConfig  `json:"devices"`
@@ -56,6 +57,11 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.EngineIntervalS <= 0 {
 		cfg.EngineIntervalS = 15
 	}
+	// Fast protection loop cadence: default 1 s. Set it ≥ engine_interval_s to
+	// disable (safety then runs only on the economic tick, inside Optimize).
+	if cfg.SafetyIntervalS == 0 {
+		cfg.SafetyIntervalS = 1
+	}
 	for i := range cfg.Stations {
 		if cfg.Stations[i].MaxCurrentA == 0 {
 			cfg.Stations[i].MaxCurrentA = 32
@@ -66,4 +72,8 @@ func loadConfig(path string) (*Config, error) {
 
 func (c *Config) EngineInterval() time.Duration {
 	return time.Duration(c.EngineIntervalS) * time.Second
+}
+
+func (c *Config) SafetyInterval() time.Duration {
+	return time.Duration(c.SafetyIntervalS) * time.Second
 }
