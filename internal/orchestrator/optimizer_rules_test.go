@@ -917,7 +917,7 @@ func TestRestoreRule_RestoresUnconstrainedSolar(t *testing.T) {
 	solar := []SolarState{ruleSol("pv", 5000)}
 	plan := &Plan{}
 
-	applyRestoreRule(solar, nil, 20, plan)
+	applyRestoreRule(solar, nil, 20, false, plan)
 
 	if len(plan.SolarCommands) == 0 {
 		t.Fatal("expected restore command for unconstrained solar")
@@ -931,10 +931,66 @@ func TestRestoreRule_SkipsSolarAlreadyCommanded(t *testing.T) {
 	solar := []SolarState{ruleSol("pv", 5000)}
 	plan := &Plan{SolarCommands: []SolarCommand{{Name: "pv", CurtailToW: 3000}}}
 
-	applyRestoreRule(solar, nil, 20, plan)
+	applyRestoreRule(solar, nil, 20, false, plan)
 
 	if len(plan.SolarCommands) != 1 {
 		t.Errorf("must not add second solar command, got %d", len(plan.SolarCommands))
+	}
+}
+
+// TestRestoreRule_RestoresDisconnectedSolarWhenNoCap is the regression for the
+// stuck-curtailment-on-reconnect cluster (QA 2026-07-03: curtailment-release,
+// clock-jump-forward, release-while-rebooting). An inverter that is DARK on the
+// ticks after the export cap clears must still get the restore queued: the
+// southbound retryDevice records every command as the device's desired state
+// while disconnected and re-asserts it on reconnect, so this command is the only
+// thing that overwrites the stale curtailment latched before the fault. Gating
+// on Connected left the device clamped at the old ceiling forever.
+func TestRestoreRule_RestoresDisconnectedSolarWhenNoCap(t *testing.T) {
+	dark := ruleSol("pv", 0)
+	dark.Connected = false
+	dark.Energized = false
+	plan := &Plan{}
+
+	applyRestoreRule([]SolarState{dark}, nil, 20, false, plan)
+
+	if len(plan.SolarCommands) != 1 {
+		t.Fatalf("expected a restore command for the disconnected inverter, got %d", len(plan.SolarCommands))
+	}
+	if plan.SolarCommands[0].Name != "pv" || !math.IsNaN(plan.SolarCommands[0].CurtailToW) {
+		t.Errorf("restore command must be {pv, NaN}, got %+v", plan.SolarCommands[0])
+	}
+}
+
+// TestRestoreRule_HoldsDarkSolarWhileCapActive: while an export/generation cap is
+// ACTIVE the cap rules command only connected inverters, so a dark inverter's
+// recorded desired state (southbound lastCtrl) still holds the live curtailment.
+// Queuing a restore would overwrite it and a reconnecting inverter would snap to
+// full nameplate under the active cap.
+func TestRestoreRule_HoldsDarkSolarWhileCapActive(t *testing.T) {
+	dark := ruleSol("pv", 0)
+	dark.Connected = false
+	dark.Energized = false
+	plan := &Plan{}
+
+	applyRestoreRule([]SolarState{dark}, nil, 20, true, plan)
+
+	if len(plan.SolarCommands) != 0 {
+		t.Errorf("dark inverter under an active cap must keep its held curtailment, got %+v", plan.SolarCommands)
+	}
+}
+
+// A CONNECTED uncommanded inverter is still restored while a cap is active (the
+// cap rules command every connected inverter each tick, so an uncommanded one is
+// genuinely unconstrained — preserve the pre-existing behavior).
+func TestRestoreRule_RestoresConnectedSolarEvenWithCapActive(t *testing.T) {
+	solar := []SolarState{ruleSol("pv", 5000)}
+	plan := &Plan{}
+
+	applyRestoreRule(solar, nil, 20, true, plan)
+
+	if len(plan.SolarCommands) != 1 || !math.IsNaN(plan.SolarCommands[0].CurtailToW) {
+		t.Errorf("connected uncommanded inverter must still be restored, got %+v", plan.SolarCommands)
 	}
 }
 
@@ -942,7 +998,7 @@ func TestRestoreRule_RestoresBattery(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 50, 5000)}
 	plan := &Plan{}
 
-	applyRestoreRule(nil, bats, 20, plan)
+	applyRestoreRule(nil, bats, 20, false, plan)
 
 	if len(plan.BatteryCommands) == 0 {
 		t.Fatal("expected restore command for unconstrained battery")
@@ -962,7 +1018,7 @@ func TestRestoreRule_IdlesLatchedDischargeBelowSOCReserve(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 2000, 15, 5000)} // discharging 2 kW at SOC=15 (≤ reserve=20)
 	plan := &Plan{}
 
-	applyRestoreRule(nil, bats, 20, plan)
+	applyRestoreRule(nil, bats, 20, false, plan)
 
 	if len(plan.BatteryCommands) != 1 {
 		t.Fatalf("expected an idle command to stop discharge below reserve, got %d", len(plan.BatteryCommands))
@@ -977,7 +1033,7 @@ func TestRestoreRule_SkipsBatteryAlreadyCommanded(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 50, 5000)}
 	plan := &Plan{BatteryCommands: []BatteryCommand{{Name: "bat", SetpointW: -2000}}}
 
-	applyRestoreRule(nil, bats, 20, plan)
+	applyRestoreRule(nil, bats, 20, false, plan)
 
 	if len(plan.BatteryCommands) != 1 {
 		t.Errorf("must not add second battery command, got %d", len(plan.BatteryCommands))

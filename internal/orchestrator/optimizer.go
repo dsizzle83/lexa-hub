@@ -129,6 +129,18 @@ type DefaultOptimizer struct {
 	// expGuard holds per-limit-session state for the export-limit rule.
 	expGuard exportGuard
 
+	// expOverTicks is the export-cap convergence counter: ticks the MEASURED
+	// export has stayed over the active export limit. Deliberately NOT a field
+	// of expGuard — that struct is the ceiling *controller's* state and resets
+	// on every cap VALUE change, but a rewritten cap value is a new controller
+	// session with the SAME compliance obligation. control-churn rewrites the
+	// cap every ~12 s alternating 0 W / 500 W (a step far wider than any noise
+	// tolerance band), so a counter sharing the controller's reset cadence
+	// would be wiped before ever reaching its threshold — structurally unable
+	// to fire for the exact fault it exists to catch. Session-scoped instead:
+	// reset only when the export limit clears entirely (checkExportLimitConvergence).
+	expOverTicks int
+
 	// impGuard holds per-limit-session state for the import-limit rule.
 	impGuard importGuard
 
@@ -141,6 +153,72 @@ type DefaultOptimizer struct {
 	// sustained count means the device is inverting/ignoring its setpoint
 	// (audit: battery-wrong-sign). Drives the checkBatterySafety disconnect.
 	battDrainTicks map[string]int
+
+	// battWrongDirTicks counts, per battery, consecutive ticks where the hub
+	// commanded the pack to charge (negative setpoint) but it measured as
+	// discharging. This catches a sign-flipped battery regardless of SOC level —
+	// the SOC-reserve check alone misses it when SoC is high (audit: battery-wrong-sign).
+	battWrongDirTicks map[string]int
+
+	// genCapActive records whether the previous tick held an active generation
+	// cap, so the release transition (cap → NaN) can emit an explicit uncurtail
+	// (audit: curtailment-release Mode A). See restoreOnGenLimitClear.
+	genCapActive bool
+
+	// tickInterval is the engine cadence. When > 0 it scales the tick-denominated
+	// breach/debounce thresholds so their WALL-CLOCK meaning is constant across
+	// cadences (fast 3 s vs stock 15 s) — the product ships in stock timing but is
+	// QA'd in fast timing, so a raw tick count means the shipped safety/CannotComply
+	// latency is not the one that was validated. 0 = use the raw constants (unit
+	// tests and the historical 3 s fast tick they were calibrated at). Set via
+	// SetTickInterval from cmd/hub.
+	tickInterval time.Duration
+
+	// lastBattCmd records the setpoint (W; <0 = charge) most recently commanded to
+	// each battery by Optimize, so the fast protection loop's EvaluateSafety — which
+	// runs between economic ticks without a fresh plan — can tell whether a measured
+	// discharge contradicts a commanded charge (audit: battery-wrong-sign). Written
+	// by Optimize and read by EvaluateSafety on the same control goroutine, so it
+	// needs no lock.
+	lastBattCmd map[string]float64
+}
+
+// tunedTickInterval is the engine cadence the *BreachTicks constants were
+// calibrated at (the FAST replay/QA tick). scaleTicks is a no-op at this cadence,
+// so unit tests that construct the optimizer without an interval see the exact
+// legacy tick counts.
+const tunedTickInterval = 3 * time.Second
+
+// SetTickInterval tells the optimizer the engine cadence so it can hold the
+// wall-clock meaning of the breach/debounce thresholds constant across cadences.
+// Safe to call once at construction, before Start.
+func (o *DefaultOptimizer) SetTickInterval(d time.Duration) { o.tickInterval = d }
+
+// scaleTicks converts a threshold expressed in tuned-cadence ticks into the
+// equivalent tick count at the configured engine cadence, preserving the
+// wall-clock duration the constant encodes. A floor of 2 keeps the single-glitch
+// tolerance the leaky counters rely on even when one stock tick already exceeds
+// the tuned hold. Returns ticks unchanged when no interval is configured (tests)
+// or the cadence matches the tuned one (fast mode).
+func (o *DefaultOptimizer) scaleTicks(ticks int) int {
+	if o.tickInterval <= 0 || o.tickInterval == tunedTickInterval {
+		return ticks
+	}
+	hold := time.Duration(ticks) * tunedTickInterval
+	n := int(math.Round(hold.Seconds() / o.tickInterval.Seconds()))
+	if n < 2 {
+		n = 2
+	}
+	return n
+}
+
+// tickSeconds returns the wall-clock length of one engine tick for latency
+// telemetry, defaulting to the tuned cadence when unset.
+func (o *DefaultOptimizer) tickSeconds() float64 {
+	if o.tickInterval <= 0 {
+		return tunedTickInterval.Seconds()
+	}
+	return o.tickInterval.Seconds()
 }
 
 // NewDefaultOptimizer returns an optimizer with sensible defaults.
@@ -165,8 +243,10 @@ func NewDefaultOptimizer() *DefaultOptimizer {
 			dischargeW:   math.NaN(),
 			activeLimitW: math.NaN(),
 		},
-		genGuard:       genGuard{activeLimitW: math.NaN()},
-		battDrainTicks: make(map[string]int),
+		genGuard:          genGuard{activeLimitW: math.NaN()},
+		battDrainTicks:    make(map[string]int),
+		battWrongDirTicks: make(map[string]int),
+		lastBattCmd:       make(map[string]float64),
 	}
 }
 
@@ -220,10 +300,15 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// Rule 3: Export/import limit — absorb excess into EVSEs, battery, then curtail solar.
 	// Always runs (CSIP compliance cannot be skipped).
 	batteries, surplusW = o.applyExportLimitRule(state.Solar, state.EVSEs, evseW, limits, state.Grid.NetW, o.SOCFullThreshold, surplusW, batteries, &plan)
+	// Closed-loop check: verify measured export actually converged to the cap.
+	o.checkExportLimitConvergence(limits.exportLimitW, state.Grid.NetW, &plan)
 
 	// Rule 3.1: Generation limit — curtail inverters so total output ≤ MaxLimW.
 	// Always runs (CSIP compliance cannot be skipped).
 	applyGenLimitRule(state.Solar, limits.maxLimitW, &plan)
+	// On the tick the cap is released, emit an explicit uncurtail so no stale
+	// ceiling latches on the inverter (audit: curtailment-release Mode A).
+	o.restoreOnGenLimitClear(state.Solar, limits.maxLimitW, &plan)
 	// Closed-loop check: verify the inverters actually converged to the cap.
 	o.checkGenLimitConvergence(state.Solar, state.Batteries, state.Grid.NetW, limits.maxLimitW, &plan)
 
@@ -273,7 +358,12 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	}
 
 	// Final: restore unconstrained devices so prior setpoints don't persist.
-	applyRestoreRule(state.Solar, batteries, o.SOCReserve, &plan)
+	// While an export or generation cap is active the cap rules own the solar
+	// setpoints, so a dark inverter must keep its held curtailment; once both
+	// clear, the restore is queued even for dark inverters so the southbound
+	// delivers it on reconnect (see applyRestoreRule).
+	solarCapActive := !math.IsNaN(limits.exportLimitW) || !math.IsNaN(limits.maxLimitW)
+	applyRestoreRule(state.Solar, batteries, o.SOCReserve, solarCapActive, &plan)
 
 	// Safety backstop: force-disconnect any pack that is draining itself below the
 	// SOC reserve against its command (a device inverting/ignoring its setpoint).
@@ -283,6 +373,17 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// can address the CannotComply Response to the right event.
 	if plan.Breach != nil && state.CSIPControl != nil {
 		plan.Breach.MRID = state.CSIPControl.MRID
+	}
+
+	// Record commanded battery setpoints so the fast protection loop's
+	// EvaluateSafety can infer charge-vs-discharge intent between economic ticks.
+	if o.lastBattCmd == nil {
+		o.lastBattCmd = make(map[string]float64)
+	}
+	for _, c := range plan.BatteryCommands {
+		if !math.IsNaN(c.SetpointW) {
+			o.lastBattCmd[c.Name] = c.SetpointW
+		}
 	}
 
 	return plan
@@ -774,18 +875,19 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	// force the whole battBreachTicks count to restart, or the curtail never engages
 	// before the breach window ends. Decrement instead, capped at the threshold so
 	// the credit is restored quickly once the pack genuinely starts absorbing.
+	battStallThreshold := o.scaleTicks(battBreachTicks)
 	if batteryAbsorbW > complianceBreachW && measuredBatteryAbsorbW < batteryAbsorbW*battConvergeFrac {
-		if o.expGuard.battStallTicks < battBreachTicks {
+		if o.expGuard.battStallTicks < battStallThreshold {
 			o.expGuard.battStallTicks++
 		}
 	} else if o.expGuard.battStallTicks > 0 {
 		o.expGuard.battStallTicks--
 	}
-	if o.expGuard.battStallTicks >= battBreachTicks {
+	if o.expGuard.battStallTicks >= battStallThreshold {
 		predictedBatteryAbsorbW = measuredBatteryAbsorbW
 		plan.AddDecision("csip/export-limit",
-			fmt.Sprintf("battery commanded %.0fW absorb but measured only %.0fW for %d ticks",
-				batteryAbsorbW, measuredBatteryAbsorbW, o.expGuard.battStallTicks),
+			fmt.Sprintf("battery commanded %.0fW absorb but measured only %.0fW for %d ticks (~%.0fs)",
+				batteryAbsorbW, measuredBatteryAbsorbW, o.expGuard.battStallTicks, float64(o.expGuard.battStallTicks)*o.tickSeconds()),
 			"battery not absorbing — curtailing solar to hold the export cap instead")
 	}
 
@@ -1056,6 +1158,123 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	return batteries, surplusW
 }
 
+// exportBreachTicks is how many ticks measured export may stay over the cap
+// before the hub reports a CannotComply. Same value and leaky accumulation as
+// genBreachTicks/importBreachTicks: long enough to ride out the ceiling
+// controller's normal 1–2-tick convergence (one-step correction + meter lag),
+// short enough that the detect→alert→northbound→gridsim CannotComply chain
+// completes inside a tight cap window (the 21–49 s overshoots in QA 2026-07-03
+// control-churn/clock-jitter would be detected ~9 s in).
+const exportBreachTicks = 3
+
+// checkExportLimitConvergence is the measured-effect backstop for an export cap.
+// applyExportLimitRule commands battery absorption, EV draw, and a solar ceiling
+// — and cross-checks each lever — but its only breach report fires when the
+// ceiling is already at essentially zero and the site is STILL over the cap (no
+// lever left). A site that never converges to a ceiling commanded WITH room to
+// spare (a device that ACKs but ignores, or control churn that keeps the loop
+// re-starting) stayed over the cap indefinitely with no CannotComply (QA
+// 2026-07-03: control-churn, clock-jitter — 6/21 FAILs). Mirror
+// checkGenLimitConvergence/checkImportConvergence: compare MEASURED export from
+// the grid meter against the CSIP-visible limit (not the commanded ceiling — the
+// grid server cares about the constraint, not our controller internals) and post
+// a CannotComply after exportBreachTicks sustained over-cap ticks.
+//
+// The counter (expOverTicks) is session-scoped: it resets when the export limit
+// clears entirely, NOT on cap value changes — see the field comment for why a
+// controller-cadence or tolerance-band reset can never fire under control-churn.
+// Skipping the per-value reset is also behaviourally identical to gen-limit's
+// new-cap reset whenever the site was compliant under the outgoing cap (the
+// counter sits at zero, so a mid-episode tighten still gets the full ramp
+// allowance); the only divergence is a site already in violation across a
+// rewrite, which keeps escalating — exactly the churn fault. Clock-offset
+// changes never touch the counter: the reset keys off limits.exportLimitW
+// alone, and the scheduler's fail-closed hold plus the hub's expiry-confirm
+// debounce keep the limit from flapping to NaN under spec-legal jitter.
+func (o *DefaultOptimizer) checkExportLimitConvergence(exportLimitW, netW float64, plan *Plan) {
+	if math.IsNaN(exportLimitW) {
+		o.expOverTicks = 0 // cap cleared — compliance session over
+		return
+	}
+	// A meter-blind tick (netW NaN) is evidence of nothing: neither breach nor
+	// compliance. Hold the counter, matching checkImportConvergence, so a blind
+	// tick inside a sustained breach doesn't restart the escalation.
+	if math.IsNaN(netW) {
+		return
+	}
+	exportW := math.Max(0, -netW)
+	// Leaky counter, matching the gen/import checks: an under-cap sample (meter
+	// blip, momentary convergence) decrements instead of zeroing, so a sustained
+	// breach with occasional noise still escalates while genuine convergence
+	// drains the counter within a few ticks.
+	threshold := o.scaleTicks(exportBreachTicks)
+	if exportW > exportLimitW+complianceBreachW {
+		if o.expOverTicks < threshold {
+			o.expOverTicks++ // cap at the threshold so it drains fast on recovery
+		}
+	} else if o.expOverTicks > 0 {
+		o.expOverTicks--
+	}
+	if o.expOverTicks >= threshold && plan.Breach == nil {
+		o.recordBreach(plan, &ComplianceBreach{
+			LimitType:  "export",
+			LimitW:     exportLimitW,
+			MeasuredW:  exportW,
+			ShortfallW: exportW - exportLimitW,
+			Reason:     "export remains over the cap after correction was commanded — the site is not converging to the limit",
+		})
+		plan.AddDecision("csip/export-limit",
+			fmt.Sprintf("export %.0fW still over cap %.0fW after %d ticks (~%.0fs)",
+				exportW, exportLimitW, o.expOverTicks, float64(o.expOverTicks)*o.tickSeconds()),
+			"reporting CannotComply — site not converging to the export limit")
+	}
+}
+
+// restoreOnGenLimitClear emits an explicit uncurtail (CurtailToW=NaN → WMaxLimPct
+// 100%) on the tick a generation cap is released (was active last tick, now NaN),
+// for each connected inverter with no other command this tick.
+//
+// applyGenLimitRule early-returns on a cleared cap without touching the inverter,
+// leaving the release to applyRestoreRule at the end of the pass. Emitting the
+// restore explicitly at the release edge — ahead of applyRestoreRule and logged as
+// its own decision — makes the transition observable and guarantees the uncurtail
+// is issued the moment the cap clears (audit: curtailment-release Mode A). Only the
+// active→clear edge fires it, so a still-active export limit (which curtails via its
+// own command, already present in plan.SolarCommands) is left untouched.
+//
+// The restore is emitted for DISCONNECTED inverters too: the southbound
+// (lexa-modbus retryDevice) records every command as the device's desired
+// state and re-asserts it when the device reconnects (Phase 4), so a release
+// that happens while the inverter is dark is delivered on its return instead
+// of leaving it latched at the stale ceiling (QA 2026-07-02:
+// release-while-rebooting).
+func (o *DefaultOptimizer) restoreOnGenLimitClear(solar []SolarState, maxLimitW float64, plan *Plan) {
+	if !math.IsNaN(maxLimitW) {
+		o.genCapActive = true
+		return
+	}
+	if !o.genCapActive {
+		return // no cap last tick either — nothing to release
+	}
+	o.genCapActive = false
+	restored := 0
+	for _, sol := range solar {
+		if hasSolarCommand(plan.SolarCommands, sol.Name) {
+			continue
+		}
+		plan.SolarCommands = append(plan.SolarCommands, SolarCommand{
+			Name:       sol.Name,
+			CurtailToW: math.NaN(), // NaN → restore to full nameplate (WMaxLimPct 100%)
+		})
+		restored++
+	}
+	if restored > 0 {
+		plan.AddDecision("csip/gen-limit",
+			"generation cap released — restoring inverters to full output",
+			fmt.Sprintf("uncurtailing %d inverters (WMaxLimPct 100%%) so no stale ceiling latches", restored))
+	}
+}
+
 // applyGenLimitRule enforces an absolute generation cap (CSIP OpModMaxLimW) by
 // curtailing the inverters so total solar output stays at or below the limit.
 //
@@ -1175,8 +1394,9 @@ func (o *DefaultOptimizer) checkGenLimitConvergence(solar []SolarState, batterie
 	// window barely affords genBreachTicks consecutive ticks). Decrement on an
 	// under-cap tick so a sustained breach with occasional noise still escalates,
 	// while a genuine convergence still drains the counter to zero within a few ticks.
+	threshold := o.scaleTicks(genBreachTicks)
 	if measuredGenW > maxLimitW+complianceBreachW {
-		if o.genGuard.overCount < genBreachTicks {
+		if o.genGuard.overCount < threshold {
 			o.genGuard.overCount++ // cap at the threshold so it drains fast on recovery
 		}
 	} else if o.genGuard.overCount > 0 {
@@ -1185,10 +1405,10 @@ func (o *DefaultOptimizer) checkGenLimitConvergence(solar []SolarState, batterie
 
 	if o.Debug {
 		log.Printf("[optimizer] gen-converge: cap=%.0f measuredGen=%.0f overCount=%d/%d",
-			maxLimitW, measuredGenW, o.genGuard.overCount, genBreachTicks)
+			maxLimitW, measuredGenW, o.genGuard.overCount, threshold)
 	}
 
-	if o.genGuard.overCount >= genBreachTicks {
+	if o.genGuard.overCount >= threshold {
 		o.recordBreach(plan, &ComplianceBreach{
 			LimitType:  "generation",
 			LimitW:     maxLimitW,
@@ -1197,17 +1417,22 @@ func (o *DefaultOptimizer) checkGenLimitConvergence(solar []SolarState, batterie
 			Reason:     "inverter output remains above the generation cap after curtailment was commanded — the device is not honouring the command",
 		})
 		plan.AddDecision("csip/gen-limit",
-			fmt.Sprintf("generation %.0fW still over cap %.0fW after %d ticks", measuredGenW, maxLimitW, o.genGuard.overCount),
+			fmt.Sprintf("generation %.0fW still over cap %.0fW after %d ticks (~%.0fs)",
+				measuredGenW, maxLimitW, o.genGuard.overCount, float64(o.genGuard.overCount)*o.tickSeconds()),
 			"reporting CannotComply — inverter not converging to the commanded ceiling")
 	}
 }
 
-// importBreachTicks is how many consecutive ticks measured grid import may stay
-// over the cap before the hub reports a CannotComply. Mirrors genBreachTicks:
-// long enough to ride out a battery discharge ramp / EV soft-stop, short enough
-// to surface a load the hub cannot actually shed — a charger that ACKs a
-// current-limit profile or suspend but keeps drawing (audit: ev-accept-but-ignore).
-const importBreachTicks = 5
+// importBreachTicks is how many ticks measured grid import may stay over the
+// cap before the hub reports a CannotComply. Mirrors genBreachTicks — same
+// value, same leaky accumulation: long enough to ride out a battery discharge
+// ramp / EV soft-stop, short enough to surface a load the hub cannot actually
+// shed — a charger that ACKs a current-limit profile or suspend but keeps
+// drawing (audit: ev-accept-but-ignore). Was 5; at 5 the CannotComply lost a
+// 40–50% timing race against the scenario hold window on the HIL bench
+// (QA 2026-07-01: battery-soc-refuse), and an unmeetable import cap deserves
+// the same escalation latency as an unmeetable generation cap.
+const importBreachTicks = 3
 
 // checkImportConvergence is the measured-effect backstop for an import cap.
 // applyImportLimitRule (battery discharge) and applyEVChargingRule (EV suspend)
@@ -1223,16 +1448,28 @@ func (o *DefaultOptimizer) checkImportConvergence(importLimitW, netW float64, pl
 		o.impGuard.breachTicks = 0 // cap cleared — reset
 		return
 	}
-	importW := 0.0
-	if !math.IsNaN(netW) {
-		importW = math.Max(0, netW)
+	// A meter-blind tick (netW NaN — e.g. the worldMoving gate excluded a frozen
+	// meter) is evidence of nothing: neither breach nor compliance. Hold the
+	// counter rather than resetting it, or a single blind tick inside a sustained
+	// breach silently restarts the whole escalation and the CannotComply loses the
+	// race against the constraint window (QA 2026-07-01: battery-soc-refuse).
+	if math.IsNaN(netW) {
+		return
 	}
+	importW := math.Max(0, netW)
+	// Leaky counter, matching checkGenLimitConvergence: a single under-cap sample
+	// (meter blip, momentary load dip) decrements instead of zeroing, so a
+	// sustained breach with occasional noise still escalates while genuine
+	// convergence drains the counter within a few ticks.
+	threshold := o.scaleTicks(importBreachTicks)
 	if importW > importLimitW+complianceBreachW {
-		o.impGuard.breachTicks++
-	} else {
-		o.impGuard.breachTicks = 0
+		if o.impGuard.breachTicks < threshold {
+			o.impGuard.breachTicks++ // cap at the threshold so it drains fast on recovery
+		}
+	} else if o.impGuard.breachTicks > 0 {
+		o.impGuard.breachTicks--
 	}
-	if o.impGuard.breachTicks >= importBreachTicks && plan.Breach == nil {
+	if o.impGuard.breachTicks >= o.scaleTicks(importBreachTicks) && plan.Breach == nil {
 		o.recordBreach(plan, &ComplianceBreach{
 			LimitType:  "import",
 			LimitW:     importLimitW,
@@ -1241,7 +1478,8 @@ func (o *DefaultOptimizer) checkImportConvergence(importLimitW, netW float64, pl
 			Reason:     "import remains over the cap after all levers — a load is not honouring the hub's curtailment/suspend command",
 		})
 		plan.AddDecision("csip/import-limit",
-			fmt.Sprintf("import %.0fW still over cap %.0fW after %d ticks", importW, importLimitW, o.impGuard.breachTicks),
+			fmt.Sprintf("import %.0fW still over cap %.0fW after %d ticks (~%.0fs)",
+				importW, importLimitW, o.impGuard.breachTicks, float64(o.impGuard.breachTicks)*o.tickSeconds()),
 			"reporting CannotComply — load not responding to curtailment")
 	}
 }
@@ -1255,29 +1493,123 @@ func (o *DefaultOptimizer) checkImportConvergence(importLimitW, netW float64, pl
 const batteryReserveDrainTicks = 3
 
 // checkBatterySafety is a measured-effect safety backstop on battery direction.
-// The optimizer's rules never discharge a pack at/below its SOC reserve, so if
-// the meter shows one doing exactly that for batteryReserveDrainTicks consecutive
-// ticks, the pack is not honouring its command. Trusting the command would walk a
-// low battery to empty; instead, force a disconnect (cease-to-energize that pack)
-// — a different command than the inverted setpoint, so the device can obey it —
-// and surface the fault. Runs after applyRestoreRule so it overrides the idle/
-// reconnect that rule issues for an otherwise-uncommanded pack.
+// checkBatterySafety detects two fault modes and force-disconnects the pack:
+//
+//  1. Reserve drain: the rules never discharge at/below SOC reserve, so measured
+//     discharge there for batteryReserveDrainTicks ticks means the pack is not
+//     honouring its command. Trusting the command would walk the battery to empty.
+//
+//  2. Wrong direction: when the hub commanded charge (negative setpoint) but the
+//     pack measures as discharging for batteryReserveDrainTicks ticks, the sign
+//     convention is inverted — the pack will discharge regardless of SOC level.
+//     Disconnecting is safer than letting it drain uncontrolled (audit: battery-wrong-sign).
+//
+// Runs after applyRestoreRule so it overrides the idle/reconnect that rule issues.
+// criticalBatteryInversion reports the unambiguous, act-now battery fault: a pack
+// commanded to charge but measured discharging (>complianceBreachW) while at/near
+// its SOC reserve (≤ reserve+5%). No correct command produces this, and at a full
+// discharge the pack crosses the reserve floor in seconds — so it warrants an
+// immediate disconnect with no debounce, on whichever loop observes it first
+// (audit: battery-wrong-sign).
+func criticalBatteryInversion(powerW, soc, socReserve float64, chargeCommanded bool) bool {
+	return chargeCommanded && powerW > complianceBreachW &&
+		!math.IsNaN(soc) && soc <= socReserve+5
+}
+
+// chargeCommandedFor reports whether the pack is currently commanded to charge —
+// from this tick's plan if present (economic tick), else from the last commanded
+// setpoint (fast protection tick, which has no fresh plan).
+func (o *DefaultOptimizer) chargeCommandedFor(name string, plan *Plan) bool {
+	if i := batteryCommandIndex(plan.BatteryCommands, name); i >= 0 {
+		return !math.IsNaN(plan.BatteryCommands[i].SetpointW) && plan.BatteryCommands[i].SetpointW < 0
+	}
+	if o.lastBattCmd != nil {
+		if sp, ok := o.lastBattCmd[name]; ok {
+			return sp < 0
+		}
+	}
+	return false
+}
+
+// EvaluateSafety is the Tier-1 fast protection pass (ADR-0001). It runs between
+// economic ticks on a short cadence and issues ONLY the immediate, unambiguous
+// protective disconnects (critical sign-inversion at reserve), so a mis-wired pack
+// is ceased in ~1 tick instead of waiting a full economic interval — which at the
+// 15 s stock cadence is far too slow for a reserve-floor emergency. It is
+// deliberately stateless (no debounce counters): the debounced reserve-drain /
+// wrong-direction paths remain in checkBatterySafety on the economic tick. Runs on
+// the same goroutine as Optimize, so it needs no lock.
+func (o *DefaultOptimizer) EvaluateSafety(state SystemState) Plan {
+	plan := Plan{Timestamp: state.Timestamp, Safety: true}
+	empty := &Plan{} // no fresh economic plan on the fast tick
+	for _, b := range state.Batteries {
+		if !b.Connected {
+			continue
+		}
+		chargeCommanded := o.chargeCommandedFor(b.Name, empty)
+		if !criticalBatteryInversion(b.PowerW, b.SOC, o.SOCReserve, chargeCommanded) {
+			continue
+		}
+		f := false
+		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+			Name: b.Name, SetpointW: 0, Connect: &f,
+		})
+		plan.AddDecision("safety/battery-direction-fast",
+			fmt.Sprintf("battery %s commanded to charge but discharging %.0fW at SOC %.1f%% ≤ reserve+5%% — fast-loop immediate disconnect",
+				b.Name, b.PowerW, b.SOC),
+			"force-disconnecting the pack (Tier-1 fast protection loop)")
+	}
+	return plan
+}
+
 func (o *DefaultOptimizer) checkBatterySafety(batteries []BatteryState, plan *Plan) {
 	if o.battDrainTicks == nil {
 		o.battDrainTicks = make(map[string]int)
 	}
+	if o.battWrongDirTicks == nil {
+		o.battWrongDirTicks = make(map[string]int)
+	}
 	for _, b := range batteries {
 		if !b.Connected || math.IsNaN(b.SOC) {
 			delete(o.battDrainTicks, b.Name)
+			delete(o.battWrongDirTicks, b.Name)
 			continue
 		}
+
+		// Check 1: reserve drain (SOC-gated).
 		dischargingAtReserve := b.PowerW > complianceBreachW && b.SOC <= o.SOCReserve
 		if dischargingAtReserve {
 			o.battDrainTicks[b.Name]++
 		} else {
 			o.battDrainTicks[b.Name] = 0
 		}
-		if o.battDrainTicks[b.Name] < batteryReserveDrainTicks {
+
+		// Check 2: wrong direction — commanded charge but measuring discharge.
+		// Look at this tick's command to infer intent; measured PowerW reflects
+		// the previous tick's state (one-tick lag is intentional: we want to see
+		// whether the pack responded to the command, not whether we issued it).
+		chargeCommanded := o.chargeCommandedFor(b.Name, plan)
+		wrongDirection := chargeCommanded && b.PowerW > complianceBreachW
+		if wrongDirection {
+			o.battWrongDirTicks[b.Name]++
+		} else {
+			o.battWrongDirTicks[b.Name] = 0
+		}
+
+		// Critical fast path (audit: battery-wrong-sign): a pack commanded to
+		// charge but measured discharging while already at/near its SOC reserve is
+		// unambiguously inverting its setpoint AND about to sail through the reserve
+		// floor — there is no benign explanation, so disconnect THIS tick without
+		// spending the debounce budget. At a 4800 W discharge the pack crosses the
+		// reserve in a few seconds, faster than the multi-tick debounce can react;
+		// the tick paths below still cover the non-critical cases (wrong direction
+		// at high SOC, slow reserve drain) where riding out a single telemetry
+		// glitch is worth the small delay.
+		threshold := o.scaleTicks(batteryReserveDrainTicks)
+		criticalTrip := criticalBatteryInversion(b.PowerW, b.SOC, o.SOCReserve, chargeCommanded)
+		drainTrip := o.battDrainTicks[b.Name] >= threshold
+		wrongDirTrip := o.battWrongDirTicks[b.Name] >= threshold
+		if !criticalTrip && !drainTrip && !wrongDirTrip {
 			continue
 		}
 
@@ -1293,10 +1625,18 @@ func (o *DefaultOptimizer) checkBatterySafety(batteries []BatteryState, plan *Pl
 				Connect:   &disconnect,
 			})
 		}
-		plan.AddDecision("safety/battery-direction",
-			fmt.Sprintf("battery %s discharging %.0fW at SOC %.1f%% ≤ reserve %.0f%% for %d ticks",
-				b.Name, b.PowerW, b.SOC, o.SOCReserve, o.battDrainTicks[b.Name]),
-			"force-disconnecting the pack — it is not honouring its charge/idle command (reserve drain)")
+		reason := fmt.Sprintf("battery %s discharging %.0fW at SOC %.1f%% ≤ reserve %.0f%% for %d ticks (~%.0fs)",
+			b.Name, b.PowerW, b.SOC, o.SOCReserve, o.battDrainTicks[b.Name], float64(o.battDrainTicks[b.Name])*o.tickSeconds())
+		switch {
+		case criticalTrip && !wrongDirTrip:
+			reason = fmt.Sprintf("battery %s commanded to charge but discharging %.0fW at SOC %.1f%% ≤ reserve+5%% — critical sign inversion, immediate disconnect (no debounce)",
+				b.Name, b.PowerW, b.SOC)
+		case wrongDirTrip:
+			reason = fmt.Sprintf("battery %s commanded to charge but discharging %.0fW (SOC %.1f%%) for %d ticks (~%.0fs) — sign inversion",
+				b.Name, b.PowerW, b.SOC, o.battWrongDirTicks[b.Name], float64(o.battWrongDirTicks[b.Name])*o.tickSeconds())
+		}
+		plan.AddDecision("safety/battery-direction", reason,
+			"force-disconnecting the pack — it is not honouring its charge command")
 	}
 }
 
@@ -1637,8 +1977,15 @@ func (o *DefaultOptimizer) applyImportLimitRule(batteries []BatteryState, limits
 		return batteries
 	}
 
-	// New limit value → restart the guard fresh.
-	if limits.importLimitW != o.impGuard.activeLimitW {
+	// New limit value → restart the guard fresh. "New" means a MEANINGFUL change:
+	// the decoded cap can vary by a hair tick-to-tick (the watts→ActivePower
+	// value×10^mult round-trip through the bus), and restarting on a bit-exact
+	// inequality wipes the guard — including breachTicks — every tick, so a
+	// sustained import breach never escalates to CannotComply (same failure the
+	// gen guard fixed in checkGenLimitConvergence; QA 2026-07-01:
+	// battery-soc-refuse). Track the cap session by a tolerance band and follow
+	// minor drift instead.
+	if math.IsNaN(o.impGuard.activeLimitW) || math.Abs(limits.importLimitW-o.impGuard.activeLimitW) > complianceBreachW {
 		o.impGuard = importGuard{dischargeW: math.NaN(), activeLimitW: limits.importLimitW}
 		// A limit that arrives while the site is already compliant must not
 		// suspend the EV: the cooldown gate exists for recovery after a
@@ -1650,6 +1997,8 @@ func (o *DefaultOptimizer) applyImportLimitRule(batteries []BatteryState, limits
 			}
 			o.impGuard.evSafeCount = cooldown
 		}
+	} else {
+		o.impGuard.activeLimitW = limits.importLimitW // same session; track sub-threshold drift
 	}
 
 	importW := 0.0
@@ -1867,14 +2216,40 @@ func batteryHeadroomReason(batteries []BatteryState, socReserve float64) string 
 // tick so that prior setpoints don't latch in Modbus registers.
 // Solar is restored to full output (NaN = nameplate max).
 // Battery is idled (0 W) and reconnected so a prior disconnect does not persist.
-func applyRestoreRule(solar []SolarState, batteries []BatteryState, socReserve float64, plan *Plan) {
+//
+// When no solar cap is active, the restore is emitted for DISCONNECTED inverters
+// too — this is the export-cap counterpart of restoreOnGenLimitClear's dark-device
+// handling: the southbound (lexa-modbus retryDevice) records every command as the
+// device's desired state even while disconnected and re-asserts it on reconnect
+// (Phase 4), so this restore is what overwrites a stale curtailment latched before
+// the fault. Gating it on Connected meant an inverter that was dark on the ticks
+// after the cap cleared kept the old ceiling as its recorded desired state and
+// returned still clamped, forever (QA 2026-07-03: curtailment-release,
+// clock-jump-forward, release-while-rebooting — 11/21 FAILs).
+//
+// While a solar cap IS active, a dark inverter is deliberately left uncommanded:
+// the cap rules only command connected inverters, so the southbound's recorded
+// desired state still holds the live curtailment — queuing a restore here would
+// overwrite it and a reconnecting inverter would snap to full nameplate under an
+// active cap (e.g. a Modbus fault mid-episode) until the next tick re-curtails.
+//
+// Batteries keep the Connected gate deliberately: the orchestrator re-commands
+// packs every engine tick once they are connected (this rule idles any uncommanded
+// pack), so a reconnecting battery is reconciled within one tick — and
+// retryDevice's reconnect reassert covers a pack that WAS commanded while dark.
+// Queuing idle commands for dark packs would add nothing but per-tick MQTT noise.
+func applyRestoreRule(solar []SolarState, batteries []BatteryState, socReserve float64, solarCapActive bool, plan *Plan) {
 	for _, sol := range solar {
-		if sol.Connected && !hasSolarCommand(plan.SolarCommands, sol.Name) {
-			plan.SolarCommands = append(plan.SolarCommands, SolarCommand{
-				Name:       sol.Name,
-				CurtailToW: math.NaN(), // NaN → restore to full nameplate output
-			})
+		if hasSolarCommand(plan.SolarCommands, sol.Name) {
+			continue
 		}
+		if !sol.Connected && solarCapActive {
+			continue // dark under an active cap: keep the held curtailment as desired state
+		}
+		plan.SolarCommands = append(plan.SolarCommands, SolarCommand{
+			Name:       sol.Name,
+			CurtailToW: math.NaN(), // NaN → restore to full nameplate output
+		})
 	}
 	reconnect := true
 	for _, b := range batteries {

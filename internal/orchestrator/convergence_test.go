@@ -188,6 +188,54 @@ func TestCheckBatterySafety_RidesOutSingleTick(t *testing.T) {
 	}
 }
 
+// EvaluateSafety (fast protection loop) must disconnect a pack commanded to
+// charge but measured discharging at/near its reserve — immediately, with no
+// debounce and no economic plan present. (audit: battery-wrong-sign, ADR-0001)
+func TestEvaluateSafety_DisconnectsSignInversionAtReserve(t *testing.T) {
+	o := NewDefaultOptimizer() // SOCReserve = 20
+	o.lastBattCmd["bat"] = -3000
+	state := SystemState{Batteries: []BatteryState{
+		{Name: "bat", PowerW: 4800, SOC: 12, Connected: true, Energized: true},
+	}}
+	plan := o.EvaluateSafety(state)
+	if !hasDisconnectCommand(&plan, "bat") {
+		t.Fatalf("expected fast-loop disconnect; commands=%+v", plan.BatteryCommands)
+	}
+}
+
+func TestEvaluateSafety_NoDisconnectWhenCharging(t *testing.T) {
+	o := NewDefaultOptimizer()
+	o.lastBattCmd["bat"] = -3000
+	state := SystemState{Batteries: []BatteryState{
+		{Name: "bat", PowerW: -3000, SOC: 12, Connected: true, Energized: true},
+	}}
+	if plan := o.EvaluateSafety(state); hasDisconnectCommand(&plan, "bat") {
+		t.Error("fast loop disconnected a correctly-charging pack")
+	}
+}
+
+func TestEvaluateSafety_NoDisconnectAboveReserve(t *testing.T) {
+	o := NewDefaultOptimizer()
+	o.lastBattCmd["bat"] = -3000
+	state := SystemState{Batteries: []BatteryState{
+		{Name: "bat", PowerW: 4800, SOC: 80, Connected: true, Energized: true},
+	}}
+	if plan := o.EvaluateSafety(state); hasDisconnectCommand(&plan, "bat") {
+		t.Error("fast loop disconnected far from reserve; should defer to the economic tick")
+	}
+}
+
+func TestEvaluateSafety_NoDisconnectWhenDischargeCommanded(t *testing.T) {
+	o := NewDefaultOptimizer()
+	o.lastBattCmd["bat"] = 3000 // hub commanded DISCHARGE, not charge
+	state := SystemState{Batteries: []BatteryState{
+		{Name: "bat", PowerW: 4800, SOC: 12, Connected: true, Energized: true},
+	}}
+	if plan := o.EvaluateSafety(state); hasDisconnectCommand(&plan, "bat") {
+		t.Error("fast loop disconnected a legitimately commanded discharge")
+	}
+}
+
 func TestCheckImportConvergence_BreachAfterSustainedOverCap(t *testing.T) {
 	o := NewDefaultOptimizer()
 	var last *Plan
@@ -207,16 +255,58 @@ func TestCheckImportConvergence_BreachAfterSustainedOverCap(t *testing.T) {
 	}
 }
 
-func TestCheckImportConvergence_ResetsWhenCompliant(t *testing.T) {
+// The counter is leaky, not hard-reset: a compliant tick drains one count, so
+// sustained compliance drains to zero but a lone blip cannot restart a climbing
+// breach from scratch (mirrors checkGenLimitConvergence).
+func TestCheckImportConvergence_CompliantTickDrainsOneCount(t *testing.T) {
 	o := NewDefaultOptimizer()
 	for i := 0; i < importBreachTicks-1; i++ {
 		o.checkImportConvergence(0, 1430, &Plan{})
 	}
-	o.checkImportConvergence(0, 0, &Plan{}) // compliant tick resets the counter
+	o.checkImportConvergence(0, 0, &Plan{}) // compliant tick drains one count
 	p := &Plan{}
-	o.checkImportConvergence(0, 1430, p) // only one over-cap tick since reset
+	o.checkImportConvergence(0, 1430, p) // back over cap: count = threshold-1
 	if p.Breach != nil {
-		t.Error("breach recorded after a compliant tick should have reset the counter")
+		t.Error("breach fired before the leaky counter re-reached the threshold")
+	}
+	p = &Plan{}
+	o.checkImportConvergence(0, 1430, p) // count reaches the threshold
+	if p.Breach == nil {
+		t.Error("a sustained breach with one compliant blip must still escalate")
+	}
+}
+
+// Sustained compliance drains the counter fully — an old near-breach cannot
+// trip a CannotComply long after the site converged.
+func TestCheckImportConvergence_SustainedComplianceDrainsToZero(t *testing.T) {
+	o := NewDefaultOptimizer()
+	for i := 0; i < importBreachTicks-1; i++ {
+		o.checkImportConvergence(0, 1430, &Plan{})
+	}
+	for i := 0; i < importBreachTicks-1; i++ {
+		o.checkImportConvergence(0, 0, &Plan{}) // drain back to zero
+	}
+	p := &Plan{}
+	o.checkImportConvergence(0, 1430, p) // one over-cap tick from a drained counter
+	if p.Breach != nil {
+		t.Error("breach recorded after sustained compliance should need a full re-escalation")
+	}
+}
+
+// A meter-blind tick (netW NaN, e.g. worldMoving excluded a frozen meter) holds
+// the counter: it is evidence of neither breach nor compliance, and must not
+// stall the escalation race against the constraint window (QA 2026-07-01:
+// battery-soc-refuse lost 50% of cycles to NaN-tick resets).
+func TestCheckImportConvergence_NaNTickHoldsCounter(t *testing.T) {
+	o := NewDefaultOptimizer()
+	for i := 0; i < importBreachTicks-1; i++ {
+		o.checkImportConvergence(0, 1430, &Plan{})
+	}
+	o.checkImportConvergence(0, math.NaN(), &Plan{}) // blind tick — counter held
+	p := &Plan{}
+	o.checkImportConvergence(0, 1430, p) // next over-cap tick completes the count
+	if p.Breach == nil {
+		t.Error("a meter-blind tick must hold the breach counter, not reset it")
 	}
 }
 
@@ -233,6 +323,33 @@ func TestCheckImportConvergence_ClearsOnNoCap(t *testing.T) {
 	}
 }
 
+// Sub-threshold drift in the decoded cap value (the watts→ActivePower
+// value×10^mult round-trip can wobble tick-to-tick) must NOT restart the import
+// guard: a bit-exact session comparison wiped breachTicks every tick, so a
+// sustained breach never escalated to CannotComply (QA 2026-07-01:
+// battery-soc-refuse; same bug class the gen guard fixed).
+func TestApplyImportLimitRule_CapDriftKeepsGuardSession(t *testing.T) {
+	o := NewDefaultOptimizer()
+	limits := gridConstraints{importLimitW: 3000, exportLimitW: math.NaN(), maxLimitW: math.NaN()}
+	o.applyImportLimitRule(nil, limits, 4000, 20, &Plan{}) // session starts
+	o.impGuard.breachTicks = 2
+
+	limits.importLimitW = 3000.4 // decode wobble, same session
+	o.applyImportLimitRule(nil, limits, 4000, 20, &Plan{})
+	if o.impGuard.breachTicks != 2 {
+		t.Errorf("sub-threshold cap drift restarted the guard: breachTicks=%d, want 2", o.impGuard.breachTicks)
+	}
+	if o.impGuard.activeLimitW != 3000.4 {
+		t.Errorf("guard did not follow drift: activeLimitW=%v, want 3000.4", o.impGuard.activeLimitW)
+	}
+
+	limits.importLimitW = 5000 // a genuinely new cap → fresh session
+	o.applyImportLimitRule(nil, limits, 4000, 20, &Plan{})
+	if o.impGuard.breachTicks != 0 {
+		t.Errorf("a meaningful cap change must restart the guard: breachTicks=%d, want 0", o.impGuard.breachTicks)
+	}
+}
+
 // An existing breach from another rule this tick is not overwritten.
 func TestCheckImportConvergence_DefersToExistingBreach(t *testing.T) {
 	o := NewDefaultOptimizer()
@@ -241,6 +358,151 @@ func TestCheckImportConvergence_DefersToExistingBreach(t *testing.T) {
 	}
 	p := &Plan{Breach: &ComplianceBreach{LimitType: "import", ShortfallW: 999, Reason: "preexisting"}}
 	o.checkImportConvergence(0, 1430, p)
+	if p.Breach.Reason != "preexisting" {
+		t.Errorf("existing breach was overwritten: %+v", p.Breach)
+	}
+}
+
+// ── checkExportLimitConvergence (closed-loop export cap) ──────────────────────
+
+// TestCheckExportConvergence_BreachAfterSustainedOverCap is the regression for
+// the silent-non-convergence cluster (QA 2026-07-03: control-churn,
+// clock-jitter): measured export sustained over the cap — with the ceiling
+// controller still holding levers, so the export rule's own zero-lever breach
+// never fires — must escalate to a CannotComply after exportBreachTicks.
+func TestCheckExportConvergence_BreachAfterSustainedOverCap(t *testing.T) {
+	o := NewDefaultOptimizer()
+	var last *Plan
+	for i := 0; i < exportBreachTicks; i++ {
+		p := &Plan{}
+		o.checkExportLimitConvergence(500, -4400, p) // cap 500 W, exporting 4400 W
+		if i < exportBreachTicks-1 && p.Breach != nil {
+			t.Fatalf("breach recorded too early at tick %d", i)
+		}
+		last = p
+	}
+	if last.Breach == nil {
+		t.Fatal("expected a CannotComply breach after sustained export over cap")
+	}
+	if last.Breach.LimitType != "export" || last.Breach.MeasuredW != 4400 {
+		t.Errorf("unexpected breach: %+v", last.Breach)
+	}
+	if math.Abs(last.Breach.ShortfallW-3900) > 1 {
+		t.Errorf("shortfall = %.0fW, want 3900W", last.Breach.ShortfallW)
+	}
+}
+
+// TestCheckExportConvergence_SurvivesCapChurn is the test that would have caught
+// the control-churn gap before it reached the bench: a rapid sequence of cap
+// VALUE rewrites (delete-and-replace alternating 0 W / 500 W, the control-churn
+// fault pattern) while the site stays in violation of every one of them must
+// still accumulate the breach counter to threshold. The counter is
+// session-scoped — a per-value or tolerance-band reset (the 0↔500 W step is far
+// wider than any noise band) would wipe it on every rewrite and the CannotComply
+// could structurally never fire.
+func TestCheckExportConvergence_SurvivesCapChurn(t *testing.T) {
+	o := NewDefaultOptimizer()
+	churn := []float64{0, 500, 0, 500, 0, 500}
+	var last *Plan
+	fired := -1
+	for i, cap := range churn {
+		last = &Plan{}
+		o.checkExportLimitConvergence(cap, -4400, last) // over EVERY cap in the churn
+		if last.Breach != nil && fired < 0 {
+			fired = i
+		}
+	}
+	if last.Breach == nil {
+		t.Fatal("a sustained violation across rapid cap rewrites must still escalate (session-scoped counter)")
+	}
+	if fired != exportBreachTicks-1 {
+		t.Errorf("breach fired at churn tick %d, want %d (counter must survive every rewrite)", fired, exportBreachTicks-1)
+	}
+}
+
+// A site that converges to the cap never breaches, no matter how long it's held.
+func TestCheckExportConvergence_ConvergedNeverBreaches(t *testing.T) {
+	o := NewDefaultOptimizer()
+	for i := 0; i < exportBreachTicks+3; i++ {
+		p := &Plan{}
+		o.checkExportLimitConvergence(500, -450, p) // exporting 450 W under the 500 W cap
+		if p.Breach != nil {
+			t.Fatalf("converged export must not breach (tick %d)", i)
+		}
+	}
+}
+
+// The counter is leaky: one compliant tick drains a count instead of zeroing, so
+// a sustained breach with a lone blip still escalates (mirrors gen/import).
+func TestCheckExportConvergence_CompliantTickDrainsOneCount(t *testing.T) {
+	o := NewDefaultOptimizer()
+	for i := 0; i < exportBreachTicks-1; i++ {
+		o.checkExportLimitConvergence(500, -4400, &Plan{})
+	}
+	o.checkExportLimitConvergence(500, -400, &Plan{}) // compliant blip drains one count
+	p := &Plan{}
+	o.checkExportLimitConvergence(500, -4400, p) // count = threshold-1
+	if p.Breach != nil {
+		t.Error("breach fired before the leaky counter re-reached the threshold")
+	}
+	p = &Plan{}
+	o.checkExportLimitConvergence(500, -4400, p) // count reaches the threshold
+	if p.Breach == nil {
+		t.Error("a sustained breach with one compliant blip must still escalate")
+	}
+}
+
+// A meter-blind tick (netW NaN) holds the counter — evidence of nothing.
+func TestCheckExportConvergence_NaNTickHoldsCounter(t *testing.T) {
+	o := NewDefaultOptimizer()
+	for i := 0; i < exportBreachTicks-1; i++ {
+		o.checkExportLimitConvergence(500, -4400, &Plan{})
+	}
+	o.checkExportLimitConvergence(500, math.NaN(), &Plan{}) // blind tick — counter held
+	p := &Plan{}
+	o.checkExportLimitConvergence(500, -4400, p) // next over-cap tick completes the count
+	if p.Breach == nil {
+		t.Error("a meter-blind tick must hold the breach counter, not reset it")
+	}
+}
+
+// Clearing the export limit entirely ends the compliance session and resets the
+// counter — the ONE reset the session-scoped counter has.
+func TestCheckExportConvergence_ClearsOnNoCap(t *testing.T) {
+	o := NewDefaultOptimizer()
+	for i := 0; i < exportBreachTicks-1; i++ {
+		o.checkExportLimitConvergence(500, -4400, &Plan{})
+	}
+	o.checkExportLimitConvergence(math.NaN(), -4400, &Plan{}) // cap cleared → reset
+	p := &Plan{}
+	o.checkExportLimitConvergence(500, -4400, p)
+	if p.Breach != nil {
+		t.Error("counter should reset when the export cap clears")
+	}
+}
+
+// Grid import (netW > 0) is zero export — always compliant with an export cap.
+func TestCheckExportConvergence_ImportIsCompliant(t *testing.T) {
+	o := NewDefaultOptimizer()
+	o.expOverTicks = 2 // mid-escalation
+	p := &Plan{}
+	o.checkExportLimitConvergence(500, 2000, p) // importing — drains the counter
+	if p.Breach != nil {
+		t.Error("an importing site cannot breach an export cap")
+	}
+	if o.expOverTicks != 1 {
+		t.Errorf("import tick should drain one count, got %d", o.expOverTicks)
+	}
+}
+
+// An existing breach from another rule this tick is not overwritten.
+func TestCheckExportConvergence_DefersToExistingBreach(t *testing.T) {
+	o := NewDefaultOptimizer()
+	for i := 0; i < exportBreachTicks-1; i++ {
+		o.checkExportLimitConvergence(500, -4400, &Plan{})
+	}
+	p := &Plan{Breach: &ComplianceBreach{LimitType: "export", ShortfallW: 9999, Reason: "preexisting"}}
+	o.checkExportLimitConvergence(500, -4400, p)
 	if p.Breach.Reason != "preexisting" {
 		t.Errorf("existing breach was overwritten: %+v", p.Breach)
 	}

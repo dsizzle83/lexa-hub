@@ -62,6 +62,11 @@ func main() {
 	// poke the engine on urgent controls).
 	opt := orchestrator.NewDefaultOptimizer()
 	opt.Debug = cfg.Debug
+	// Tell the optimizer the engine cadence so its tick-denominated breach/debounce
+	// thresholds keep a constant WALL-CLOCK meaning across cadences (the product ships
+	// at 15 s but is QA'd at the 3 s fast tick). Without this, the shipped safety and
+	// CannotComply latencies are 5× the ones validated in fast mode.
+	opt.SetTickInterval(cfg.EngineInterval())
 	// Activate the reactive TOU peak-discharge rule as a fallback. The daily
 	// planner is the primary battery dispatcher; this rule only fires when no
 	// plan target is available for the current interval (startup, or a gap in
@@ -92,6 +97,21 @@ func main() {
 	// never saw the CannotComply.
 	activeBreachMRID := "" // "" = no breach currently active
 	planObserver := func(plan orchestrator.Plan) {
+		// Surface the plan trace on the bus so lexa-api's /status last_plan is
+		// real data instead of the historical empty stub (the QA harness's
+		// decision introspection depends on it). Published on EVERY pass —
+		// decisions or not — so the timestamp doubles as an engine heartbeat.
+		// Retained: lexa-api restarting mid-episode still sees the latest plan.
+		pl := bus.PlanLog{Ts: plan.Timestamp.Unix()}
+		for _, dec := range plan.Decisions {
+			pl.Decisions = append(pl.Decisions, bus.PlanDecision{
+				Rule: dec.Rule, Reason: dec.Reason, Impact: dec.Impact,
+			})
+		}
+		if err := mqttutil.PublishJSONRetained(mc, bus.TopicHubPlan, pl); err != nil {
+			log.Printf("lexa-hub: publish plan log: %v", err)
+		}
+
 		alert, newMRID := breachAlert(activeBreachMRID, plan)
 		activeBreachMRID = newMRID
 		if alert == nil {
@@ -110,10 +130,11 @@ func main() {
 	}
 
 	eng := orchestrator.New(reader, opt, orchestrator.Config{
-		Interval:     cfg.EngineInterval(),
-		Debug:        cfg.Debug,
-		Planner:      cfg.Planner,
-		PlanObserver: planObserver,
+		Interval:       cfg.EngineInterval(),
+		SafetyInterval: cfg.SafetyInterval(),
+		Debug:          cfg.Debug,
+		Planner:        cfg.Planner,
+		PlanObserver:   planObserver,
 	})
 
 	// Subscribe to all state topics.
@@ -191,6 +212,11 @@ func main() {
 // by the caller.
 func breachAlert(prevMRID string, plan orchestrator.Plan) (*bus.ComplianceAlert, string) {
 	switch {
+	// A fast-loop safety plan never evaluates CSIP limits: its nil Breach means
+	// "not assessed", not "compliant". Treating it as a clear edge would publish
+	// a spurious CannotComply-resolved between economic ticks mid-episode.
+	case plan.Safety:
+		return nil, prevMRID
 	case plan.Breach != nil && plan.Breach.MRID != prevMRID:
 		b := plan.Breach
 		return &bus.ComplianceAlert{

@@ -999,3 +999,123 @@ func containsStr(s, sub string) bool {
 	}
 	return false
 }
+
+// ── Stuck-curtailment-on-reconnect + export convergence (QA 2026-07-03) ────────
+
+// TestOptimizer_RestoresDisconnectedSolarAfterCapClears drives the full Optimize
+// path through the stuck-curtailment failure: an export cap curtails the
+// inverter, then the cap clears on a tick where the inverter is DARK. The plan
+// must still carry the restore command (CurtailToW=NaN) for the dark inverter —
+// that command is what lexa-modbus's retryDevice records as the desired state
+// and re-asserts on reconnect (see TestRetryDevice_ReassertsDesiredStateOnReconnect
+// in cmd/modbus for the southbound half). Without it the device returns still
+// clamped at the stale ceiling (QA 2026-07-03: curtailment-release,
+// clock-jump-forward, release-while-rebooting).
+func TestOptimizer_RestoresDisconnectedSolarAfterCapClears(t *testing.T) {
+	opt := newOpt()
+
+	// Tick 1: zero-export cap active, inverter connected and exporting → curtailed.
+	s1 := state0()
+	s1.Solar = []orchestrator.SolarState{solar("pv", 4000, 5000)}
+	s1.Grid.NetW = -4000
+	s1.CSIPControl = &orchestrator.CSIPControlState{
+		Source: "event", MRID: "cap-1",
+		Base: model.DERControlBase{OpModExpLimW: ap(0)},
+	}
+	p1 := opt.Optimize(s1)
+	curtailed := false
+	for _, c := range p1.SolarCommands {
+		if c.Name == "pv" && !math.IsNaN(c.CurtailToW) && c.CurtailToW < 4500 {
+			curtailed = true
+		}
+	}
+	if !curtailed {
+		t.Fatalf("setup: expected the export cap to curtail pv; commands=%+v", p1.SolarCommands)
+	}
+
+	// Tick 2: the cap has cleared and the inverter is dark on this very tick.
+	s2 := state0()
+	dark := solar("pv", 0, 5000)
+	dark.Connected = false
+	dark.Energized = false
+	s2.Solar = []orchestrator.SolarState{dark}
+	p2 := opt.Optimize(s2)
+
+	restored := false
+	for _, c := range p2.SolarCommands {
+		if c.Name == "pv" && math.IsNaN(c.CurtailToW) {
+			restored = true
+		}
+	}
+	if !restored {
+		t.Errorf("cap cleared while inverter dark: plan must carry the restore for the dark device; commands=%+v",
+			p2.SolarCommands)
+	}
+}
+
+// TestOptimizer_DarkSolarUnderActiveCapNotRestored: the counterpart guard — while
+// the export cap is still ACTIVE, a dark inverter must NOT be sent a restore
+// (its held curtailment is the correct desired state for its reconnect).
+func TestOptimizer_DarkSolarUnderActiveCapNotRestored(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+	dark := solar("pv", 0, 5000)
+	dark.Connected = false
+	dark.Energized = false
+	s.Solar = []orchestrator.SolarState{dark}
+	s.Grid.NetW = -200
+	s.CSIPControl = &orchestrator.CSIPControlState{
+		Source: "event", MRID: "cap-1",
+		Base: model.DERControlBase{OpModExpLimW: ap(0)},
+	}
+	plan := opt.Optimize(s)
+	for _, c := range plan.SolarCommands {
+		if c.Name == "pv" && math.IsNaN(c.CurtailToW) {
+			t.Errorf("dark inverter under an ACTIVE cap must not be restored; commands=%+v", plan.SolarCommands)
+		}
+	}
+}
+
+// TestOptimizer_ExportChurnEscalatesCannotComply drives the full Optimize path
+// through the control-churn fault: the export cap is rewritten every tick
+// (alternating 0 W / 500 W — each rewrite resets the ceiling controller's
+// expGuard) while measured export stays far over BOTH caps and the ceiling still
+// has room to spare (so the export rule's own zero-lever breach cannot fire).
+// The convergence counter must survive the guard resets and escalate to a
+// CannotComply breach, stamped with the active control's MRID. This is the
+// integration test that pins the counter OUTSIDE the per-value guard reset — the
+// design gap that let control-churn/clock-jitter breach silently (QA 2026-07-03).
+func TestOptimizer_ExportChurnEscalatesCannotComply(t *testing.T) {
+	opt := newOpt()
+	churn := []int16{0, 500, 0, 500, 0, 500}
+	var last orchestrator.Plan
+	firedAt := -1
+	for i, cap := range churn {
+		s := state0()
+		// PV 4500 W with 1600 W of home load → export 2900 W: over both caps,
+		// but the computed solar ceiling (~load) stays well above zero, so only
+		// the convergence check can report this.
+		s.Solar = []orchestrator.SolarState{solar("pv", 4500, 5000)}
+		s.Grid.NetW = -2900
+		s.CSIPControl = &orchestrator.CSIPControlState{
+			Source: "event", MRID: "churn-mrid",
+			Base: model.DERControlBase{OpModExpLimW: ap(cap)},
+		}
+		last = opt.Optimize(s)
+		if last.Breach != nil && firedAt < 0 {
+			firedAt = i
+		}
+	}
+	if last.Breach == nil {
+		t.Fatal("sustained over-cap export across rapid cap rewrites must escalate to CannotComply")
+	}
+	if last.Breach.LimitType != "export" {
+		t.Errorf("LimitType = %q, want export", last.Breach.LimitType)
+	}
+	if last.Breach.MRID != "churn-mrid" {
+		t.Errorf("breach MRID = %q, want churn-mrid (northbound needs it to address the Response)", last.Breach.MRID)
+	}
+	if firedAt < 2 {
+		t.Errorf("breach fired at tick %d — too early, the sustained gate must ride out a normal ramp", firedAt)
+	}
+}

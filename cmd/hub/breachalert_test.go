@@ -58,3 +58,22 @@ func TestBreachAlert(t *testing.T) {
 		t.Errorf("no breach and none active must publish nothing, got %+v", a)
 	}
 }
+
+// A fast-loop safety plan (EvaluateSafety) carries no breach evaluation. Since
+// safetyTick now feeds the plan observer (2026-07-03, for the /status plan
+// log), its nil Breach must NOT read as a clear edge — a wrong-sign disconnect
+// firing between economic ticks mid-breach would otherwise publish a spurious
+// "compliance restored" to the grid server.
+func TestBreachAlert_SafetyPlanHoldsEpisode(t *testing.T) {
+	a, cur := breachAlert("A", orchestrator.Plan{Safety: true})
+	if a != nil {
+		t.Fatalf("safety plan mid-episode must publish nothing, got %+v", a)
+	}
+	if cur != "A" {
+		t.Fatalf("safety plan must preserve the active breach mRID, got %q", cur)
+	}
+	// And with no episode active it is equally a no-op.
+	if a, cur := breachAlert("", orchestrator.Plan{Safety: true}); a != nil || cur != "" {
+		t.Fatalf("safety plan with no episode must be a no-op, got %+v / %q", a, cur)
+	}
+}
