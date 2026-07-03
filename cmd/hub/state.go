@@ -31,6 +31,21 @@ const (
 	// past ValidUntil) while still clearing a genuinely-expired control whose
 	// publisher has died within a few ticks.
 	expiryConfirmTicks = 3
+
+	// meterFrozenAfter is the window after which a meter that keeps publishing
+	// the same W value is treated as a frozen sensor and excluded from the
+	// optimizer's grid reading. The optimizer falls back to its computed power
+	// balance, which is safer than acting on a sensor stuck at a stale reading.
+	// A typical meter publishes every ~2–3 s; 30 s = ~12 consecutive identical
+	// readings. A noise gate of 10 W prevents false triggers from ADC jitter.
+	meterFrozenAfter  = 30 * time.Second
+	meterFrozenNoiseW = 10.0
+
+	// solarMovingWindow is how recently an inverter's W must have changed for the
+	// world to be considered "moving". A frozen meter is only excluded while the
+	// world is demonstrably changing — this prevents false positives when the grid
+	// is genuinely steady (meter stable because load is stable, not because it's stuck).
+	solarMovingWindow = 20 * time.Second
 )
 
 // MQTTSystemReader implements orchestrator.SystemReader by maintaining a
@@ -66,14 +81,22 @@ type MQTTSystemReader struct {
 }
 
 type measSnapshot struct {
-	W  float64 // NaN if not received
-	V  float64
-	Hz float64
-	at time.Time // receive time of the last message; zero = never received
+	W          float64 // NaN if not received
+	V          float64
+	Hz         float64
+	at         time.Time // receive time of the last message; zero = never received
+	wChangedAt time.Time // when W last changed by more than meterFrozenNoiseW
 }
 
 func (s measSnapshot) fresh(now time.Time) bool {
 	return !s.at.IsZero() && now.Sub(s.at) <= measStaleAfter
+}
+
+// frozenW returns true when messages are still arriving (fresh) but the W value
+// has not changed by more than meterFrozenNoiseW for meterFrozenAfter. This
+// detects a sensor that is stuck at a stale reading without going silent.
+func (s measSnapshot) frozenW(now time.Time) bool {
+	return s.fresh(now) && !s.wChangedAt.IsZero() && now.Sub(s.wChangedAt) > meterFrozenAfter
 }
 
 // evseSnapshot pairs the last EVSE state with its receive time.
@@ -106,8 +129,13 @@ func newMQTTSystemReader(devices []DeviceConfig) *MQTTSystemReader {
 func (r *MQTTSystemReader) onMeasurement(_ string, msg bus.Measurement) {
 	r.mu.Lock()
 	snap := r.lastMeas[msg.Device]
+	now := time.Now()
 	if msg.W != nil {
-		snap.W = *msg.W
+		newW := *msg.W
+		if math.IsNaN(snap.W) || math.Abs(newW-snap.W) > meterFrozenNoiseW {
+			snap.wChangedAt = now
+		}
+		snap.W = newW
 	}
 	if msg.V != nil {
 		snap.V = *msg.V
@@ -115,7 +143,7 @@ func (r *MQTTSystemReader) onMeasurement(_ string, msg bus.Measurement) {
 	if msg.Hz != nil {
 		snap.Hz = *msg.Hz
 	}
-	snap.at = time.Now()
+	snap.at = now
 	r.lastMeas[msg.Device] = snap
 	r.mu.Unlock()
 }
@@ -166,6 +194,43 @@ func (r *MQTTSystemReader) noteStaleness(name string, snap measSnapshot, now tim
 	}
 }
 
+// ReadSafetyState implements orchestrator.SafetyReader: a cheap, side-effect-free
+// snapshot of just the batteries (power + SOC + connectivity) for the fast
+// protection loop. It deliberately does NOT run CSIP-control expiry, meter-freeze,
+// or EVSE-staleness logic — those are per-economic-tick concerns whose
+// tick-denominated state polling at the fast cadence would perturb. Takes only a
+// read lock so it never contends with the economic ReadSystemState write lock
+// beyond RWMutex fairness.
+func (r *MQTTSystemReader) ReadSafetyState() (orchestrator.SystemState, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	now := time.Now()
+	state := orchestrator.SystemState{
+		Timestamp: now,
+		Grid:      orchestrator.NewGridState(),
+	}
+	for _, dc := range r.devices {
+		if dc.Role != "battery" {
+			continue
+		}
+		snap := r.lastMeas[dc.Name]
+		b := orchestrator.NewBatteryState(dc.Name)
+		if snap.fresh(now) && !math.IsNaN(snap.W) {
+			b.PowerW = snap.W
+			b.Connected = true
+			b.Energized = true
+		}
+		b.MaxChargeW = dc.MaxW
+		b.MaxDischargeW = dc.MaxW
+		if bm, ok := r.lastBattMet[dc.Name]; ok && bm.SOC != nil {
+			b.SOC = *bm.SOC
+		}
+		state.Batteries = append(state.Batteries, b)
+	}
+	return state, nil
+}
+
 // ReadSystemState implements orchestrator.SystemReader.
 //
 // Takes the write lock (not RLock) because it may clear an expired CSIP
@@ -179,6 +244,20 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 	state := orchestrator.SystemState{
 		Timestamp: now,
 		Grid:      orchestrator.NewGridState(),
+	}
+
+	// Pre-scan: does the world appear to be moving? Frozen-meter detection requires
+	// at least one inverter to have changed its W recently; otherwise a legitimately
+	// steady grid (stable load, zero wind) would produce a false positive.
+	worldMoving := false
+	for _, dc := range r.devices {
+		if dc.Role == "inverter" {
+			s := r.lastMeas[dc.Name]
+			if !s.wChangedAt.IsZero() && now.Sub(s.wChangedAt) < solarMovingWindow {
+				worldMoving = true
+				break
+			}
+		}
 	}
 
 	for _, dc := range r.devices {
@@ -231,8 +310,24 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 			// A stale meter contributes nothing: Grid.NetW stays NaN, which
 			// makes the optimizer fall back to its computed power balance
 			// instead of "verifying" limits against a frozen reading.
-			if !snap.fresh(now) {
+			//
+			// A frozen meter (same W for meterFrozenAfter while still publishing)
+			// is also excluded — but ONLY while the world is demonstrably moving
+			// (worldMoving=true). A legitimately stable grid looks identical to a
+			// frozen sensor without this cross-source gate.
+			frozenKey := dc.Name + ":frozen"
+			frozen := worldMoving && snap.frozenW(now)
+			if !snap.fresh(now) || frozen {
+				if frozen && !r.stale[frozenKey] {
+					r.stale[frozenKey] = true
+					log.Printf("[hub] meter %q W value frozen at %.0f W for %s while grid is moving; excluding from grid reading",
+						dc.Name, snap.W, now.Sub(snap.wChangedAt).Round(time.Second))
+				}
 				continue
+			}
+			if r.stale[frozenKey] {
+				r.stale[frozenKey] = false
+				log.Printf("[hub] meter %q W value moving again (%.0f W); restoring to grid reading", dc.Name, snap.W)
 			}
 			if !math.IsNaN(snap.W) {
 				if math.IsNaN(state.Grid.NetW) {
