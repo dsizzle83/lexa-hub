@@ -5,6 +5,7 @@ import (
 	"math"
 	"testing"
 
+	"lexa-hub/internal/bus"
 	"lexa-hub/internal/northbound/model"
 	"lexa-hub/internal/southbound/device"
 )
@@ -15,6 +16,7 @@ type fakeDevice struct {
 	readErr error
 	ctrlErr error
 	closed  bool
+	applied []model.DERControlBase // every control this device received, in order
 }
 
 func (f *fakeDevice) ReadMeasurements() (device.Measurements, error) {
@@ -23,7 +25,13 @@ func (f *fakeDevice) ReadMeasurements() (device.Measurements, error) {
 	}
 	return device.Measurements{W: f.w, V: 240, Hz: 60}, nil
 }
-func (f *fakeDevice) ApplyControl(model.DERControlBase) error { return f.ctrlErr }
+func (f *fakeDevice) ApplyControl(ctrl model.DERControlBase) error {
+	if f.ctrlErr != nil {
+		return f.ctrlErr
+	}
+	f.applied = append(f.applied, ctrl)
+	return nil
+}
 func (f *fakeDevice) Status() (device.DeviceStatus, error) {
 	return device.DeviceStatus{Connected: true}, nil
 }
@@ -112,5 +120,133 @@ func TestRetryDevice_DisconnectedIsSafe(t *testing.T) {
 	}
 	if st, _ := rd.Status(); st.Connected {
 		t.Error("Status must report not-connected while disconnected")
+	}
+}
+
+// === Reconnect reconcile (Phase 4) ========================================
+
+// ctrlCeilingW decodes the OpModMaxLimW of a control, or NaN when absent.
+func ctrlCeilingW(ctrl model.DERControlBase) float64 {
+	if ctrl.OpModMaxLimW == nil {
+		return math.NaN()
+	}
+	return float64(ctrl.OpModMaxLimW.Value) * math.Pow(10, float64(ctrl.OpModMaxLimW.Multiplier))
+}
+
+// A control transition that happens while the device is dark must be delivered
+// on reconnect: cap active → device drops → cap released (restore commanded
+// into the void) → device returns → the RESTORE must land before the first
+// trusted read, or the inverter stays latched at the stale ceiling forever
+// (QA 2026-07-02: release-while-rebooting).
+func TestRetryDevice_ReassertsDesiredStateOnReconnect(t *testing.T) {
+	first := &fakeDevice{w: 1000}
+	second := &fakeDevice{w: 1000}
+	opens := 0
+	rd := &retryDevice{
+		cfg: DeviceConfig{Name: "solar", Role: "inverter"},
+		open: func() (device.Device, error) {
+			opens++
+			if opens == 1 {
+				return first, nil
+			}
+			return second, nil
+		},
+	}
+
+	// Cap active: curtail to 1000 W.
+	curtail := model.DERControlBase{OpModMaxLimW: &model.ActivePower{Value: 1000}}
+	if _, err := rd.ReadMeasurements(); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if err := rd.ApplyControl(curtail); err != nil {
+		t.Fatalf("curtail: %v", err)
+	}
+
+	// Device drops; the cap is RELEASED while it is dark.
+	first.readErr = errors.New("write: broken pipe")
+	if _, err := rd.ReadMeasurements(); err == nil {
+		t.Fatal("expected the dead session to error")
+	}
+	restore := solarCommandToControl(bus.SolarCommand{}) // nil CurtailToW = uncurtail
+	if err := rd.ApplyControl(restore); err != nil {
+		t.Fatalf("restore into the void must not error: %v", err)
+	}
+
+	// Device returns: the restore must be re-asserted before the first read.
+	if _, err := rd.ReadMeasurements(); err != nil {
+		t.Fatalf("reconnect read: %v", err)
+	}
+	if len(second.applied) != 1 {
+		t.Fatalf("reconnected device received %d controls, want 1 (the re-asserted restore)", len(second.applied))
+	}
+	if ceil := ctrlCeilingW(second.applied[0]); ceil < 1e6 {
+		t.Errorf("re-asserted ceiling = %.0f W — the stale 1000 W curtailment, not the restore", ceil)
+	}
+}
+
+// A never-commanded inverter may still hold a stale ceiling (latched before
+// this process started): reconnect clears it with the restore ceiling.
+func TestRetryDevice_ClearsStaleCeilingOnFirstConnect(t *testing.T) {
+	dev := &fakeDevice{w: 1000}
+	rd := &retryDevice{
+		cfg:  DeviceConfig{Name: "solar", Role: "inverter"},
+		open: func() (device.Device, error) { return dev, nil },
+	}
+	if _, err := rd.ReadMeasurements(); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(dev.applied) != 1 {
+		t.Fatalf("inverter received %d controls on first connect, want 1 (stale-ceiling clear)", len(dev.applied))
+	}
+	if ceil := ctrlCeilingW(dev.applied[0]); ceil < 1e6 {
+		t.Errorf("first-connect clear ceiling = %.0f W, want the restore ceiling", ceil)
+	}
+}
+
+// Read-only and orchestrator-refreshed devices get no unsolicited write.
+func TestRetryDevice_NoUnsolicitedWriteForMeterOrBattery(t *testing.T) {
+	for _, role := range []string{"meter", "battery"} {
+		dev := &fakeDevice{w: 100}
+		rd := &retryDevice{
+			cfg:  DeviceConfig{Name: role, Role: role},
+			open: func() (device.Device, error) { return dev, nil },
+		}
+		if _, err := rd.ReadMeasurements(); err != nil {
+			t.Fatalf("%s read: %v", role, err)
+		}
+		if len(dev.applied) != 0 {
+			t.Errorf("%s received %d unsolicited controls on connect, want 0", role, len(dev.applied))
+		}
+	}
+}
+
+// A failed reconcile write means the session is suspect: drop it and retry the
+// whole open+reconcile+read sequence next poll — never read past a device in
+// an unknown control state.
+func TestRetryDevice_ReconcileFailureDropsSession(t *testing.T) {
+	bad := &fakeDevice{w: 1000, ctrlErr: errors.New("write refused")}
+	good := &fakeDevice{w: 1000}
+	opens := 0
+	rd := &retryDevice{
+		cfg: DeviceConfig{Name: "solar", Role: "inverter"},
+		open: func() (device.Device, error) {
+			opens++
+			if opens == 1 {
+				return bad, nil
+			}
+			return good, nil
+		},
+	}
+	if _, err := rd.ReadMeasurements(); err == nil {
+		t.Fatal("expected the failed reconcile to surface as an error")
+	}
+	if !bad.closed {
+		t.Error("the un-reconciled session must be dropped")
+	}
+	if _, err := rd.ReadMeasurements(); err != nil {
+		t.Fatalf("next poll should reconnect and reconcile cleanly: %v", err)
+	}
+	if len(good.applied) != 1 {
+		t.Errorf("recovered device received %d controls, want 1", len(good.applied))
 	}
 }

@@ -55,6 +55,12 @@ func main() {
 	defer mc.Disconnect(500)
 
 	reg := registry.New(cfg.PollInterval())
+	log.Printf("lexa-modbus: poll interval=%s (measurement-freshness ceiling; parallel per-device poll)", cfg.PollInterval())
+
+	// Tier-0 edge safety interlock (ADR-0001): a local reflex that force-disconnects
+	// a pack discharging below its reserve while commanded to charge, within one poll
+	// and independent of the hub/broker.
+	interlock := newBatterySafetyInterlock(reg, cfg)
 
 	// Open each device; log failures but continue so other devices still poll.
 	for _, dc := range cfg.Devices {
@@ -77,7 +83,7 @@ func main() {
 	}
 
 	// Subscribe to control topics before starting the poll loop.
-	subscribeControls(mc, cfg, reg)
+	subscribeControls(mc, cfg, reg, interlock)
 
 	// Subscribe to the registry and fan out to MQTT.
 	updates, unsub := reg.Subscribe()
@@ -86,7 +92,7 @@ func main() {
 	reg.Start()
 	defer reg.Stop()
 
-	go publishMeasurements(mc, cfg, updates)
+	go publishMeasurements(mc, cfg, updates, interlock)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -115,7 +121,7 @@ func openDevice(dc DeviceConfig) (device.Device, error) {
 
 // publishMeasurements drains the registry subscription channel and publishes
 // measurements (and battery metrics) to MQTT.
-func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.MeasurementUpdate) {
+func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.MeasurementUpdate, interlock *batterySafetyInterlock) {
 	deviceRole := map[string]string{}
 	nameplate := map[string]float64{}
 	for _, dc := range cfg.Devices {
@@ -130,6 +136,11 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 		}
 		now := time.Now().Unix()
 		m := upd.Measurements
+
+		// Tier-0 edge safety interlock: evaluate every fresh poll BEFORE publishing,
+		// on the raw measurement, so a mis-wired pack is disconnected locally within
+		// one poll regardless of the hub. No-ops for non-battery devices.
+		interlock.check(upd.Name, m)
 
 		msg := bus.Measurement{Device: upd.Name, Ts: now}
 		if !math.IsNaN(m.W) {
@@ -167,7 +178,7 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 }
 
 // subscribeControls sets up MQTT subscriptions for battery and solar commands.
-func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry) {
+func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry, interlock *batterySafetyInterlock) {
 	// Build a map from device name → role for quick lookup.
 	roleOf := map[string]string{}
 	for _, dc := range cfg.Devices {
@@ -179,6 +190,8 @@ func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry) {
 		if roleOf[dev] != "battery" {
 			return
 		}
+		// Record the hub's intent for the Tier-0 interlock before applying.
+		interlock.noteControl(dev, cmd)
 		ctrl := battCommandToControl(cmd)
 		if err := reg.ApplyControlTo(dev, ctrl); err != nil {
 			log.Printf("lexa-modbus: apply battery control %s: %v", dev, err)
@@ -305,6 +318,15 @@ type retryDevice struct {
 	open func() (device.Device, error)
 	mu   sync.Mutex
 	live device.Device
+
+	// lastCtrl is the most recent control the orchestrator commanded for this
+	// device — recorded even while disconnected (the DESIRED state, not the
+	// delivered one). On reconnect it is re-asserted so a device that was dark
+	// through a control transition converges to what the hub currently wants
+	// instead of keeping whatever it latched before the drop (Phase 4; QA
+	// 2026-07-02: release-while-rebooting — a cap released while the inverter
+	// was rebooting left it clamped at the stale ceiling indefinitely).
+	lastCtrl *model.DERControlBase
 }
 
 // reopen establishes a fresh device connection.
@@ -325,6 +347,19 @@ func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
 		}
 		r.live = dev
 		log.Printf("lexa-modbus: reconnected device %s", r.cfg.Name)
+		// Reconcile-on-reconnect (Phase 4): the device may have missed every
+		// control transition while dark — including a release, which for an
+		// inverter is a WRITE (the restore ceiling), not an absence of writes.
+		// Bring its registers back to the hub's current desired state before
+		// the first measurement is trusted.
+		if ctrl, why, ok := r.reassertLocked(); ok {
+			if err := r.live.ApplyControl(ctrl); err != nil {
+				log.Printf("lexa-modbus: device %s reconnect reconcile (%s) failed: %v", r.cfg.Name, why, err)
+				r.dropLocked() // suspect session; retry whole sequence next poll
+				return device.Measurements{W: math.NaN(), V: math.NaN(), Hz: math.NaN()}, err
+			}
+			log.Printf("lexa-modbus: device %s reconnected — %s", r.cfg.Name, why)
+		}
 	}
 	m, err := r.live.ReadMeasurements()
 	if err != nil {
@@ -333,11 +368,41 @@ func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
 	return m, err
 }
 
+// reassertLocked picks the control to reconcile a just-reconnected device to.
+// Caller must hold r.mu.
+//
+//   - A control was commanded at some point (connected or not): re-assert it —
+//     it is the hub's current desired state, and the device may hold something
+//     older (or have reboot-reset to defaults; the orchestrator's periodic
+//     re-command covers that case too, but only while a control is ACTIVE).
+//   - Never commanded AND the device is an inverter: clear a possible stale
+//     ceiling by asserting the restore ceiling. An idle inverter receives no
+//     periodic commands, so a ceiling latched before this process started (or
+//     released while the device was dark) would otherwise persist forever.
+//   - Never commanded, battery: nothing — the orchestrator re-commands packs
+//     every engine tick, and an unsolicited write could fight it.
+//   - Meter: never — read-only device.
+func (r *retryDevice) reassertLocked() (model.DERControlBase, string, bool) {
+	if r.lastCtrl != nil {
+		return *r.lastCtrl, "re-asserted the hub's current control", true
+	}
+	if r.cfg.Role == "inverter" {
+		ap := activePowerFromWatts(restoreCeilingW)
+		return model.DERControlBase{OpModMaxLimW: &ap}, "cleared possible stale ceiling (restore to full output)", true
+	}
+	return model.DERControlBase{}, "", false
+}
+
 func (r *retryDevice) ApplyControl(ctrl model.DERControlBase) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Record the DESIRED state even while disconnected — reconnect reconciles
+	// to the newest command, so a release/re-command that happened while the
+	// device was dark is not lost (Phase 4: release-while-rebooting).
+	stored := ctrl
+	r.lastCtrl = &stored
 	if r.live == nil {
-		return nil // disconnected; the next ReadMeasurements poll reconnects, then controls resume
+		return nil // disconnected; the next ReadMeasurements poll reconnects and re-asserts
 	}
 	err := r.live.ApplyControl(ctrl)
 	if err != nil {
