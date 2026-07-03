@@ -234,6 +234,10 @@ func main() {
 	cancel()
 }
 
+// discoveryFailures counts consecutive failed walks, for the fail-closed log
+// line and operator triage. Touched only from the single discovery goroutine.
+var discoveryFailures int
+
 func runDiscovery(
 	mc mqtt.Client,
 	fetcher *tlsclient.WolfSSLFetcher,
@@ -246,10 +250,23 @@ func runDiscovery(
 	walker := discovery.NewWalker(fetcher, lfdi)
 	tree, err := walker.Discover("/dcap")
 	if err != nil {
-		log.Printf("lexa-northbound: discovery error: %v", err)
-		publishNoControl(mc, 0)
+		// FAIL CLOSED on a walk error: publish NOTHING. "Server unreachable /
+		// walk failed" is not "server says there are no controls" — publishing
+		// a retained no-control here actively wiped the enforced cap the moment
+		// the WAN dropped or the head-end wedged (QA 2026-07-02: northbound-hang
+		// FAIL, wan-outage-hold DEGRADED — ~9.4 kW exported over a 0 W cap until
+		// the server returned). The retained last-good control stays on the bus,
+		// lexa-hub keeps enforcing it, and the hub's own local clock discipline
+		// (csipExpiredTicks in cmd/hub/state.go) still releases it at ValidUntil
+		// if the outage outlives the control. Only a SUCCESSFUL walk that
+		// resolves no valid control may release — and that path already holds
+		// last-known-good via the scheduler's fail-closed Evaluate.
+		discoveryFailures++
+		log.Printf("lexa-northbound: discovery error (consecutive=%d): %v — holding last-published control (fail-closed)",
+			discoveryFailures, err)
 		return
 	}
+	discoveryFailures = 0
 
 	serverNow := scheduler.ServerNow(tree.ClockOffset)
 	active := sched.Evaluate(tree.Programs, serverNow)
@@ -614,13 +631,6 @@ func toActiveControl(ac *scheduler.ActiveControl, clockOffset int64) bus.ActiveC
 		msg.FixedW = &w
 	}
 	return msg
-}
-
-func publishNoControl(mc mqtt.Client, clockOffset int64) {
-	msg := bus.ActiveControl{Source: "none", ClockOffset: clockOffset, Ts: time.Now().Unix()}
-	if err := mqttutil.PublishJSONRetained(mc, bus.TopicCSIPControl, msg); err != nil {
-		log.Printf("lexa-northbound: publish no-control: %v", err)
-	}
 }
 
 func apW(ap *model.ActivePower) float64 {

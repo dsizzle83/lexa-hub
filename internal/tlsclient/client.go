@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"unsafe"
 
 	"lexa-hub/internal/wolfssl"
@@ -130,6 +131,27 @@ func (c *Client) Dial() error {
 
 	if err := wolfssl.SetFD(ssl, int(file.Fd())); err != nil {
 		return err
+	}
+
+	// Per-read/write timeout, set on the socket itself (SO_RCVTIMEO/SNDTIMEO):
+	// wolfSSL does blocking read(2)/write(2) directly on the dup'ed fd, which
+	// Go's net.Conn deadlines (netpoller-based) cannot interrupt. A timed-out
+	// read makes wolfSSL_read fail, the request errors, and the fetcher
+	// discards the session — a wedged server degrades discovery instead of
+	// hanging the client goroutine forever (QA 2026-07-02: northbound-hang).
+	// Set before Connect so the timeout also bounds a mid-handshake stall.
+	if rt := c.cfg.ReadTimeout; rt >= 0 {
+		if rt == 0 {
+			rt = DefaultReadTimeout
+		}
+		tv := syscall.NsecToTimeval(rt.Nanoseconds())
+		fd := int(file.Fd())
+		if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
+			return fmt.Errorf("set SO_RCVTIMEO: %w", err)
+		}
+		if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_SNDTIMEO, &tv); err != nil {
+			return fmt.Errorf("set SO_SNDTIMEO: %w", err)
+		}
 	}
 
 	host, _, err := net.SplitHostPort(c.cfg.ServerAddr)

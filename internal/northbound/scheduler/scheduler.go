@@ -130,24 +130,36 @@ func ServerNow(clockOffset int64) int64 {
 // transient or hostile resource from unseating a live safety cap (audit:
 // malform-empty-program, malform-huge-activepower). Returns nil only when there
 // is neither a valid current control nor an unexpired last-known-good.
+//
+// Exception — explicit server clear: when the highest-priority program EXISTS
+// on the server but carries no active event and no DefaultDERControl, the
+// server has intentionally cleared its controls (e.g. via DELETE /admin/control
+// or an event whose ValidUntil passed). That is a meaningful server action, not
+// a discovery anomaly, so the hub releases the last-known-good immediately
+// rather than holding it until its own expiry (audit: curtailment-release).
+// Only a fully absent program list (all=0, or a discovery failure returning no
+// programs) triggers the fail-closed hold.
 func (s *Scheduler) Evaluate(programs []discovery.ProgramState, serverNow int64) *ActiveControl {
-	return s.failClosed(s.resolve(programs, serverNow), serverNow)
+	resolved, programFound := s.resolve(programs, serverNow)
+	return s.failClosed(resolved, programFound, discovery.HighestPriorityProgram(programs), serverNow)
 }
 
 // resolve performs the pure §12.3 precedence resolution, with no fail-closed
-// retention. Returns nil when no control is active in the highest-priority
-// program (or there is no program at all).
-func (s *Scheduler) resolve(programs []discovery.ProgramState, serverNow int64) *ActiveControl {
+// retention. Returns (nil, false) when there is no program at all, or
+// (nil, true) when the highest-priority program exists but has no active event
+// or DefaultDERControl. The bool is used by failClosed to distinguish an
+// explicit server clear from a fully absent program list.
+func (s *Scheduler) resolve(programs []discovery.ProgramState, serverNow int64) (*ActiveControl, bool) {
 	hp := discovery.HighestPriorityProgram(programs)
 	if hp == nil {
-		return nil
+		return nil, false // no programs at all
 	}
 
 	s.pruneRandOffsets(programs)
 
 	if hp.Controls != nil && len(hp.Controls.DERControl) > 0 {
 		if ac := s.activeEvent(hp, serverNow); ac != nil {
-			return ac
+			return ac, true
 		}
 	}
 
@@ -157,16 +169,26 @@ func (s *Scheduler) resolve(programs []discovery.ProgramState, serverNow int64) 
 			Base:   hp.DefaultControl.DERControlBase,
 			Source: "default",
 			MRID:   hp.DefaultControl.MRID,
-		}
+		}, true
 	}
 
-	return nil
+	return nil, true // program exists but no active control — explicit clear
 }
 
 // failClosed adopts a freshly-resolved control when it is valid, otherwise
 // re-serves the last-known-good control until it expires. A malformed control
 // (implausible limit) is never adopted and never stored as last-known-good.
-func (s *Scheduler) failClosed(resolved *ActiveControl, serverNow int64) *ActiveControl {
+//
+// programFound indicates whether the discovery found at least one program on
+// the server. When false (no programs at all) and nothing resolved, we hold
+// fail-closed. When true and nothing resolved, it is an explicit server clear
+// (e.g. the utility deleted its controls but kept the DERProgram); release —
+// UNLESS the control we were enforcing is still being served (present in the
+// program, not cancelled) and unexpired: then "no active event" only means the
+// server's clock currently reads BEFORE the event's start (an NTP correction
+// stepped it back), not that the event was withdrawn. hp is the
+// highest-priority program, for that still-served check.
+func (s *Scheduler) failClosed(resolved *ActiveControl, programFound bool, hp *discovery.ProgramState, serverNow int64) *ActiveControl {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -176,8 +198,49 @@ func (s *Scheduler) failClosed(resolved *ActiveControl, serverNow int64) *Active
 		return resolved
 	}
 
-	// Either nothing resolved (empty/missing programs) or the resolved control
-	// is malformed: hold the last-known-good control rather than failing open.
+	// Malformed control (implausible limit): hold last-known-good so a bad
+	// server response cannot unseat an active safety cap. programFound is
+	// irrelevant here — a malformed control is never an explicit clear.
+	if resolved != nil {
+		if s.lastGood != nil && !controlExpired(s.lastGood, serverNow) {
+			held := *s.lastGood
+			held.Held = true
+			return &held
+		}
+		s.lastGood = nil
+		return nil
+	}
+
+	// resolved == nil. Distinguish the two cases:
+	//
+	// • programFound=true: the server has a program but no active event or
+	//   DefaultDERControl — an explicit "nothing to enforce" signal. Release
+	//   rather than holding last-known-good (the utility cleared its controls).
+	//
+	// • programFound=false: no programs at all (server returned an empty list or
+	//   discovery returned nothing). Treat conservatively as an anomaly and hold
+	//   last-known-good fail-closed so a transient/hostile empty program list
+	//   does not silently drop an active safety cap.
+	if programFound {
+		// Clock-regression guard (QA 2026-07-02: clock-jitter): if the event we
+		// were enforcing is STILL served by the program — same mRID, not
+		// cancelled — and unexpired, then it did not "end" and was not
+		// withdrawn; the server's clock stepped back past its start (a ±60 s
+		// NTP correction), making it read as not-yet-started for a walk or two.
+		// Releasing here flapped the cap with the jitter (the 5 s discovery
+		// period aliased against the correction cycle, leaving whole windows
+		// unenforced). Hold the control instead; a genuine withdrawal removes
+		// or cancels the event and still releases below, and a genuine end
+		// trips controlExpired.
+		if s.lastGood != nil && !controlExpired(s.lastGood, serverNow) && stillServed(hp, s.lastGood.MRID) {
+			held := *s.lastGood
+			held.Held = true
+			return &held
+		}
+		s.lastGood = nil
+		return nil
+	}
+
 	if s.lastGood != nil && !controlExpired(s.lastGood, serverNow) {
 		held := *s.lastGood
 		held.Held = true
@@ -193,6 +256,26 @@ func (s *Scheduler) failClosed(resolved *ActiveControl, serverNow int64) *Active
 // A control with ValidUntil==0 (a DefaultDERControl) never expires on its own.
 func controlExpired(ac *ActiveControl, serverNow int64) bool {
 	return ac.ValidUntil != 0 && serverNow >= ac.ValidUntil
+}
+
+// stillServed reports whether the program still lists an event with the given
+// mRID that has not been cancelled (currentStatus=6). Used by the clock-
+// regression guard: an event that is still served did not end or get
+// withdrawn, no matter what the (possibly stepped-back) server clock says
+// about its start time. Also matches a held DefaultDERControl's mRID.
+func stillServed(hp *discovery.ProgramState, mrid string) bool {
+	if hp == nil || mrid == "" {
+		return false
+	}
+	if hp.Controls != nil {
+		for i := range hp.Controls.DERControl {
+			ctrl := &hp.Controls.DERControl[i]
+			if ctrl.MRID == mrid {
+				return ctrl.EventStatus == nil || ctrl.EventStatus.CurrentStatus != 6
+			}
+		}
+	}
+	return hp.DefaultControl != nil && hp.DefaultControl.MRID == mrid
 }
 
 // plausibleControl reports whether every active-power limit on the control
