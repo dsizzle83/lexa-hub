@@ -318,3 +318,18 @@ type DERStatusSummary struct {
 	EstimatedWAvail  *float64 `json:"estimated_w_avail,omitempty"`
 	ModesSupported   uint32   `json:"modes_supported,omitempty"`
 }
+
+// PlanLog is the optimizer's plan trace for one engine pass (TopicHubPlan).
+// Decisions may be empty — the message is still published so its timestamp
+// serves as an engine heartbeat.
+type PlanLog struct {
+	Ts        int64          `json:"ts"` // Unix seconds of the plan's evaluation
+	Decisions []PlanDecision `json:"decisions,omitempty"`
+}
+
+// PlanDecision mirrors orchestrator.Decision for the bus.
+type PlanDecision struct {
+	Rule   string `json:"rule"`
+	Reason string `json:"reason"`
+	Impact string `json:"impact"`
+}

@@ -15,6 +15,7 @@
 //	lexa/control/battery/{device}             hub          → modbus
 //	lexa/control/solar/{device}               hub          → modbus
 //	lexa/evse/{station}/command               hub          → ocpp
+//	lexa/hub/plan                             hub          → api (retained)
 package bus
 
 import "fmt"
@@ -47,6 +48,17 @@ const (
 // TopicNorthboundSchedule is published by lexa-northbound after each discovery
 // walk. It carries the resolved 24-hour DER control schedule (retained, QoS 1).
 const TopicNorthboundSchedule = "lexa/northbound/schedule"
+
+// TopicHubPlan carries the optimizer's most recent plan trace (decision log +
+// timestamp), published by lexa-hub on every engine pass — economic tick and
+// safety tick alike — and retained so lexa-api serves the latest plan across
+// its own restarts. This is pure observability (the /status last_plan field):
+// before it existed, /status served a hardcoded empty decision list, so the QA
+// harness's decision introspection silently never worked ("the hub's plan log
+// was empty" appeared in every diagnosis that asked). The per-pass timestamp
+// doubles as an engine heartbeat: a hub whose /status last_plan timestamp
+// stops advancing has a wedged control loop (QA gaps doc, "wedge detection").
+const TopicHubPlan = "lexa/hub/plan"
 
 func EVSEStateTopic(stationID string) string {
 	return fmt.Sprintf("lexa/evse/%s/state", stationID)
