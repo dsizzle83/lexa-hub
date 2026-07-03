@@ -61,3 +61,36 @@ func TestEvseStale(t *testing.T) {
 		t.Error("an idle EVSE (no session) is not 'stale telemetry'")
 	}
 }
+
+// /status must stop reporting a CSIP control once it is past ValidUntil (+
+// grace) in server time: during a WAN outage nobody clears the retained bus
+// message, and reporting it as active makes the hub look like it is enforcing
+// withdrawn authority when the orchestrator has already dropped it.
+func TestBuildStatus_ExpiredControlNotReported(t *testing.T) {
+	now := time.Now()
+	live := &bus.ActiveControl{Source: "event", MRID: "M-live", ValidUntil: now.Unix() + 300}
+	snap := snapshot{now: now, csipControl: live}
+	if got := buildStatus(snap); got.CSIPControl == nil || got.CSIPControl.MRID != "M-live" {
+		t.Fatalf("unexpired control must be reported, got %+v", got.CSIPControl)
+	}
+
+	stale := &bus.ActiveControl{Source: "event", MRID: "M-stale", ValidUntil: now.Unix() - csipReportGraceS - 5}
+	snap = snapshot{now: now, csipControl: stale}
+	if got := buildStatus(snap); got.CSIPControl != nil {
+		t.Errorf("control %ds past ValidUntil+grace still reported: %+v", csipReportGraceS+5, got.CSIPControl)
+	}
+
+	// Within the grace window: still reported (covers the hub's own debounce).
+	graceful := &bus.ActiveControl{Source: "event", MRID: "M-grace", ValidUntil: now.Unix() - 5}
+	snap = snapshot{now: now, csipControl: graceful}
+	if got := buildStatus(snap); got.CSIPControl == nil {
+		t.Error("control within the report grace must still be reported")
+	}
+
+	// ValidUntil=0 (DefaultDERControl) never expires on its own.
+	def := &bus.ActiveControl{Source: "default", MRID: "M-default"}
+	snap = snapshot{now: now, csipControl: def}
+	if got := buildStatus(snap); got.CSIPControl == nil {
+		t.Error("a ValidUntil=0 default control must always be reported")
+	}
+}

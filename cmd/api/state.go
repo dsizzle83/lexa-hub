@@ -46,6 +46,12 @@ type stateStore struct {
 	csipPrograms int
 	clockOffsetS int64
 
+	// lastPlan is the hub's most recent plan trace (TopicHubPlan, retained).
+	// nil until the first message — /status then reports an empty decision
+	// list, which after this field's introduction genuinely means "no plan
+	// received", not the historical always-empty stub.
+	lastPlan *bus.PlanLog
+
 	staleAfter time.Duration
 }
 
@@ -108,6 +114,12 @@ func (s *stateStore) onBattMetrics(_ string, m bus.BattMetrics) {
 	d.UpdatedAt = time.Now()
 }
 
+func (s *stateStore) onPlanLog(_ string, p bus.PlanLog) {
+	s.mu.Lock()
+	s.lastPlan = &p
+	s.mu.Unlock()
+}
+
 func (s *stateStore) onCSIPControl(_ string, c bus.ActiveControl) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -156,6 +168,7 @@ type snapshot struct {
 	csipControl  *bus.ActiveControl
 	csipPrograms int
 	clockOffsetS int64
+	lastPlan     *bus.PlanLog
 	staleAfter   time.Duration
 	now          time.Time
 }
@@ -176,6 +189,10 @@ func (s *stateStore) snapshot() snapshot {
 	if s.csipControl != nil {
 		cc := *s.csipControl
 		out.csipControl = &cc
+	}
+	if s.lastPlan != nil {
+		pl := *s.lastPlan
+		out.lastPlan = &pl
 	}
 	// Stable order: sort by stationID, then connector.
 	keys := make([]string, 0, len(s.evses))

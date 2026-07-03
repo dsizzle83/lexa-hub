@@ -85,6 +85,12 @@ type evseJSON struct {
 	Stale bool `json:"stale,omitempty"`
 }
 
+// csipReportGraceS is how many seconds past a control's ValidUntil (in server
+// time) /status keeps reporting it. Covers the orchestrator's own
+// expiry-confirm debounce plus a clock-jitter margin, so the API never reports
+// a control as active meaningfully after the hub stopped enforcing it.
+const csipReportGraceS = 15
+
 // buildStatus reduces the aggregated snapshot into the dashboard-facing JSON.
 func buildStatus(snap snapshot) statusResp {
 	resp := statusResp{
@@ -98,7 +104,32 @@ func buildStatus(snap snapshot) statusResp {
 		},
 	}
 
-	if snap.csipControl != nil {
+	// Relay the hub's actual plan trace (TopicHubPlan). The timestamp is the
+	// PLAN's evaluation time, not now — a frozen timestamp here is the wedge
+	// signal the QA gaps doc asked for. Until 2026-07-03 this field was a
+	// hardcoded empty stub, so every harness diagnosis that inspected hub
+	// decisions read "plan log empty" regardless of what the optimizer did.
+	if snap.lastPlan != nil {
+		resp.LastPlan.Timestamp = time.Unix(snap.lastPlan.Ts, 0).UTC().Format(time.RFC3339)
+		for _, dec := range snap.lastPlan.Decisions {
+			resp.LastPlan.Decisions = append(resp.LastPlan.Decisions, decisionJSON{
+				Rule: dec.Rule, Reason: dec.Reason, Impact: dec.Impact,
+			})
+		}
+	}
+
+	// Apply the same local-expiry discipline lexa-hub applies (cmd/hub state.go):
+	// the retained control message outlives its authority when the northbound is
+	// dark (a WAN outage means nobody republishes or clears it), and /status is
+	// the operator's — and the QA harness's — view of what the hub is enforcing.
+	// Reporting a control the orchestrator has already dropped makes the hub
+	// look like it is acting on withdrawn authority when it is not (QA
+	// 2026-07-02: wan-outage-expiry INV-EXPIRED was this artifact). The hub
+	// debounces with expiryConfirmTicks before RELEASING; for pure reporting a
+	// small fixed grace is enough and needs no tick cadence.
+	expired := snap.csipControl != nil && snap.csipControl.ValidUntil > 0 &&
+		snap.now.Unix()+snap.clockOffsetS >= snap.csipControl.ValidUntil+csipReportGraceS
+	if snap.csipControl != nil && !expired {
 		c := snap.csipControl
 		info := &csipControlInfo{
 			Source:     c.Source,

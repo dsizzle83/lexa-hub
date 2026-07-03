@@ -90,6 +90,17 @@ func main() {
 		log.Fatalf("lexa-api: subscribe schedule: %v", err)
 	}
 
+	if err := mqttutil.Subscribe(mc, bus.TopicHubPlan, func(topic string, p bus.PlanLog) {
+		store.onPlanLog(topic, p)
+		// Emit only decision-bearing plans to /logs — the heartbeat cadence
+		// (every engine tick) would drown the stream.
+		for _, dec := range p.Decisions {
+			lb.Emit(fmt.Sprintf("[plan] %s: %s → %s", dec.Rule, dec.Reason, dec.Impact))
+		}
+	}); err != nil {
+		log.Fatalf("lexa-api: subscribe hub plan: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler)
 	mux.HandleFunc("/status", statusHandler(store))
