@@ -1,0 +1,140 @@
+# CI for lexa-hub.
+#
+# Three required checks, split on the verified cgo boundary: only
+# internal/wolfssl and internal/tlsclient (and the two services that import
+# tlsclient, cmd/northbound + cmd/telemetry) need wolfSSL headers. Everything
+# else, including internal/northbound, is pure Go.
+#
+#   vet-build-test  go vet + cgo-free build + `-race` over every pure-Go
+#                   package (internal/... and cmd/...).
+#   cgo             builds wolfSSL 5.7.6-stable from source (cached), then
+#                   builds + `-race` tests the two cgo services/packages.
+#   cross           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 build of the four
+#                   pure-Go services — proves the deploy artifacts still
+#                   cross-compile. The arm64 cgo pair (northbound, telemetry)
+#                   needs the aarch64 sysroot and stays a desktop-only
+#                   `make build-arm64`.
+#
+# Self-hosted runner fallback: if hosted GitHub runners become unacceptable
+# under an air-gap policy, any of these jobs can move to
+# `runs-on: [self-hosted, desktop]` — the bench desktop already carries the
+# amd64 wolfSSL sysroot at ~/.local/wolfssl-amd64 (see Makefile) and is the
+# natural home for future bench-touching jobs (SSH to the 69.0.0.x Pis, live
+# conformance runs) that must never run on a hosted runner. Registering that
+# runner requires a repo-scoped registration token from
+# Settings > Actions > Runners > New self-hosted runner — not set up here.
+#
+# No bench/SSH/secret access: these jobs only ever talk to GitHub and
+# github.com/wolfSSL — no 69.0.0.x, no credentials beyond the default
+# GITHUB_TOKEN.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  vet-build-test:
+    name: vet-build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go vet (pure-Go surface)
+        run: |
+          go vet $(go list ./... | grep -v -e internal/wolfssl -e internal/tlsclient -e cmd/northbound -e cmd/telemetry)
+
+      - name: build (cgo-free services)
+        run: CGO_ENABLED=0 go build ./cmd/hub ./cmd/modbus ./cmd/ocpp ./cmd/api
+
+      - name: "test -race (pure-Go: internal/... + cmd/...)"
+        run: make test-nocgo
+
+  cgo:
+    name: cgo
+    runs-on: ubuntu-latest
+    env:
+      WOLFSSL_VER: 5.7.6-stable
+      WOLFSSL_SYSROOT: /home/runner/wolfssl-amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Cache wolfSSL sysroot
+        id: cache-wolfssl
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WOLFSSL_SYSROOT }}
+          key: wolfssl-${{ env.WOLFSSL_VER }}-${{ runner.os }}-v1
+
+      - name: Build wolfSSL from source (cache miss only)
+        if: steps.cache-wolfssl.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool m4
+
+          cd /tmp
+          wget -q "https://github.com/wolfSSL/wolfssl/archive/refs/tags/v${WOLFSSL_VER}.tar.gz" \
+            -O "wolfssl-${WOLFSSL_VER}.tar.gz"
+          tar xzf "wolfssl-${WOLFSSL_VER}.tar.gz"
+          cd "wolfssl-${WOLFSSL_VER}"
+          autoreconf -i
+
+          mkdir -p /tmp/wolfssl-build
+          cd /tmp/wolfssl-build
+          # Host build (no --host=): the runner builds and runs on the same
+          # amd64 target, unlike the Makefile's arm64 cross-build recipe.
+          # Flag set otherwise identical to the Makefile's wolfssl-arm64
+          # target — the CCM cipher invariant depends on --enable-aesccm.
+          "/tmp/wolfssl-${WOLFSSL_VER}/configure" \
+            --prefix="${WOLFSSL_SYSROOT}" \
+            --enable-tls13 --enable-aesccm --enable-tlsx \
+            --enable-certgen --enable-opensslall \
+            --enable-static --disable-shared \
+            --disable-examples --disable-crypttests
+          make -j"$(nproc)"
+          make install
+
+      - name: Build cgo services
+        env:
+          CGO_CFLAGS: -I${{ env.WOLFSSL_SYSROOT }}/include
+          # Static libwolfssl.a needs -lm (pow/log in dh.c) or this fails
+          # at link time with undefined pow/log.
+          CGO_LDFLAGS: -L${{ env.WOLFSSL_SYSROOT }}/lib -lm
+        run: go build ./cmd/northbound ./cmd/telemetry
+
+      - name: "test -race (cgo: tlsclient, wolfssl, northbound)"
+        env:
+          CGO_CFLAGS: -I${{ env.WOLFSSL_SYSROOT }}/include
+          CGO_LDFLAGS: -L${{ env.WOLFSSL_SYSROOT }}/lib -lm
+        # The integration-tagged handshake tests in internal/tlsclient
+        # (client_test.go, fetcher_test.go) stay desktop/bench-only via
+        # `make test-integration` in csip-tls-test; plain `go test` here
+        # compiles the package and runs everything else, including
+        # cmd/northbound's response_test.go.
+        run: go test -race ./internal/tlsclient/ ./internal/wolfssl/ ./cmd/northbound/
+
+  cross:
+    name: cross
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: cross-compile arm64 (deploy artifacts, pure-Go)
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./cmd/hub ./cmd/modbus ./cmd/ocpp ./cmd/api

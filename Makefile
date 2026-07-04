@@ -6,7 +6,7 @@ SVCDIR  := /etc/systemd/system
 SERVICES := hub northbound modbus ocpp telemetry api
 BINS     := $(addprefix $(BINDIR)/lexa-, $(SERVICES))
 
-.PHONY: all build install install-configs install-services clean tidy test
+.PHONY: all build install install-configs install-services clean tidy test test-nocgo
 
 all: build
 
@@ -113,6 +113,14 @@ tidy:
 
 test:
 	go test -race ./internal/...
+
+# Mirrors CI's vet-build-test job: -race over every package that does NOT
+# import internal/wolfssl or internal/tlsclient (the cgo boundary), across
+# both ./internal/... and ./cmd/.... Needs no wolfSSL headers — runs
+# anywhere, including hosted CI runners. See .github/workflows/ci.yml.
+test-nocgo:
+	go test -race $(shell go list ./internal/... | grep -v -e internal/wolfssl -e internal/tlsclient)
+	go test -race $(shell go list ./cmd/... | grep -v -e cmd/northbound -e cmd/telemetry)
 
 clean:
 	rm -rf $(BINDIR)
