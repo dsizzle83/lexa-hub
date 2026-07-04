@@ -128,6 +128,14 @@ All configs live in `/etc/lexa/`. Edit the copies created by `make install-confi
 - **Cross-compile**: lexa-northbound and lexa-telemetry require CGo (wolfSSL headers
   are ARM64-only on the SOM). Build on target or with a proper cross toolchain.
   The other three services are `CGO_ENABLED=0` cross-compilable.
+- **lexa-hub is `Type=notify` with `WatchdogSec=60`** (TASK-007): the keepalive rides
+  the engine tick via `Engine.PlanObserver` (`internal/watchdog`, wired in
+  `cmd/hub/main.go`), not a separate timer — anything that stalls the tick loop
+  (`ReadSystemState`, `Optimize`, `executePlan`'s synchronous MQTT publishes) for
+  >60 s starves the heartbeat and systemd restarts the service (intended; see
+  `systemd/lexa-hub.service` for the sizing math). `NOTIFY_SOCKET` unset (dev/test)
+  makes `Ready`/`Kick` no-ops. Only `cmd/hub` is wired so far — TASK-008 rolls the
+  same package out to the other five services.
 
 ## Defensive fault-handling (do not strip — each backs a mayhem-QA finding)
 

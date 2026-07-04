@@ -6,7 +6,33 @@ Requires=mosquitto.service
 Wants=lexa-modbus.service lexa-northbound.service lexa-ocpp.service
 
 [Service]
-Type=simple
+# Type=notify + WatchdogSec (TASK-007, review §11 / §14 item 5): a crash
+# already restarts the hub via Restart=on-failure below, but a live-but-
+# wedged process (deadlocked tick loop, stalled paho publish, hung state
+# read) previously never did. The hub sends READY=1 once its control loop
+# is ticking (cmd/hub/main.go, right after eng.Start()) and WATCHDOG=1 from
+# Engine.PlanObserver — which the orchestrator invokes ON THE ENGINE'S OWN
+# CONTROL GOROUTINE every economic tick and on every safety pass that
+# produces commands (internal/orchestrator/engine.go tick()/safetyTick()).
+# That is deliberate: the kick rides the tick loop itself rather than an
+# independent timer, so a wedge anywhere in the tick (ReadSystemState,
+# Optimize, executePlan's synchronous MQTT publishes) starves the
+# heartbeat instead of masking it.
+#
+# WatchdogSec sizing: >= 4x the slowest legitimate economic tick. The
+# product ships STOCK (engine_interval_s=15 in configs/hub.json) but the
+# bench QAs at FAST (3s) — size for STOCK since that's what's deployed to
+# customers. Worst legitimate tick under a sick-but-alive broker: plan-log
+# publish (5s PUBACK timeout) + a breach alert (5s) + up to 4 actuator
+# publishes (4 x 5s) ~= 30s, still under the 60s budget below. 4 x 15s = 60s
+# also lands exactly there, so WatchdogSec=60 is the floor that's safe for
+# both timing modes while still catching a true wedge within about a
+# minute. (This quantifies review §11's "synchronous publish waits" risk;
+# TASK-046 removes that worst case properly — until then the watchdog just
+# has to tolerate it.)
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 User=lexa
 Group=lexa
 ExecStart=/usr/local/sbin/lexa-hub -config /etc/lexa/hub.json
