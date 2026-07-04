@@ -258,3 +258,85 @@ func TestEvaluate_ClockRegressionDoesNotResurrectEndedEvent(t *testing.T) {
 		t.Errorf("ended event must stay released while still listed, got %+v", got)
 	}
 }
+
+// ── Clock-regression guard, default-fallback half (QA 2026-07-03 v6) ──────────
+//
+// The 2026-07-02 tests above all use progsNoDefault — the guard they pin only
+// engages when resolution returns nothing. The live bench's program carries a
+// DefaultDERControl (5 kW export cap), so a start-regression walk resolves the
+// DEFAULT instead, which was adopted over the still-served event: enforcement
+// flapped 0 W ↔ 5 kW with every jitter cycle (V6 clock-jitter FAILs).
+
+// A clock step back past the adopted event's start must hold the EVENT, not
+// fall back to the program's default.
+func TestEvaluate_ClockRegressionHoldsEventOverDefault(t *testing.T) {
+	s := New()
+	evt := eventWithExpLim("E1", epoch, 600, 0, 0) // 0 W export cap, active [epoch, epoch+600)
+	programs := progs(evt)                         // program carries a 5000 W default
+
+	if ac := s.Evaluate(programs, epoch+30); ac == nil || ac.MRID != "E1" || ac.Held {
+		t.Fatalf("expected fresh control E1, got %+v", ac)
+	}
+
+	// Clock lurches 60 s back: serverNow < start; resolution picks the default.
+	held := s.Evaluate(programs, epoch-30)
+	if held == nil {
+		t.Fatal("clock regression released the still-served event")
+	}
+	if held.MRID != "E1" || !held.Held {
+		t.Errorf("expected E1 held over the default through the regression, got %+v", held)
+	}
+	if held.Source != "event" {
+		t.Errorf("held control Source = %q, want event", held.Source)
+	}
+
+	// Clock recovers: the event is fresh-resolved again.
+	if ac := s.Evaluate(programs, epoch+35); ac == nil || ac.MRID != "E1" || ac.Held {
+		t.Errorf("expected fresh E1 after the clock recovered, got %+v", ac)
+	}
+}
+
+// A genuinely ENDED event must fall back to the default — the guard must not
+// resurrect finished events over it (curtailment-release would regress).
+func TestEvaluate_EndedEventFallsBackToDefault(t *testing.T) {
+	s := New()
+	evt := eventWithExpLim("E1", epoch, 100, 0, 0) // ValidUntil = epoch+100
+	programs := progs(evt)
+
+	if ac := s.Evaluate(programs, epoch+30); ac == nil || ac.MRID != "E1" {
+		t.Fatalf("expected fresh control E1, got %+v", ac)
+	}
+	got := s.Evaluate(programs, epoch+200)
+	if got == nil || got.Source != "default" || got.Held {
+		t.Errorf("ended event must yield the fresh default, got %+v", got)
+	}
+}
+
+// A withdrawn event (gone from the served list) must fall back to the default
+// even mid-regression — the guard must not defeat a genuine withdrawal.
+func TestEvaluate_WithdrawnEventFallsBackToDefault(t *testing.T) {
+	s := New()
+	evt := eventWithExpLim("E1", epoch, 600, 0, 0)
+	if ac := s.Evaluate(progs(evt), epoch+30); ac == nil || ac.MRID != "E1" {
+		t.Fatalf("expected fresh control E1, got %+v", ac)
+	}
+	got := s.Evaluate(progs(), epoch-30) // event deleted; default remains
+	if got == nil || got.Source != "default" || got.Held {
+		t.Errorf("withdrawn event must yield the fresh default even during a regression, got %+v", got)
+	}
+}
+
+// A cancelled event (currentStatus=6) equally falls back to the default.
+func TestEvaluate_CancelledEventFallsBackToDefault(t *testing.T) {
+	s := New()
+	evt := eventWithExpLim("E1", epoch, 600, 0, 0)
+	if ac := s.Evaluate(progs(evt), epoch+30); ac == nil || ac.MRID != "E1" {
+		t.Fatalf("expected fresh control E1, got %+v", ac)
+	}
+	cancelled := eventWithExpLim("E1", epoch, 600, 0, 0)
+	cancelled.EventStatus = &model.EventStatus{CurrentStatus: 6}
+	got := s.Evaluate(progs(cancelled), epoch-30)
+	if got == nil || got.Source != "default" || got.Held {
+		t.Errorf("cancelled event must yield the fresh default even during a regression, got %+v", got)
+	}
+}

@@ -193,6 +193,27 @@ func (s *Scheduler) failClosed(resolved *ActiveControl, programFound bool, hp *d
 	defer s.mu.Unlock()
 
 	if resolved != nil && plausibleControl(resolved) {
+		// Clock-regression guard, default-fallback half (QA 2026-07-03 v6:
+		// clock-jitter). The 2026-07-02 guard below covers a regression that
+		// resolves to NOTHING — but a program that carries a DefaultDERControl
+		// (this bench's program 0: a 5 kW export cap) never resolves to
+		// nothing: when serverNow steps back past the adopted event's start,
+		// §12.3 sees "no active event" and falls back to the DEFAULT, which
+		// would be adopted here, clobbering lastGood. Enforcement then flapped
+		// between the event cap and the default with every jitter cycle
+		// (V6 C3/C4: 0 W ↔ 5 kW every walk — non-convergence all window, and
+		// the export breach counter drained on every default tick so no
+		// CannotComply ever fired). An active event always outranks the
+		// default, and the only legitimate paths from event to default are
+		// expiry (controlExpired) and withdrawal/cancellation (stillServed) —
+		// "the clock stepped back before start" is neither. Hold the event.
+		if resolved.Source == "default" &&
+			s.lastGood != nil && s.lastGood.Source == "event" &&
+			!controlExpired(s.lastGood, serverNow) && stillServed(hp, s.lastGood.MRID) {
+			held := *s.lastGood
+			held.Held = true
+			return &held
+		}
 		stored := *resolved
 		s.lastGood = &stored
 		return resolved
