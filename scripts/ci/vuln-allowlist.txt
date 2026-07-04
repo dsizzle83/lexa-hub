@@ -1,0 +1,23 @@
+# govulncheck triage allowlist (TASK-005).
+#
+# One entry per accepted finding, format:
+#   GO-YYYY-NNNN  <one-line reason>  <date>  <owner>
+#
+# Lines starting with '#' and blank lines are ignored. Only reachable
+# findings (finding.trace has a frame with "function") are checked against
+# this file — see scripts/ci/govulncheck.sh for the reachability rule.
+#
+# Do NOT add an entry here just because TASK-006 (dependency refresh) will
+# fix it — that hides the refresh's motivation. This file is for findings
+# that are reachable AND genuinely stuck (no upstream fix, vendored/forked
+# code, accepted risk with sign-off) — see
+# ../csip-tls-test/docs/refactor/VULN_BASELINE_2026-07-04.md.
+#
+# Baseline scan 2026-07-04: 2 reachable findings, both real call paths
+# through the vendored paho.mqtt.golang v1.4.3 (internal/mqttutil.Connect /
+# cmd/northbound/main.go) — GO-2025-4173 (paho string-encoding bug, fixed in
+# paho v1.5.1) and GO-2025-3503 (x/net IPv6 zone-ID proxy bypass, reached via
+# paho's proxy.FromEnvironment, fixed in x/net v0.36.0). Both are cleared by
+# the TASK-006 dependency refresh (paho + x/net bump) — intentionally NOT
+# allowlisted here; this job is expected to report red (non-blocking) until
+# TASK-006 merges. See the baseline doc for the full disposition table.
