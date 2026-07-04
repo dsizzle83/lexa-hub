@@ -24,11 +24,12 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/northbound/identity"
 	"lexa-hub/internal/northbound/model"
-	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/southbound/device"
 	"lexa-hub/internal/tlsclient"
+	"lexa-hub/internal/watchdog"
 	"lexa-hub/internal/wolfssl"
 )
 
@@ -91,6 +92,16 @@ func main() {
 		log.Fatal("lexa-telemetry: no MUPs registered — exiting")
 	}
 
+	// sd_notify READY (TASK-008): registerMUP makes exactly one bounded POST
+	// attempt per device (no internal retry loop — a per-device failure is
+	// logged and skipped, above), so this loop cannot hang on an unreachable
+	// server; it either finishes fast or the process has already exited via
+	// the len(mups)==0 Fatal. Placed before the (fast, local) MQTT
+	// subscriptions below since MUP registration — the network round trip to
+	// the utility server — is the part of startup that could plausibly be
+	// slow, and it has just completed.
+	watchdog.Ready()
+
 	// mu guards both latest measurements and clockOffset so snapshots are
 	// always from the same lock epoch (no clock/data skew between locks).
 	var mu sync.RWMutex
@@ -133,6 +144,15 @@ func main() {
 	ticker := time.NewTicker(cfg.MUPPostRate())
 	defer ticker.Stop()
 
+	// TASK-008 watchdog kick ticker: added as a case in the SAME select as
+	// the post loop below (not a free-running goroutine) so a wedged
+	// postMeasurements blocks this kick too — telemetry has no tight control
+	// loop like northbound/modbus, so riding the post-loop select is the
+	// closest available liveness signal. 10 s cadence gives ample headroom
+	// under WatchdogSec=60 even at the slowest configured MUPPostRate.
+	kick := time.NewTicker(10 * time.Second)
+	defer kick.Stop()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -141,6 +161,9 @@ func main() {
 		case <-quit:
 			log.Println("lexa-telemetry: shutting down")
 			return
+
+		case <-kick.C:
+			watchdog.Kick()
 
 		case <-ticker.C:
 			mu.RLock()

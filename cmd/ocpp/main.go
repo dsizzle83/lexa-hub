@@ -38,6 +38,7 @@ import (
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/ocppserver"
+	"lexa-hub/internal/watchdog"
 )
 
 func main() {
@@ -82,10 +83,34 @@ func main() {
 	go srv.Start()
 	defer srv.Stop()
 
+	// sd_notify READY (TASK-008): the OCPP WS listener goroutine has been
+	// started. Weaker liveness than northbound/modbus — see the WatchdogSec
+	// comment in lexa-ocpp.service: process + MQTT connectivity, not OCPP
+	// listener health (follow-up TASK-044).
+	watchdog.Ready()
+
+	// TASK-008: no tight control loop exists here (srv.Start runs the OCPP
+	// listener in its own goroutine) — this ticker is the liveness proxy,
+	// gated on MQTT connectivity so a genuinely dead process (not just a
+	// disconnected broker) is what trips the watchdog. A sustained broker
+	// outage (> WatchdogSec) DOES restart this service; that is accepted
+	// crash-only behavior (AD-011), noted in the PR.
+	kick := time.NewTicker(10 * time.Second)
+	defer kick.Stop()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("lexa-ocpp: shutting down")
+	for {
+		select {
+		case <-quit:
+			log.Println("lexa-ocpp: shutting down")
+			return
+		case <-kick.C:
+			if mc.IsConnected() {
+				watchdog.Kick()
+			}
+		}
+	}
 }
 
 // f64ptr returns a pointer to v, or nil if v is NaN.

@@ -8,7 +8,26 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# Type=notify + WatchdogSec (TASK-008, review §11 item 5 / RSK-08): northbound
+# is the utility-facing path and the service most plausibly wedged by a
+# wolfSSL hang (§8.6) — exactly who most needs this. lexa-northbound sends
+# READY=1 once MQTT is connected and both subscriptions are up (before the
+# first discovery walk even starts, so a slow/unreachable utility server
+# cannot itself cause a systemd start timeout), and WATCHDOG=1 both once the
+# initial walk returns AND at the top of every subsequent loop iteration
+# (cmd/northbound/main.go) — the loop reaching that line at all is the
+# liveness signal, independent of whether runDiscovery succeeds.
+#
+# WatchdogSec sizing: floor is 120s, >= 4x the STOCK 20s walk interval, with
+# headroom for a walk that legitimately runs long under northbound-hang
+# conditions (chained tlsclient fetch timeouts can stretch one walk well
+# past a single 20s tick — QA 2026-07-02). Do NOT tighten this without
+# re-running the northbound-hang / wan-outage-hold / wan-outage-expiry
+# Mayhem scenarios: a server that stops responding must NOT fire this
+# watchdog — the walk loop keeps iterating (fail-closed) on fetch errors.
+Type=notify
+NotifyAccess=main
+WatchdogSec=120
 User=lexa
 Group=lexa
 ExecStart=/usr/local/sbin/lexa-northbound -config /etc/lexa/northbound.json

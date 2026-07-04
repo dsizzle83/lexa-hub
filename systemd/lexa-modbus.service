@@ -5,7 +5,25 @@ After=network.target mosquitto.service
 Requires=mosquitto.service
 
 [Service]
-Type=simple
+# Type=notify + WatchdogSec (TASK-008, review §11 item 5 / RSK-08): a wedged
+# poll loop silently stops updating measurement freshness, which gates
+# everything downstream (optimizer, compliance, telemetry). lexa-modbus
+# sends READY=1 once reg.Start() (the poll loop) and publishMeasurements
+# (the MQTT fan-out goroutine) are both running, and WATCHDOG=1 as the
+# first statement of publishMeasurements' update-drain body
+# (cmd/modbus/main.go) — covering registry, channel, and publish path in one
+# kick site. A device poll error still emits an update each round (upd.Err),
+# so unreachable devices alone do not starve the kick; only a wedged
+# registry/channel does.
+#
+# WatchdogSec=60 sizing: >= 4x STOCK's ~10s poll x 3 devices (worst-case
+# serialized poll round well under 60s in practice; parallel per-device poll
+# keeps a single slow device from stalling the others). Kick wiring lives
+# only in publishMeasurements — do not touch retryDevice/interlock code
+# (radioactive per 05 §12) to add kicks elsewhere.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 User=lexa
 Group=lexa
 ExecStart=/usr/local/sbin/lexa-modbus -config /etc/lexa/modbus.json

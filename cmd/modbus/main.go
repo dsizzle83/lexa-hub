@@ -37,6 +37,7 @@ import (
 	"lexa-hub/internal/southbound/inverter"
 	"lexa-hub/internal/southbound/meter"
 	"lexa-hub/internal/southbound/registry"
+	"lexa-hub/internal/watchdog"
 )
 
 func main() {
@@ -94,6 +95,11 @@ func main() {
 
 	go publishMeasurements(mc, cfg, updates, interlock)
 
+	// sd_notify READY (TASK-008): the poll loop (reg.Start) and its MQTT
+	// fan-out goroutine (publishMeasurements) are both running — the kick
+	// site below covers registry, channel, and publish path in one place.
+	watchdog.Ready()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -130,6 +136,13 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 	}
 
 	for upd := range updates {
+		// TASK-008 watchdog kick: first statement of the update-drain body so
+		// it fires on every registry update — including poll-error updates
+		// (upd.Err below), since a device timing out still emits an update
+		// each poll round. Only a wedged registry/channel (nothing arriving
+		// at all) starves this kick, which is the failure mode WatchdogSec
+		// exists to catch here.
+		watchdog.Kick()
 		if upd.Err != nil {
 			log.Printf("lexa-modbus: device %s poll error: %v", upd.Name, upd.Err)
 			continue

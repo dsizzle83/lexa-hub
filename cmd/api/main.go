@@ -22,9 +22,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/mqttutil"
+	"lexa-hub/internal/watchdog"
 )
 
 func main() {
@@ -115,9 +117,63 @@ func main() {
 		}
 	}()
 
+	// TASK-008: cfg.ListenAddr is host:port form (default ":9100") — prefixing
+	// the loopback host gives a same-process self-probe URL for /healthz.
+	healthzURL := "http://127.0.0.1" + cfg.ListenAddr + "/healthz"
+
+	// Give the ListenAndServe goroutine above a moment to bind before the
+	// single startup probe (task spec: "probe once before Ready"). A failed
+	// probe here does not block Ready — an HTTP server that never binds is a
+	// real bug systemd's own TimeoutStartSec will catch via a missing Ready
+	// altogether if this were made to block; instead we log loudly and let
+	// the kick loop below (which gates on the same probe) be the ongoing
+	// signal of whether /healthz is actually up.
+	time.Sleep(100 * time.Millisecond)
+	if !probeHealthz(healthzURL) {
+		log.Printf("lexa-api: startup healthz probe failed (%s) — sending Ready anyway; watchdog kicks will gate on this same probe", healthzURL)
+	}
+
+	// sd_notify READY (TASK-008): the HTTP listener goroutine is up (probed
+	// once, above) and all MQTT subscriptions were established earlier in
+	// this function (each subscribe error is fatal, so reaching this line
+	// means they succeeded).
+	watchdog.Ready()
+
+	// TASK-008: no tight control loop exists here — this ticker is the
+	// liveness proxy, kicking only when BOTH MQTT is connected AND a fresh
+	// loopback /healthz probe returns 200, so a wedged HTTP server (mux
+	// handlers deadlocked, listener goroutine dead) withholds the kick even
+	// though the process itself is still scheduling goroutines.
+	kick := time.NewTicker(10 * time.Second)
+	defer kick.Stop()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("lexa-api: shutting down")
-	_ = srv.Close()
+	for {
+		select {
+		case <-quit:
+			log.Println("lexa-api: shutting down")
+			_ = srv.Close()
+			return
+		case <-kick.C:
+			if mc.IsConnected() && probeHealthz(healthzURL) {
+				watchdog.Kick()
+			}
+		}
+	}
+}
+
+// probeHealthz performs a single bounded GET against the local /healthz
+// endpoint, returning true only on a 200 response. Used both for the
+// startup probe and for gating each watchdog kick (TASK-008): the api
+// service has no tight control loop, so an actual, current HTTP round trip
+// is the strongest liveness signal available.
+func probeHealthz(url string) bool {
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
