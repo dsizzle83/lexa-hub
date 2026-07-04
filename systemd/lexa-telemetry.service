@@ -31,6 +31,17 @@ RestartSec=10s
 StartLimitIntervalSec=120
 StartLimitBurst=5
 
+# journald rate cap (TASK-009, review §11 flash wear / RSK-14): one summary
+# line per device per post (bench MUPPostRate=60s) plus per-quantity POST
+# error lines only on failure — a handful of lines per 30s window at most in
+# normal operation (estimated from mup_post_rate_s cadence — pending
+# on-bench measurement, see lexa-hub/docs/FLASH_BUDGET.md). Burst=150 is
+# generous headroom for a re-registration storm (3-failure threshold in
+# cmd/telemetry/main.go triggers a re-register + its own log line per
+# device) without suppressing that forensic trail.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=150
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lexa-telemetry

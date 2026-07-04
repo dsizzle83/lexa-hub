@@ -30,6 +30,16 @@ RestartSec=5s
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
+# journald rate cap (TASK-009, review §11 flash wear / RSK-14): the /logs SSE
+# feed (lb.Emit) is an in-memory ring buffer, NOT journal output — the
+# journal only sees startup/subscribe-failure/Fatalf lines and the TASK-008
+# startup healthz-probe warning, so steady-state volume here is low
+# (estimated from code inspection — pending on-bench measurement, see
+# lexa-hub/docs/FLASH_BUDGET.md). Burst=100 is generous headroom over that
+# baseline; it exists to catch a runaway bug, not to bound busy-day traffic.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=100
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lexa-api

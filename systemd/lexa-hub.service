@@ -42,6 +42,16 @@ RestartSec=5s
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
+# journald rate cap (TASK-009, review §11 flash wear / RSK-14): FAST 3s tick
+# logs ~2 lines/tick (plan summary + occasional decision line) ≈ 20 lines per
+# 30s window (docs/refactor/tasks/TASK-009.md background estimate — pending
+# on-bench measurement, see lexa-hub/docs/FLASH_BUDGET.md). Burst=400 is 20x
+# that, generous enough to pass a fault-storm burst of breach/dedupe-reset
+# logging uncapped while still catching a genuine runaway-logging bug
+# (~100 lines/s would still trip it within a couple of intervals).
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=400
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lexa-hub

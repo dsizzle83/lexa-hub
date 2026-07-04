@@ -150,6 +150,12 @@ All configs live in `/etc/lexa/`. Edit the copies created by `make install-confi
   NOT restart northbound/modbus, whose loops keep iterating fail-closed on fetch/poll
   errors (verify via the `northbound-hang`/`wan-outage-*` Mayhem scenarios before
   touching any of this).
+- **journald caps** (TASK-009, review §11 flash wear / RSK-14): every `lexa-*.service`
+  sets `LogRateLimitIntervalSec`/`LogRateLimitBurst`, and `systemd/journald-lexa.conf`
+  (installed by `deploy-hub-pi.sh` to `/etc/systemd/journald.conf.d/lexa.conf`) caps the
+  Pi's total journal at `SystemMaxUse=200M`. Rate/size math, per-service estimates, and
+  the wear budget live in `docs/FLASH_BUDGET.md` — read it before changing per-tick
+  logging or raising any cap.
 
 ## Defensive fault-handling (do not strip — each backs a mayhem-QA finding)
 

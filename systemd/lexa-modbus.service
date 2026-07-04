@@ -34,6 +34,18 @@ RestartSec=5s
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
+# journald rate cap (TASK-009, review §11 flash wear / RSK-14): normal
+# steady-state logging is sparse (per-poll updates don't log unless
+# upd.Err/REJECT-implausible/publish-error) but the hub re-commands battery
+# setpoints every economic tick (FAST 3s), each logged on apply — ~10
+# lines/30s per battery device baseline (estimated from the FAST tick cadence
+# in CLAUDE.md/task background — pending on-bench measurement, see
+# lexa-hub/docs/FLASH_BUDGET.md). Burst=300 gives >20x headroom for that plus
+# a reconnect/poll-error storm (retryDevice logs on every drop/reconnect)
+# without suppressing genuine fault-storm forensics.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=300
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lexa-modbus
