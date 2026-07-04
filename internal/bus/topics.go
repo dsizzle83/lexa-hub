@@ -25,6 +25,24 @@
 // compliance alert, schedule, plan log) is QoS 1 (bounded PUBACK wait,
 // mqttutil.publishTimeout). See CLAUDE.md's MQTT topic map for the same table
 // (D5 closure: doc and code now agree, enforced by bus.PubQoS).
+//
+// Every message type below is versioned (AD-006): it embeds Envelope by
+// value, giving it an omitempty "v" field, and has a per-schema version
+// constant in envelope.go (e.g. MeasurementV). A subscriber calls
+// CheckVersion(topic, payload, supportedV) before unmarshalling; the decode
+// policy is absent-v accepted as legacy v0 while LegacyV0Accepted is true (the
+// transition default), 1..supported accepted, greater-than-supported or
+// negative rejected via RejectAndAlarm (counted per topic, logged
+// first-plus-every-Nth to stay inside the journald budget). Same-major
+// unknown fields are simply ignored by json.Unmarshal, which is what keeps
+// additive schema evolution cheap. For a retained control-plane topic, a
+// rejected message means hold last-known-good (the scheduler's existing
+// fail-closed discipline) rather than running on a zero-valued decode; a
+// later task (TASK-042) adds an active re-request instead of waiting out the
+// retained message's own expiry. This task (TASK-017) lands the type,
+// constants, CheckVersion, and RejectAndAlarm only — nothing below is wired
+// to call them yet; publishers stamping V and subscribers calling
+// CheckVersion is TASK-018's rollout.
 package bus
 
 import (
