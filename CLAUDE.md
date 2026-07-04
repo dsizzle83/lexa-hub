@@ -7,7 +7,9 @@ battery storage, smart meter, EVSE (OCPP 2.0.1) — via an MQTT message bus.
 **This is the product.** Its test bench (grid/device/EV simulators, conformance suites,
 dashboard) lives in `~/projects/csip-tls-test`. Two packages are duplicated across the
 repos and must change in lockstep: `internal/southbound/sunspec` register maps (audit
-MTR-4 — a lone change misreads real hardware) and `internal/ocppserver`.
+MTR-4 — a lone change misreads real hardware) and `internal/ocppserver`. Enforced by
+`scripts/ci/lockstep-check.sh` in csip-tls-test CI (TASK-004) — report-only until Phase 1
+replaces the duplication with a shared module (AD-003/TASK-024).
 
 ## Architecture: separate systemd services
 
