@@ -96,7 +96,26 @@ func main() {
 	// alerter latched, so a fresh gen-cap breach published no alert and gridsim
 	// never saw the CannotComply.
 	activeBreachMRID := "" // "" = no breach currently active
+	// dedupeResets clears every actuator's command deduper; populated when the
+	// actuators are wired below (before the engine starts, so no race — the
+	// observer and executePlan both run on the engine's control goroutine).
+	var dedupeResets []func()
 	planObserver := func(plan orchestrator.Plan) {
+		// A compliance breach means the measured effect contradicts the
+		// commanded state — the device may have reverted behind the hub's back
+		// (reboot to defaults, installer override), which is exactly the case
+		// the dedupers' "already sent" assumption gets wrong. Reset them so
+		// this tick's commands publish unconditionally (the observer runs
+		// before executePlan). Self-limiting: fires only while a breach
+		// persists; without it a reverted device saw no corrective write for
+		// up to reassertEvery even as the hub posted CannotComply about it
+		// (QA 2026-07-03: a 0 W ceiling dedupe-suppressed for 30 s against an
+		// uncurtailed inverter).
+		if plan.Breach != nil {
+			for _, reset := range dedupeResets {
+				reset()
+			}
+		}
 		// Surface the plan trace on the bus so lexa-api's /status last_plan is
 		// real data instead of the historical empty stub (the QA harness's
 		// decision introspection depends on it). Published on EVERY pass —
@@ -179,15 +198,21 @@ func main() {
 	for _, dc := range cfg.Devices {
 		switch dc.Role {
 		case "battery":
-			eng.RegisterBatteryActuator(dc.Name, &MQTTBatteryActuator{mc: mc, device: dc.Name})
+			a := &MQTTBatteryActuator{mc: mc, device: dc.Name}
+			dedupeResets = append(dedupeResets, a.dedupe.reset)
+			eng.RegisterBatteryActuator(dc.Name, a)
 		case "inverter":
-			eng.RegisterSolarActuator(dc.Name, &MQTTSolarActuator{mc: mc, device: dc.Name})
+			a := &MQTTSolarActuator{mc: mc, device: dc.Name}
+			dedupeResets = append(dedupeResets, a.dedupe.reset)
+			eng.RegisterSolarActuator(dc.Name, a)
 		}
 	}
 
 	// Wire MQTT actuators for known EVSE stations.
 	for _, sc := range cfg.Stations {
-		eng.RegisterEVSEActuator(sc.ID, &MQTTEVSEActuator{mc: mc, stationID: sc.ID})
+		a := &MQTTEVSEActuator{mc: mc, stationID: sc.ID}
+		dedupeResets = append(dedupeResets, a.dedupe.reset)
+		eng.RegisterEVSEActuator(sc.ID, a)
 	}
 
 	eng.Start()

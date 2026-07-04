@@ -42,6 +42,19 @@ func (d *cmdDeduper) shouldSend(sig string, now time.Time) bool {
 	return true
 }
 
+// reset forgets the last-sent command so the next apply publishes
+// unconditionally. Called when the optimizer records a compliance breach: a
+// breach means the MEASURED effect contradicts the commanded state, so the
+// device may have reverted behind the hub's back (reboot to defaults, installer
+// override — the solar-reboot-forget class) and the "already sent" assumption
+// the deduper rests on is exactly what's in doubt. Without this, a device that
+// reverted while the commanded value was unchanged got no corrective write for
+// up to reassertEvery even as the hub posted CannotComply about the mismatch
+// (QA 2026-07-03 spot-run: a 0 W ceiling suppressed for 30 s against an
+// uncurtailed inverter). Self-limiting: re-sends happen only on breach ticks
+// and stop as soon as the measured effect converges.
+func (d *cmdDeduper) reset() { d.lastSig = ""; d.lastSent = time.Time{} }
+
 // MQTTBatteryActuator publishes battery commands to lexa/control/battery/{device}.
 type MQTTBatteryActuator struct {
 	mc     mqtt.Client
