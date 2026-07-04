@@ -71,6 +71,8 @@ make wolfssl-arm64           # rebuild arm64 wolfSSL sysroot (/tmp — wiped on 
 make build-arm64             # cross-compile all 6 binaries → bin/arm64/
 ```
 
+CI: `.github/workflows/ci.yml` — vet + `-race` (pure-Go) + cgo build on every PR; required checks on `main`.
+
 ## Current bench deployment
 
 The ConnectCore dev kit (69.0.0.2) is offline; the hub runs on **hub-pi `dhpi4` at
