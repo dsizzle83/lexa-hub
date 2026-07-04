@@ -16,9 +16,51 @@
 //	lexa/control/solar/{device}               hub          → modbus
 //	lexa/evse/{station}/command               hub          → ocpp
 //	lexa/hub/plan                             hub          → api (retained)
+//
+// Publish QoS is a per-topic policy owned here (PubQoS), not hardcoded by
+// callers: the measurement plane (lexa/measurements/*, lexa/battery/*/metrics,
+// lexa/evse/*/state) is QoS 0 — high-frequency, freshness-gated by
+// subscribers, a dropped sample is the documented design, not a bug; every
+// other topic (commands, CSIP control/pricing/billing/flow-reservation,
+// compliance alert, schedule, plan log) is QoS 1 (bounded PUBACK wait,
+// mqttutil.publishTimeout). See CLAUDE.md's MQTT topic map for the same table
+// (D5 closure: doc and code now agree, enforced by bus.PubQoS).
 package bus
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
+
+// QoS byte values, named for readability at PubQoS call sites.
+const (
+	QoS0 byte = 0
+	QoS1 byte = 1
+)
+
+// PubQoS returns the publish QoS for topic per the documented policy: QoS 0
+// for the measurement plane (device measurements, battery metrics, EVSE
+// state), QoS 1 for everything else. Callers publish with
+// mqttutil.PublishJSONQoS(client, topic, bus.PubQoS(topic), v) rather than
+// hardcoding a QoS, so this function is the single place the policy lives
+// (review D5: previously every publish hardcoded QoS 1).
+//
+// Subscribe QoS is untouched by this policy — Subscribe always requests QoS
+// 1, and effective delivery QoS is min(publish, subscribe), so a QoS-0
+// publish stays best-effort and a QoS-1 publish stays reliably delivered
+// regardless of what a subscriber requests.
+func PubQoS(topic string) byte {
+	switch {
+	case strings.HasPrefix(topic, "lexa/measurements/"):
+		return QoS0
+	case strings.HasPrefix(topic, "lexa/battery/") && strings.HasSuffix(topic, "/metrics"):
+		return QoS0
+	case strings.HasPrefix(topic, "lexa/evse/") && strings.HasSuffix(topic, "/state"):
+		return QoS0
+	default:
+		return QoS1
+	}
+}
 
 func MeasurementTopic(device string) string {
 	return fmt.Sprintf("lexa/measurements/%s", device)

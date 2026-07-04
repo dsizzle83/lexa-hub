@@ -162,7 +162,11 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 		if !math.IsNaN(m.Hz) {
 			msg.Hz = &m.Hz
 		}
-		if err := mqttutil.PublishJSON(mc, bus.MeasurementTopic(upd.Name), msg); err != nil {
+		// Measurement plane is QoS 0 (bus.PubQoS): high-frequency, freshness-
+		// gated by subscribers, so a dropped sample under broker congestion
+		// is the documented design rather than a fault (review D5).
+		measTopic := bus.MeasurementTopic(upd.Name)
+		if err := mqttutil.PublishJSONQoS(mc, measTopic, bus.PubQoS(measTopic), msg); err != nil {
 			log.Printf("lexa-modbus: publish measurement %s: %v", upd.Name, err)
 		}
 
@@ -170,7 +174,8 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 		// API's SoC display and the optimizer's storage model.
 		if deviceRole[upd.Name] == "battery" && !math.IsNaN(m.SOC) {
 			bm := bus.BattMetrics{Device: upd.Name, SOC: &m.SOC, Ts: now}
-			if err := mqttutil.PublishJSON(mc, bus.BattMetricsTopic(upd.Name), bm); err != nil {
+			bmTopic := bus.BattMetricsTopic(upd.Name)
+			if err := mqttutil.PublishJSONQoS(mc, bmTopic, bus.PubQoS(bmTopic), bm); err != nil {
 				log.Printf("lexa-modbus: publish battery metrics %s: %v", upd.Name, err)
 			}
 		}
