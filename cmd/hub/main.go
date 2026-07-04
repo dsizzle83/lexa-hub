@@ -38,6 +38,7 @@ import (
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/orchestrator"
+	"lexa-hub/internal/watchdog"
 )
 
 func main() {
@@ -101,6 +102,17 @@ func main() {
 	// observer and executePlan both run on the engine's control goroutine).
 	var dedupeResets []func()
 	planObserver := func(plan orchestrator.Plan) {
+		// systemd watchdog keepalive (TASK-007). Must stay the first thing
+		// this closure does, before any publish: the engine calls
+		// PlanObserver on its own control goroutine on every economic tick
+		// and on every safety pass that produces commands (engine.go
+		// tick()/safetyTick()), so a kick here rides the tick loop itself —
+		// if ReadSystemState/Optimize/executePlan or this closure's own
+		// publishes below wedge, the NEXT tick's kick simply never happens
+		// and systemd's WatchdogSec fires. A goroutine-based timer kick
+		// would defeat this entirely by staying alive after the loop dies.
+		watchdog.Kick()
+
 		// A compliance breach means the measured effect contradicts the
 		// commanded state — the device may have reverted behind the hub's back
 		// (reboot to defaults, installer override), which is exactly the case
@@ -217,6 +229,13 @@ func main() {
 
 	eng.Start()
 	defer eng.Stop()
+
+	// sd_notify READY (TASK-007): tells systemd (Type=notify) the hub has
+	// finished starting and is now ticking, so the watchdog deadline starts
+	// counting from a point where PlanObserver's kicks are actually due. A
+	// no-op when NOTIFY_SOCKET isn't set (dev/test, or a unit still on
+	// Type=simple).
+	watchdog.Ready()
 
 	log.Printf("lexa-hub: running (engine interval=%s planner replan=%ds debug=%v)",
 		cfg.EngineInterval(), cfg.Planner.ReplanIntervalS, cfg.Debug)
