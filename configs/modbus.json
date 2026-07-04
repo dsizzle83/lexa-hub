@@ -8,7 +8,7 @@
       "url": "tcp://69.0.0.10:5020",
       "unit_id": 1,
       "role": "inverter",
-      "max_w": 10000
+      "max_w": 4800
     },
     {
       "name": "battery-0",
