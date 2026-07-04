@@ -27,6 +27,16 @@
 # No bench/SSH/secret access: these jobs only ever talk to GitHub and
 # github.com/wolfSSL — no 69.0.0.x, no credentials beyond the default
 # GITHUB_TOKEN.
+#
+# TASK-005: `vulncheck` job runs a pinned govulncheck (scripts/ci/govulncheck.sh)
+# on every PR/push AND nightly (new CVEs land without a code change). It reuses
+# the `cgo` job's wolfSSL cache/build steps — govulncheck needs the whole
+# module to *build* (cgo packages included) or it silently scans less than you
+# think. Currently `continue-on-error: true` (non-blocking); the first baseline
+# scan found 2 reachable findings (paho.mqtt.golang GO-2025-4173, x/net
+# GO-2025-3503), both cleared by the TASK-006 dependency refresh — see
+# ../csip-tls-test/docs/refactor/VULN_BASELINE_2026-07-04.md.
+# TODO(TASK-006): once merged, drop continue-on-error and make this required.
 
 name: CI
 
@@ -34,6 +44,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '17 4 * * *' # nightly vuln scan (UTC); see `vulncheck` job below
 
 permissions:
   contents: read
@@ -42,6 +54,7 @@ jobs:
   vet-build-test:
     name: vet-build-test
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +75,7 @@ jobs:
   cgo:
     name: cgo
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     env:
       WOLFSSL_VER: 5.7.6-stable
       WOLFSSL_SYSROOT: /home/runner/wolfssl-amd64
@@ -129,6 +143,7 @@ jobs:
   cross:
     name: cross
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
 
@@ -138,3 +153,65 @@ jobs:
 
       - name: cross-compile arm64 (deploy artifacts, pure-Go)
         run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./cmd/hub ./cmd/modbus ./cmd/ocpp ./cmd/api
+
+  # TASK-005: pinned govulncheck (scripts/ci/govulncheck.sh) + triage
+  # allowlist (scripts/ci/vuln-allowlist.txt). Reuses the `cgo` job's wolfSSL
+  # cache/build steps — govulncheck must build the whole module (cgo packages
+  # included) or it silently scans a shrunken package set. Gates only on
+  # REACHABLE findings (real call path, not merely imported or transitively
+  # required); everything else is informational. Runs on PR, push:main, and
+  # the nightly cron (new CVEs land with no code change). Non-blocking
+  # (continue-on-error) until TASK-006's dependency refresh clears the
+  # baseline — see ../csip-tls-test/docs/refactor/VULN_BASELINE_2026-07-04.md.
+  vulncheck:
+    name: vulncheck
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      WOLFSSL_VER: 5.7.6-stable
+      WOLFSSL_SYSROOT: /home/runner/wolfssl-amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Cache wolfSSL sysroot
+        id: cache-wolfssl
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WOLFSSL_SYSROOT }}
+          key: wolfssl-${{ env.WOLFSSL_VER }}-${{ runner.os }}-v1
+
+      - name: Build wolfSSL from source (cache miss only)
+        if: steps.cache-wolfssl.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool m4
+
+          cd /tmp
+          wget -q "https://github.com/wolfSSL/wolfssl/archive/refs/tags/v${WOLFSSL_VER}.tar.gz" \
+            -O "wolfssl-${WOLFSSL_VER}.tar.gz"
+          tar xzf "wolfssl-${WOLFSSL_VER}.tar.gz"
+          cd "wolfssl-${WOLFSSL_VER}"
+          autoreconf -i
+
+          mkdir -p /tmp/wolfssl-build
+          cd /tmp/wolfssl-build
+          "/tmp/wolfssl-${WOLFSSL_VER}/configure" \
+            --prefix="${WOLFSSL_SYSROOT}" \
+            --enable-tls13 --enable-aesccm --enable-tlsx \
+            --enable-certgen --enable-opensslall \
+            --enable-static --disable-shared \
+            --disable-examples --disable-crypttests
+          make -j"$(nproc)"
+          make install
+
+      - name: govulncheck (pinned, reachable-findings gate)
+        env:
+          CGO_CFLAGS: -I${{ env.WOLFSSL_SYSROOT }}/include
+          CGO_LDFLAGS: -L${{ env.WOLFSSL_SYSROOT }}/lib -lm
+        run: |
+          set -o pipefail
+          bash scripts/ci/govulncheck.sh 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
