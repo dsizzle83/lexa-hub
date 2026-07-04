@@ -36,6 +36,11 @@ Each concern runs as its own process and communicates only via Mosquitto MQTT:
 | `lexa/control/solar/{device}` | lexa-hub | lexa-modbus | 1 |
 | `lexa/evse/{station}/command` | lexa-hub | lexa-ocpp | 1 |
 
+QoS is enforced by `bus.PubQoS` (`internal/bus/topics.go`), not hardcoded per
+call site — publishers pass `bus.PubQoS(topic)` to
+`mqttutil.PublishJSONQoS`. Previously every publish hardcoded QoS 1
+regardless of this table (review D5); closed 2026-07-04.
+
 ## Directory map
 
 ```

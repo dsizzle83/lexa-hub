@@ -71,6 +71,14 @@ var registries sync.Map // mqtt.Client → *subRegistry
 // so a late or dropped command is harmless.
 const publishTimeout = 5 * time.Second
 
+// qos0AckTimeout bounds how long a QoS 0 publish waits before returning.
+// QoS 0 has no PUBACK: paho completes the token locally as soon as the
+// message is written to the wire, so this is never a broker round trip —
+// it exists solely to still surface a marshal error or a "not connected"
+// send failure to the caller instead of silently dropping it, without
+// paying anything close to publishTimeout's 5 s hot-path cost.
+const qos0AckTimeout = 100 * time.Millisecond
+
 // Connect creates an MQTT client connected to broker with the given clientID.
 // Auto-reconnect is enabled; the call blocks until the initial connection succeeds
 // or times out after 30 s.  Subscriptions made through Subscribe are replayed
@@ -108,22 +116,37 @@ func Connect(broker, clientID string) (mqtt.Client, error) {
 // PublishJSON marshals v to JSON and publishes it to topic with QoS 1.
 // Waits at most publishTimeout for the broker's acknowledgement.
 func PublishJSON(client mqtt.Client, topic string, v any) error {
-	return publishJSON(client, topic, v, false)
+	return publishJSON(client, topic, 1, false, v)
 }
 
 // PublishJSONRetained is like PublishJSON but the message is retained.
 func PublishJSONRetained(client mqtt.Client, topic string, v any) error {
-	return publishJSON(client, topic, v, true)
+	return publishJSON(client, topic, 1, true, v)
 }
 
-func publishJSON(client mqtt.Client, topic string, v any, retained bool) error {
+// PublishJSONQoS marshals v to JSON and publishes it to topic at the given
+// QoS (0 or 1), not retained. Callers should pass bus.PubQoS(topic) for qos
+// rather than a hardcoded literal, so the per-topic QoS policy stays owned
+// in one place (internal/bus). QoS 1 behaves exactly like PublishJSON
+// (bounded publishTimeout wait for the PUBACK). QoS 0 does not wait for a
+// PUBACK — there isn't one — but still bounds the call at qos0AckTimeout so
+// a marshal or send error is not silently swallowed.
+func PublishJSONQoS(client mqtt.Client, topic string, qos byte, v any) error {
+	return publishJSON(client, topic, qos, false, v)
+}
+
+func publishJSON(client mqtt.Client, topic string, qos byte, retained bool, v any) error {
 	payload, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("mqttutil: marshal %T: %w", v, err)
 	}
-	tok := client.Publish(topic, 1, retained, payload)
-	if !tok.WaitTimeout(publishTimeout) {
-		return fmt.Errorf("mqttutil: publish %s: no ack after %s", topic, publishTimeout)
+	tok := client.Publish(topic, qos, retained, payload)
+	wait := publishTimeout
+	if qos == 0 {
+		wait = qos0AckTimeout
+	}
+	if !tok.WaitTimeout(wait) {
+		return fmt.Errorf("mqttutil: publish %s: no ack after %s", topic, wait)
 	}
 	return tok.Error()
 }

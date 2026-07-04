@@ -250,8 +250,13 @@ func (b *mqttBridge) publishAll(stationID string) {
 	}
 	b.mu.RUnlock()
 
+	// EVSE state is QoS 0 (bus.PubQoS): part of the measurement plane, same
+	// freshness-gated best-effort policy as lexa/measurements and
+	// lexa/battery/*/metrics (review D5).
+	topic := bus.EVSEStateTopic(stationID)
+	qos := bus.PubQoS(topic)
 	for _, msg := range msgs {
-		_ = mqttutil.PublishJSON(b.mc, bus.EVSEStateTopic(stationID), msg)
+		_ = mqttutil.PublishJSONQoS(b.mc, topic, qos, msg)
 	}
 }
 
