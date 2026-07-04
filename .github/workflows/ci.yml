@@ -33,7 +33,11 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    # TEMP validation-only trigger for task/** so hosted Actions runs
+    # without an open PR (no gh/API credential available to open one in
+    # this environment). Reverted to `branches: [main]` before hand-off —
+    # see the follow-up commit on this branch.
+    branches: [main, "task/**"]
 
 permissions:
   contents: read
