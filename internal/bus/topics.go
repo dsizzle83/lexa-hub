@@ -184,6 +184,15 @@ func CtrlSolarTopic(device string) string {
 	return fmt.Sprintf("lexa/control/solar/%s", device)
 }
 
+// DesiredTopic returns the retained desired-state topic for a device (AD-013):
+// lexa/desired/{class}/{device}, class ∈ battery|solar|evse. For EVSE, device
+// is the OCPP stationID (the connector rides inside the document). Nothing
+// publishes or subscribes to this yet — the reconciler (TASK-026) is the first
+// consumer.
+func DesiredTopic(class, device string) string {
+	return fmt.Sprintf("lexa/desired/%s/%s", class, device)
+}
+
 // Wildcard subscription topics used by subscribers.
 const (
 	SubMeasurements = "lexa/measurements/+"
@@ -192,6 +201,9 @@ const (
 	SubEVSECommand  = "lexa/evse/+/command"
 	SubCtrlBattery  = "lexa/control/battery/+"
 	SubCtrlSolar    = "lexa/control/solar/+"
+	// SubDesired matches every retained desired-state document across all
+	// device classes (AD-013). The reconciler (TASK-026) subscribes this.
+	SubDesired = "lexa/desired/+/+"
 )
 
 // DeviceFromMeasurementTopic extracts the device name from a topic like
@@ -227,6 +239,18 @@ func DeviceFromCtrlBatteryTopic(topic string) string {
 // "lexa/control/solar/{device}".
 func DeviceFromCtrlSolarTopic(topic string) string {
 	return lastSegment(topic)
+}
+
+// ClassFromDesiredTopic extracts the device class from
+// "lexa/desired/{class}/{device}" (the segment at index 2).
+func ClassFromDesiredTopic(topic string) string {
+	return nthSegment(topic, 2)
+}
+
+// DeviceFromDesiredTopic extracts the device (or EVSE stationID) from
+// "lexa/desired/{class}/{device}" (the segment at index 3).
+func DeviceFromDesiredTopic(topic string) string {
+	return nthSegment(topic, 3)
 }
 
 func lastSegment(topic string) string {
