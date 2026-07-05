@@ -15,4 +15,4 @@ review.txt
 # local go.work (`go work init . ../lexa-proto`) for cross-repo dev against a
 # live lexa-proto checkout — it must never be committed again.
 go.work
-go.work.sum
+go.work.sum.claude/worktrees/
