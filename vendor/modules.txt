@@ -1,0 +1,90 @@
+# github.com/cenkalti/backoff v2.2.1+incompatible
+## explicit
+github.com/cenkalti/backoff
+# github.com/eclipse/paho.mqtt.golang v1.5.1
+## explicit; go 1.24.0
+github.com/eclipse/paho.mqtt.golang
+github.com/eclipse/paho.mqtt.golang/packets
+# github.com/go-playground/locales v0.12.1
+## explicit
+github.com/go-playground/locales
+github.com/go-playground/locales/currency
+# github.com/go-playground/universal-translator v0.16.0
+## explicit
+github.com/go-playground/universal-translator
+# github.com/goburrow/serial v0.1.0
+## explicit
+github.com/goburrow/serial
+# github.com/gorilla/mux v1.8.1
+## explicit; go 1.20
+github.com/gorilla/mux
+# github.com/gorilla/websocket v1.5.3
+## explicit; go 1.12
+github.com/gorilla/websocket
+# github.com/grandcat/zeroconf v1.0.0
+## explicit; go 1.13
+github.com/grandcat/zeroconf
+# github.com/leodido/go-urn v1.1.0
+## explicit
+github.com/leodido/go-urn
+# github.com/lorenzodonini/ocpp-go v0.19.0
+## explicit; go 1.16
+github.com/lorenzodonini/ocpp-go/internal/callbackqueue
+github.com/lorenzodonini/ocpp-go/logging
+github.com/lorenzodonini/ocpp-go/ocpp
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/authorization
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/availability
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/data
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/diagnostics
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/display
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/firmware
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/iso15118
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/localauth
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/meter
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/provisioning
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/remotecontrol
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/reservation
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/security
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/smartcharging
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/tariffcost
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/transactions
+github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types
+github.com/lorenzodonini/ocpp-go/ocppj
+github.com/lorenzodonini/ocpp-go/ws
+# github.com/miekg/dns v1.1.27
+## explicit; go 1.12
+github.com/miekg/dns
+# github.com/relvacode/iso8601 v1.6.0
+## explicit; go 1.13
+github.com/relvacode/iso8601
+# github.com/simonvetter/modbus v1.6.4
+## explicit; go 1.16
+github.com/simonvetter/modbus
+# golang.org/x/crypto v0.53.0
+## explicit; go 1.25.0
+golang.org/x/crypto/ed25519
+# golang.org/x/net v0.56.0
+## explicit; go 1.25.0
+golang.org/x/net/bpf
+golang.org/x/net/internal/iana
+golang.org/x/net/internal/socket
+golang.org/x/net/internal/socks
+golang.org/x/net/ipv4
+golang.org/x/net/ipv6
+golang.org/x/net/proxy
+# golang.org/x/sync v0.21.0
+## explicit; go 1.25.0
+golang.org/x/sync/semaphore
+# golang.org/x/sys v0.46.0
+## explicit; go 1.25.0
+golang.org/x/sys/unix
+golang.org/x/sys/windows
+# gopkg.in/go-playground/validator.v9 v9.30.0
+## explicit
+gopkg.in/go-playground/validator.v9
+# lexa-proto v0.0.0 => ../lexa-proto
+## explicit; go 1.26
+lexa-proto/modbus
+lexa-proto/sunspec
+# lexa-proto => ../lexa-proto

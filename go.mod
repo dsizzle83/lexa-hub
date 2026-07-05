@@ -6,8 +6,9 @@ require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/grandcat/zeroconf v1.0.0
 	github.com/lorenzodonini/ocpp-go v0.19.0
-	github.com/simonvetter/modbus v1.6.4
 )
+
+require github.com/simonvetter/modbus v1.6.4 // indirect
 
 require (
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
@@ -24,4 +25,7 @@ require (
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	gopkg.in/go-playground/validator.v9 v9.30.0 // indirect
+	lexa-proto v0.0.0
 )
+
+replace lexa-proto => ../lexa-proto
