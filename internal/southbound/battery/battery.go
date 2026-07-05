@@ -10,8 +10,8 @@ import (
 	"lexa-hub/internal/northbound/model"
 	"lexa-hub/internal/southbound/derbase"
 	"lexa-hub/internal/southbound/device"
-	"lexa-hub/internal/southbound/modbus"
-	"lexa-hub/internal/southbound/sunspec"
+	"lexa-proto/modbus"
+	"lexa-proto/sunspec"
 )
 
 const tag = "battery"

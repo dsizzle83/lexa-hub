@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"lexa-hub/internal/northbound/model"
-	"lexa-hub/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 )
 
 // memDev is an in-memory SunSpec holding-register device implementing
