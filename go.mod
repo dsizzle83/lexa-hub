@@ -19,9 +19,9 @@ require (
 	github.com/leodido/go-urn v1.1.0 // indirect
 	github.com/miekg/dns v1.1.27 // indirect
 	github.com/relvacode/iso8601 v1.6.0 // indirect
-	golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550 // indirect
-	golang.org/x/net v0.8.0 // indirect
-	golang.org/x/sync v0.1.0 // indirect
-	golang.org/x/sys v0.6.0 // indirect
+	golang.org/x/crypto v0.53.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/sync v0.21.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
 	gopkg.in/go-playground/validator.v9 v9.30.0 // indirect
 )
