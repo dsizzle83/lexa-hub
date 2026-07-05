@@ -250,3 +250,99 @@ func TestRetryDevice_ReconcileFailureDropsSession(t *testing.T) {
 		t.Errorf("recovered device received %d controls, want 1", len(good.applied))
 	}
 }
+
+// TestRetryDevice_ActiveReconciledSuppressesLastCtrl (TASK-028): a device owned
+// by the active battery reconciler must NOT record lastCtrl (so no competing
+// reassert) and must invoke onReconnect (not replay lastCtrl) on every reopen —
+// the reconciler is the single reasserter.
+func TestRetryDevice_ActiveReconciledSuppressesLastCtrl(t *testing.T) {
+	dev := &fakeDevice{w: -500}
+	opens := 0
+	reconnects := 0
+	rd := &retryDevice{
+		cfg:              DeviceConfig{Name: "battery-0", Role: "battery"},
+		reconciledActive: true,
+		onReconnect:      func() { reconnects++ },
+		open: func() (device.Device, error) {
+			opens++
+			return dev, nil
+		},
+	}
+
+	// First connect: onReconnect fires, and NO reassert write is made (a battery
+	// with no lastCtrl would already skip reassert; this pins the active path).
+	if _, err := rd.ReadMeasurements(); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if reconnects != 1 {
+		t.Fatalf("onReconnect calls = %d, want 1", reconnects)
+	}
+	if len(dev.applied) != 0 {
+		t.Fatalf("active-reconciled device must get no reassert write on connect, got %d", len(dev.applied))
+	}
+
+	// A control write goes to hardware but is NOT recorded as lastCtrl.
+	if err := rd.ApplyControl(model.DERControlBase{OpModConnect: bptr(true)}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if rd.lastCtrl != nil {
+		t.Error("active-reconciled device must not record lastCtrl")
+	}
+	if len(dev.applied) != 1 {
+		t.Errorf("the control write should still reach hardware, applied=%d", len(dev.applied))
+	}
+
+	// Drop and reconnect: onReconnect fires again, still no lastCtrl replay.
+	dev.readErr = errors.New("write: broken pipe")
+	if _, err := rd.ReadMeasurements(); err == nil {
+		t.Fatal("expected the dropped session to error")
+	}
+	dev.readErr = nil
+	if _, err := rd.ReadMeasurements(); err != nil {
+		t.Fatalf("reconnect read: %v", err)
+	}
+	if reconnects != 2 {
+		t.Errorf("onReconnect calls = %d, want 2 after reconnect", reconnects)
+	}
+	// applied is still just the one explicit control — no reassert replays.
+	if len(dev.applied) != 1 {
+		t.Errorf("no reassert replay expected; applied=%d, want 1", len(dev.applied))
+	}
+}
+
+// TestRetryDevice_LegacyReassertIntactForSolar guards that the reconnect-reassert
+// change is battery-active-scoped: a solar (inverter) device with reconciledActive
+// false keeps its lastCtrl reassert-on-reconnect (bit-identical to before).
+func TestRetryDevice_LegacyReassertIntactForSolar(t *testing.T) {
+	first := &fakeDevice{w: 1000}
+	second := &fakeDevice{w: 1000}
+	opens := 0
+	rd := &retryDevice{
+		cfg: DeviceConfig{Name: "solar", Role: "inverter"},
+		open: func() (device.Device, error) {
+			opens++
+			if opens == 1 {
+				return first, nil
+			}
+			return second, nil
+		},
+	}
+	if _, err := rd.ReadMeasurements(); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	curtail := model.DERControlBase{OpModMaxLimW: &model.ActivePower{Value: 1000}}
+	if err := rd.ApplyControl(curtail); err != nil {
+		t.Fatalf("curtail: %v", err)
+	}
+	if rd.lastCtrl == nil {
+		t.Fatal("solar must still record lastCtrl (reconciledActive is false)")
+	}
+	first.readErr = errors.New("write: broken pipe")
+	rd.ReadMeasurements() // drop
+	if _, err := rd.ReadMeasurements(); err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	if len(second.applied) != 1 {
+		t.Fatalf("solar reconnect must reassert lastCtrl, applied=%d", len(second.applied))
+	}
+}

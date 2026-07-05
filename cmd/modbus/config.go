@@ -102,9 +102,14 @@ func loadConfig(path string) (*Config, error) {
 		case "", ReconcilerOff, ReconcilerShadow:
 			// ok
 		case ReconcilerActive:
-			// Explicitly reserved (task-file requirement): a premature flip
-			// to active must be impossible, not a silent no-op.
-			return nil, fmt.Errorf("reconciler active mode lands in TASK-028 (class %q)", class)
+			// TASK-028 makes the battery reconciler authoritative; "active" is
+			// legal for battery ONLY. Solar/EVSE stay fatal until TASK-029/030
+			// build and gate their write paths — a config asking for them now
+			// is almost certainly a copy-paste from a later deploy step, so it
+			// fails loud rather than silently activating an unbuilt path.
+			if class != "battery" {
+				return nil, fmt.Errorf("reconciler active mode is battery-only until TASK-029/030 (class %q)", class)
+			}
 		default:
 			return nil, fmt.Errorf("reconciler: unknown mode %q for class %q (want off|shadow|active)", mode, class)
 		}
