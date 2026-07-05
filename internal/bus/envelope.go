@@ -48,6 +48,7 @@ const (
 	FlowReservationStatusV  = 1 // lexa/csip/flowreservation/status         (FlowReservationStatusMsg)
 	DERScheduleV            = 1 // lexa/northbound/schedule                 (DERScheduleMsg)
 	PlanLogV                = 1 // lexa/hub/plan                            (PlanLog)
+	DesiredStateV           = 1 // lexa/desired/{class}/{device}            (DesiredState, AD-013)
 )
 
 // LegacyV0Accepted is the transition switch for AD-006's compatibility
