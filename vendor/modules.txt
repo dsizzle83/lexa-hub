@@ -86,5 +86,6 @@ gopkg.in/go-playground/validator.v9
 # lexa-proto v0.0.0 => ../lexa-proto
 ## explicit; go 1.26
 lexa-proto/modbus
+lexa-proto/ocppserver
 lexa-proto/sunspec
 # lexa-proto => ../lexa-proto
