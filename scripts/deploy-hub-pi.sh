@@ -114,12 +114,14 @@ for svc in $SERVICES; do
     mosquitto_passwd -b -c "$PASSWD_FILE" "lexa-$svc" "$pass"
   fi
 done
-# password_file/acl_file must be readable by the mosquitto broker process
-# after it drops root; group-readable, not world-readable (openssl rand
-# output at rest, one file per service, is the only worse leak — this file
-# is names+hashes only, still don't loosen it).
-chown root:mosquitto "$PASSWD_FILE" "$ACL_FILE" 2>/dev/null || true
-chmod 640 "$PASSWD_FILE" "$ACL_FILE"
+# mosquitto 2.x warns (and future versions will refuse) if password_file's
+# group is not root — it reads these as root at startup before dropping
+# privileges, so root:root 0600 is both compliant and functional. Caveat:
+# a SIGHUP reload re-reads as the mosquitto user and would fail; this
+# deploy always restarts the service (fresh root read), never SIGHUPs.
+# (P0-exit gate finding 2026-07-05; was root:mosquitto 0640.)
+chown root:root "$PASSWD_FILE" "$ACL_FILE" 2>/dev/null || true
+chmod 600 "$PASSWD_FILE" "$ACL_FILE"
 
 if [[ "$ENABLE_MQTT_ACL" == "1" ]]; then
   cat > /etc/mosquitto/conf.d/lexa.conf <<'CONF'

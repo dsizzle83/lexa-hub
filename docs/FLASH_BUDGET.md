@@ -26,9 +26,17 @@ anything that increases logging further.**
 
 FAST mode (bench QA tick/poll cadences; see `csip-tls-test/CLAUDE.md`):
 
+> **Measured 2026-07-05 (P0-exit gate, FAST, 10-min window):** hub 108
+> lines/min, northbound 12, modbus 12.6, ocpp 12, telemetry 3, api 0.1 —
+> total ≈148/min ≈ 213k/day. The hub runs ≈2.7× the per-tick estimate
+> below (≈54/30 s vs est. ~20) but stays far under its 400 burst cap; caps
+> unchanged. Journal disk usage at measurement: 34.8 M of the 200 M
+> `SystemMaxUse`. Re-measure at the P5 gate when the optimizer split
+> changes the hub's logging profile.
+
 | Service | Cadence (FAST) | Est. lines/cycle (normal) | Est. lines/30s | `LogRateLimitBurst` (20×, rounded up) |
 |---|---|---|---|---|
-| lexa-hub | 3 s engine tick | ~2 (plan summary + occasional decision) | ~20 | 400 |
+| lexa-hub | 3 s engine tick | ~2 (plan summary + occasional decision) | ~20 est. / **~54 measured** | 400 |
 | lexa-northbound | 5 s discovery walk | ~2 (discovery OK line + occasional response/pricing/billing) | ~12–24 | 300 |
 | lexa-modbus | 3 s tick (battery re-command), 2 s × 3 devices poll (silent unless error) | ~1 per battery device on tick | ~10 | 300 |
 | lexa-telemetry | 60 s MUP post (bench) | ~1 per device per post | <5 | 150 |
