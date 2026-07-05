@@ -17,6 +17,14 @@ import (
 
 const (
 	maxResponseBody = 10 << 20 // 10 MiB — safe ceiling for embedded targets
+
+	// maxResponseHeader caps the header block readResponse will buffer
+	// before finding "\r\n\r\n" — a server streaming garbage with no header
+	// terminator no longer grows the buffer without bound (TASK-047, D9/
+	// §10.2). 64 KiB comfortably exceeds any real CSIP response: gridsim
+	// sends a handful of headers, verified against the httpwire fuzz corpus
+	// (internal/tlsclient/httpwire/testdata/fuzz/).
+	maxResponseHeader = 64 << 10 // 64 KiB
 )
 
 // Client is a CSIP-compliant mTLS client. It owns a wolfSSL context
@@ -265,11 +273,11 @@ func (c *Client) Get(path string) ([]byte, error) {
 // Falls back to read-until-close if Content-Length is absent.
 //
 // The parsing core (header loop, chunked-encoding rejection, Content-Length
-// handling) lives in the CGo-free httpwire leaf package so it can be
-// fuzzed without a wolfSSL sysroot (TASK-047, D9/§10.2); this is a thin
-// wrapper binding it to the wolfSSL-backed session.
+// handling, header/body size caps) lives in the CGo-free httpwire leaf
+// package so it can be fuzzed without a wolfSSL sysroot (TASK-047, D9/
+// §10.2); this is a thin wrapper binding it to the wolfSSL-backed session.
 func (c *Client) readResponse() ([]byte, error) {
 	return httpwire.ReadHTTPResponse(func(p []byte) (int, error) {
 		return wolfssl.Read(c.ssl, p)
-	}, maxResponseBody)
+	}, maxResponseHeader, maxResponseBody)
 }

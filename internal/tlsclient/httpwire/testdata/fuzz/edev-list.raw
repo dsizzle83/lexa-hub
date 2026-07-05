@@ -1,0 +1,28 @@
+HTTP/1.1 200 OK
+Content-Length: 1001
+Content-Type: application/sep+xml
+Date: Sun, 05 Jul 2026 16:01:17 GMT
+Connection: close
+
+<?xml version="1.0" encoding="UTF-8"?>
+<EndDeviceList xmlns="urn:ieee:std:2030.5:ns" href="/edev" all="3" results="3" pollRate="300">
+  <EndDevice xmlns="urn:ieee:std:2030.5:ns" href="/edev/0">
+    <lFDI>0000000000000000000000000000000000000001</lFDI>
+    <sFDI>100000001</sFDI>
+    <changedTime>1783266277</changedTime>
+  </EndDevice>
+  <EndDevice xmlns="urn:ieee:std:2030.5:ns" href="/edev/1">
+    <lFDI>0000000000000000000000000000000000000002</lFDI>
+    <sFDI>100000002</sFDI>
+    <changedTime>1783266777</changedTime>
+  </EndDevice>
+  <EndDevice xmlns="urn:ieee:std:2030.5:ns" href="/edev/2">
+    <lFDI>AB12CD34EF56789012345678901234567890ABCD</lFDI>
+    <sFDI>123456789</sFDI>
+    <changedTime>1783267277</changedTime>
+    <enabled>true</enabled>
+    <DERListLink href="/edev/2/der" all="1"></DERListLink>
+    <FunctionSetAssignmentsListLink href="/edev/2/fsa" all="1"></FunctionSetAssignmentsListLink>
+    <RegistrationLink href="/edev/2/reg"></RegistrationLink>
+  </EndDevice>
+</EndDeviceList>

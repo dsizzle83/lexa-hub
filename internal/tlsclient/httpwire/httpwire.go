@@ -4,11 +4,16 @@
 // no cgo — unlike internal/tlsclient itself, which links wolfSSL and can
 // only be built/tested where that sysroot is available (TASK-047, D9/§10.2).
 //
-// ReadHTTPResponse is byte-for-byte the same algorithm as the former
+// ReadHTTPResponse is the same algorithm as the former
 // (*tlsclient.Client).readResponse: header-loop until "\r\n\r\n", then
 // either exactly Content-Length body bytes or read-until-close, capped at
 // maxBody (the pre-existing maxResponseBody cap in tlsclient/client.go,
-// now caller-supplied).
+// now caller-supplied) — plus one new behavior, the maxHeader cap: a
+// server that streams bytes without ever sending the header terminator no
+// longer grows the buffer without bound (TASK-047, D9/§10.2 — "header
+// floods ... fuzz it or replace it"). For every response a real CSIP
+// server sends, this is unobservable: gridsim's headers run well under
+// 1 KiB, verified against the fuzz corpus in testdata/fuzz/.
 //
 // The parser rejects (does not decode) chunked Transfer-Encoding — see
 // isChunkedEncoding. Implementing chunked decoding is a separate decision
@@ -33,7 +38,13 @@ var headerTerminator = []byte("\r\n\r\n")
 // short read (n < len(p), err == nil) is valid and must be handled by
 // calling read again.
 //
-// Phase 1 buffers bytes until it finds the "\r\n\r\n" header terminator.
+// Phase 1 buffers bytes until it finds the "\r\n\r\n" header terminator. If
+// the header block grows past maxHeader bytes before a terminator is
+// found, ReadHTTPResponse fails closed with an error rather than buffering
+// forever. Because the terminator search runs on the whole accumulated
+// buffer after every read, a header block that legitimately arrives with
+// trailing body bytes attached in the same read is not penalized: the cap
+// check only fires when no terminator has been found yet.
 //
 // Phase 2 rejects chunked Transfer-Encoding (detection only, see
 // isChunkedEncoding) and otherwise reads exactly Content-Length body bytes,
@@ -48,7 +59,7 @@ var headerTerminator = []byte("\r\n\r\n")
 // read-until-close case. Callers (tlsclient/fetcher.go, response.go) parse
 // this blob directly, so the successful-path bytes must stay identical to
 // the pre-extraction implementation.
-func ReadHTTPResponse(read func([]byte) (int, error), maxBody int) ([]byte, error) {
+func ReadHTTPResponse(read func([]byte) (int, error), maxHeader, maxBody int) ([]byte, error) {
 	scratch := make([]byte, 4096)
 	var buf []byte
 	headerEnd := -1
@@ -60,6 +71,8 @@ func ReadHTTPResponse(read func([]byte) (int, error), maxBody int) ([]byte, erro
 			buf = append(buf, scratch[:n]...)
 			if idx := bytes.Index(buf, headerTerminator); idx >= 0 {
 				headerEnd = idx + len(headerTerminator)
+			} else if len(buf) > maxHeader {
+				return nil, fmt.Errorf("response header block too large: exceeded %d bytes", maxHeader)
 			}
 		}
 		if err != nil || n == 0 {
