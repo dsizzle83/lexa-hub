@@ -33,6 +33,41 @@ type Config struct {
 	// literal "off" disables the listener. See cmd/hub/config.go's
 	// MetricsAddr doc for the bench-vs-product bind rationale (AD-008).
 	MetricsAddr string `json:"metrics_addr"`
+
+	// Reconciler selects the per-device-class Device Reconciler mode
+	// (AD-002/AD-013, TASK-027): "off" | "shadow" | "active", keyed by device
+	// class ("battery" today; "solar"/"evse" are TASK-029/030's). Missing or
+	// empty ⇒ "off" (ReconcilerMode below resolves the default in one place).
+	// "shadow" runs the reconciler as a passive recorder alongside the legacy
+	// write path (zero hardware writes). "active" is REJECTED at load —
+	// TASK-028 is what makes the reconciler authoritative; a config asking
+	// for it before then is almost certainly a copy-paste from a later
+	// deploy step, so this fails loud rather than silently downgrading to
+	// shadow or off.
+	Reconciler map[string]string `json:"reconciler"`
+}
+
+// Reconciler mode values (the "reconciler" config map's values).
+const (
+	ReconcilerOff    = "off"
+	ReconcilerShadow = "shadow"
+	ReconcilerActive = "active"
+)
+
+// ReconcilerMode returns the configured reconciler mode for class ("battery"
+// | "solar" | "evse"), defaulting to ReconcilerOff when the class is absent
+// or its value is the empty string. loadConfig has already rejected any
+// other value, so by the time a process is running the result is always
+// "off" or "shadow" — "active" never reaches a running process (TASK-028).
+func (c *Config) ReconcilerMode(class string) string {
+	if c.Reconciler == nil {
+		return ReconcilerOff
+	}
+	mode := c.Reconciler[class]
+	if mode == "" {
+		return ReconcilerOff
+	}
+	return mode
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -55,6 +90,18 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.MetricsAddr == "" {
 		cfg.MetricsAddr = "127.0.0.1:9103"
+	}
+	for class, mode := range cfg.Reconciler {
+		switch mode {
+		case "", ReconcilerOff, ReconcilerShadow:
+			// ok
+		case ReconcilerActive:
+			// Explicitly reserved (task-file requirement): a premature flip
+			// to active must be impossible, not a silent no-op.
+			return nil, fmt.Errorf("reconciler active mode lands in TASK-028 (class %q)", class)
+		default:
+			return nil, fmt.Errorf("reconciler: unknown mode %q for class %q (want off|shadow|active)", mode, class)
+		}
 	}
 	return &cfg, nil
 }

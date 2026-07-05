@@ -394,3 +394,42 @@ func TestStaleThenFreshRecovery(t *testing.T) {
 		t.Fatalf("want stale again 300s after the fresh doc, got %v", reps)
 	}
 }
+
+// TestPartialReadbackIsCompleteDeterministic guards a bug found while wiring
+// TASK-027 (the first real multi-field consumer): a doc expressing TWO
+// opinions (SetpointW and Connect — the common shape for a real battery
+// command, ubiquitous in cmd/hub's optimizer) against a readback that can
+// only ever supply ONE of them (lexa-modbus has no Connect-state register)
+// must hold as incomplete EVERY time, regardless of Go's randomized map
+// iteration order — never sometimes report "diverged, complete" because the
+// other (present, out-of-tolerance) field happened to be visited first.
+// Run with -count many times under `go test -race -count=200` to catch a
+// regression the randomized map order would otherwise only flip on
+// intermittently.
+func TestPartialReadbackIsCompleteDeterministic(t *testing.T) {
+	doc := bus.DesiredState{
+		Envelope:    bus.Envelope{V: bus.DesiredStateV},
+		DeviceClass: bus.DesiredClassBattery,
+		DeviceID:    "batt-0",
+		SetpointW:   fptr(1000),
+		Connect:     bptr(true),
+		Source:      "economic",
+		IssuedAt:    issuedAt(0),
+		Seq:         1,
+	}
+	for i := 0; i < 50; i++ {
+		r := New(bus.DesiredClassBattery, "batt-0", testCfg())
+		r.SetDesired(doc, at(0))
+
+		// SetpointW is present and wildly out of tolerance; Connect is
+		// entirely absent from the readback (no register for it).
+		a, reps := r.Observe(good(at(1*time.Second), map[Field]float64{SetpointW: 0}), at(1*time.Second))
+		mustNone(t, a)
+		if len(reps) != 0 {
+			t.Fatalf("iteration %d: incomplete sample must emit no reports, got %v", i, reps)
+		}
+		if r.converged || !r.divergentSince.IsZero() {
+			t.Fatalf("iteration %d: incomplete sample must hold the previous (unassessed) state, not open a divergence", i)
+		}
+	}
+}

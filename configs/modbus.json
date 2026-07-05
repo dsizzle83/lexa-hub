@@ -5,6 +5,9 @@
   "mqtt_pass_file": "",
   "metrics_addr": "",
   "poll_interval_s": 10,
+  "reconciler": {
+    "battery": "off"
+  },
   "devices": [
     {
       "name": "inverter-0",

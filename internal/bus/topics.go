@@ -123,6 +123,11 @@ func SupportedV(topic string) int {
 		return DERScheduleV
 	case topic == TopicHubPlan:
 		return PlanLogV
+	case strings.HasPrefix(topic, "lexa/desired/"):
+		// AD-013's DesiredStateV case, deferred from TASK-026 (the reconciler
+		// core landed unwired) to TASK-027, whose hub-side publisher is the
+		// first thing to ever put a message on this topic family.
+		return DesiredStateV
 	default:
 		return 1
 	}

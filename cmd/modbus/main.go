@@ -32,6 +32,7 @@ import (
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
+	"lexa-hub/internal/reconcile"
 	"lexa-hub/internal/southbound/battery"
 	"lexa-hub/internal/southbound/device"
 	"lexa-hub/internal/southbound/inverter"
@@ -111,8 +112,34 @@ func main() {
 		log.Printf("lexa-modbus: registered device %s role=%s url=%s", dc.Name, dc.Role, dc.URL)
 	}
 
+	// TASK-027: one shadow reconciler per battery-role device when
+	// "reconciler":{"battery":"shadow"} is configured. A recorder only — see
+	// reconcile_shadow.go's file doc for the grep-proof no-write-path claim.
+	var battShadows map[string]*batteryShadow
+	if cfg.ReconcilerMode("battery") == ReconcilerShadow {
+		battShadows = make(map[string]*batteryShadow)
+		for _, dc := range cfg.Devices {
+			if dc.Role != "battery" {
+				continue
+			}
+			battShadows[dc.Name] = newBatteryShadow(dc.Name, reconcile.Config{}, mreg)
+		}
+		if err := mqttutil.Subscribe(mc, bus.SubDesired, func(topic string, doc bus.DesiredState) {
+			if bus.ClassFromDesiredTopic(topic) != bus.DesiredClassBattery {
+				return
+			}
+			if s, ok := battShadows[bus.DeviceFromDesiredTopic(topic)]; ok {
+				s.setDesired(doc, time.Now())
+			}
+		}); err != nil {
+			log.Printf("lexa-modbus: subscribe desired (shadow): %v", err)
+		}
+		go runBatteryShadowTicker(battShadows, 60*time.Second)
+		log.Printf("lexa-modbus: battery reconciler SHADOW mode active for %d device(s)", len(battShadows))
+	}
+
 	// Subscribe to control topics before starting the poll loop.
-	subscribeControls(mc, cfg, reg, interlock)
+	subscribeControls(mc, cfg, reg, interlock, battShadows)
 
 	// Subscribe to the registry and fan out to MQTT.
 	updates, unsub := reg.Subscribe()
@@ -121,7 +148,7 @@ func main() {
 	reg.Start()
 	defer reg.Stop()
 
-	go publishMeasurements(mc, cfg, updates, interlock)
+	go publishMeasurements(mc, cfg, updates, interlock, battShadows)
 
 	metrics.Serve(cfg.MetricsAddr, mreg)
 
@@ -157,7 +184,7 @@ func openDevice(dc DeviceConfig) (device.Device, error) {
 
 // publishMeasurements drains the registry subscription channel and publishes
 // measurements (and battery metrics) to MQTT.
-func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.MeasurementUpdate, interlock *batterySafetyInterlock) {
+func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.MeasurementUpdate, interlock *batterySafetyInterlock, battShadows map[string]*batteryShadow) {
 	deviceRole := map[string]string{}
 	nameplate := map[string]float64{}
 	for _, dc := range cfg.Devices {
@@ -177,7 +204,8 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 			log.Printf("lexa-modbus: device %s poll error: %v", upd.Name, upd.Err)
 			continue
 		}
-		now := time.Now().Unix()
+		nowT := time.Now()
+		now := nowT.Unix()
 		m := upd.Measurements
 
 		// Tier-0 edge safety interlock: evaluate every fresh poll BEFORE publishing,
@@ -185,6 +213,7 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 		// one poll regardless of the hub. No-ops for non-battery devices.
 		interlock.check(upd.Name, m)
 
+		wPlausible := plausibleW(m.W, nameplate[upd.Name])
 		msg := bus.Measurement{Envelope: bus.Envelope{V: bus.MeasurementV}, Device: upd.Name, Ts: now}
 		if !math.IsNaN(m.W) {
 			// Sanity-check decoded power against the nameplate before publishing.
@@ -192,12 +221,21 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 			// decodes power ~10× the truth; withholding the suspect W leaves the
 			// hub on its last-known-good rather than optimising against a value the
 			// device physically cannot produce. Other fields (V/Hz) still flow.
-			if plausibleW(m.W, nameplate[upd.Name]) {
+			if wPlausible {
 				msg.W = &m.W
 			} else {
 				log.Printf("lexa-modbus: REJECT implausible %s power %.0fW (nameplate %.0fW) — withholding W (suspect scale factor)",
 					upd.Name, m.W, nameplate[upd.Name])
 			}
+		}
+
+		// TASK-027: feed the battery shadow reconciler this poll's readback
+		// (a recorder only — see reconcile_shadow.go). Reuses the plausibleW
+		// verdict above (ledger L9's pattern) rather than re-deriving it, so
+		// shadow and the published measurement never disagree about whether
+		// this W was trustworthy.
+		if s, ok := battShadows[upd.Name]; ok {
+			s.observe(m, wPlausible, nowT)
 		}
 		if !math.IsNaN(m.V) {
 			msg.VoltageV = &m.V
@@ -226,7 +264,7 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 }
 
 // subscribeControls sets up MQTT subscriptions for battery and solar commands.
-func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry, interlock *batterySafetyInterlock) {
+func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry, interlock *batterySafetyInterlock, battShadows map[string]*batteryShadow) {
 	// Build a map from device name → role for quick lookup.
 	roleOf := map[string]string{}
 	for _, dc := range cfg.Devices {
@@ -245,6 +283,11 @@ func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry, inte
 			log.Printf("lexa-modbus: apply battery control %s: %v", dev, err)
 		} else {
 			log.Printf("lexa-modbus: battery %s control applied", dev)
+			// TASK-027: tell the shadow what the LEGACY path actually wrote,
+			// so its verdict line can compare against it. Recorder only.
+			if s, ok := battShadows[dev]; ok {
+				s.observeLegacyWrite(ctrl)
+			}
 		}
 	}); err != nil {
 		log.Printf("lexa-modbus: subscribe battery control: %v", err)
