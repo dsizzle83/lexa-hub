@@ -23,6 +23,8 @@ type DeviceConfig struct {
 type Config struct {
 	MQTTBroker    string         `json:"mqtt_broker"`     // e.g. "tcp://localhost:1883"
 	MQTTClientID  string         `json:"mqtt_client_id"`  // default "lexa-modbus"
+	MQTTUser      string         `json:"mqtt_user"`       // broker credentials (TASK-013/W7); empty ⇒ anonymous
+	MQTTPassFile  string         `json:"mqtt_pass_file"`  // path to 0600 password file; empty ⇒ anonymous
 	PollIntervalS int            `json:"poll_interval_s"` // default 10
 	Devices       []DeviceConfig `json:"devices"`
 }

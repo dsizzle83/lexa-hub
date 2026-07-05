@@ -28,6 +28,16 @@ type Config struct {
 	MQTTBroker   string `json:"mqtt_broker"`
 	MQTTClientID string `json:"mqtt_client_id"`
 
+	// MQTTUser/MQTTPassFile are the broker credentials (TASK-013/W7/AD-008).
+	// Empty MQTTUser (the repo example default) ⇒ anonymous connect — today's
+	// behavior, preserved for the staged rollout: the deploy script populates
+	// these once passwords exist on the Pi, while the broker still allows
+	// anonymous, and only later flips allow_anonymous off. MQTTPassFile is a
+	// path to a 0600 lexa-owned file holding the password, never the password
+	// inline (it must never enter git or a deploy artifact).
+	MQTTUser     string `json:"mqtt_user"`
+	MQTTPassFile string `json:"mqtt_pass_file"`
+
 	EngineIntervalS int  `json:"engine_interval_s"` // default 15
 	SafetyIntervalS int  `json:"safety_interval_s"` // fast protection loop; default 1, 0 disables
 	Debug           bool `json:"debug"`

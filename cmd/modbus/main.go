@@ -49,7 +49,11 @@ func main() {
 		log.Fatalf("lexa-modbus: load config: %v", err)
 	}
 
-	mc, err := mqttutil.Connect(cfg.MQTTBroker, cfg.MQTTClientID)
+	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
+	if err != nil {
+		log.Fatalf("lexa-modbus: %v", err)
+	}
+	mc, err := mqttutil.ConnectAuth(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass)
 	if err != nil {
 		log.Fatalf("lexa-modbus: %v", err)
 	}

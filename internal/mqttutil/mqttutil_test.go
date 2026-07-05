@@ -1,6 +1,7 @@
 package mqttutil
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -131,5 +132,65 @@ func TestPublishJSONQoS1StillWaitsFullTimeout(t *testing.T) {
 	if elapsed < publishTimeout {
 		t.Fatalf("QoS 1 publish returned after %s — want it to wait the full publishTimeout (%s)",
 			elapsed, publishTimeout)
+	}
+}
+
+// TestApplyAuth_SetsCredentialsOnlyWhenUserNonEmpty is TASK-013's option-
+// plumbing test (W7/AD-008): the broker credential fields must be additive —
+// an empty user (today's every-config default) must leave the options
+// exactly as anonymous Connect built them, and a non-empty user must set
+// both Username and Password so ConnectAuth's caller-supplied pass reaches
+// the CONNECT packet paho builds from these options.
+func TestApplyAuth_SetsCredentialsOnlyWhenUserNonEmpty(t *testing.T) {
+	anon := mqtt.NewClientOptions()
+	applyAuth(anon, "", "")
+	if anon.Username != "" || anon.Password != "" {
+		t.Fatalf("anonymous case: got Username=%q Password=%q, want both empty", anon.Username, anon.Password)
+	}
+
+	authed := mqtt.NewClientOptions()
+	applyAuth(authed, "lexa-modbus", "s3cr3t")
+	if authed.Username != "lexa-modbus" {
+		t.Fatalf("Username = %q, want lexa-modbus", authed.Username)
+	}
+	if authed.Password != "s3cr3t" {
+		t.Fatalf("Password = %q, want s3cr3t", authed.Password)
+	}
+}
+
+// TestLoadPassword covers the three states config.go callers rely on: unset
+// (anonymous default), a valid pass-file (trims the trailing newline
+// openssl rand -hex writes), and configured-but-empty (fail loud rather than
+// send an empty password the broker will reject or, worse, silently connect
+// anonymously).
+func TestLoadPassword(t *testing.T) {
+	pass, err := LoadPassword("")
+	if err != nil || pass != "" {
+		t.Fatalf("empty path: got (%q, %v), want (\"\", nil)", pass, err)
+	}
+
+	dir := t.TempDir()
+	valid := dir + "/lexa-modbus.pass"
+	if err := os.WriteFile(valid, []byte("s3cr3t-hex\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pass, err = LoadPassword(valid)
+	if err != nil {
+		t.Fatalf("valid pass-file: unexpected error %v", err)
+	}
+	if pass != "s3cr3t-hex" {
+		t.Fatalf("valid pass-file: got %q, want trimmed \"s3cr3t-hex\"", pass)
+	}
+
+	empty := dir + "/empty.pass"
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPassword(empty); err == nil {
+		t.Fatal("configured-but-empty pass-file: want an error, got nil")
+	}
+
+	if _, err := LoadPassword(dir + "/does-not-exist.pass"); err == nil {
+		t.Fatal("missing pass-file: want an error, got nil")
 	}
 }

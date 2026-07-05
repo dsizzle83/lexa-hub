@@ -1,0 +1,110 @@
+# /etc/mosquitto/lexa-acl
+# Per-service topic ACL for the LEXA hub broker (TASK-013 / W7 / AD-008).
+#
+# Mirrors internal/bus/topics.go: every stanza below is commented with the
+# bus.Topic*/bus.Sub* constant (or CtrlBatteryTopic/CtrlSolarTopic/
+# EVSEStateTopic/EVSECommandTopic pattern) it grants, derived from the actual
+# Subscribe/Publish call sites in each cmd/*/main.go, not just the doc
+# comment at the top of topics.go. Re-derive by grepping mqttutil.Publish*/
+# mqttutil.Subscribe call sites before changing a stanza — this file is a
+# authorization boundary, not a topic map.
+#
+# With allow_anonymous false (the flipped state — see mosquitto-lexa.conf and
+# deploy-hub-pi.sh's --enable-mqtt-acl), a client that presents no username or
+# an unrecognized one gets no stanza at all here, i.e. zero access: mosquitto
+# ACL files are deny-by-default per client. That is the point of this file;
+# do not add a catch-all/anonymous stanza.
+#
+# Install: cp systemd/mosquitto-lexa.acl /etc/mosquitto/lexa-acl (or let
+# deploy-hub-pi.sh install it from the deploy bundle).
+
+user lexa-modbus
+# bus.MeasurementTopic("<device>") — modbus publishes one measurement/poll.
+topic write lexa/measurements/+
+# bus.BattMetricsTopic("<device>") — modbus publishes battery SOC/metrics.
+topic write lexa/battery/+/metrics
+# bus.SubCtrlBattery — hub → modbus battery setpoint commands.
+topic read lexa/control/battery/+
+# bus.SubCtrlSolar — hub → modbus solar/inverter curtail commands.
+topic read lexa/control/solar/+
+
+user lexa-northbound
+# bus.TopicCSIPControl (retained) — resolved CSIP DERControl limits.
+topic write lexa/csip/control
+# bus.TopicCSIPPricing (retained).
+topic write lexa/csip/pricing
+# bus.TopicCSIPBilling (retained).
+topic write lexa/csip/billing
+# bus.TopicCSIPFRStatus (retained).
+topic write lexa/csip/flowreservation/status
+# bus.TopicNorthboundSchedule (retained) — resolved 24h DER schedule.
+topic write lexa/northbound/schedule
+# bus.TopicCSIPComplianceAlert — hub → northbound CannotComply trigger.
+topic read lexa/csip/compliance/alert
+# bus.TopicCSIPFRRequest — hub → northbound (RSK-09: the other easy-to-miss
+# hub→northbound line; a missing grant here silently drops flow-reservation
+# requests the same way a missing compliance/alert grant silently drops
+# CannotComply).
+topic read lexa/csip/flowreservation/request
+
+user lexa-hub
+# bus.CtrlBatteryTopic("<device>").
+topic write lexa/control/battery/+
+# bus.CtrlSolarTopic("<device>").
+topic write lexa/control/solar/+
+# bus.EVSECommandTopic("<station>").
+topic write lexa/evse/+/command
+# bus.TopicHubPlan (retained) — plan-log observability for lexa-api.
+topic write lexa/hub/plan
+# bus.TopicCSIPComplianceAlert — see lexa-northbound's matching read grant.
+topic write lexa/csip/compliance/alert
+# bus.TopicCSIPFRRequest — see lexa-northbound's matching read grant (RSK-09).
+topic write lexa/csip/flowreservation/request
+# bus.SubMeasurements.
+topic read lexa/measurements/+
+# bus.SubBattMetrics.
+topic read lexa/battery/+/metrics
+# bus.TopicCSIPControl (retained).
+topic read lexa/csip/control
+# bus.SubEVSEState.
+topic read lexa/evse/+/state
+# bus.TopicNorthboundSchedule (retained).
+topic read lexa/northbound/schedule
+# bus.TopicCSIPPricing (retained).
+topic read lexa/csip/pricing
+
+user lexa-ocpp
+# bus.EVSEStateTopic("<station>").
+topic write lexa/evse/+/state
+# bus.SubEVSECommand.
+topic read lexa/evse/+/command
+
+user lexa-telemetry
+# bus.SubMeasurements — telemetry posts MUP measurements upstream over CSIP.
+topic read lexa/measurements/+
+# bus.TopicCSIPControl (retained) — logged for observability only.
+topic read lexa/csip/control
+
+user lexa-api
+# bus.SubMeasurements.
+topic read lexa/measurements/+
+# bus.SubBattMetrics.
+topic read lexa/battery/+/metrics
+# bus.TopicCSIPControl (retained).
+topic read lexa/csip/control
+# bus.SubEVSEState.
+topic read lexa/evse/+/state
+# bus.TopicNorthboundSchedule (retained).
+topic read lexa/northbound/schedule
+# bus.TopicHubPlan (retained).
+topic read lexa/hub/plan
+
+# qa-inject: the QA mqttproxy's /inject endpoint (csip-tls-test cmd/mqttproxy,
+# deployed only by scripts/mqtt-chaos.sh during a Mayhem run). It forges
+# arbitrary topics/payloads/retain flags for the mqtt-* fault scenarios
+# (malformed control, stale retained, etc.), so it legitimately needs the
+# whole tree — this is a bench-only QA account, never provisioned off-bench,
+# and the broker listener stays localhost-only regardless (defense in depth,
+# not a LAN opening).
+user qa-inject
+topic readwrite lexa/#

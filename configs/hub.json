@@ -1,6 +1,8 @@
 {
   "mqtt_broker": "tcp://localhost:1883",
   "mqtt_client_id": "lexa-hub",
+  "mqtt_user": "",
+  "mqtt_pass_file": "",
   "engine_interval_s": 15,
   "debug": false,
   "devices": [

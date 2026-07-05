@@ -18,6 +18,11 @@ type Config struct {
 	MQTTBroker   string `json:"mqtt_broker"`
 	MQTTClientID string `json:"mqtt_client_id"`
 
+	// MQTTUser/MQTTPassFile: broker credentials (TASK-013/W7/AD-008); empty
+	// MQTTUser ⇒ anonymous connect (staged-rollout default, see cmd/hub/config.go).
+	MQTTUser     string `json:"mqtt_user"`
+	MQTTPassFile string `json:"mqtt_pass_file"`
+
 	// OCPP 2.0.1 CSMS WebSocket server (Security Profile 2)
 	Port     int    `json:"port"`      // default 8887
 	CertPath string `json:"cert_path"` // TLS cert; plain WS when empty

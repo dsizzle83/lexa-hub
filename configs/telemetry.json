@@ -1,6 +1,8 @@
 {
   "mqtt_broker": "tcp://localhost:1883",
   "mqtt_client_id": "lexa-telemetry",
+  "mqtt_user": "",
+  "mqtt_pass_file": "",
   "server": "69.0.0.20:11111",
   "ca_cert": "/etc/lexa/certs/ca.pem",
   "client_cert": "/etc/lexa/certs/client.pem",
