@@ -3,7 +3,7 @@ module lexa-hub
 go 1.26
 
 require (
-	github.com/eclipse/paho.mqtt.golang v1.4.3
+	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/grandcat/zeroconf v1.0.0
 	github.com/lorenzodonini/ocpp-go v0.19.0
 	github.com/simonvetter/modbus v1.6.4
