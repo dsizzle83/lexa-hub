@@ -6,6 +6,7 @@ import (
 	"math"
 	"time"
 
+	"lexa-hub/internal/utilitytime"
 	model "lexa-proto/csipmodel"
 )
 
@@ -323,7 +324,10 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 
 		// Rule 5: TOU peak discharge.
 		// CSIP dispatch (OpModFixedW) is handled in Rule 2; this rule covers autonomous peak shifting.
-		serverNow := time.Unix(now.Unix()+state.ClockOffset, 0)
+		// serverNow source only (AD-004, TASK-036): utilitytime.ServerNowAt is the
+		// same now.Unix()+state.ClockOffset arithmetic, single-owned. orchestrator
+		// stays I/O-free — this is a pure function call, no Clock/wall-time read.
+		serverNow := time.Unix(utilitytime.ServerNowAt(now, state.ClockOffset), 0)
 		isPeak := o.CostModel != nil && o.CostModel.IsPeakHour(serverNow)
 		peakReason := ""
 		if isPeak {
