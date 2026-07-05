@@ -27,6 +27,11 @@ topic write lexa/battery/+/metrics
 topic read lexa/control/battery/+
 # bus.SubCtrlSolar — hub → modbus solar/inverter curtail commands.
 topic read lexa/control/solar/+
+# bus.DesiredTopic("battery", <device>) (retained) — TASK-027 shadow
+# reconciler consumes the hub's retained battery desired-state doc
+# (AD-013). Scoped to battery only: solar/EVSE reconcilers land in
+# TASK-029/030 and get their own grant then.
+topic read lexa/desired/battery/+
 
 user lexa-northbound
 # bus.TopicCSIPControl (retained) — resolved CSIP DERControl limits.
@@ -50,6 +55,11 @@ topic read lexa/csip/flowreservation/request
 user lexa-hub
 # bus.CtrlBatteryTopic("<device>").
 topic write lexa/control/battery/+
+# bus.DesiredTopic("battery", <device>) (retained) — TASK-027 hub-side
+# battery desired-doc publisher (cmd/hub/desired.go), additive alongside
+# the legacy actuator publish above. Scoped to battery only, matches the
+# lexa-modbus read grant; extend per-class as TASK-029/030 land.
+topic write lexa/desired/battery/+
 # bus.CtrlSolarTopic("<device>").
 topic write lexa/control/solar/+
 # bus.EVSECommandTopic("<station>").
