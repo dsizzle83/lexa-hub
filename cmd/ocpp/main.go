@@ -37,8 +37,8 @@ import (
 
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/mqttutil"
-	"lexa-hub/internal/ocppserver"
 	"lexa-hub/internal/watchdog"
+	"lexa-proto/ocppserver"
 )
 
 func main() {
