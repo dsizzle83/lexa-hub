@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DefaultDERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/dderc">
+  <mRID>DDERC-SP-001</mRID>
+  <description>Default: export limit 5kW, connect and energize</description>
+  <DERControlBase>
+    <opModConnect>true</opModConnect>
+    <opModEnergize>true</opModEnergize>
+    <opModExpLimW>
+      <multiplier>0</multiplier>
+      <value>5000</value>
+    </opModExpLimW>
+  </DERControlBase>
+</DefaultDERControl>

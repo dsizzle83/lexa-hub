@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DeviceCapability xmlns="urn:ieee:std:2030.5:ns" href="/dcap">
+  <EndDeviceListLink href="/edev" all="0"/>
+  <MirrorUsagePointListLink href="/mup" all="0"/>
+  <SelfDeviceLink href="/sdev"/>
+  <TimeLink href="/tm"/>
+</DeviceCapability>
