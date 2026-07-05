@@ -87,6 +87,20 @@ func (il *batterySafetyInterlock) protects(dev string) bool {
 	return ok
 }
 
+// isTripped reports whether the interlock currently has dev force-disconnected.
+// It is a read-only accessor over the interlock's own mutex (no logic change,
+// ledger L8): the ACTIVE battery reconciler consults it to honour Tier-0
+// seniority — while a pack is tripped, the reconciler must NOT issue a
+// connect-restoring write (that would fight the interlock, the exact
+// guard-versus-guard oscillation this program exists to prevent). The interlock
+// re-evaluates every poll and clears the trip once the fault clears
+// (check's wasTripped branch), so normal reconciliation resumes on its own.
+func (il *batterySafetyInterlock) isTripped(dev string) bool {
+	il.mu.Lock()
+	defer il.mu.Unlock()
+	return il.tripped[dev]
+}
+
 // noteControl records the hub's latest intent for a battery so the interlock can
 // tell a measured discharge from a legitimately commanded one. A charge command
 // is a negative setpoint; a disconnect command clears the charge intent (the hub

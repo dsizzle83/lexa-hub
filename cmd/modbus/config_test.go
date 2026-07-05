@@ -18,9 +18,10 @@ func writeModbusConfig(t *testing.T, body string) string {
 }
 
 // TestLoadConfig_ReconcilerModes covers every value the "reconciler" config
-// map may hold (TASK-027): absent/empty/off/shadow load cleanly, "active" is
-// rejected at load with a message naming TASK-028 (so a premature flip is
-// impossible, not a silent downgrade), and any other value is rejected too.
+// map may hold (TASK-027/028): absent/empty/off/shadow load cleanly; battery
+// "active" is now ACCEPTED (TASK-028 made the battery reconciler
+// authoritative); "active" for any non-battery class stays rejected until
+// TASK-029/030 build those write paths; any other value is rejected too.
 func TestLoadConfig_ReconcilerModes(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -31,7 +32,9 @@ func TestLoadConfig_ReconcilerModes(t *testing.T) {
 		{"empty string", `{"reconciler":{"battery":""},"devices":[]}`, ""},
 		{"off", `{"reconciler":{"battery":"off"},"devices":[]}`, ""},
 		{"shadow", `{"reconciler":{"battery":"shadow"},"devices":[]}`, ""},
-		{"active rejected", `{"reconciler":{"battery":"active"},"devices":[]}`, "TASK-028"},
+		{"battery active accepted", `{"reconciler":{"battery":"active"},"devices":[]}`, ""},
+		{"solar active rejected", `{"reconciler":{"solar":"active"},"devices":[]}`, "battery-only"},
+		{"evse active rejected", `{"reconciler":{"evse":"active"},"devices":[]}`, "battery-only"},
 		{"unknown rejected", `{"reconciler":{"battery":"bogus"},"devices":[]}`, "unknown mode"},
 	}
 	for _, c := range cases {

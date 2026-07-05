@@ -96,6 +96,9 @@ func main() {
 	interlock.trips = interlockTripsCtr
 
 	// Open each device; log failures but continue so other devices still poll.
+	// retryDevices is kept so the active battery reconciler can attach its
+	// reconnect hook to the exact wrapper the registry polls (TASK-028).
+	retryDevices := map[string]*retryDevice{}
 	for _, dc := range cfg.Devices {
 		dev, err := openDevice(dc)
 		if errors.Is(err, errUnknownRole) {
@@ -112,37 +115,68 @@ func main() {
 			rd.live = dev
 		}
 		reg.Add(&registry.Entry{Name: dc.Name, Addr: dc.URL, Device: rd})
+		retryDevices[dc.Name] = rd
 		log.Printf("lexa-modbus: registered device %s role=%s url=%s", dc.Name, dc.Role, dc.URL)
 	}
 
-	// TASK-027: one shadow reconciler per battery-role device when
-	// "reconciler":{"battery":"shadow"} is configured. A recorder only — see
-	// reconcile_shadow.go's file doc for the grep-proof no-write-path claim.
-	var battShadows map[string]*batteryShadow
-	if cfg.ReconcilerMode("battery") == ReconcilerShadow {
-		battShadows = make(map[string]*batteryShadow)
+	// TASK-027/028: one reconciler shell per battery-role device when the
+	// battery reconciler is in shadow or active mode. SHADOW is a recorder (no
+	// hardware writes — see reconcile_shell.go's grep-proof no-write-path claim
+	// for shadow mode). ACTIVE gives the reconciler write authority through the
+	// SAME registry path legacy used, with Tier-0 interlock seniority, and makes
+	// the reconciler the single reasserter-on-reconnect (retryDevice's lastCtrl
+	// reassert suppressed for the device). Legacy battery commands keep flowing
+	// either way (belt and braces for instant rollback).
+	var battShells map[string]*batteryShell
+	battMode := cfg.ReconcilerMode("battery")
+	batteryActive := battMode == ReconcilerActive
+	if battMode == ReconcilerShadow || battMode == ReconcilerActive {
+		mode := modeShadow
+		if batteryActive {
+			mode = modeActive
+		}
+		battShells = make(map[string]*batteryShell)
 		for _, dc := range cfg.Devices {
 			if dc.Role != "battery" {
 				continue
 			}
-			battShadows[dc.Name] = newBatteryShadow(dc.Name, reconcile.Config{}, mreg)
+			var drv reconcileDriver
+			var ilg interlockGate
+			var note func(bus.BattCommand)
+			if mode == modeActive {
+				name := dc.Name
+				drv = registryDriver{reg: reg, dev: name}
+				ilg = interlock
+				note = func(cmd bus.BattCommand) { interlock.noteControl(name, cmd) }
+			}
+			shell := newBatteryShell(dc.Name, reconcile.Config{}, mreg, mode, drv, ilg, note)
+			battShells[dc.Name] = shell
+			// Active: route reconnects to the reconciler (the SINGLE reasserter)
+			// and suppress retryDevice's own lastCtrl reassert for this device —
+			// avoiding the double-write race the task warns of (ledger L4).
+			if mode == modeActive {
+				if rd := retryDevices[dc.Name]; rd != nil {
+					rd.reconciledActive = true
+					rd.onReconnect = shell.markReconnected
+				}
+			}
 		}
 		if err := mqttutil.Subscribe(mc, bus.SubDesired, func(topic string, doc bus.DesiredState) {
 			if bus.ClassFromDesiredTopic(topic) != bus.DesiredClassBattery {
 				return
 			}
-			if s, ok := battShadows[bus.DeviceFromDesiredTopic(topic)]; ok {
+			if s, ok := battShells[bus.DeviceFromDesiredTopic(topic)]; ok {
 				s.setDesired(doc, time.Now())
 			}
 		}); err != nil {
-			log.Printf("lexa-modbus: subscribe desired (shadow): %v", err)
+			log.Printf("lexa-modbus: subscribe desired (reconciler): %v", err)
 		}
-		go runBatteryShadowTicker(battShadows, 60*time.Second)
-		log.Printf("lexa-modbus: battery reconciler SHADOW mode active for %d device(s)", len(battShadows))
+		go runBatteryShellTicker(battShells, 60*time.Second)
+		log.Printf("lexa-modbus: battery reconciler %s mode active for %d device(s)", battMode, len(battShells))
 	}
 
 	// Subscribe to control topics before starting the poll loop.
-	subscribeControls(mc, cfg, reg, interlock, battShadows)
+	subscribeControls(mc, cfg, reg, interlock, battShells, batteryActive)
 
 	// Subscribe to the registry and fan out to MQTT.
 	updates, unsub := reg.Subscribe()
@@ -151,7 +185,7 @@ func main() {
 	reg.Start()
 	defer reg.Stop()
 
-	go publishMeasurements(mc, cfg, updates, interlock, battShadows)
+	go publishMeasurements(mc, cfg, updates, interlock, battShells)
 
 	metrics.Serve(cfg.MetricsAddr, mreg)
 
@@ -187,7 +221,7 @@ func openDevice(dc DeviceConfig) (device.Device, error) {
 
 // publishMeasurements drains the registry subscription channel and publishes
 // measurements (and battery metrics) to MQTT.
-func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.MeasurementUpdate, interlock *batterySafetyInterlock, battShadows map[string]*batteryShadow) {
+func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.MeasurementUpdate, interlock *batterySafetyInterlock, battShells map[string]*batteryShell) {
 	deviceRole := map[string]string{}
 	nameplate := map[string]float64{}
 	for _, dc := range cfg.Devices {
@@ -232,12 +266,13 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 			}
 		}
 
-		// TASK-027: feed the battery shadow reconciler this poll's readback
-		// (a recorder only — see reconcile_shadow.go). Reuses the plausibleW
-		// verdict above (ledger L9's pattern) rather than re-deriving it, so
-		// shadow and the published measurement never disagree about whether
-		// this W was trustworthy.
-		if s, ok := battShadows[upd.Name]; ok {
+		// TASK-027/028: feed the battery reconciler shell this poll's readback.
+		// Reuses the plausibleW verdict above (ledger L9's pattern) rather than
+		// re-deriving it, so the reconciler and the published measurement never
+		// disagree about whether this W was trustworthy. In active mode this is
+		// also where a diverged read triggers a corrective write and a
+		// just-reconnected pack reasserts desired.
+		if s, ok := battShells[upd.Name]; ok {
 			s.observe(m, wPlausible, nowT)
 		}
 		if !math.IsNaN(m.V) {
@@ -267,16 +302,43 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 }
 
 // subscribeControls sets up MQTT subscriptions for battery and solar commands.
-func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry, interlock *batterySafetyInterlock, battShadows map[string]*batteryShadow) {
+// batteryActive gates the legacy battery write path: when the battery
+// reconciler is active it OWNS hardware writes, so legacy battery commands keep
+// flowing (belt and braces for instant rollback) but are ignored on hardware —
+// no interlock.noteControl (intent is fed from the desired doc the reconciler
+// executes), no apply. The solar path is unaffected by battery mode.
+func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry, interlock *batterySafetyInterlock, battShells map[string]*batteryShell, batteryActive bool) {
 	// Build a map from device name → role for quick lookup.
 	roleOf := map[string]string{}
 	for _, dc := range cfg.Devices {
 		roleOf[dc.Name] = dc.Role
 	}
 
+	// last-ignored command signature per device, so an ignored legacy command is
+	// logged once per CHANGE (not once per redelivery) — guarded because the
+	// MQTT callback may fire for different devices concurrently.
+	var ignoreMu sync.Mutex
+	lastIgnored := map[string]string{}
+
 	if err := mqttutil.Subscribe(mc, bus.SubCtrlBattery, func(topic string, cmd bus.BattCommand) {
 		dev := bus.DeviceFromCtrlBatteryTopic(topic)
 		if roleOf[dev] != "battery" {
+			return
+		}
+		if batteryActive {
+			// Reconciler owns battery writes: ignore the legacy command on
+			// hardware but record that the belt-and-braces stream still arrives
+			// (log once per change).
+			sig := describeControl(battCommandToControl(cmd))
+			ignoreMu.Lock()
+			changed := lastIgnored[dev] != sig
+			if changed {
+				lastIgnored[dev] = sig
+			}
+			ignoreMu.Unlock()
+			if changed {
+				log.Printf("lexa-modbus: legacy battery command ignored (reconciler active) %s: %s", dev, sig)
+			}
 			return
 		}
 		// Record the hub's intent for the Tier-0 interlock before applying.
@@ -288,7 +350,7 @@ func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry, inte
 			log.Printf("lexa-modbus: battery %s control applied", dev)
 			// TASK-027: tell the shadow what the LEGACY path actually wrote,
 			// so its verdict line can compare against it. Recorder only.
-			if s, ok := battShadows[dev]; ok {
+			if s, ok := battShells[dev]; ok {
 				s.observeLegacyWrite(ctrl)
 			}
 		}
@@ -420,7 +482,23 @@ type retryDevice struct {
 	// instead of keeping whatever it latched before the drop (Phase 4; QA
 	// 2026-07-02: release-while-rebooting — a cap released while the inverter
 	// was rebooting left it clamped at the stale ceiling indefinitely).
+	//
+	// TASK-028: for an active-reconciled device, lastCtrl is NOT recorded and
+	// its reconnect reassert is NOT fired — the reconciler is the single
+	// reasserter (double-write races otherwise), signalled via onReconnect. The
+	// never-commanded-inverter branch of reassertLocked stays intact for solar.
 	lastCtrl *model.DERControlBase
+
+	// reconciledActive marks a device whose writes are owned by the active
+	// battery reconciler: suppresses lastCtrl recording/reassert (above) and
+	// enables the onReconnect signal below.
+	reconciledActive bool
+	// onReconnect, when set (active-reconciled devices only), is invoked after a
+	// successful reopen so the reconciler reasserts the standing desired (ledger
+	// L4). It MUST NOT take any lock the apply path holds — it runs under r.mu,
+	// and the reconciler's apply path is mu → registry → r.mu; the shell's
+	// markReconnected only does an atomic store, satisfying that.
+	onReconnect func()
 
 	// TASK-044 metrics (all nil-safe; every registry_test.go/control_test.go
 	// construction of retryDevice omits them and still works — see
@@ -462,12 +540,21 @@ func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
 		r.live = dev
 		r.reconnects.Inc()
 		slog.Info("lexa-modbus: reconnected device", "device", r.cfg.Name) // TASK-045
-		// Reconcile-on-reconnect (Phase 4): the device may have missed every
-		// control transition while dark — including a release, which for an
-		// inverter is a WRITE (the restore ceiling), not an absence of writes.
-		// Bring its registers back to the hub's current desired state before
-		// the first measurement is trusted.
-		if ctrl, why, ok := r.reassertLocked(); ok {
+		if r.reconciledActive {
+			// TASK-028: the active reconciler owns reassert-on-reconnect (ledger
+			// L4). Signal it instead of replaying lastCtrl, so there is exactly
+			// ONE reasserter and no double-write race. The callback only sets an
+			// atomic flag (no lock), so calling it under r.mu is deadlock-safe;
+			// the shell reasserts on this poll's Observe.
+			if r.onReconnect != nil {
+				r.onReconnect()
+			}
+		} else if ctrl, why, ok := r.reassertLocked(); ok {
+			// Reconcile-on-reconnect (Phase 4): the device may have missed every
+			// control transition while dark — including a release, which for an
+			// inverter is a WRITE (the restore ceiling), not an absence of writes.
+			// Bring its registers back to the hub's current desired state before
+			// the first measurement is trusted.
 			if err := r.live.ApplyControl(ctrl); err != nil {
 				r.writeFailures.Inc()
 				slog.Warn("lexa-modbus: device reconnect reconcile failed",
@@ -516,8 +603,15 @@ func (r *retryDevice) ApplyControl(ctrl model.DERControlBase) error {
 	// Record the DESIRED state even while disconnected — reconnect reconciles
 	// to the newest command, so a release/re-command that happened while the
 	// device was dark is not lost (Phase 4: release-while-rebooting).
-	stored := ctrl
-	r.lastCtrl = &stored
+	//
+	// TASK-028: an active-reconciled device does NOT record lastCtrl — the
+	// reconciler is the single reasserter (its own Reconnected write covers the
+	// reboot case), and a lastCtrl replay here would be a competing second
+	// reasserter (the double-write race the task forbids).
+	if !r.reconciledActive {
+		stored := ctrl
+		r.lastCtrl = &stored
+	}
 	if r.live == nil {
 		return nil // disconnected; the next ReadMeasurements poll reconnects and re-asserts
 	}

@@ -109,6 +109,16 @@ const (
 	// because its issuedAt is strictly newer — the publisher-restart case
 	// (AD-013 rule 2). A restart must be observable, not silent.
 	ReportSeqReset
+	// ReportInterlockHold is emitted by an ACTIVE reconciler shell (never by the
+	// core itself) when it suppresses a connect-restoring Write because the
+	// Tier-0 battery interlock (ledger L8) currently has the device
+	// force-disconnected. It records that convergence is being withheld by
+	// design — Tier-0 is senior — so TASK-031 can attribute a held device to
+	// "not converged because the interlock vetoed" rather than a reconciler
+	// fault. Appended at the end of the enum so existing values keep their
+	// iota (the append-only journal, TASK-039, is String-keyed but the numeric
+	// stability costs nothing).
+	ReportInterlockHold
 )
 
 // String renders a ReportKind.
@@ -126,6 +136,8 @@ func (k ReportKind) String() string {
 		return "RejectedObs"
 	case ReportSeqReset:
 		return "SeqReset"
+	case ReportInterlockHold:
+		return "InterlockHold"
 	default:
 		return "ReportKind(?)"
 	}

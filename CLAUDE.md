@@ -256,14 +256,41 @@ All configs live in `/etc/lexa/`. Edit the copies created by `make install-confi
 | `/etc/lexa/api.json` | lexa-api |
 | `/etc/lexa/certs/` | ca.pem, client.pem, ocpp.crt etc. |
 
-`modbus.json`'s `"reconciler"` key (TASK-027, AD-002/AD-013) maps device class →
-`"off"|"shadow"|"active"`, e.g. `{"battery":"shadow"}`. `"shadow"` runs the
-Device Reconciler (`internal/reconcile`) as a passive recorder alongside the
+`modbus.json`'s `"reconciler"` key (TASK-027/028, AD-002/AD-013) maps device
+class → `"off"|"shadow"|"active"`, e.g. `{"battery":"shadow"}`. `"shadow"` runs
+the Device Reconciler (`internal/reconcile`) as a passive recorder alongside the
 legacy control path — zero hardware writes, logs `reconciler[shadow] ...`
-verdict lines and `lexa_mb_shadow_*_total` metrics. `"active"` is rejected at
-load (`log.Fatalf`-equivalent config error) until TASK-028. Editing the Pi's
-copy without updating `configs/modbus.json` in-repo is undone by the next
-deploy (05 §6 discipline).
+verdict lines and `lexa_mb_shadow_*_total` metrics.
+
+`"active"` (TASK-028) gives the reconciler **write authority** and is legal for
+**`battery` only** (solar/EVSE `active` is still a fatal config error until
+TASK-029/030). In battery-active mode the reconciler owns hardware writes:
+desired-doc → `reconcile.SetDesired` → `battCommandToControl` (the single
+sign-mapping owner, reused) → `registry.ApplyControlTo` — the same registry path
+legacy used; a diverged readback drives a corrective write (`reconciler[active]
+… applied …` journal lines, `lexa_mb_reconcile_writes_total`), and a reconnected
+pack reasserts the standing desired (`reconcile.Reconnected`, ledger L4). The
+reconciler is the **single reasserter**: `retryDevice.lastCtrl` recording/replay
+is suppressed for an active-reconciled battery (solar keeps it). The legacy
+`lexa/control/battery/{device}` topic **keeps publishing and being subscribed**
+(belt and braces for instant rollback) but is ignored on hardware when active
+(`legacy battery command ignored (reconciler active)`); rollback = set `shadow`
+and restart lexa-modbus, legacy writes resume immediately.
+
+**Interlock seniority (critical):** the Tier-0 battery interlock
+(`cmd/modbus/interlock.go`, ledger L8) stays **senior to the reconciler**. While
+it has a pack force-disconnected (`isTripped`), the reconciler **suppresses
+connect-restoring writes** (reports `InterlockHold`) rather than rewriting
+`Conn=1` against the Tier-0 disconnect — the exact guard-versus-guard
+oscillation the program exists to kill. The interlock re-evaluates and clears
+its trip each poll once the fault clears; normal reconciliation resumes then.
+The interlock's charge intent is fed from the desired doc the reconciler
+executes (moved off the legacy subscribe path).
+
+Editing the Pi's copy without updating `configs/modbus.json` in-repo is undone
+by a full `deploy-hub-pi.sh` (it overwrites `/etc/lexa/*.json`); the in-repo
+default stays conservative (`battery: off`) and the flip is a deliberate,
+binary-only deploy + hand-set Pi config (05 §6 discipline).
 
 ## Critical invariants
 
