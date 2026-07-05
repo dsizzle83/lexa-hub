@@ -1,7 +1,13 @@
-// Package derbase provides shared SunSpec DER device logic for the inverter and
-// battery packages: IEEE 1547-2018 models (701-714), legacy models
+// Package derbase provides shared SunSpec DER device logic consumed by
+// lexa-hub's inverter and battery packages (TASK-023 — moved here from
+// lexa-hub/internal/southbound/derbase; product side is merge authority
+// per AD-003): IEEE 1547-2018 models (701-714), legacy models
 // (103/121/123/802), measurement parsing, and — its main job — translation of
 // IEEE 2030.5 / CSIP DERControlBase operating modes into SunSpec Modbus writes.
+//
+// Depends on this module's sunspec and csipmodel packages only — no
+// dependency on either consumer repo, so lexa-hub's internal/southbound/device
+// aliases this package's Measurements type rather than the reverse.
 //
 // CSIP → SunSpec mapping (model 704 unless noted):
 //
@@ -25,8 +31,7 @@ import (
 	"math"
 	"time"
 
-	"lexa-hub/internal/northbound/model"
-	"lexa-hub/internal/southbound/device"
+	model "lexa-proto/csipmodel"
 	"lexa-proto/sunspec"
 )
 
@@ -102,19 +107,61 @@ func Init(r *sunspec.Reader, tag string) (Base, error) {
 }
 
 // ── Measurements ─────────────────────────────────────────────────────────────
+//
+// Measurements is defined here (not in lexa-hub's internal/southbound/device)
+// because derbase is what constructs it from raw SunSpec registers — see
+// TASK-023's derbase move. lexa-hub's device package keeps its own Device /
+// DeviceStatus abstractions (owned by the southbound Device Reconciler,
+// TASK-025) but re-exports this type as `type Measurements = derbase.Measurements`
+// so every existing lexa-hub call site (device.Measurements{...} literals,
+// method signatures) keeps compiling unchanged.
 
-// ReadMeasurementsM701 parses model 701 into device.Measurements.
-func ReadMeasurementsM701(regs []uint16) device.Measurements {
+// Measurements holds a snapshot of electrical measurements from a DER device.
+//
+// Sign convention — power fields use the generator/load sign from the device's
+// own perspective (IEC 62053 / SunSpec convention):
+//
+//	W > 0  device is exporting power (solar generating, battery discharging)
+//	W < 0  device is importing power (battery charging, load consuming)
+//
+// The grid meter's W follows the same convention from the meter's perspective:
+//
+//	W > 0  power flowing from grid into site (import)
+//	W < 0  power flowing from site into grid (export)
+//
+// Fields set to math.NaN() are not available from this device.
+type Measurements struct {
+	// AC-side
+	W   float64 // net AC real power (watts)
+	VA  float64 // apparent power (volt-amps)
+	Var float64 // reactive power (vars, positive = capacitive)
+	V   float64 // phase-A-to-neutral voltage (volts)
+	Hz  float64 // AC frequency (Hz)
+	PF  float64 // power factor (−1 to +1)
+
+	// DC-side (inverters only; NaN if not applicable)
+	DCV float64 // DC bus voltage (volts)
+	DCW float64 // DC power (watts)
+
+	// Thermal
+	TmpCab float64 // cabinet temperature (°C); NaN if not reported
+
+	// Storage (batteries only; NaN if not applicable)
+	SOC float64 // state of charge (0–100 %)
+}
+
+// ReadMeasurementsM701 parses model 701 into Measurements.
+func ReadMeasurementsM701(regs []uint16) Measurements {
 	m := sunspec.Parse701(regs)
 	v := m.LNV
 	if math.IsNaN(v) {
 		v = m.VL1
 	}
-	return device.Measurements{W: m.W, V: v, Hz: m.Hz, VA: m.VA, Var: m.Var, PF: m.PF, TmpCab: m.TmpCab, SOC: math.NaN()}
+	return Measurements{W: m.W, V: v, Hz: m.Hz, VA: m.VA, Var: m.Var, PF: m.PF, TmpCab: m.TmpCab, SOC: math.NaN()}
 }
 
 // ReadMeasurementsACModel parses legacy Model 10x (101/102/103).
-func ReadMeasurementsACModel(regs []uint16) device.Measurements {
+func ReadMeasurementsACModel(regs []uint16) Measurements {
 	get := func(off int) uint16 {
 		if off < len(regs) {
 			return regs[off]
@@ -122,7 +169,7 @@ func ReadMeasurementsACModel(regs []uint16) device.Measurements {
 		return 0
 	}
 	sf := func(off int) int16 { return int16(get(off)) }
-	m := device.Measurements{TmpCab: math.NaN(), SOC: math.NaN()}
+	m := Measurements{TmpCab: math.NaN(), SOC: math.NaN()}
 	if len(regs) > sunspec.M103_W_SF {
 		m.W = sunspec.ApplyScaleSigned(get(sunspec.M103_W), sf(sunspec.M103_W_SF))
 	}

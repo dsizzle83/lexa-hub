@@ -41,7 +41,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/northbound/discovery"
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 )
 
 // ActiveControl is what the client should apply right now.

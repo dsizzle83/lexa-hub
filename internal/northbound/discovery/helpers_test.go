@@ -3,7 +3,7 @@ package discovery
 import (
 	"testing"
 
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 )
 
 func TestVerifyRegistrationPIN(t *testing.T) {

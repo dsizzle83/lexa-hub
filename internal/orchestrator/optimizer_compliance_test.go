@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 )
 
 // TestExportLimit_PhantomEVCredit_StillCurtails guards Bug E: the export-limit

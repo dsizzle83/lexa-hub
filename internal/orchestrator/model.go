@@ -24,7 +24,7 @@ import (
 	"math"
 	"time"
 
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 )
 
 // ── Device state snapshots ────────────────────────────────────────────────────

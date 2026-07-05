@@ -114,7 +114,8 @@ cmd/
 internal/
   bus/        MQTT topic constants + JSON message types (shared by all services)
   mqttutil/   Thin MQTT client helpers (connect, PublishJSON, Subscribe[T])
-  northbound/ IEEE 2030.5 model, discovery walker, scheduler, identity, DNS-SD
+  northbound/ IEEE 2030.5 discovery walker, scheduler, identity, DNS-SD
+              (model types moved to lexa-proto/csipmodel — TASK-023)
   tlsclient/  wolfSSL mTLS client (keep-alive fetcher)
   wolfssl/    CGo wrapper for wolfSSL_Init (call exactly once per process)
   southbound/ Modbus/SunSpec: device interface, inverter, battery, meter, registry

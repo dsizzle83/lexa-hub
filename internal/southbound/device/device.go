@@ -6,7 +6,10 @@
 // implementations live in sibling packages (inverter, battery).
 package device
 
-import "lexa-hub/internal/northbound/model"
+import (
+	model "lexa-proto/csipmodel"
+	"lexa-proto/derbase"
+)
 
 // Device is the southbound abstraction for a single piece of DER hardware.
 // Implementations must be safe for concurrent use.
@@ -28,38 +31,12 @@ type Device interface {
 }
 
 // Measurements holds a snapshot of electrical measurements from a DER device.
-//
-// Sign convention — power fields use the generator/load sign from the device's
-// own perspective (IEC 62053 / SunSpec convention):
-//
-//	W > 0  device is exporting power (solar generating, battery discharging)
-//	W < 0  device is importing power (battery charging, load consuming)
-//
-// The grid meter's W follows the same convention from the meter's perspective:
-//
-//	W > 0  power flowing from grid into site (import)
-//	W < 0  power flowing from site into grid (export)
-//
-// Fields set to math.NaN() are not available from this device.
-type Measurements struct {
-	// AC-side
-	W   float64 // net AC real power (watts)
-	VA  float64 // apparent power (volt-amps)
-	Var float64 // reactive power (vars, positive = capacitive)
-	V   float64 // phase-A-to-neutral voltage (volts)
-	Hz  float64 // AC frequency (Hz)
-	PF  float64 // power factor (−1 to +1)
-
-	// DC-side (inverters only; NaN if not applicable)
-	DCV float64 // DC bus voltage (volts)
-	DCW float64 // DC power (watts)
-
-	// Thermal
-	TmpCab float64 // cabinet temperature (°C); NaN if not reported
-
-	// Storage (batteries only; NaN if not applicable)
-	SOC float64 // state of charge (0–100 %)
-}
+// It is defined in lexa-proto/derbase (TASK-023) — derbase is what actually
+// constructs it from raw SunSpec registers — and aliased here so every
+// existing call site (device.Measurements{...} literals, method signatures)
+// keeps compiling unchanged. See derbase.Measurements for the full field
+// docs (sign convention, NaN-means-unavailable, etc).
+type Measurements = derbase.Measurements
 
 // DeviceStatus describes the current operational state of a DER.
 type DeviceStatus struct {

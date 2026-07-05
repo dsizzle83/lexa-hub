@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 )
 
 // Fetcher abstracts the HTTP GET + XML parse cycle. The walker calls

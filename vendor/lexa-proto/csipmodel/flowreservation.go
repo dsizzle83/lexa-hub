@@ -1,4 +1,4 @@
-package model
+package csipmodel
 
 import "encoding/xml"
 

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/southbound/device"
 	"lexa-hub/internal/southbound/registry"
 )

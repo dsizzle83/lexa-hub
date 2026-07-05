@@ -6,7 +6,7 @@ import (
 	"math"
 	"time"
 
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 )
 
 // exportGuard carries state across ticks for the conservative export-limit rule.

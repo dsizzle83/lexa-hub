@@ -1,6 +1,6 @@
 package discovery
 
-import "lexa-hub/internal/northbound/model"
+import model "lexa-proto/csipmodel"
 
 // ───────────────────────────────────────────────────────────────────────
 // Flow Reservation function set discovery

@@ -7,7 +7,7 @@ import (
 	"math"
 	"testing"
 
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────

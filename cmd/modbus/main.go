@@ -31,7 +31,7 @@ import (
 
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/mqttutil"
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/southbound/battery"
 	"lexa-hub/internal/southbound/device"
 	"lexa-hub/internal/southbound/inverter"

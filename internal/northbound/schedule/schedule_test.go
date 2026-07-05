@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/northbound/discovery"
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/northbound/schedule"
 )
 

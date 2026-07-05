@@ -1,9 +1,9 @@
-// Package model — IEEE 2030.5 DER function set types.
-//
-// This file contains the full DERControlBase (all operating modes, including
-// curve-linked ride-through and inverter control modes), DERCurve, DERAvailability,
-// and expanded DERCapability / DERStatus as specified in IEEE 2030.5-2018 §10.10.
-package model
+// This file extends the csipmodel package (see resources.go for the package
+// doc comment and the XML-namespace invariant) with the full IEEE 2030.5 DER
+// function set: DERControlBase (all operating modes, including curve-linked
+// ride-through and inverter control modes), DERCurve, DERAvailability, and
+// expanded DERCapability / DERStatus as specified in IEEE 2030.5-2018 §10.10.
+package csipmodel
 
 import "encoding/xml"
 
@@ -12,33 +12,33 @@ import "encoding/xml"
 // These match the DERControlType enumeration in the 2030.5 XSD (Table 21).
 // A DER device sets the corresponding bit to advertise support for each mode.
 const (
-	ModeConnect                 uint32 = 1 << 0  // opModConnect / opModEnergize
-	ModeMaxLimW                 uint32 = 1 << 1  // opModMaxLimW
-	ModeFixedW                  uint32 = 1 << 2  // opModFixedW
-	ModeFixedVar                uint32 = 1 << 3  // opModFixedVar
-	ModeFixedPFAbsorb           uint32 = 1 << 4  // opModFixedPFAbsorbW
-	ModeFixedPFInject           uint32 = 1 << 5  // opModFixedPFInjectW
-	ModeVoltVar                 uint32 = 1 << 6  // opModVoltVar (dynamic Volt-VAr)
-	ModeFreqWatt                uint32 = 1 << 7  // opModFreqWatt (Freq-Watt)
-	ModeWattPF                  uint32 = 1 << 8  // opModWattPF (Watt-PF)
-	ModeVoltWatt                uint32 = 1 << 9  // opModVoltWatt (Volt-Watt)
-	ModeHFRTMayTrip             uint32 = 1 << 10 // opModHFRTMayTrip
-	ModeHFRTMustTrip            uint32 = 1 << 11 // opModHFRTMustTrip
-	ModeHVRTMayTrip             uint32 = 1 << 12 // opModHVRTMayTrip
-	ModeHVRTMomentaryCessation  uint32 = 1 << 13 // opModHVRTMomentaryCessation
-	ModeHVRTMustTrip            uint32 = 1 << 14 // opModHVRTMustTrip
-	ModeLFRTMayTrip             uint32 = 1 << 15 // opModLFRTMayTrip
-	ModeLFRTMustTrip            uint32 = 1 << 16 // opModLFRTMustTrip
-	ModeLVRTMayTrip             uint32 = 1 << 17 // opModLVRTMayTrip
-	ModeLVRTMomentaryCessation  uint32 = 1 << 18 // opModLVRTMomentaryCessation
-	ModeLVRTMustTrip            uint32 = 1 << 19 // opModLVRTMustTrip
-	ModeFreqDroop               uint32 = 1 << 20 // opModFreqDroop
-	ModeTargetW                 uint32 = 1 << 21 // opModTargetW
-	ModeTargetVar               uint32 = 1 << 22 // opModTargetVar
-	ModeExpLimW                 uint32 = 1 << 23 // opModExpLimW
-	ModeImpLimW                 uint32 = 1 << 24 // opModImpLimW
-	ModeGenLimW                 uint32 = 1 << 25 // opModGenLimW
-	ModeLoadLimW                uint32 = 1 << 26 // opModLoadLimW
+	ModeConnect                uint32 = 1 << 0  // opModConnect / opModEnergize
+	ModeMaxLimW                uint32 = 1 << 1  // opModMaxLimW
+	ModeFixedW                 uint32 = 1 << 2  // opModFixedW
+	ModeFixedVar               uint32 = 1 << 3  // opModFixedVar
+	ModeFixedPFAbsorb          uint32 = 1 << 4  // opModFixedPFAbsorbW
+	ModeFixedPFInject          uint32 = 1 << 5  // opModFixedPFInjectW
+	ModeVoltVar                uint32 = 1 << 6  // opModVoltVar (dynamic Volt-VAr)
+	ModeFreqWatt               uint32 = 1 << 7  // opModFreqWatt (Freq-Watt)
+	ModeWattPF                 uint32 = 1 << 8  // opModWattPF (Watt-PF)
+	ModeVoltWatt               uint32 = 1 << 9  // opModVoltWatt (Volt-Watt)
+	ModeHFRTMayTrip            uint32 = 1 << 10 // opModHFRTMayTrip
+	ModeHFRTMustTrip           uint32 = 1 << 11 // opModHFRTMustTrip
+	ModeHVRTMayTrip            uint32 = 1 << 12 // opModHVRTMayTrip
+	ModeHVRTMomentaryCessation uint32 = 1 << 13 // opModHVRTMomentaryCessation
+	ModeHVRTMustTrip           uint32 = 1 << 14 // opModHVRTMustTrip
+	ModeLFRTMayTrip            uint32 = 1 << 15 // opModLFRTMayTrip
+	ModeLFRTMustTrip           uint32 = 1 << 16 // opModLFRTMustTrip
+	ModeLVRTMayTrip            uint32 = 1 << 17 // opModLVRTMayTrip
+	ModeLVRTMomentaryCessation uint32 = 1 << 18 // opModLVRTMomentaryCessation
+	ModeLVRTMustTrip           uint32 = 1 << 19 // opModLVRTMustTrip
+	ModeFreqDroop              uint32 = 1 << 20 // opModFreqDroop
+	ModeTargetW                uint32 = 1 << 21 // opModTargetW
+	ModeTargetVar              uint32 = 1 << 22 // opModTargetVar
+	ModeExpLimW                uint32 = 1 << 23 // opModExpLimW
+	ModeImpLimW                uint32 = 1 << 24 // opModImpLimW
+	ModeGenLimW                uint32 = 1 << 25 // opModGenLimW
+	ModeLoadLimW               uint32 = 1 << 26 // opModLoadLimW
 )
 
 // ─── DERCurve curve-type codes ────────────────────────────────────────────────
@@ -65,26 +65,26 @@ const (
 
 // Generator connection status codes (genConnectStatus).
 const (
-	GenConnectAvailable  uint8 = 0 // available but not connected
-	GenConnectConnected  uint8 = 1 // connected and operating
-	GenConnectTest       uint8 = 2 // in test mode
-	GenConnectFault      uint8 = 3 // fault condition
+	GenConnectAvailable uint8 = 0 // available but not connected
+	GenConnectConnected uint8 = 1 // connected and operating
+	GenConnectTest      uint8 = 2 // in test mode
+	GenConnectFault     uint8 = 3 // fault condition
 )
 
 // Operational mode status codes (operationalModeStatus).
 const (
-	OpStatusIdle          uint8 = 0
-	OpStatusOperating     uint8 = 1
-	OpStatusStandby       uint8 = 2
-	OpStatusShutdown      uint8 = 3
-	OpStatusFault         uint8 = 4
-	OpStatusSleeping      uint8 = 5
+	OpStatusIdle      uint8 = 0
+	OpStatusOperating uint8 = 1
+	OpStatusStandby   uint8 = 2
+	OpStatusShutdown  uint8 = 3
+	OpStatusFault     uint8 = 4
+	OpStatusSleeping  uint8 = 5
 )
 
 // Storage mode status codes (storageModeStatus).
 const (
-	StorageIdle       uint8 = 0
-	StorageCharging   uint8 = 1
+	StorageIdle        uint8 = 0
+	StorageCharging    uint8 = 1
 	StorageDischarging uint8 = 2
 )
 
@@ -118,10 +118,10 @@ type DERCurve struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERCurve"`
 	Resource
 
-	MRID        string `xml:"mRID,omitempty"`
-	Description string `xml:"description,omitempty"`
-	Version     uint16 `xml:"version,omitempty"`
-	CreationTime int64 `xml:"creationTime,omitempty"`
+	MRID         string `xml:"mRID,omitempty"`
+	Description  string `xml:"description,omitempty"`
+	Version      uint16 `xml:"version,omitempty"`
+	CreationTime int64  `xml:"creationTime,omitempty"`
 
 	// CurveType identifies what this curve represents (see CurveType* constants).
 	CurveType uint16 `xml:"curveType"`
@@ -159,7 +159,7 @@ type DERCurve struct {
 
 // DERCurveList is a collection of DERCurve resources belonging to one DERProgram.
 type DERCurveList struct {
-	XMLName  xml.Name   `xml:"urn:ieee:std:2030.5:ns DERCurveList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERCurveList"`
 	Resource
 
 	All      uint32     `xml:"all,attr"`
@@ -218,41 +218,41 @@ type ReactivePower struct {
 // XML element names match the 2030.5 schema exactly (case-sensitive).
 type ExtendedDERControlBase struct {
 	// ── Scalar modes ─────────────────────────────────────────────────────────
-	OpModConnect         *bool          `xml:"opModConnect,omitempty"`
-	OpModEnergize        *bool          `xml:"opModEnergize,omitempty"`
-	OpModFixedPFAbsorbW  *SignedPerCent `xml:"opModFixedPFAbsorbW,omitempty"`
-	OpModFixedPFInjectW  *SignedPerCent `xml:"opModFixedPFInjectW,omitempty"`
-	OpModFixedVar        *FixedVar      `xml:"opModFixedVar,omitempty"`
-	OpModFixedW          *ActivePower   `xml:"opModFixedW,omitempty"`
-	OpModMaxLimW         *ActivePower   `xml:"opModMaxLimW,omitempty"`
-	OpModExpLimW         *ActivePower   `xml:"opModExpLimW,omitempty"`
-	OpModGenLimW         *ActivePower   `xml:"opModGenLimW,omitempty"`
-	OpModImpLimW         *ActivePower   `xml:"opModImpLimW,omitempty"`
-	OpModLoadLimW        *ActivePower   `xml:"opModLoadLimW,omitempty"`
-	OpModTargetW         *ActivePower   `xml:"opModTargetW,omitempty"`
-	OpModTargetVar       *ReactivePower `xml:"opModTargetVar,omitempty"`
-	RampTms              *uint16        `xml:"rampTms,omitempty"`
+	OpModConnect        *bool          `xml:"opModConnect,omitempty"`
+	OpModEnergize       *bool          `xml:"opModEnergize,omitempty"`
+	OpModFixedPFAbsorbW *SignedPerCent `xml:"opModFixedPFAbsorbW,omitempty"`
+	OpModFixedPFInjectW *SignedPerCent `xml:"opModFixedPFInjectW,omitempty"`
+	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"`
+	OpModFixedW         *ActivePower   `xml:"opModFixedW,omitempty"`
+	OpModMaxLimW        *ActivePower   `xml:"opModMaxLimW,omitempty"`
+	OpModExpLimW        *ActivePower   `xml:"opModExpLimW,omitempty"`
+	OpModGenLimW        *ActivePower   `xml:"opModGenLimW,omitempty"`
+	OpModImpLimW        *ActivePower   `xml:"opModImpLimW,omitempty"`
+	OpModLoadLimW       *ActivePower   `xml:"opModLoadLimW,omitempty"`
+	OpModTargetW        *ActivePower   `xml:"opModTargetW,omitempty"`
+	OpModTargetVar      *ReactivePower `xml:"opModTargetVar,omitempty"`
+	RampTms             *uint16        `xml:"rampTms,omitempty"`
 
 	// ── Curve-linked modes — each holds an href to a DERCurve ────────────────
 	// Dynamic Volt-VAr — anti-islanding baseline mode (§10.10.4.2).
-	OpModVoltVar                *CurveLink `xml:"opModVoltVar,omitempty"`
+	OpModVoltVar *CurveLink `xml:"opModVoltVar,omitempty"`
 	// Frequency-Watt — droop-based frequency regulation (§10.10.4.3).
-	OpModFreqWatt               *CurveLink `xml:"opModFreqWatt,omitempty"`
+	OpModFreqWatt *CurveLink `xml:"opModFreqWatt,omitempty"`
 	// Watt-PF — power-factor as a function of real power output (§10.10.4.5).
-	OpModWattPF                 *CurveLink `xml:"opModWattPF,omitempty"`
+	OpModWattPF *CurveLink `xml:"opModWattPF,omitempty"`
 	// Volt-Watt — ramp real power output as a function of voltage (§10.10.4.4).
-	OpModVoltWatt               *CurveLink `xml:"opModVoltWatt,omitempty"`
+	OpModVoltWatt *CurveLink `xml:"opModVoltWatt,omitempty"`
 
 	// High-frequency ride-through curves.
-	OpModHFRTMayTrip            *CurveLink `xml:"opModHFRTMayTrip,omitempty"`
-	OpModHFRTMustTrip           *CurveLink `xml:"opModHFRTMustTrip,omitempty"`
+	OpModHFRTMayTrip  *CurveLink `xml:"opModHFRTMayTrip,omitempty"`
+	OpModHFRTMustTrip *CurveLink `xml:"opModHFRTMustTrip,omitempty"`
 	// High-voltage ride-through curves.
 	OpModHVRTMayTrip            *CurveLink `xml:"opModHVRTMayTrip,omitempty"`
 	OpModHVRTMomentaryCessation *CurveLink `xml:"opModHVRTMomentaryCessation,omitempty"`
 	OpModHVRTMustTrip           *CurveLink `xml:"opModHVRTMustTrip,omitempty"`
 	// Low-frequency ride-through curves.
-	OpModLFRTMayTrip            *CurveLink `xml:"opModLFRTMayTrip,omitempty"`
-	OpModLFRTMustTrip           *CurveLink `xml:"opModLFRTMustTrip,omitempty"`
+	OpModLFRTMayTrip  *CurveLink `xml:"opModLFRTMayTrip,omitempty"`
+	OpModLFRTMustTrip *CurveLink `xml:"opModLFRTMustTrip,omitempty"`
 	// Low-voltage ride-through curves.
 	OpModLVRTMayTrip            *CurveLink `xml:"opModLVRTMayTrip,omitempty"`
 	OpModLVRTMomentaryCessation *CurveLink `xml:"opModLVRTMomentaryCessation,omitempty"`
@@ -268,20 +268,20 @@ type ExtendedDERControl struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERControl"`
 	Resource
 
-	MRID            string                 `xml:"mRID,omitempty"`
-	Description     string                 `xml:"description,omitempty"`
-	Version         uint16                 `xml:"version,omitempty"`
-	CreationTime    int64                  `xml:"creationTime,omitempty"`
-	EventStatus     *EventStatus           `xml:"EventStatus,omitempty"`
-	Interval        DateTimeInterval       `xml:"interval"`
-	DERControlBase  ExtendedDERControlBase `xml:"DERControlBase"`
-	RandomizeStart  *int32                 `xml:"randomizeStart,omitempty"`
-	RandomizeDuration *int32              `xml:"randomizeDuration,omitempty"`
+	MRID              string                 `xml:"mRID,omitempty"`
+	Description       string                 `xml:"description,omitempty"`
+	Version           uint16                 `xml:"version,omitempty"`
+	CreationTime      int64                  `xml:"creationTime,omitempty"`
+	EventStatus       *EventStatus           `xml:"EventStatus,omitempty"`
+	Interval          DateTimeInterval       `xml:"interval"`
+	DERControlBase    ExtendedDERControlBase `xml:"DERControlBase"`
+	RandomizeStart    *int32                 `xml:"randomizeStart,omitempty"`
+	RandomizeDuration *int32                 `xml:"randomizeDuration,omitempty"`
 }
 
 // ExtendedDERControlList is a collection of ExtendedDERControl events.
 type ExtendedDERControlList struct {
-	XMLName    xml.Name             `xml:"urn:ieee:std:2030.5:ns DERControlList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERControlList"`
 	Resource
 
 	All        uint32               `xml:"all,attr"`
@@ -295,10 +295,10 @@ type ExtendedDefaultDERControl struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DefaultDERControl"`
 	Resource
 
-	MRID            string                 `xml:"mRID,omitempty"`
-	Description     string                 `xml:"description,omitempty"`
-	Version         uint16                 `xml:"version,omitempty"`
-	DERControlBase  ExtendedDERControlBase `xml:"DERControlBase"`
+	MRID           string                 `xml:"mRID,omitempty"`
+	Description    string                 `xml:"description,omitempty"`
+	Version        uint16                 `xml:"version,omitempty"`
+	DERControlBase ExtendedDERControlBase `xml:"DERControlBase"`
 }
 
 // ─── DERCapability (expanded) ─────────────────────────────────────────────────
@@ -318,17 +318,17 @@ type DERCapabilityFull struct {
 	ModesSupported uint32 `xml:"modesSupported"`
 
 	// Nameplate ratings (all use ActivePower — value × 10^multiplier in W or VA or VAr).
-	RtgMaxW           ActivePower  `xml:"rtgMaxW"`            // nameplate peak active power
-	RtgMaxVA          *ActivePower `xml:"rtgMaxVA,omitempty"` // nameplate peak apparent power
-	RtgMaxVar         *ActivePower `xml:"rtgMaxVar,omitempty"` // nameplate peak reactive power (absorb)
-	RtgMaxVarNeg      *ActivePower `xml:"rtgMaxVarNeg,omitempty"` // nameplate peak reactive power (inject)
-	RtgMinPFOverExcited  *int16   `xml:"rtgMinPFOverExcited,omitempty"`  // min power factor, over-excited
-	RtgMinPFUnderExcited *int16   `xml:"rtgMinPFUnderExcited,omitempty"` // min power factor, under-excited
-	RtgMaxChargeRateW *ActivePower `xml:"rtgMaxChargeRateW,omitempty"`    // max charge rate (storage)
+	RtgMaxW              ActivePower  `xml:"rtgMaxW"`                        // nameplate peak active power
+	RtgMaxVA             *ActivePower `xml:"rtgMaxVA,omitempty"`             // nameplate peak apparent power
+	RtgMaxVar            *ActivePower `xml:"rtgMaxVar,omitempty"`            // nameplate peak reactive power (absorb)
+	RtgMaxVarNeg         *ActivePower `xml:"rtgMaxVarNeg,omitempty"`         // nameplate peak reactive power (inject)
+	RtgMinPFOverExcited  *int16       `xml:"rtgMinPFOverExcited,omitempty"`  // min power factor, over-excited
+	RtgMinPFUnderExcited *int16       `xml:"rtgMinPFUnderExcited,omitempty"` // min power factor, under-excited
+	RtgMaxChargeRateW    *ActivePower `xml:"rtgMaxChargeRateW,omitempty"`    // max charge rate (storage)
 	RtgMaxDischargeRateW *ActivePower `xml:"rtgMaxDischargeRateW,omitempty"` // max discharge rate
-	RtgVNom           *int32      `xml:"rtgVNom,omitempty"`    // nominal voltage (V)
-	RtgVarNomPct      *int16      `xml:"rtgVarNomPct,omitempty"` // var at nominal voltage (% of rtgMaxVA)
-	RtgWOvPF          *int16      `xml:"rtgWOvPF,omitempty"`   // reactive power capability at rated W, over PF (VAr)
+	RtgVNom              *int32       `xml:"rtgVNom,omitempty"`              // nominal voltage (V)
+	RtgVarNomPct         *int16       `xml:"rtgVarNomPct,omitempty"`         // var at nominal voltage (% of rtgMaxVA)
+	RtgWOvPF             *int16       `xml:"rtgWOvPF,omitempty"`             // reactive power capability at rated W, over PF (VAr)
 }
 
 // ─── DERStatus (full) ─────────────────────────────────────────────────────────
@@ -358,9 +358,9 @@ type DERStatusFull struct {
 
 	// ManufacturerStatus: manufacturer-defined status code.
 	ManufacturerStatus *struct {
-		DateTime         int64  `xml:"dateTime"`
-		Description      string `xml:"description,omitempty"`
-		PEVInfo          string `xml:"pEVInfo,omitempty"`
+		DateTime    int64  `xml:"dateTime"`
+		Description string `xml:"description,omitempty"`
+		PEVInfo     string `xml:"pEVInfo,omitempty"`
 	} `xml:"manufacturerStatus,omitempty"`
 
 	// OperationalModeStatus: current operating mode (see OpStatus* constants).
@@ -415,9 +415,9 @@ type DERSettingsFull struct {
 	UpdatedTime int64 `xml:"updatedTime,omitempty"`
 
 	// Power limits — operator-configured ceilings.
-	SetMaxW   *ActivePower `xml:"setMaxW,omitempty"`   // max real power output
-	SetMaxVA  *ActivePower `xml:"setMaxVA,omitempty"`  // max apparent power
-	SetMaxVar *ActivePower `xml:"setMaxVar,omitempty"` // max reactive power (absorb)
+	SetMaxW      *ActivePower `xml:"setMaxW,omitempty"`      // max real power output
+	SetMaxVA     *ActivePower `xml:"setMaxVA,omitempty"`     // max apparent power
+	SetMaxVar    *ActivePower `xml:"setMaxVar,omitempty"`    // max reactive power (absorb)
 	SetMaxVarNeg *ActivePower `xml:"setMaxVarNeg,omitempty"` // max reactive power (inject)
 
 	// Power factor limits (signed, hundredths: 95 = 0.95 leading).

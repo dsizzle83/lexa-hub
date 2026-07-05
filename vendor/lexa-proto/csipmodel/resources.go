@@ -1,4 +1,8 @@
-// Package model defines Go structs for IEEE 2030.5 / CSIP resources.
+// Package csipmodel defines Go structs for the IEEE 2030.5 / CSIP XML data
+// model — the wire-format types both lexa-hub (client-side unmarshal) and
+// csip-tls-test's gridsim (server-side marshal) work from (TASK-023). This is
+// the data model only: walkers, schedulers, identity, and DNS-SD stay
+// repo-local forks that merely import this package.
 //
 // Every struct uses XML tags that match the 2030.5 schema exactly,
 // including the mandatory namespace urn:ieee:std:2030.5:ns.
@@ -6,9 +10,18 @@
 // SubscribableResource, etc.) is flattened into Go structs with embedded
 // fields, because Go's encoding/xml handles embedded struct tags correctly.
 //
-// Only the resource types required by a CSIP DER client are defined here.
-// Server-only types (like billing, messaging, prepayment) are omitted.
-package model
+// Only the resource types required by a CSIP DER client (and the gridsim
+// that serves them) are defined here. Prepayment and messaging function
+// sets are out of scope.
+//
+// CRITICAL — silent-failure hazard: a 2030.5 root element unmarshalled
+// without its namespace (urn:ieee:std:2030.5:ns) decodes to a zero-value
+// struct with NO error from encoding/xml. Every root element below carries
+// an explicit `xml:"urn:ieee:std:2030.5:ns <Name>"` XMLName tag for exactly
+// this reason — never add a root element type without one, and never edit
+// an existing tag without re-running the round-trip suite in
+// resources_test.go plus both consumers' conformance suites.
+package csipmodel
 
 import "encoding/xml"
 
