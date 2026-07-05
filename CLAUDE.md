@@ -5,11 +5,16 @@ Bridges utility grid management (northbound, wolfSSL mTLS) to DER assets — sol
 battery storage, smart meter, EVSE (OCPP 2.0.1) — via an MQTT message bus.
 
 **This is the product.** Its test bench (grid/device/EV simulators, conformance suites,
-dashboard) lives in `~/projects/csip-tls-test`. Two packages are duplicated across the
+dashboard) lives in `~/projects/csip-tls-test`. One package is still duplicated across the
 repos and must change in lockstep: `internal/southbound/sunspec` register maps (audit
-MTR-4 — a lone change misreads real hardware) and `internal/ocppserver`. Enforced by
-`scripts/ci/lockstep-check.sh` in csip-tls-test CI (TASK-004) — report-only until Phase 1
-replaces the duplication with a shared module (AD-003/TASK-024).
+MTR-4 — a lone change misreads real hardware). Enforced by `scripts/ci/lockstep-check.sh`
+in csip-tls-test CI (TASK-004) — report-only until Phase 1 replaces the duplication with a
+shared module (AD-003/TASK-024). `internal/ocppserver` moved to `lexa-proto/ocppserver`
+(TASK-022); `cmd/ocpp` imports the shared copy. The old `internal/ocppserver/` tree is left
+in place unreferenced (not deleted) because hosted CI runs `GOWORK=off` with no sibling
+`lexa-proto` checkout for the build/test jobs — deleting it today would just make the dead
+code disappear, not fix that CI can't resolve `lexa-proto/ocppserver` without `go.work`.
+Removal tracked with the same TASK-024 pin-gate landing that resolves the CI gap.
 
 ## Architecture: separate systemd services
 
@@ -113,7 +118,6 @@ internal/
   tlsclient/  wolfSSL mTLS client (keep-alive fetcher)
   wolfssl/    CGo wrapper for wolfSSL_Init (call exactly once per process)
   southbound/ Modbus/SunSpec: device interface, inverter, battery, meter, registry
-  ocppserver/ OCPP 2.0.1 CSMS (pure Go, no wolfSSL)
   orchestrator/ Rule-based optimizer engine (no I/O — reads SystemState, returns Plan)
 
 systemd/     Unit files + mosquitto config fragment
