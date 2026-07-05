@@ -27,7 +27,7 @@ import (
 
 	"lexa-hub/internal/northbound/model"
 	"lexa-hub/internal/southbound/device"
-	"lexa-hub/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 )
 
 // Base holds shared SunSpec DER state and methods. Embed in concrete types.

@@ -5,7 +5,7 @@ import (
 	"math"
 
 	"lexa-hub/internal/orchestrator"
-	"lexa-hub/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 )
 
 // Compile-time check: Battery must satisfy BatteryMetricsReader.
