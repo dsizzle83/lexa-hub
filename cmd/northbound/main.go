@@ -46,6 +46,7 @@ import (
 	"lexa-hub/internal/northbound/schedule"
 	"lexa-hub/internal/northbound/scheduler"
 	"lexa-hub/internal/tlsclient"
+	"lexa-hub/internal/utilitytime"
 	"lexa-hub/internal/watchdog"
 	"lexa-hub/internal/wolfssl"
 	model "lexa-proto/csipmodel"
@@ -205,7 +206,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	sched := scheduler.New()
-	respTracker := newResponseTracker(fetcherResp, lfdi, cfg.ResponseSetPath, responsesPostedCtr)
+	// clk is the single owner of the accumulated utility-time offset (AD-004,
+	// TASK-035). The walker still acquires the raw offset per walk
+	// (tree.ClockOffset); runDiscovery feeds it here via clk.SetOffset, and every
+	// serverNow computation reads it back through clk.ServerNow — the same
+	// arithmetic as scheduler.ServerNow(tree.ClockOffset), now single-owned.
+	clk := utilitytime.New(utilitytime.Config{})
+	respTracker := newResponseTracker(fetcherResp, lfdi, cfg.ResponseSetPath, clk, responsesPostedCtr)
 
 	// Flow reservation: a third TLS session dedicated to POSTing reservation
 	// requests received from the hub via MQTT. This keeps it isolated from the
@@ -271,7 +278,7 @@ func main() {
 
 	// Run the first discovery immediately, then loop.
 	go func() {
-		runDiscovery(mc, fetcherDisc, lfdi, sched, respTracker, frManager, cfg, nbm)
+		runDiscovery(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, cfg, nbm)
 		// TASK-008: kick once the initial walk returns, success or fail-closed
 		// — a walk that erred and held last-known-good is still a live,
 		// iterating loop (QA 2026-07-02 northbound-hang/wan-outage-hold: a
@@ -290,7 +297,7 @@ func main() {
 				// runDiscovery's internal errors are handled by its own
 				// fail-closed logging and never prevent reaching this line.
 				watchdog.Kick()
-				runDiscovery(mc, fetcherDisc, lfdi, sched, respTracker, frManager, cfg, nbm)
+				runDiscovery(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, cfg, nbm)
 			}
 		}
 	}()
@@ -320,6 +327,7 @@ func runDiscovery(
 	fetcher *tlsclient.WolfSSLFetcher,
 	lfdi string,
 	sched *scheduler.Scheduler,
+	clk *utilitytime.Clock,
 	rt *responseTracker,
 	frm *flowReservationManager,
 	cfg *Config,
@@ -353,7 +361,22 @@ func runDiscovery(
 	discoveryFailures = 0
 	nbm.clockOffset.Set(float64(tree.ClockOffset))
 
-	serverNow := scheduler.ServerNow(tree.ClockOffset)
+	// Feed the walk's raw offset to the single-owner Clock (AD-004, TASK-035).
+	// The Clock accumulates ownership of the accepted offset; SetOffset never
+	// alters the value ServerNow returns (still local + raw offset), so this is
+	// behavior-preserving. Log only a real Step transition (05 §9: transition
+	// logs, not per-tick) — a stepped clock is the class the clock-jitter saga
+	// hardened against, worth an operator breadcrumb; Wobble/First are silent.
+	if class := clk.SetOffset(tree.ClockOffset); class == utilitytime.Step {
+		slog.Info("lexa-northbound: utility clock stepped", "offset_s", tree.ClockOffset)
+	}
+
+	// serverNow now reads from the single-owner Clock (AD-004, TASK-035).
+	// clk.ServerNow() == time.Now().Unix() + clk.offset, and clk.offset was just
+	// set to tree.ClockOffset above, so this is arithmetically identical to the
+	// former scheduler.ServerNow(tree.ClockOffset). Computed ONCE per walk and
+	// shared across Evaluate/Build/SupersededMRIDs, exactly as before.
+	serverNow := clk.ServerNow()
 	active := sched.Evaluate(tree.Programs, serverNow)
 
 	if active != nil && active.Held {
@@ -760,7 +783,12 @@ type responseTracker struct {
 	poster          responsePoster
 	lfdi            string
 	responseSetPath string
-	clockOffset     int64
+	// clk is the single-owner Clock (AD-004, TASK-035); Response CreatedDateTime
+	// values read serverNow from it. It shares the same Clock instance the
+	// discovery loop feeds via SetOffset, so postResponse sees the same
+	// accumulated offset the last walk accepted — identical arithmetic to the
+	// former scheduler.ServerNow(rt.clockOffset).
+	clk *utilitytime.Clock
 	// posted records the last Response status sent for each event mRID, so we
 	// never re-post a transition and can tell whether an event has already
 	// reached a terminal state (Completed/Cancelled/Superseded).
@@ -779,11 +807,12 @@ type responseTracker struct {
 	responsesPosted *metrics.Counter
 }
 
-func newResponseTracker(p responsePoster, lfdi, path string, responsesPosted *metrics.Counter) *responseTracker {
+func newResponseTracker(p responsePoster, lfdi, path string, clk *utilitytime.Clock, responsesPosted *metrics.Counter) *responseTracker {
 	return &responseTracker{
 		poster:          p,
 		lfdi:            lfdi,
 		responseSetPath: path,
+		clk:             clk,
 		posted:          make(map[string]uint8),
 		alerted:         make(map[string]bool),
 		responsesPosted: responsesPosted,
@@ -830,8 +859,7 @@ func terminalResponse(status uint8) bool {
 func (rt *responseTracker) update(tree *discovery.ResourceTree, active *scheduler.ActiveControl, superseded map[string]bool) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	rt.clockOffset = tree.ClockOffset
-	serverNow := scheduler.ServerNow(tree.ClockOffset)
+	serverNow := rt.clk.ServerNow()
 
 	// Pass 1 — receipt, cancellation, and supersession for every event.
 	for _, ps := range tree.Programs {
@@ -906,7 +934,7 @@ func (rt *responseTracker) set(mrid string, status uint8) {
 
 func (rt *responseTracker) postResponse(mrid string, status uint8) {
 	resp := model.Response{
-		CreatedDateTime: scheduler.ServerNow(rt.clockOffset),
+		CreatedDateTime: rt.clk.ServerNow(),
 		EndDeviceLFDI:   rt.lfdi,
 		Status:          status,
 		Subject:         mrid,

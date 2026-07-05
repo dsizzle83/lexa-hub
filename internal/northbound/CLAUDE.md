@@ -17,7 +17,7 @@ dnssd/      mDNS browse for _ieee2030._tls._tcp. TXT "path=X" overrides /dcap de
 ## Walker traversal order
 `/dcap` → Time (→ ClockOffset) → EndDeviceList (find self by LFDI) → DERList → FSAList → DERPrograms → DERControlList + DefaultDERControl → MUPList
 
-**ClockOffset**: `serverNow = time.Now().Unix() + tree.ClockOffset`. Required — CSIP §5.2.1.3 requires client within 30 s of server. Pass `serverNow` to every `scheduler.Evaluate()` call.
+**ClockOffset**: `serverNow = time.Now().Unix() + tree.ClockOffset` — the formula is unchanged but now **single-owned by `internal/utilitytime`** (AD-004, TASK-035): `cmd/northbound` feeds each walk's `tree.ClockOffset` to a `utilitytime.Clock` (`clk.SetOffset`) and reads `serverNow` back via `clk.ServerNow()`; the scheduler's expiry/window checks delegate to `utilitytime.Expired`/`InWindow`. `scheduler.ServerNow` is retained but deprecated. Required — CSIP §5.2.1.3 requires client within 30 s of server. Pass `serverNow` to every `scheduler.Evaluate()` call.
 
 ## Scheduler priority rules
 1. `currentStatus=6` (cancelled) → always skip.

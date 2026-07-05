@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/northbound/discovery"
+	"lexa-hub/internal/utilitytime"
 	model "lexa-proto/csipmodel"
 )
 
@@ -108,7 +109,12 @@ func New() *Scheduler {
 
 // ServerNow returns the estimated current server time by adding the clock
 // offset (from ResourceTree.ClockOffset) to the local wall clock.
-// Use this as the serverNow argument to Evaluate.
+//
+// Deprecated: utility time is now single-owned by internal/utilitytime
+// (AD-004, TASK-035). New code should read serverNow from a utilitytime.Clock
+// (clk.ServerNow()) or utilitytime.ServerNowAt(now, offset), which use the
+// identical arithmetic (local + raw offset). Retained only until the remaining
+// hub-side consumers migrate (TASK-036).
 func ServerNow(clockOffset int64) int64 {
 	return time.Now().Unix() + clockOffset
 }
@@ -275,8 +281,10 @@ func (s *Scheduler) failClosed(resolved *ActiveControl, programFound bool, hp *d
 
 // controlExpired reports whether ac is past its ValidUntil at serverNow.
 // A control with ValidUntil==0 (a DefaultDERControl) never expires on its own.
+// Delegates to utilitytime.Expired (AD-004, TASK-035) — identical semantics:
+// ValidUntil != 0 && serverNow >= ValidUntil (boundary inclusive of ValidUntil).
 func controlExpired(ac *ActiveControl, serverNow int64) bool {
-	return ac.ValidUntil != 0 && serverNow >= ac.ValidUntil
+	return utilitytime.Expired(ac.ValidUntil, serverNow)
 }
 
 // stillServed reports whether the program still lists an event with the given
@@ -337,8 +345,8 @@ func (s *Scheduler) activeEvent(ps *discovery.ProgramState, serverNow int64) *Ac
 		start := s.randomizedStart(ctrl)
 		end := start + s.randomizedDuration(ctrl)
 
-		// Check whether serverNow is within the event interval.
-		if serverNow < start || serverNow >= end {
+		// Check whether serverNow is within the event interval [start, end).
+		if !utilitytime.InWindow(start, end, serverNow) {
 			continue
 		}
 
@@ -446,7 +454,7 @@ func (s *Scheduler) SupersededMRIDs(programs []discovery.ProgramState, serverNow
 		}
 		start := s.randomizedStart(ctrl)
 		end := start + s.randomizedDuration(ctrl)
-		if serverNow < start || serverNow >= end {
+		if !utilitytime.InWindow(start, end, serverNow) {
 			continue
 		}
 		if s.isSuperseded(ctrl, hp.Controls.DERControl, serverNow) {

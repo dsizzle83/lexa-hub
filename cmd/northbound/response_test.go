@@ -6,6 +6,7 @@ import (
 
 	"lexa-hub/internal/northbound/discovery"
 	"lexa-hub/internal/northbound/scheduler"
+	"lexa-hub/internal/utilitytime"
 	model "lexa-proto/csipmodel"
 )
 
@@ -74,7 +75,7 @@ func eq(t *testing.T, got []uint8, want ...uint8) {
 // Received(1) → Started(2) → Completed(3) over three poll cycles.
 func TestResponse_ReceivedStartedCompleted(t *testing.T) {
 	fp := &fakePoster{}
-	rt := newResponseTracker(fp, "LFDI", "/rsps/0/r", nil)
+	rt := newResponseTracker(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil)
 
 	rt.update(treeWith(ctrl("E1", 0)), eventActive("E1"), nil) // cycle 1: received+started
 	rt.update(treeWith(ctrl("E1", 0)), eventActive("E1"), nil) // cycle 2: no change
@@ -88,7 +89,7 @@ func TestResponse_ReceivedStartedCompleted(t *testing.T) {
 // must be acknowledged with status=6 — exactly once.
 func TestResponse_CancelledAfterReceived(t *testing.T) {
 	fp := &fakePoster{}
-	rt := newResponseTracker(fp, "LFDI", "/rsps/0/r", nil)
+	rt := newResponseTracker(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil)
 
 	rt.update(treeWith(ctrl("E2", 0)), eventActive("E2"), nil) // received + started
 	rt.update(treeWith(ctrl("E2", 6)), nil, nil)               // server cancels
@@ -101,7 +102,7 @@ func TestResponse_CancelledAfterReceived(t *testing.T) {
 // An event that arrives already cancelled is dropped — no responses at all.
 func TestResponse_BornCancelledIgnored(t *testing.T) {
 	fp := &fakePoster{}
-	rt := newResponseTracker(fp, "LFDI", "/rsps/0/r", nil)
+	rt := newResponseTracker(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil)
 
 	rt.update(treeWith(ctrl("E3", 6)), nil, nil)
 	rt.update(treeWith(ctrl("E3", 6)), nil, nil)
@@ -115,7 +116,7 @@ func TestResponse_BornCancelledIgnored(t *testing.T) {
 // acknowledged with status=7 (superseded), once.
 func TestResponse_Superseded(t *testing.T) {
 	fp := &fakePoster{}
-	rt := newResponseTracker(fp, "LFDI", "/rsps/0/r", nil)
+	rt := newResponseTracker(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil)
 
 	rt.update(treeWith(ctrl("E4", 0)), eventActive("E4"), nil)           // received + started
 	rt.update(treeWith(ctrl("E4", 0)), nil, map[string]bool{"E4": true}) // now superseded
