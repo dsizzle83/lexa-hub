@@ -3,7 +3,7 @@ package bus
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 )
@@ -155,8 +155,10 @@ func RejectAndAlarm(err *VersionError) {
 	v, _ := rejectCounters.LoadOrStore(err.Topic, new(uint64))
 	n := atomic.AddUint64(v.(*uint64), 1)
 	if n == 1 || n%logEveryN == 0 {
-		log.Printf("[bus] REJECT unknown schema version topic=%s v=%d supported=%d count=%d",
-			err.Topic, err.Got, err.Supported, n)
+		// TASK-045: migrated to slog (rate-limited decode-reject alarm).
+		// "REJECT" kept intact in the message text.
+		slog.Warn("[bus] REJECT unknown schema version",
+			"topic", err.Topic, "v", err.Got, "supported", err.Supported, "count", n)
 	}
 }
 

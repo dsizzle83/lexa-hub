@@ -15,9 +15,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"os"
 	"os/signal"
@@ -36,6 +38,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/watchdog"
@@ -50,6 +53,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("lexa-ocpp: load config: %v", err)
 	}
+	logutil.Setup("lexa-ocpp", logutil.ParseLevel(cfg.LogLevel)) // TASK-045
 
 	// TASK-044: metrics registry + standard process gauges, wired before the
 	// MQTT connect below so its instrumentation hooks have counters ready.
@@ -492,8 +496,11 @@ func (h *meterForwarder) OnMeterValues(csID string, req *meter.MeterValuesReques
 	applySamplesLocked(s, req.MeterValue)
 	currentA, soc, energyWh := s.currentA, s.soc, s.energyWh
 	h.bridge.mu.Unlock()
-	log.Printf("[ocpp] MeterValues cs=%s evse=%d current=%.1fA soc=%.1f%% energy=%.0fWh",
-		csID, req.EvseID, currentA, soc, energyWh)
+	// TASK-045 per-tick demotion: bare MeterValues arrives on every sample
+	// (~10 s during an active session) — steady-state, not a transition (the
+	// invariant per CLAUDE.md is the TransactionEvent lifecycle, not this).
+	slog.Debug("[ocpp] MeterValues", "cs", csID, "evse", req.EvseID,
+		"current_a", currentA, "soc_pct", soc, "energy_wh", energyWh)
 	h.bridge.publishAll(csID)
 	return meter.NewMeterValuesResponse(), nil
 }
@@ -516,9 +523,20 @@ func (h *txForwarder) OnTransactionEvent(csID string, req *transactions.Transact
 	}
 	currentA, soc, energyWh := s.currentA, s.soc, s.energyWh
 	h.bridge.mu.Unlock()
-	log.Printf("[ocpp] TransactionEvent cs=%s type=%s tx=%s seq=%d trigger=%s state=%s current=%.1fA soc=%.1f%% energy=%.0fWh",
-		csID, req.EventType, req.TransactionInfo.TransactionID, req.SequenceNo,
-		req.TriggerReason, req.TransactionInfo.ChargingState, currentA, soc, energyWh)
+	// TASK-045: Started/Ended are real session lifecycle edges (CLAUDE.md's
+	// OCPP-1 invariant) and stay at Info; Updated repeats through the whole
+	// session (often on a periodic MeterValuePeriodic trigger) and is
+	// steady-state, so it is demoted to Debug — the per-tick audit's other
+	// OCPP demotion (bare MeterValues, above).
+	level := slog.LevelInfo
+	if req.EventType == transactions.TransactionEventUpdated {
+		level = slog.LevelDebug
+	}
+	slog.Log(context.Background(), level, "[ocpp] TransactionEvent",
+		"cs", csID, "type", req.EventType, "tx", req.TransactionInfo.TransactionID,
+		"seq", req.SequenceNo, "trigger", req.TriggerReason,
+		"state", req.TransactionInfo.ChargingState,
+		"current_a", currentA, "soc_pct", soc, "energy_wh", energyWh)
 	h.bridge.publishAll(csID)
 	return transactions.NewTransactionEventResponse(), nil
 }

@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"os"
 	"os/signal"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/northbound/identity"
@@ -48,6 +50,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("lexa-telemetry: load config: %v", err)
 	}
+	logutil.Setup("lexa-telemetry", logutil.ParseLevel(cfg.LogLevel)) // TASK-045
 
 	wolfssl.Init()
 	defer wolfssl.Cleanup()
@@ -330,7 +333,13 @@ func postMeasurements(
 	if posted == 0 {
 		return nil
 	}
-	log.Printf("lexa-telemetry: posted %s W=%.0f V=%.1f Hz=%.2f", devName, m.W, m.V, m.Hz)
+	// TASK-045 per-tick demotion: fires every mup_post_rate_s (default 300 s,
+	// but bench-tunable much faster) for every device — steady-state
+	// success, not a transition. The per-service TASK-044 counters
+	// (lexa_telemetry_mup_posts_total, lexa_telemetry_post_failures_total)
+	// already cover "is posting happening"; the POST-error path above stays
+	// at Info (it is an edge, not steady-state).
+	slog.Debug("lexa-telemetry: posted", "device", devName, "w", m.W, "v", m.V, "hz", m.Hz)
 	return nil
 }
 

@@ -29,6 +29,7 @@ package main
 import (
 	"flag"
 	"log"
+	"log/slog"
 	"math"
 	"os"
 	"os/signal"
@@ -36,6 +37,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/orchestrator"
@@ -50,6 +52,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("lexa-hub: load config: %v", err)
 	}
+
+	// TASK-045: install the slog default first, before anything else that
+	// might log — every other line in this main() after this point (and
+	// every migrated transition site in state.go/actuators.go) goes through
+	// this handler. log.Printf call sites this task does not migrate keep
+	// working unchanged (slog does not touch the "log" package's output).
+	logutil.Setup("lexa-hub", logutil.ParseLevel(cfg.LogLevel))
 
 	// TASK-044: metrics registry + standard process gauges, wired before the
 	// MQTT connect below so its instrumentation hooks have counters ready.
@@ -208,10 +217,16 @@ func main() {
 		alert.Ts = time.Now().Unix()
 		if alert.Active {
 			breachesTotalCtr.Inc() // lexa_hub_breaches_total: one per breach EDGE, not per tick
-			log.Printf("lexa-hub: COMPLIANCE BREACH %s limit=%.0fW measured=%.0fW shortfall=%.0fW (%s) mrid=%s",
-				alert.LimitType, alert.LimitW, alert.MeasuredW, alert.ShortfallW, alert.Reason, alert.MRID)
+			// TASK-045: migrated to slog (breach begin edge). "COMPLIANCE BREACH"
+			// kept as the message text — grep-verified nothing in csip-tls-test
+			// quotes this phrase today, but it stays intact defensively (matches
+			// the QA harness's own vocabulary for this fault class).
+			slog.Info("COMPLIANCE BREACH",
+				"limit_type", alert.LimitType, "limit_w", alert.LimitW,
+				"measured_w", alert.MeasuredW, "shortfall_w", alert.ShortfallW,
+				"reason", alert.Reason, "mrid", alert.MRID)
 		} else {
-			log.Printf("lexa-hub: compliance breach cleared")
+			slog.Info("compliance breach cleared")
 		}
 		if err := mqttutil.PublishJSON(mc, bus.TopicCSIPComplianceAlert, *alert); err != nil {
 			log.Printf("lexa-hub: publish compliance alert: %v", err)

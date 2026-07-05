@@ -38,6 +38,10 @@ type Config struct {
 	// literal "off" disables the listener. See cmd/hub/config.go's
 	// MetricsAddr doc for the bench-vs-product bind rationale (AD-008).
 	MetricsAddr string `json:"metrics_addr"`
+
+	// LogLevel selects the slog level ("debug"|"info"|"warn"|"error");
+	// default "info" (TASK-045). See internal/logutil.ParseLevel.
+	LogLevel string `json:"log_level"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -60,6 +64,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.MetricsAddr == "" {
 		cfg.MetricsAddr = "127.0.0.1:9104"
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
 	}
 	for i := range cfg.Stations {
 		if cfg.Stations[i].MaxCurrentA == 0 {

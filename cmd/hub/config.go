@@ -52,6 +52,10 @@ type Config struct {
 	SafetyIntervalS int  `json:"safety_interval_s"` // fast protection loop; default 1, 0 disables
 	Debug           bool `json:"debug"`
 
+	// LogLevel selects the slog level ("debug"|"info"|"warn"|"error");
+	// default "info" (TASK-045). See internal/logutil.ParseLevel.
+	LogLevel string `json:"log_level"`
+
 	Devices  []DeviceConfig  `json:"devices"`
 	Stations []StationConfig `json:"stations"`
 
@@ -89,6 +93,9 @@ func loadConfig(path string) (*Config, error) {
 		if cfg.Stations[i].MaxCurrentA == 0 {
 			cfg.Stations[i].MaxCurrentA = 32
 		}
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
 	}
 	return &cfg, nil
 }

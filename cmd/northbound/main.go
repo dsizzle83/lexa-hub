@@ -27,6 +27,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"os"
 	"os/signal"
@@ -37,6 +38,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/northbound/discovery"
@@ -135,6 +137,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("lexa-northbound: load config: %v", err)
 	}
+	logutil.Setup("lexa-northbound", logutil.ParseLevel(cfg.LogLevel)) // TASK-045
 
 	wolfssl.Init()
 	defer wolfssl.Cleanup()
@@ -341,8 +344,10 @@ func runDiscovery(
 		// last-known-good via the scheduler's fail-closed Evaluate.
 		discoveryFailures++
 		nbm.walkFailures.Inc()
-		log.Printf("lexa-northbound: discovery error (consecutive=%d): %v — holding last-published control (fail-closed)",
-			discoveryFailures, err)
+		// TASK-045: migrated to slog. "holding last-published control (fail-closed)"
+		// kept intact (WAN-outage vocabulary; grep-verified unquoted today).
+		slog.Warn("lexa-northbound: discovery error — holding last-published control (fail-closed)",
+			"consecutive", discoveryFailures, "err", err)
 		return
 	}
 	discoveryFailures = 0
@@ -352,8 +357,9 @@ func runDiscovery(
 	active := sched.Evaluate(tree.Programs, serverNow)
 
 	if active != nil && active.Held {
-		log.Printf("lexa-northbound: WARNING discovery resolved no valid control (empty/malformed resource); holding last-known-good mrid=%s until validUntil=%d (fail-closed)",
-			active.MRID, active.ValidUntil)
+		// TASK-045: migrated to slog. "holding last-known-good" kept intact.
+		slog.Warn("lexa-northbound: discovery resolved no valid control (empty/malformed resource); holding last-known-good (fail-closed)",
+			"mrid", active.MRID, "valid_until", active.ValidUntil)
 	}
 
 	msg := toActiveControl(active, tree.ClockOffset)
@@ -365,10 +371,15 @@ func runDiscovery(
 	der24h := schedule.Build(tree, serverNow)
 	publishSchedule(mc, der24h)
 
-	log.Printf("lexa-northbound: discovery OK programs=%d curves_programs=%d pricing=%d billing=%d source=%s mrid=%s clockOffset=%ds slots=%d",
-		len(tree.Programs), countProgramsWithCurves(tree.Programs),
-		len(tree.PricingProfiles), len(tree.BillingAccounts),
-		msg.Source, msg.MRID, tree.ClockOffset, len(der24h.Slots))
+	// TASK-045 per-tick demotion: a successful walk logs on EVERY discovery
+	// cycle (discovery_interval_s, 60 s STOCK / faster FAST) — steady-state,
+	// not a transition. walkDuration (lexa-northbound's TASK-044 gauge)
+	// already covers "is discovery alive", so this drops to Debug rather than
+	// Info; the fail-closed WARN/error paths above stay at Warn.
+	slog.Debug("lexa-northbound: discovery OK",
+		"programs", len(tree.Programs), "curves_programs", countProgramsWithCurves(tree.Programs),
+		"pricing", len(tree.PricingProfiles), "billing", len(tree.BillingAccounts),
+		"source", msg.Source, "mrid", msg.MRID, "clock_offset_s", tree.ClockOffset, "slots", len(der24h.Slots))
 
 	rt.update(tree, active, sched.SupersededMRIDs(tree.Programs, serverNow))
 
@@ -915,5 +926,7 @@ func (rt *responseTracker) postResponse(mrid string, status uint8) {
 	if name == "" {
 		name = fmt.Sprintf("status=%d", status)
 	}
-	log.Printf("lexa-northbound: response posted: %s mrid=%s", name, mrid)
+	// TASK-045: migrated to slog. Each call is already a lifecycle edge (this
+	// function is only reached from update()'s transition logic, never per-tick).
+	slog.Info("lexa-northbound: response posted", "status_name", name, "status", status, "mrid", mrid)
 }

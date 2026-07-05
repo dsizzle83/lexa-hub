@@ -132,6 +132,54 @@ metrics implementation a caller wires in.
 A registered-but-zero counter is normal and expected for sources not yet wired
 (e.g. `lexa_hub_tick_overruns_total`, real source lands in TASK-046).
 
+## Logging & the plan heartbeat (TASK-045)
+
+All six services install a `log/slog` default (`internal/logutil.Setup`, first
+line of `main()`): a text `key=value` handler on stderr — journald timestamps
+every line itself, so slog's own `time=` key is not a duplicate. Config key
+`log_level` per service JSON (`"debug"|"info"|"warn"|"error"`, default
+`"info"`); an empty/unrecognized value fails soft to `info`
+(`internal/logutil.ParseLevel`). Adoption is pragmatic, not a full sweep:
+only structured-value transition sites (staleness/frozen-meter/control-expiry
+edges, compliance-breach begin/clear, reconnect/reassert, decode-reject
+alarms, discovery fail-closed/response-posted) were migrated; most
+`log.Printf` call sites are unchanged (slog does not touch the standard `log`
+package's output) — see TASK-045's task file for the full migration list and
+the per-tick demotion table (lines that used to log every cycle at Info now
+log at Debug or only on a state edge: lexa-northbound's per-walk "discovery
+OK", lexa-ocpp's bare MeterValues and TransactionEvent Updated, lexa-telemetry's
+per-post line).
+
+**Plan heartbeat**: lexa-api now ACTS on the retained `lexa/hub/plan` topic
+instead of only relaying it. `cmd/api/heartbeat.go`'s `planHeartbeat` tracks
+the ARRIVAL time (not the plan's own `Ts` — a hub with a warped/stepped clock,
+e.g. under csip-tls-test's Bench Replay clock warp, must not corrupt stall
+detection) of the last PlanLog and reports one of three states, evaluated
+fresh on every `/status` request and on a 5 s ticker that also drives the
+edge-triggered alarm + metrics:
+
+- `never` — no PlanLog seen since this process started. **Never alarms**
+  (a bench bring-up race, api before hub, or a hub that has never run, must
+  not page) — this is the INCONCLUSIVE-safe state review §11 asked for.
+- `ok` — a PlanLog arrived within `plan_stall_after_s` (config key, default
+  75 — safe at both the STOCK 15 s `engine_interval_s` and the FAST bench
+  cadence; the hub also publishes on every safety tick, so real advancement
+  is normally far faster than this bound).
+- `stalled` — more than `plan_stall_after_s` since the last arrival: a wedged
+  control loop (`internal/bus/topics.go`'s `TopicHubPlan` doc).
+
+`/status` gains `"plan_heartbeat": {"state": "...", "age_s": N}` (additive
+JSON); metrics `lexa_api_plan_heartbeat_stalled` (0/1 gauge) and
+`lexa_api_plan_heartbeat_age_seconds`. `/status`'s existing fields
+(`last_plan` and its relay semantics) are unchanged — `cmd/api/plan_test.go`
+still pins that.
+
+**Crash-only (AD-011)**: this repo intentionally has no blanket `recover()` —
+a wedged or panicking service is meant to die and let systemd restart it (5 s),
+with retained MQTT topics re-seeding state. Operator-facing detail (what dies
+with a service, what comes back, what to check after a restart):
+`docs/OPERATIONS.md`.
+
 ## Directory map
 
 ```
