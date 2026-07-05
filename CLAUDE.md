@@ -16,8 +16,8 @@ replaces the duplication with a shared module (AD-003/TASK-024).
 Each concern runs as its own process and communicates only via Mosquitto MQTT:
 
 ```
-[mosquitto]          — MQTT broker (localhost:1883)
-    │
+[mosquitto]          — MQTT broker (localhost:1883); per-service creds + topic ACL,
+    │                   staged rollout — see "Broker security" below (TASK-013, AD-008)
     ├─ lexa-modbus   — polls SunSpec/Modbus devices; applies control commands
     ├─ lexa-northbound — IEEE 2030.5 discovery walker; publishes active DER control
     ├─ lexa-telemetry— subscribes to measurements; POSTs MUP readings to northbound server
@@ -57,6 +57,43 @@ boot. `Measurement`'s voltage field is `VoltageV`/`"voltage_v"`, not
 `Measurement` in `internal/bus/messages.go` for why. TASK-018 (2026-07-04)
 rolled this out everywhere; the v0-tolerance flip to reject-only is a
 separate, later change (AD-006 enforcement criteria).
+## Broker security
+
+Anonymous MQTT access is dead (TASK-013 / W7 / AD-008): the assumption that
+"localhost-only ⇒ anonymous is fine" broke the day a third-party process
+(csip-tls-test's `cmd/mqttproxy`, deployed by `scripts/mqtt-chaos.sh` for QA
+fault injection) started running on the hub Pi — any local process can
+otherwise command hardware. Each of the six lexa services plus the QA
+`qa-inject` user (mqttproxy's `/inject`) now authenticates with its own
+broker user, and `systemd/mosquitto-lexa.acl` grants each user only the
+topics `internal/bus/topics.go` says it publishes/subscribes (re-derive the
+matrix from actual `Subscribe`/`Publish` call sites before changing it — it's
+an authorization boundary, not a topic map).
+
+- **Credentials**: per-service passwords live under `/etc/lexa/mqtt/<svc>.pass`
+  (0600, `lexa:lexa`, generated on-device by `scripts/deploy-hub-pi.sh` via
+  `openssl rand -hex 16` — never committed to git or a deploy artifact). Each
+  service's config carries `mqtt_user`/`mqtt_pass_file`; empty ⇒ anonymous
+  connect (`mqttutil.Connect`/`ConnectAuth("", "", "", "")`).
+- **Broker enforcement**: `password_file`/`acl_file` in
+  `systemd/mosquitto-lexa.conf` (repo target state: `allow_anonymous false`).
+  The deployed Pi conf.d drop-in (`deploy-hub-pi.sh`'s heredoc) stages this
+  behind `--enable-mqtt-acl`: every deploy always generates credentials and
+  patches them into every service's config, but `allow_anonymous` only flips
+  to `false` — and `password_file`/`acl_file` only get installed — when that
+  flag is passed. This lets a plain deploy leave every service holding valid
+  credentials against a broker that still accepts anonymous connections,
+  so credential rollout and ACL enforcement are separate, verifiable steps
+  (journal evidence: `[mqtt] connected to ... (broker user=...)`).
+- **qa-inject**: bench-only broker user for `cmd/mqttproxy`'s `/inject`
+  endpoint (a hand-rolled MQTT CONNECT, `-user`/`-passfile` flags,
+  `sim/mqttproxy.service`'s ExecStart); provisioned by `mqtt-chaos.sh deploy`
+  into the same `/etc/mosquitto/lexa-passwd`. It's granted `lexa/#`
+  read+write in the ACL — QA legitimately needs to forge any topic — never
+  provisioned off-bench. mqttproxy's transparent PASSTHROUGH path needs no
+  credentials of its own: proxied lexa services present their own end-to-end.
+- Localhost-only listener (`listener 1883 localhost`) is unchanged — the ACL
+  is defense-in-depth behind it, not a LAN opening.
 
 ## Directory map
 

@@ -165,7 +165,11 @@ func main() {
 	}
 	log.Printf("lexa-northbound: LFDI=%s server=%s", lfdi, cfg.Server)
 
-	mc, err := mqttutil.Connect(cfg.MQTTBroker, cfg.MQTTClientID)
+	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
+	if err != nil {
+		log.Fatalf("lexa-northbound: %v", err)
+	}
+	mc, err := mqttutil.ConnectAuth(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass)
 	if err != nil {
 		log.Fatalf("lexa-northbound: %v", err)
 	}

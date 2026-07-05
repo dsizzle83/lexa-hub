@@ -21,6 +21,13 @@ type Config struct {
 	MQTTBroker   string `json:"mqtt_broker"`    // tcp://localhost:1883
 	MQTTClientID string `json:"mqtt_client_id"` // default "lexa-api"
 
+	// MQTTUser/MQTTPassFile: broker credentials (TASK-013/W7/AD-008). Empty
+	// MQTTUser ⇒ anonymous connect (default; see mqttutil.LoadPassword and
+	// cmd/hub/config.go's Config for the staged-rollout rationale shared by
+	// all six services).
+	MQTTUser     string `json:"mqtt_user"`
+	MQTTPassFile string `json:"mqtt_pass_file"`
+
 	// ListenAddr is the HTTP listen address (host:port). Default ":9100".
 	ListenAddr string `json:"listen_addr"`
 

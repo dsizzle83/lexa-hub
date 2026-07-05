@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,11 +83,29 @@ const publishTimeout = 5 * time.Second
 // paying anything close to publishTimeout's 5 s hot-path cost.
 const qos0AckTimeout = 100 * time.Millisecond
 
-// Connect creates an MQTT client connected to broker with the given clientID.
-// Auto-reconnect is enabled; the call blocks until the initial connection succeeds
-// or times out after 30 s.  Subscriptions made through Subscribe are replayed
-// automatically after every reconnect.
+// Connect creates an anonymous MQTT client connected to broker with the given
+// clientID. Auto-reconnect is enabled; the call blocks until the initial
+// connection succeeds or times out after 30 s. Subscriptions made through
+// Subscribe are replayed automatically after every reconnect.
+//
+// Connect is a thin wrapper over ConnectAuth("", ""): it keeps every existing
+// caller anonymous-by-default, which is the staged-rollout requirement for
+// TASK-013's broker credentials — a service only authenticates once its
+// config carries mqtt_user/mqtt_pass_file.
 func Connect(broker, clientID string) (mqtt.Client, error) {
+	return ConnectAuth(broker, clientID, "", "")
+}
+
+// ConnectAuth is like Connect but authenticates with user/pass when user is
+// non-empty (paho only sends the MQTT CONNECT username/password flags once a
+// username is set — SetUsername("") followed by SetPassword("x") would still
+// connect anonymously from the broker's point of view, so callers must pass
+// user == "" to mean "no credentials", not just an empty password). An empty
+// user connects anonymously, identical to Connect — the broker's
+// allow_anonymous stays the on/off switch; a service's own credentials are
+// additive and harmless while the bench broker still allows anonymous
+// clients (W7, AD-008).
+func ConnectAuth(broker, clientID, user, pass string) (mqtt.Client, error) {
 	reg := &subRegistry{}
 
 	opts := mqtt.NewClientOptions().
@@ -96,12 +116,21 @@ func Connect(broker, clientID string) (mqtt.Client, error) {
 		SetConnectRetry(true).
 		SetConnectRetryInterval(5 * time.Second).
 		SetOnConnectHandler(func(c mqtt.Client) {
-			log.Printf("[mqtt] connected to %s as %s", broker, clientID)
+			if user != "" {
+				// Deliberately logged so journal evidence can confirm which
+				// broker user a service authenticated as (TASK-013 step 6/7:
+				// "all six services + mqttproxy connected with per-user
+				// credentials") without ever logging the password.
+				log.Printf("[mqtt] connected to %s as %s (broker user=%s)", broker, clientID, user)
+			} else {
+				log.Printf("[mqtt] connected to %s as %s (anonymous)", broker, clientID)
+			}
 			reg.replay(c)
 		}).
 		SetConnectionLostHandler(func(c mqtt.Client, err error) {
 			log.Printf("[mqtt] connection lost: %v", err)
 		})
+	applyAuth(opts, user, pass)
 
 	client := mqtt.NewClient(opts)
 	registries.Store(client, reg)
@@ -113,6 +142,40 @@ func Connect(broker, clientID string) (mqtt.Client, error) {
 		return nil, fmt.Errorf("mqtt: connect %s: %w", broker, err)
 	}
 	return client, nil
+}
+
+// applyAuth sets opts.Username/Password when user is non-empty, leaving them
+// unset (anonymous) otherwise. Split out from ConnectAuth so the option
+// plumbing is unit-testable without dialing a real broker (Connect/
+// ConnectAuth block on a network round trip).
+func applyAuth(opts *mqtt.ClientOptions, user, pass string) {
+	if user != "" {
+		opts.SetUsername(user)
+		opts.SetPassword(pass)
+	}
+}
+
+// LoadPassword reads an MQTT broker password from passFile, trimming
+// surrounding whitespace (the file is written by openssl rand -hex or
+// similar, which appends a trailing newline). An empty passFile returns
+// ("", nil) — the staged-rollout default (mqtt_pass_file unset, service
+// connects anonymously via Connect/ConnectAuth("", "", "", "")). A
+// configured-but-unreadable-or-empty file is a startup-time configuration
+// error: fail loud rather than silently connect anonymously or send an
+// empty password the broker will reject (mirrors cmd/api's LoadAPIToken).
+func LoadPassword(passFile string) (string, error) {
+	if passFile == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(passFile)
+	if err != nil {
+		return "", fmt.Errorf("mqttutil: read mqtt_pass_file %s: %w", passFile, err)
+	}
+	pass := strings.TrimSpace(string(data))
+	if pass == "" {
+		return "", fmt.Errorf("mqttutil: mqtt_pass_file %s is configured but empty", passFile)
+	}
+	return pass, nil
 }
 
 // PublishJSON marshals v to JSON and publishes it to topic with QoS 1.

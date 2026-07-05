@@ -48,7 +48,11 @@ func main() {
 		log.Printf("lexa-api: bearer-token auth disabled (api_token_file unset) — /status,/logs open, staged-rollout default")
 	}
 
-	mc, err := mqttutil.Connect(cfg.MQTTBroker, cfg.MQTTClientID)
+	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
+	if err != nil {
+		log.Fatalf("lexa-api: %v", err)
+	}
+	mc, err := mqttutil.ConnectAuth(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass)
 	if err != nil {
 		log.Fatalf("lexa-api: %v", err)
 	}

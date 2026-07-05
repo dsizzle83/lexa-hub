@@ -1,6 +1,8 @@
 {
   "mqtt_broker": "tcp://localhost:1883",
   "mqtt_client_id": "lexa-ocpp",
+  "mqtt_user": "",
+  "mqtt_pass_file": "",
   "port": 8887,
   "cert_path": "",
   "key_path": "",

@@ -1,6 +1,8 @@
 {
   "mqtt_broker": "tcp://localhost:1883",
   "mqtt_client_id": "lexa-api",
+  "mqtt_user": "",
+  "mqtt_pass_file": "",
   "listen_addr": ":9100",
   "stale_after_s": 30,
   "log_buffer_size": 256,
