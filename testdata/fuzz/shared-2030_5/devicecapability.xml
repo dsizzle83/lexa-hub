@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DeviceCapability xmlns="urn:ieee:std:2030.5:ns" href="/dcap" pollRate="900">
+  <DERProgramListLink href="/derp" all="3"></DERProgramListLink>
+  <TimeLink href="/tm"></TimeLink>
+  <ResponseSetListLink href="/rsps" all="1"></ResponseSetListLink>
+  <TariffProfileListLink href="/tp" all="1"></TariffProfileListLink>
+  <EndDeviceListLink href="/edev" all="3"></EndDeviceListLink>
+  <MirrorUsagePointListLink href="/mup"></MirrorUsagePointListLink>
+  <SelfDeviceLink href="/sdev"></SelfDeviceLink>
+</DeviceCapability>

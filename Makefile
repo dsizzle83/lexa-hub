@@ -134,8 +134,22 @@ clean:
 # TASK-047 is these three runs clean; failures land a crash file under
 # internal/tlsclient/httpwire/testdata/fuzz/<FuzzName>/ that `go test`
 # (no -fuzz) reruns forever after as a regression case.
+#
+# TASK-048 extends this same target with the other two untrusted decode
+# surfaces: the 2030.5 XML unmarshal path (internal/northbound/scheduler —
+# the model package these targets used to live in, internal/northbound/model,
+# was merged into lexa-proto/csipmodel by TASK-023; the fuzz targets moved to
+# the consumer that owns the downstream plausibility gate they drive) and the
+# bus JSON decode path (internal/bus, mirroring mqttutil.Subscribe[T]'s
+# CheckVersion + json.Unmarshal sequence). Same CGo-free, any-runner
+# properties as httpwire. Crashers land under each package's own
+# testdata/fuzz/<FuzzName>/, same regression-replay behavior as above.
 FUZZTIME ?= 15m
 fuzz:
 	go test -fuzz=FuzzReadHTTPResponse      -fuzztime=$(FUZZTIME) ./internal/tlsclient/httpwire/
 	go test -fuzz=FuzzResponseContentLength -fuzztime=$(FUZZTIME) ./internal/tlsclient/httpwire/
 	go test -fuzz=FuzzIsChunkedEncoding      -fuzztime=$(FUZZTIME) ./internal/tlsclient/httpwire/
+	go test -fuzz=FuzzUnmarshalDeviceCapability -fuzztime=$(FUZZTIME) ./internal/northbound/scheduler/
+	go test -fuzz=FuzzUnmarshalTime             -fuzztime=$(FUZZTIME) ./internal/northbound/scheduler/
+	go test -fuzz=FuzzUnmarshalDERControlList   -fuzztime=$(FUZZTIME) ./internal/northbound/scheduler/
+	go test -fuzz=FuzzBusDecode                 -fuzztime=$(FUZZTIME) ./internal/bus/

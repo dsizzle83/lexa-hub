@@ -254,8 +254,18 @@ jobs:
   # subsequent `go test` (no -fuzz needed) reruns as a normal test case —
   # the artifact upload below is a convenience for grabbing that file out of
   # a run that failed before anyone noticed on their own machine.
+  #
+  # TASK-048 adds the other two untrusted decode surfaces to this same
+  # nightly job: the 2030.5 XML unmarshal path (internal/northbound/scheduler,
+  # driving the plausibleControl/plausibleLimit gate against decoded
+  # DERControlList/DeviceCapability/Time documents) and the bus JSON decode
+  # path (internal/bus, mirroring mqttutil.Subscribe[T]'s CheckVersion +
+  # json.Unmarshal). Both are pure Go (csipmodel/bus import nothing beyond
+  # encoding/xml, encoding/json, and stdlib) — no wolfSSL sysroot needed here
+  # either, same as httpwire. Crashers land under each package's own
+  # testdata/fuzz/<FuzzName>/ and are uploaded the same way.
   fuzz:
-    name: fuzz (nightly, httpwire)
+    name: fuzz (nightly, httpwire + 2030.5 XML + bus JSON)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
     steps:
@@ -272,12 +282,27 @@ jobs:
           go test -fuzz=FuzzResponseContentLength -fuzztime=15m ./internal/tlsclient/httpwire/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           go test -fuzz=FuzzIsChunkedEncoding      -fuzztime=15m ./internal/tlsclient/httpwire/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: fuzz 2030.5 XML decode (15m/target, no cgo) — TASK-048
+        run: |
+          set -o pipefail
+          go test -fuzz=FuzzUnmarshalDeviceCapability -fuzztime=15m ./internal/northbound/scheduler/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -fuzz=FuzzUnmarshalTime             -fuzztime=15m ./internal/northbound/scheduler/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -fuzz=FuzzUnmarshalDERControlList   -fuzztime=15m ./internal/northbound/scheduler/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: fuzz bus JSON decode (15m, no cgo) — TASK-048
+        run: |
+          set -o pipefail
+          go test -fuzz=FuzzBusDecode -fuzztime=15m ./internal/bus/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: upload crashers (only present on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: httpwire-fuzz-crashers
-          path: internal/tlsclient/httpwire/testdata/fuzz/*/
+          name: fuzz-crashers
+          path: |
+            internal/tlsclient/httpwire/testdata/fuzz/*/
+            internal/northbound/scheduler/testdata/fuzz/*/
+            internal/bus/testdata/fuzz/*/
           if-no-files-found: ignore
   # TASK-024: shared-module version-pin gate (AD-003(c)) -- mirror image of
   # csip-tls-test's proto-pin job. See the header comment above `on:` for the
