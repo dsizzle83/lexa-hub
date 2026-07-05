@@ -23,7 +23,7 @@ func TestStatusRelaysHubPlan(t *testing.T) {
 		},
 	})
 
-	resp := buildStatus(store.snapshot())
+	resp := buildStatus(store.snapshot(), heartbeatStatus{State: heartbeatNever})
 
 	if len(resp.LastPlan.Decisions) != 2 {
 		t.Fatalf("last_plan.decisions = %d entries, want 2", len(resp.LastPlan.Decisions))
@@ -47,7 +47,7 @@ func TestStatusHeartbeatPlanEmptyDecisions(t *testing.T) {
 	planTs := time.Now().Unix()
 	store.onPlanLog(bus.TopicHubPlan, bus.PlanLog{Ts: planTs})
 
-	resp := buildStatus(store.snapshot())
+	resp := buildStatus(store.snapshot(), heartbeatStatus{State: heartbeatNever})
 
 	if resp.LastPlan.Decisions == nil || len(resp.LastPlan.Decisions) != 0 {
 		t.Errorf("heartbeat plan must yield an empty (non-nil) decision list, got %#v", resp.LastPlan.Decisions)
@@ -61,8 +61,36 @@ func TestStatusHeartbeatPlanEmptyDecisions(t *testing.T) {
 // Before any plan arrives, /status behaves as it always did (empty list).
 func TestStatusNoPlanYet(t *testing.T) {
 	store := newStateStore(nil, time.Minute)
-	resp := buildStatus(store.snapshot())
+	resp := buildStatus(store.snapshot(), heartbeatStatus{State: heartbeatNever})
 	if len(resp.LastPlan.Decisions) != 0 {
 		t.Errorf("no plan received: decisions must be empty, got %+v", resp.LastPlan.Decisions)
+	}
+}
+
+// TestStatusPlanHeartbeatField pins /status.plan_heartbeat's JSON shape
+// (TASK-045): whatever heartbeatStatus buildStatus is given passes through
+// verbatim as {"state":..., "age_s":...} — the store/snapshot path (last_plan)
+// and the heartbeat path are independent inputs to buildStatus.
+func TestStatusPlanHeartbeatField(t *testing.T) {
+	store := newStateStore(nil, time.Minute)
+
+	cases := []struct {
+		name string
+		hb   heartbeatStatus
+	}{
+		{"never", heartbeatStatus{State: heartbeatNever}},
+		{"ok", heartbeatStatus{State: heartbeatOK, AgeS: 3.5}},
+		{"stalled", heartbeatStatus{State: heartbeatStalled, AgeS: 120}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp := buildStatus(store.snapshot(), c.hb)
+			if resp.PlanHeartbeat.State != string(c.hb.State) {
+				t.Errorf("plan_heartbeat.state = %q, want %q", resp.PlanHeartbeat.State, c.hb.State)
+			}
+			if resp.PlanHeartbeat.AgeS != c.hb.AgeS {
+				t.Errorf("plan_heartbeat.age_s = %v, want %v", resp.PlanHeartbeat.AgeS, c.hb.AgeS)
+			}
+		})
 	}
 }

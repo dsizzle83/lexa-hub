@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"math"
 	"sync"
 	"time"
@@ -216,11 +216,14 @@ func (r *MQTTSystemReader) noteStaleness(name string, snap measSnapshot, now tim
 	switch {
 	case stale && !r.stale[name]:
 		r.stale[name] = true
-		log.Printf("[hub] measurement source %q STALE — no update for %s; optimizer now running on estimated values for it",
-			name, now.Sub(snap.at).Round(time.Second))
+		// TASK-045: migrated to slog. "STALE" kept intact in the message text
+		// (grep-verified: no csip-tls-test caller quotes it today, but the
+		// phrase is this fault class's name throughout the QA docs).
+		slog.Warn("[hub] measurement source STALE — optimizer now running on estimated values for it",
+			"device", name, "since", now.Sub(snap.at).Round(time.Second).String())
 	case !stale && r.stale[name]:
 		r.stale[name] = false
-		log.Printf("[hub] measurement source %q recovered (fresh again)", name)
+		slog.Info("[hub] measurement source recovered (fresh again)", "device", name)
 	}
 }
 
@@ -350,14 +353,17 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 			if !snap.fresh(now) || frozen {
 				if frozen && !r.stale[frozenKey] {
 					r.stale[frozenKey] = true
-					log.Printf("[hub] meter %q W value frozen at %.0f W for %s while grid is moving; excluding from grid reading",
-						dc.Name, snap.W, now.Sub(snap.wChangedAt).Round(time.Second))
+					// TASK-045: migrated to slog. "frozen" kept intact (INV-STALE
+					// vocabulary; grep-verified unquoted by csip-tls-test today).
+					slog.Warn("[hub] meter W value frozen while grid is moving; excluding from grid reading",
+						"device", dc.Name, "w", snap.W, "frozen_for", now.Sub(snap.wChangedAt).Round(time.Second).String())
 				}
 				continue
 			}
 			if r.stale[frozenKey] {
 				r.stale[frozenKey] = false
-				log.Printf("[hub] meter %q W value moving again (%.0f W); restoring to grid reading", dc.Name, snap.W)
+				slog.Info("[hub] meter W value moving again; restoring to grid reading",
+					"device", dc.Name, "w", snap.W)
 			}
 			if !math.IsNaN(snap.W) {
 				if math.IsNaN(state.Grid.NetW) {
@@ -391,8 +397,11 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 		now.Unix()+r.clockOffset >= r.lastCSIP.ValidUntil {
 		r.csipExpiredTicks++
 		if r.csipExpiredTicks >= expiryConfirmTicks {
-			log.Printf("[hub] CSIP control %s (source=%s) expired at %d (server-now %d) for %d ticks; dropping",
-				r.lastCSIP.MRID, r.lastCSIP.Source, r.lastCSIP.ValidUntil, now.Unix()+r.clockOffset, r.csipExpiredTicks)
+			// TASK-045: migrated to slog (control expiry edge).
+			slog.Info("[hub] CSIP control expired; dropping",
+				"mrid", r.lastCSIP.MRID, "source", r.lastCSIP.Source,
+				"valid_until", r.lastCSIP.ValidUntil, "server_now", now.Unix()+r.clockOffset,
+				"confirm_ticks", r.csipExpiredTicks)
 			r.lastCSIP = nil
 			r.csipExpiredTicks = 0
 		}

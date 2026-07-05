@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/watchdog"
@@ -39,6 +40,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("lexa-api: load config: %v", err)
 	}
+	logutil.Setup("lexa-api", logutil.ParseLevel(cfg.LogLevel)) // TASK-045
 
 	apiToken, err := cfg.LoadAPIToken()
 	if err != nil {
@@ -64,6 +66,13 @@ func main() {
 		}
 		r.Counter("lexa_bus_decode_failures_total").Set(total)
 	})
+
+	// TASK-045: the plan heartbeat consumes the retained lexa/hub/plan
+	// topic (bus.PlanLog) — see cmd/api/heartbeat.go's doc for why arrival
+	// time, not the plan's own Ts, drives stall detection.
+	planHB := newPlanHeartbeat(cfg.PlanStallAfter())
+	planHB.stalledGauge = reg.Gauge("lexa_api_plan_heartbeat_stalled")
+	planHB.ageGauge = reg.Gauge("lexa_api_plan_heartbeat_age_seconds")
 
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
@@ -128,6 +137,9 @@ func main() {
 
 	if err := mqttutil.Subscribe(mc, bus.TopicHubPlan, func(topic string, p bus.PlanLog) {
 		store.onPlanLog(topic, p)
+		// TASK-045: arrival stamping — time.Now() here, not p.Ts. See
+		// cmd/api/heartbeat.go's planHeartbeat doc.
+		planHB.onPlanLog(p.Ts, time.Now())
 		// Emit only decision-bearing plans to /logs — the heartbeat cadence
 		// (every engine tick) would drown the stream.
 		for _, dec := range p.Decisions {
@@ -141,7 +153,7 @@ func main() {
 	// /healthz is NEVER wrapped — TASK-008's api watchdog self-probe (and any
 	// future load-balancer check) needs an unauthenticated liveness endpoint.
 	mux.HandleFunc("/healthz", healthzHandler)
-	mux.HandleFunc("/status", requireBearer(apiToken, statusHandler(store)))
+	mux.HandleFunc("/status", requireBearer(apiToken, statusHandler(store, planHB)))
 	mux.HandleFunc("/logs", requireBearer(apiToken, logsHandler(lb)))
 	// /metrics is NEVER wrapped either (TASK-044): same reasoning as
 	// /healthz — a Prometheus scraper is infra, not a dashboard consumer of
@@ -190,6 +202,12 @@ func main() {
 	kick := time.NewTicker(10 * time.Second)
 	defer kick.Stop()
 
+	// TASK-045: heartbeat evaluation cadence — independent of the watchdog
+	// kick ticker above (different purpose: this one drives the edge-triggered
+	// stall alarm + metric gauges, not liveness).
+	hbTicker := time.NewTicker(5 * time.Second)
+	defer hbTicker.Stop()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	for {
@@ -202,6 +220,8 @@ func main() {
 			if mc.IsConnected() && probeHealthz(healthzURL) {
 				watchdog.Kick()
 			}
+		case <-hbTicker.C:
+			planHB.tick(time.Now())
 		}
 	}
 }

@@ -47,6 +47,19 @@ type Config struct {
 	// only once every consumer presents the token). /healthz never checks it.
 	APITokenFile string `json:"api_token_file"`
 
+	// LogLevel selects the slog level ("debug"|"info"|"warn"|"error");
+	// default "info" (TASK-045). See internal/logutil.ParseLevel.
+	LogLevel string `json:"log_level"`
+
+	// PlanStallAfterS bounds how long since the last lexa/hub/plan (TopicHubPlan)
+	// ARRIVAL before the heartbeat is reported "stalled" (TASK-045). Default 75 s
+	// — safe at both the STOCK economic cadence (5 × 15 s engine_interval_s) and
+	// the FAST bench cadence (5 × 15 s FAST engine_interval_s worst case; the hub
+	// also publishes on every 1 s safety tick, so in practice the heartbeat
+	// advances far faster than this bound in both modes). lexa-api does not know
+	// the hub's actual interval, so this is its own config rather than derived.
+	PlanStallAfterS int `json:"plan_stall_after_s"`
+
 	Devices []DeviceConfig `json:"devices"`
 }
 
@@ -74,11 +87,22 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.LogBufferSize == 0 {
 		cfg.LogBufferSize = 256
 	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
+	if cfg.PlanStallAfterS == 0 {
+		cfg.PlanStallAfterS = 75
+	}
 	return &cfg, nil
 }
 
 func (c *Config) StaleAfter() time.Duration {
 	return time.Duration(c.StaleAfterS) * time.Second
+}
+
+// PlanStallAfter is PlanStallAfterS as a time.Duration (TASK-045).
+func (c *Config) PlanStallAfter() time.Duration {
+	return time.Duration(c.PlanStallAfterS) * time.Second
 }
 
 // LoadAPIToken reads the bearer token from APITokenFile. An unset

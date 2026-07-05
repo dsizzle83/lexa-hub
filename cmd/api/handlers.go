@@ -23,6 +23,17 @@ type statusResp struct {
 	// (a hung meter serving a cached value, or a silent charger) — surfaced so the
 	// fault is visible, not silently trusted (INV-STALE / INV-EVBLIND).
 	StaleSources []string `json:"stale_sources,omitempty"`
+	// PlanHeartbeat surfaces whether the retained lexa/hub/plan heartbeat is
+	// still advancing (TASK-045): "never" (no PlanLog seen yet — silent by
+	// design, not an alarm), "ok", or "stalled". AgeS is the seconds since
+	// the last PlanLog ARRIVAL (not the plan's own timestamp — see
+	// planHeartbeat's doc in heartbeat.go).
+	PlanHeartbeat planHeartbeatJSON `json:"plan_heartbeat"`
+}
+
+type planHeartbeatJSON struct {
+	State string  `json:"state"`
+	AgeS  float64 `json:"age_s"`
 }
 
 type deviceInfo struct {
@@ -91,8 +102,11 @@ type evseJSON struct {
 // a control as active meaningfully after the hub stopped enforcing it.
 const csipReportGraceS = 15
 
-// buildStatus reduces the aggregated snapshot into the dashboard-facing JSON.
-func buildStatus(snap snapshot) statusResp {
+// buildStatus reduces the aggregated snapshot into the dashboard-facing
+// JSON. hb is the plan heartbeat's current state (TASK-045), evaluated by
+// the caller (statusHandler) so this function stays a pure reduction, as it
+// was before this field existed.
+func buildStatus(snap snapshot, hb heartbeatStatus) statusResp {
 	resp := statusResp{
 		Timestamp:    snap.now.UTC().Format(time.RFC3339),
 		ClockOffsetS: snap.clockOffsetS,
@@ -102,6 +116,7 @@ func buildStatus(snap snapshot) statusResp {
 			Timestamp: snap.now.UTC().Format(time.RFC3339),
 			Decisions: []decisionJSON{},
 		},
+		PlanHeartbeat: planHeartbeatJSON{State: string(hb.State), AgeS: hb.AgeS},
 	}
 
 	// Relay the hub's actual plan trace (TopicHubPlan). The timestamp is the
@@ -243,8 +258,10 @@ func buildStatus(snap snapshot) statusResp {
 	return resp
 }
 
-// statusHandler serves GET /status as JSON.
-func statusHandler(store *stateStore) http.HandlerFunc {
+// statusHandler serves GET /status as JSON. hb supplies the plan heartbeat
+// field (TASK-045), evaluated fresh on every request (not cached from the
+// periodic ticker) so /status always reflects the live state.
+func statusHandler(store *stateStore, hb *planHeartbeat) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if r.Method == http.MethodOptions {
@@ -252,7 +269,7 @@ func statusHandler(store *stateStore) http.HandlerFunc {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		resp := buildStatus(store.snapshot())
+		resp := buildStatus(store.snapshot(), hb.evaluate(time.Now()))
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			log.Printf("lexa-api: /status encode: %v", err)

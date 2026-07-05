@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"os"
 	"os/signal"
@@ -30,6 +31,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/southbound/battery"
@@ -49,6 +51,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("lexa-modbus: load config: %v", err)
 	}
+	logutil.Setup("lexa-modbus", logutil.ParseLevel(cfg.LogLevel)) // TASK-045
 
 	// TASK-044: metrics registry (named mreg — "reg" below is already the
 	// southbound device registry) + standard process gauges, wired before
@@ -415,7 +418,7 @@ func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
 		}
 		r.live = dev
 		r.reconnects.Inc()
-		log.Printf("lexa-modbus: reconnected device %s", r.cfg.Name)
+		slog.Info("lexa-modbus: reconnected device", "device", r.cfg.Name) // TASK-045
 		// Reconcile-on-reconnect (Phase 4): the device may have missed every
 		// control transition while dark — including a release, which for an
 		// inverter is a WRITE (the restore ceiling), not an absence of writes.
@@ -424,11 +427,12 @@ func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
 		if ctrl, why, ok := r.reassertLocked(); ok {
 			if err := r.live.ApplyControl(ctrl); err != nil {
 				r.writeFailures.Inc()
-				log.Printf("lexa-modbus: device %s reconnect reconcile (%s) failed: %v", r.cfg.Name, why, err)
+				slog.Warn("lexa-modbus: device reconnect reconcile failed",
+					"device", r.cfg.Name, "why", why, "err", err)
 				r.dropLocked() // suspect session; retry whole sequence next poll
 				return device.Measurements{W: math.NaN(), V: math.NaN(), Hz: math.NaN()}, err
 			}
-			log.Printf("lexa-modbus: device %s reconnected — %s", r.cfg.Name, why)
+			slog.Info("lexa-modbus: device reconnected", "device", r.cfg.Name, "why", why)
 		}
 	}
 	m, err := r.live.ReadMeasurements()
@@ -512,6 +516,6 @@ func (r *retryDevice) dropLocked() {
 	if r.live != nil {
 		_ = r.live.Close() // release the fd before clearing the reference
 		r.live = nil
-		log.Printf("lexa-modbus: device %s session dropped — will reconnect on next poll", r.cfg.Name)
+		slog.Warn("lexa-modbus: device session dropped — will reconnect on next poll", "device", r.cfg.Name) // TASK-045
 	}
 }

@@ -70,27 +70,27 @@ func TestBuildStatus_ExpiredControlNotReported(t *testing.T) {
 	now := time.Now()
 	live := &bus.ActiveControl{Source: "event", MRID: "M-live", ValidUntil: now.Unix() + 300}
 	snap := snapshot{now: now, csipControl: live}
-	if got := buildStatus(snap); got.CSIPControl == nil || got.CSIPControl.MRID != "M-live" {
+	if got := buildStatus(snap, heartbeatStatus{State: heartbeatNever}); got.CSIPControl == nil || got.CSIPControl.MRID != "M-live" {
 		t.Fatalf("unexpired control must be reported, got %+v", got.CSIPControl)
 	}
 
 	stale := &bus.ActiveControl{Source: "event", MRID: "M-stale", ValidUntil: now.Unix() - csipReportGraceS - 5}
 	snap = snapshot{now: now, csipControl: stale}
-	if got := buildStatus(snap); got.CSIPControl != nil {
+	if got := buildStatus(snap, heartbeatStatus{State: heartbeatNever}); got.CSIPControl != nil {
 		t.Errorf("control %ds past ValidUntil+grace still reported: %+v", csipReportGraceS+5, got.CSIPControl)
 	}
 
 	// Within the grace window: still reported (covers the hub's own debounce).
 	graceful := &bus.ActiveControl{Source: "event", MRID: "M-grace", ValidUntil: now.Unix() - 5}
 	snap = snapshot{now: now, csipControl: graceful}
-	if got := buildStatus(snap); got.CSIPControl == nil {
+	if got := buildStatus(snap, heartbeatStatus{State: heartbeatNever}); got.CSIPControl == nil {
 		t.Error("control within the report grace must still be reported")
 	}
 
 	// ValidUntil=0 (DefaultDERControl) never expires on its own.
 	def := &bus.ActiveControl{Source: "default", MRID: "M-default"}
 	snap = snapshot{now: now, csipControl: def}
-	if got := buildStatus(snap); got.CSIPControl == nil {
+	if got := buildStatus(snap, heartbeatStatus{State: heartbeatNever}); got.CSIPControl == nil {
 		t.Error("a ValidUntil=0 default control must always be reported")
 	}
 }
