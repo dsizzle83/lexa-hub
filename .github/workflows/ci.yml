@@ -32,11 +32,10 @@
 # on every PR/push AND nightly (new CVEs land without a code change). It reuses
 # the `cgo` job's wolfSSL cache/build steps — govulncheck needs the whole
 # module to *build* (cgo packages included) or it silently scans less than you
-# think. Currently `continue-on-error: true` (non-blocking); the first baseline
-# scan found 2 reachable findings (paho.mqtt.golang GO-2025-4173, x/net
-# GO-2025-3503), both cleared by the TASK-006 dependency refresh — see
-# ../csip-tls-test/docs/refactor/VULN_BASELINE_2026-07-04.md.
-# TODO(TASK-006): once merged, drop continue-on-error and make this required.
+# think. Required (blocking) as of TASK-006: the first baseline scan's 2
+# reachable findings (paho.mqtt.golang GO-2025-4173, x/net GO-2025-3503) are
+# both cleared — see ../csip-tls-test/docs/refactor/VULN_BASELINE_2026-07-04.md
+# and its TASK-006 addendum.
 
 name: CI
 
@@ -160,13 +159,12 @@ jobs:
   # included) or it silently scans a shrunken package set. Gates only on
   # REACHABLE findings (real call path, not merely imported or transitively
   # required); everything else is informational. Runs on PR, push:main, and
-  # the nightly cron (new CVEs land with no code change). Non-blocking
-  # (continue-on-error) until TASK-006's dependency refresh clears the
-  # baseline — see ../csip-tls-test/docs/refactor/VULN_BASELINE_2026-07-04.md.
+  # the nightly cron (new CVEs land with no code change). Required (blocking)
+  # as of TASK-006's dependency refresh, which cleared the baseline — see
+  # ../csip-tls-test/docs/refactor/VULN_BASELINE_2026-07-04.md.
   vulncheck:
     name: vulncheck
     runs-on: ubuntu-latest
-    continue-on-error: true
     env:
       WOLFSSL_VER: 5.7.6-stable
       WOLFSSL_SYSROOT: /home/runner/wolfssl-amd64

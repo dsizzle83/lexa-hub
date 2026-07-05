@@ -114,14 +114,19 @@ for svc in $SERVICES; do
     mosquitto_passwd -b -c "$PASSWD_FILE" "lexa-$svc" "$pass"
   fi
 done
-# mosquitto 2.x warns (and future versions will refuse) if password_file's
-# group is not root — it reads these as root at startup before dropping
-# privileges, so root:root 0600 is both compliant and functional. Caveat:
-# a SIGHUP reload re-reads as the mosquitto user and would fail; this
-# deploy always restarts the service (fresh root read), never SIGHUPs.
-# (P0-exit gate finding 2026-07-05; was root:mosquitto 0640.)
-chown root:root "$PASSWD_FILE" "$ACL_FILE" 2>/dev/null || true
-chmod 600 "$PASSWD_FILE" "$ACL_FILE"
+# CORRECTED 2026-07-05 (TASK-006 bench validation): the 06931cc change to
+# root:root 0600 was based on a false premise. strace of a fresh
+# `systemctl restart mosquitto` on the hub Pi shows this package's
+# mosquitto (2.0.21, Debian) calls setgid(106)/setuid(103) — dropping to
+# the mosquitto:mosquitto user — BEFORE it ever opens password_file or
+# acl_file, on every start (fresh or SIGHUP reload alike), regardless of
+# whether a config `user` directive is present. root:root 0600 therefore
+# makes the file unreadable unconditionally: mosquitto.service went into
+# a restart-loop / "Unable to open pwfile" the moment this ran. Restoring
+# root:mosquitto 0640 (the pre-06931cc mode) so the dropped-privilege
+# process can always read it via group permission, on any restart path.
+chown root:mosquitto "$PASSWD_FILE" "$ACL_FILE" 2>/dev/null || true
+chmod 640 "$PASSWD_FILE" "$ACL_FILE"
 
 if [[ "$ENABLE_MQTT_ACL" == "1" ]]; then
   cat > /etc/mosquitto/conf.d/lexa.conf <<'CONF'
