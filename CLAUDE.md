@@ -232,5 +232,5 @@ survive; the guards below are deliberate, not redundant. Keep them when refactor
 
 ## Stack
 
-Go 1.21 · wolfSSL CGo (northbound + telemetry only) · eclipse/paho.mqtt.golang ·
+Go 1.26 · wolfSSL CGo (northbound + telemetry only) · eclipse/paho.mqtt.golang v1.5.1 ·
 lorenzodonini/ocpp-go · simonvetter/modbus · grandcat/zeroconf
