@@ -10,6 +10,8 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+
+	"lexa-hub/internal/bus"
 )
 
 // subscription is one topic/handler pair registered via Subscribe.
@@ -155,8 +157,25 @@ func publishJSON(client mqtt.Client, topic string, qos byte, retained bool, v an
 // handler receives the raw topic string and the JSON-decoded value of type T.
 // The subscription is recorded so that it survives broker reconnects; handler
 // may therefore be invoked again with the retained message after a reconnect.
+//
+// Before decoding, every message passes bus.CheckVersion (AD-006, TASK-018):
+// a message whose envelope version exceeds what bus.SupportedV(topic)
+// reports is dropped via bus.RejectAndAlarm without ever reaching handler —
+// same treatment as a malformed-JSON drop, just gated one step earlier. A
+// message with no "v" field (legacy v0, indistinguishable from an explicit
+// "v":0) is accepted while bus.LegacyV0Accepted is true, which it is
+// throughout this transition — rejecting absent-v here would refuse a
+// retained pre-envelope message at boot (the exact §8.3 hazard this rollout
+// exists to prevent). CheckVersion never flags malformed JSON itself (that
+// stays the real json.Unmarshal's job, immediately below, unchanged).
 func Subscribe[T any](client mqtt.Client, topic string, handler func(topic string, msg T)) error {
 	h := func(_ mqtt.Client, m mqtt.Message) {
+		if verr := bus.CheckVersion(m.Topic(), m.Payload(), bus.SupportedV(m.Topic())); verr != nil {
+			if ve, ok := verr.(*bus.VersionError); ok {
+				bus.RejectAndAlarm(ve)
+			}
+			return
+		}
 		var v T
 		if err := json.Unmarshal(m.Payload(), &v); err != nil {
 			log.Printf("[mqtt] unmarshal on %s: %v", m.Topic(), err)

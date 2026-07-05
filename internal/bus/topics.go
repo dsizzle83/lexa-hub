@@ -39,10 +39,11 @@
 // rejected message means hold last-known-good (the scheduler's existing
 // fail-closed discipline) rather than running on a zero-valued decode; a
 // later task (TASK-042) adds an active re-request instead of waiting out the
-// retained message's own expiry. This task (TASK-017) lands the type,
-// constants, CheckVersion, and RejectAndAlarm only — nothing below is wired
-// to call them yet; publishers stamping V and subscribers calling
-// CheckVersion is TASK-018's rollout.
+// retained message's own expiry. TASK-017 landed the type, constants,
+// CheckVersion, and RejectAndAlarm; TASK-018 wired every publisher below to
+// stamp V and every subscriber (mqttutil.Subscribe's version gate, plus the
+// one raw mc.Subscribe in cmd/northbound) to call CheckVersion via
+// SupportedV.
 package bus
 
 import (
@@ -77,6 +78,53 @@ func PubQoS(topic string) byte {
 		return QoS0
 	default:
 		return QoS1
+	}
+}
+
+// SupportedV returns the highest envelope schema version a subscriber on
+// topic currently supports (TASK-018), for use as CheckVersion's `supported`
+// argument. Like PubQoS, this is the single place a concrete topic string is
+// mapped to policy — here, to the per-schema version constant in
+// envelope.go — so callers (mqttutil.Subscribe's version gate, the raw
+// FR-request subscribe in cmd/northbound) never hardcode a version.
+//
+// Every family here is currently at its "born at 1" constant (TASK-017); a
+// topic this function does not recognize gets supported=1 rather than 0,
+// so an unrecognized-but-legitimate topic still accepts v0 (legacy) and v1
+// instead of rejecting everything — recognizing every topic precisely is
+// this function's job to keep current, not CheckVersion's to guess at.
+func SupportedV(topic string) int {
+	switch {
+	case strings.HasPrefix(topic, "lexa/measurements/"):
+		return MeasurementV
+	case strings.HasPrefix(topic, "lexa/battery/") && strings.HasSuffix(topic, "/metrics"):
+		return BattMetricsV
+	case topic == TopicCSIPControl:
+		return ActiveControlV
+	case topic == TopicCSIPComplianceAlert:
+		return ComplianceAlertV
+	case strings.HasPrefix(topic, "lexa/control/battery/"):
+		return BattCommandV
+	case strings.HasPrefix(topic, "lexa/control/solar/"):
+		return SolarCommandV
+	case strings.HasPrefix(topic, "lexa/evse/") && strings.HasSuffix(topic, "/state"):
+		return EVSEStateV
+	case strings.HasPrefix(topic, "lexa/evse/") && strings.HasSuffix(topic, "/command"):
+		return EVSECommandV
+	case topic == TopicCSIPPricing:
+		return PricingUpdateV
+	case topic == TopicCSIPBilling:
+		return BillingUpdateV
+	case topic == TopicCSIPFRRequest:
+		return FlowReservationRequestV
+	case topic == TopicCSIPFRStatus:
+		return FlowReservationStatusV
+	case topic == TopicNorthboundSchedule:
+		return DERScheduleV
+	case topic == TopicHubPlan:
+		return PlanLogV
+	default:
+		return 1
 	}
 }
 

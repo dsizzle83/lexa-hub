@@ -2,17 +2,35 @@ package bus
 
 // Measurement is published by the modbus service for each device poll.
 // Pointer fields are omitted when the device does not report that quantity.
+//
+// The voltage field is named VoltageV (wire key "voltage_v"), not V/"v": this
+// type is one of the ~15 top-level published types that embeds Envelope
+// (TASK-018), and Envelope's own field is also named V with wire key "v" (the
+// schema version). Go's JSON encoder resolves same-key conflicts between an
+// embedded field and the struct's own field by depth — the shallower (own)
+// field silently wins and the embedded one is dropped from the wire
+// entirely — so keeping this field as V/"v" would have made every
+// Measurement publish appear to stamp a version while actually never
+// emitting "v" at all (verified: internal/bus/envelope_test.go's collision
+// case). VoltageV/"voltage_v" also matches the naming EVSEState already
+// uses for the same physical quantity, so this aligns Measurement with the
+// existing convention rather than inventing a new one. Every caller that
+// read/wrote the old V field (cmd/modbus, cmd/hub, cmd/api, cmd/telemetry)
+// is updated in the same change; there is no other reader of the old wire
+// key "v" as voltage to migrate.
 type Measurement struct {
-	Device string   `json:"device"`
-	W      *float64 `json:"w,omitempty"`  // net power (W): + discharge/gen, - charge/load
-	V      *float64 `json:"v,omitempty"`  // voltage (V)
-	Hz     *float64 `json:"hz,omitempty"` // frequency (Hz)
-	Ts     int64    `json:"ts"`           // Unix seconds
+	Envelope
+	Device   string   `json:"device"`
+	W        *float64 `json:"w,omitempty"`         // net power (W): + discharge/gen, - charge/load
+	VoltageV *float64 `json:"voltage_v,omitempty"` // voltage (V)
+	Hz       *float64 `json:"hz,omitempty"`        // frequency (Hz)
+	Ts       int64    `json:"ts"`                  // Unix seconds
 }
 
 // BattMetrics is published by the modbus service for battery-role devices after
 // each successful SunSpec battery metrics read.
 type BattMetrics struct {
+	Envelope
 	Device        string   `json:"device"`
 	SOC           *float64 `json:"soc_pct,omitempty"`
 	SOH           *float64 `json:"soh_pct,omitempty"`
@@ -26,6 +44,7 @@ type BattMetrics struct {
 // Watt values already have the IEEE 2030.5 ActivePower multiplier applied.
 // Source is "event", "default", or "none" (no programs / no active control).
 type ActiveControl struct {
+	Envelope
 	Source      string   `json:"source"`
 	MRID        string   `json:"mrid,omitempty"`
 	Connect     *bool    `json:"connect,omitempty"`
@@ -43,6 +62,7 @@ type ActiveControl struct {
 // Active distinguishes the onset (true) from the clear (false) of a breach so
 // the northbound service posts exactly one CannotComply Response per episode.
 type ComplianceAlert struct {
+	Envelope
 	MRID       string  `json:"mrid"`        // active DERControl that cannot be met
 	LimitType  string  `json:"limit_type"`  // "import" | "export" | "generation"
 	LimitW     float64 `json:"limit_w"`     // commanded limit (W)
@@ -56,6 +76,7 @@ type ComplianceAlert struct {
 // BattCommand is published by the hub (orchestrator) to the modbus service.
 // Nil SetpointW means "leave unchanged".
 type BattCommand struct {
+	Envelope
 	Device    string   `json:"device"`
 	SetpointW *float64 `json:"setpoint_w,omitempty"` // + discharge, − charge (W)
 	Connect   *bool    `json:"connect,omitempty"`
@@ -65,6 +86,7 @@ type BattCommand struct {
 // SolarCommand is published by the hub to the modbus service.
 // Nil CurtailToW means "restore to full nameplate output".
 type SolarCommand struct {
+	Envelope
 	Device     string   `json:"device"`
 	CurtailToW *float64 `json:"curtail_to_w,omitempty"` // nil = uncurtailed
 	Ts         int64    `json:"ts"`
@@ -72,6 +94,7 @@ type SolarCommand struct {
 
 // EVSEState is published by the ocpp service whenever connector state changes.
 type EVSEState struct {
+	Envelope
 	StationID     string   `json:"station_id"`
 	ConnectorID   int      `json:"connector_id"`
 	Connected     bool     `json:"connected"`
@@ -89,6 +112,7 @@ type EVSEState struct {
 // EVSECommand is published by the hub to the ocpp service.
 // MaxCurrentA == 0 means suspend the charging session.
 type EVSECommand struct {
+	Envelope
 	StationID   string  `json:"station_id"`
 	ConnectorID int     `json:"connector_id"`
 	MaxCurrentA float64 `json:"max_current_a"`
@@ -101,6 +125,7 @@ type EVSECommand struct {
 // that finds a TariffProfile. It carries the full schedule of upcoming pricing
 // intervals so the hub can make look-ahead battery dispatch decisions.
 type PricingUpdate struct {
+	Envelope
 	TariffProfiles []TariffProfileMsg `json:"tariff_profiles"`
 	Ts             int64              `json:"ts"`
 }
@@ -148,6 +173,7 @@ type PriceBlockMsg struct {
 // BillingUpdate is published by the csip service when billing data is available.
 // It carries the current billing period summary for each customer agreement.
 type BillingUpdate struct {
+	Envelope
 	CustomerAccounts []CustomerAccountMsg `json:"customer_accounts"`
 	Ts               int64                `json:"ts"`
 }
@@ -183,6 +209,7 @@ type BillingPeriodMsg struct {
 // discharging window. The csip service will POST the request to the utility
 // server's EndDevice FlowReservationRequestList.
 type FlowReservationRequestMsg struct {
+	Envelope
 	// MRID is the client-assigned identifier for this request (hex string).
 	MRID        string `json:"mrid"`
 	Description string `json:"description,omitempty"`
@@ -205,6 +232,7 @@ type FlowReservationRequestMsg struct {
 // lexa/csip/flowreservation/status after each discovery walk that finds
 // FlowReservationResponses. The hub uses this to schedule EVSE charging windows.
 type FlowReservationStatusMsg struct {
+	Envelope
 	Reservations []ReservationMsg `json:"reservations"`
 	Ts           int64            `json:"ts"`
 }
@@ -226,6 +254,7 @@ type ReservationMsg struct {
 // after each discovery walk. It carries the resolved 24-hour DER control plan,
 // which lexa-hub uses for look-ahead battery dispatch and EVSE scheduling.
 type DERScheduleMsg struct {
+	Envelope
 	WindowStart int64              `json:"window_start"` // Unix seconds
 	WindowEnd   int64              `json:"window_end"`
 	BuildTime   int64              `json:"build_time"`
@@ -323,6 +352,7 @@ type DERStatusSummary struct {
 // Decisions may be empty — the message is still published so its timestamp
 // serves as an engine heartbeat.
 type PlanLog struct {
+	Envelope
 	Ts        int64          `json:"ts"` // Unix seconds of the plan's evaluation
 	Decisions []PlanDecision `json:"decisions,omitempty"`
 }

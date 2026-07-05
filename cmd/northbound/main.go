@@ -190,7 +190,20 @@ func main() {
 	// Subscribe to FlowReservationRequest messages from the hub.
 	// These arrive when the hub wants to schedule a charging/discharging window
 	// on the utility server.
+	//
+	// This is the one subscribe in the codebase that bypasses mqttutil.Subscribe
+	// (it needs the raw payload for handleRequest, not a JSON-decoded T), so it
+	// carries its own bus.CheckVersion/RejectAndAlarm gate (TASK-018) instead of
+	// getting it for free the way every mqttutil.Subscribe caller does. Same
+	// policy as the central gate: absent-v (legacy v0) accepted while
+	// bus.LegacyV0Accepted is true, unknown-major dropped and counted.
 	if token := mc.Subscribe(bus.TopicCSIPFRRequest, 1, func(_ mqtt.Client, msg mqtt.Message) {
+		if verr := bus.CheckVersion(msg.Topic(), msg.Payload(), bus.SupportedV(msg.Topic())); verr != nil {
+			if ve, ok := verr.(*bus.VersionError); ok {
+				bus.RejectAndAlarm(ve)
+			}
+			return
+		}
 		frManager.handleRequest(msg.Payload())
 	}); token.Wait() && token.Error() != nil {
 		log.Printf("lexa-northbound: subscribe flowreservation/request: %v", token.Error())
@@ -344,6 +357,7 @@ func countProgramsWithCurves(programs []discovery.ProgramState) int {
 // it retained so lexa-hub always has the current 24-hour DER plan.
 func publishSchedule(mc mqtt.Client, sched *schedule.DER24hSchedule) {
 	msg := bus.DERScheduleMsg{
+		Envelope:    bus.Envelope{V: bus.DERScheduleV},
 		WindowStart: sched.WindowStart,
 		WindowEnd:   sched.WindowEnd,
 		BuildTime:   sched.BuildTime,
@@ -491,7 +505,7 @@ func curveSummary(c *model.DERCurve) *bus.DERCurveSummary {
 // publishPricing converts the discovered pricing state to a PricingUpdate
 // message and publishes it retained so the hub always has the latest rates.
 func publishPricing(mc mqtt.Client, tree *discovery.ResourceTree, serverNow int64) {
-	msg := bus.PricingUpdate{Ts: time.Now().Unix()}
+	msg := bus.PricingUpdate{Envelope: bus.Envelope{V: bus.PricingUpdateV}, Ts: time.Now().Unix()}
 
 	for _, ts := range tree.PricingProfiles {
 		pm := bus.TariffProfileMsg{
@@ -541,7 +555,7 @@ func toTimeTariffMsg(tti model.TimeTariffInterval) bus.TimeTariffMsg {
 // publishBilling converts the discovered billing state to a BillingUpdate
 // message and publishes it retained.
 func publishBilling(mc mqtt.Client, tree *discovery.ResourceTree) {
-	msg := bus.BillingUpdate{Ts: time.Now().Unix()}
+	msg := bus.BillingUpdate{Envelope: bus.Envelope{V: bus.BillingUpdateV}, Ts: time.Now().Unix()}
 
 	for _, cas := range tree.BillingAccounts {
 		cam := bus.CustomerAccountMsg{
@@ -576,7 +590,7 @@ func publishBilling(mc mqtt.Client, tree *discovery.ResourceTree) {
 // publishFlowReservations converts discovered FlowReservationResponses to a
 // FlowReservationStatusMsg and publishes it retained.
 func publishFlowReservations(mc mqtt.Client, tree *discovery.ResourceTree) {
-	msg := bus.FlowReservationStatusMsg{Ts: time.Now().Unix()}
+	msg := bus.FlowReservationStatusMsg{Envelope: bus.Envelope{V: bus.FlowReservationStatusV}, Ts: time.Now().Unix()}
 
 	if tree.FlowReservations != nil {
 		for _, frr := range tree.FlowReservations.FlowReservationResponse {
@@ -625,6 +639,7 @@ func derefF64(p *float64) float64 {
 // toActiveControl converts a scheduler.ActiveControl to the MQTT bus message.
 func toActiveControl(ac *scheduler.ActiveControl, clockOffset int64) bus.ActiveControl {
 	msg := bus.ActiveControl{
+		Envelope:    bus.Envelope{V: bus.ActiveControlV},
 		Source:      "none",
 		ClockOffset: clockOffset,
 		Ts:          time.Now().Unix(),

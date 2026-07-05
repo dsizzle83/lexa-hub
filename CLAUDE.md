@@ -45,6 +45,19 @@ call site — publishers pass `bus.PubQoS(topic)` to
 `mqttutil.PublishJSONQoS`. Previously every publish hardcoded QoS 1
 regardless of this table (review D5); closed 2026-07-04.
 
+Every bus message carries `"v"` (schema version): each top-level published
+type embeds `bus.Envelope` and every publish site stamps its per-schema
+constant (`internal/bus/envelope.go`); every subscriber version-checks before
+decode (`mqttutil.Subscribe`'s gate, plus the one raw `mc.Subscribe` in
+cmd/northbound for the FR-request topic). Absent `"v"` is legacy v0, accepted
+during the transition (`bus.LegacyV0Accepted = true`, AD-006) — this is
+deliberate: rejecting it would refuse a retained pre-envelope message at
+boot. `Measurement`'s voltage field is `VoltageV`/`"voltage_v"`, not
+`V`/`"v"` — that key is the schema version now; see the doc comment on
+`Measurement` in `internal/bus/messages.go` for why. TASK-018 (2026-07-04)
+rolled this out everywhere; the v0-tolerance flip to reject-only is a
+separate, later change (AD-006 enforcement criteria).
+
 ## Directory map
 
 ```

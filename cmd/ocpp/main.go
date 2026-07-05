@@ -233,6 +233,7 @@ func (b *mqttBridge) publishAll(stationID string) {
 	var msgs []bus.EVSEState
 	if len(s.connectors) == 0 {
 		msg := bus.EVSEState{
+			Envelope:    bus.Envelope{V: bus.EVSEStateV},
 			StationID:   s.id,
 			ConnectorID: 0,
 			Connected:   s.connected,
@@ -254,6 +255,7 @@ func (b *mqttBridge) publishAll(stationID string) {
 				powerW = s.currentA * s.voltageV
 			}
 			msg := bus.EVSEState{
+				Envelope:      bus.Envelope{V: bus.EVSEStateV},
 				StationID:     s.id,
 				ConnectorID:   c.connectorID,
 				Connected:     s.connected,

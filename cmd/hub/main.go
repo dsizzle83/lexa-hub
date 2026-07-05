@@ -133,7 +133,7 @@ func main() {
 		// decision introspection depends on it). Published on EVERY pass —
 		// decisions or not — so the timestamp doubles as an engine heartbeat.
 		// Retained: lexa-api restarting mid-episode still sees the latest plan.
-		pl := bus.PlanLog{Ts: plan.Timestamp.Unix()}
+		pl := bus.PlanLog{Envelope: bus.Envelope{V: bus.PlanLogV}, Ts: plan.Timestamp.Unix()}
 		for _, dec := range plan.Decisions {
 			pl.Decisions = append(pl.Decisions, bus.PlanDecision{
 				Rule: dec.Rule, Reason: dec.Reason, Impact: dec.Impact,
@@ -264,12 +264,13 @@ func breachAlert(prevMRID string, plan orchestrator.Plan) (*bus.ComplianceAlert,
 	case plan.Breach != nil && plan.Breach.MRID != prevMRID:
 		b := plan.Breach
 		return &bus.ComplianceAlert{
-			MRID: b.MRID, LimitType: b.LimitType, LimitW: b.LimitW,
+			Envelope: bus.Envelope{V: bus.ComplianceAlertV},
+			MRID:     b.MRID, LimitType: b.LimitType, LimitW: b.LimitW,
 			MeasuredW: b.MeasuredW, ShortfallW: b.ShortfallW, Reason: b.Reason,
 			Active: true,
 		}, b.MRID
 	case plan.Breach == nil && prevMRID != "":
-		return &bus.ComplianceAlert{Active: false}, ""
+		return &bus.ComplianceAlert{Envelope: bus.Envelope{V: bus.ComplianceAlertV}, Active: false}, ""
 	default:
 		return nil, prevMRID
 	}

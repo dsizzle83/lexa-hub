@@ -155,7 +155,7 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 		// one poll regardless of the hub. No-ops for non-battery devices.
 		interlock.check(upd.Name, m)
 
-		msg := bus.Measurement{Device: upd.Name, Ts: now}
+		msg := bus.Measurement{Envelope: bus.Envelope{V: bus.MeasurementV}, Device: upd.Name, Ts: now}
 		if !math.IsNaN(m.W) {
 			// Sanity-check decoded power against the nameplate before publishing.
 			// A corrupted SunSpec scale factor (audit GS-1/MTR-1: solar-bad-scale)
@@ -170,7 +170,7 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 			}
 		}
 		if !math.IsNaN(m.V) {
-			msg.V = &m.V
+			msg.VoltageV = &m.V
 		}
 		if !math.IsNaN(m.Hz) {
 			msg.Hz = &m.Hz
@@ -186,7 +186,7 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 		// Batteries also publish on the metrics topic, which feeds both the
 		// API's SoC display and the optimizer's storage model.
 		if deviceRole[upd.Name] == "battery" && !math.IsNaN(m.SOC) {
-			bm := bus.BattMetrics{Device: upd.Name, SOC: &m.SOC, Ts: now}
+			bm := bus.BattMetrics{Envelope: bus.Envelope{V: bus.BattMetricsV}, Device: upd.Name, SOC: &m.SOC, Ts: now}
 			bmTopic := bus.BattMetricsTopic(upd.Name)
 			if err := mqttutil.PublishJSONQoS(mc, bmTopic, bus.PubQoS(bmTopic), bm); err != nil {
 				log.Printf("lexa-modbus: publish battery metrics %s: %v", upd.Name, err)
