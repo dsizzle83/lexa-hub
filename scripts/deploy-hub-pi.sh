@@ -2,8 +2,9 @@
 # Deploys the full lexa-hub service set to a Raspberry Pi (interim hub while
 # the ConnectCore dev kit is unavailable).
 #
-# Usage:   bash scripts/deploy-hub-pi.sh <pi-ip> [ssh-user]
+# Usage:   bash scripts/deploy-hub-pi.sh <pi-ip> [ssh-user] [--enable-api-auth]
 # Example: bash scripts/deploy-hub-pi.sh 69.0.0.14 pi
+#          bash scripts/deploy-hub-pi.sh 69.0.0.1 dmitri --enable-api-auth
 #
 # Prereqs (already done if you're following the bench bring-up):
 #   - make build-arm64 (bin/arm64/lexa-* present, incl. northbound/telemetry)
@@ -14,12 +15,25 @@
 #   - installs distro mosquitto + the lexa localhost listener conf
 #   - creates the lexa system user, /etc/lexa{,/certs}
 #   - installs binaries to /usr/local/sbin, configs, systemd units
+#   - generates /etc/lexa/api.token (idempotent) for lexa-api's bearer-token
+#     auth (TASK-014 / AD-008); the token is only wired into api.json's
+#     api_token_file when --enable-api-auth is passed — staged rollout, so a
+#     plain deploy never flips auth on before the dashboard/metersim have the
+#     token distributed to them (see docs/BENCH.md)
 #   - enables + starts: mosquitto → lexa-modbus, lexa-ocpp, lexa-api,
 #     lexa-northbound, lexa-telemetry → lexa-hub
 set -euo pipefail
 
-PI="${1:?usage: deploy-hub-pi.sh <pi-ip> [ssh-user]}"
-SSHUSER="${2:-pi}"
+PI="${1:?usage: deploy-hub-pi.sh <pi-ip> [ssh-user] [--enable-api-auth]}"
+shift
+SSHUSER="pi"
+ENABLE_API_AUTH=0
+for arg in "$@"; do
+  case "$arg" in
+    --enable-api-auth) ENABLE_API_AUTH=1 ;;
+    *) SSHUSER="$arg" ;;
+  esac
+done
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 CSIP="$(cd "$HERE/../csip-tls-test" && pwd)"
 STAGE="$CSIP/certs/client-staging"
@@ -41,9 +55,10 @@ scp -q "$STAGE/client-cert.pem" "$SSHUSER@$PI:/tmp/lexa-deploy/certs/client.pem"
 scp -q "$STAGE/client-key.pem"  "$SSHUSER@$PI:/tmp/lexa-deploy/certs/client-key.pem"
 
 echo "── Installing on the Pi (sudo)"
-ssh "$SSHUSER@$PI" 'sudo bash -s' <<'REMOTE'
+ssh "$SSHUSER@$PI" "sudo bash -s -- $ENABLE_API_AUTH" <<'REMOTE'
 set -euo pipefail
 D=/tmp/lexa-deploy
+ENABLE_API_AUTH="${1:-0}"
 
 # MQTT broker: distro package + lexa localhost listener. The repo's
 # mosquitto-lexa.conf is written for the dev kit's standalone broker; the
@@ -77,6 +92,35 @@ install -m 644 $D/configs/*.json /etc/lexa/
 install -m 640 -o lexa -g lexa $D/certs/ca.pem $D/certs/client.pem /etc/lexa/certs/
 install -m 600 -o lexa -g lexa $D/certs/client-key.pem /etc/lexa/certs/
 
+# lexa-api bearer-token auth (TASK-014 / AD-008). The config install above
+# just overwrote /etc/lexa/api.json from the repo's example (api_token_file
+# ""), so any enabling of auth has to happen AFTER install, patched in like
+# hub-replay-tune.sh patches timing — never re-declared wholesale.
+TOKEN_FILE=/etc/lexa/api.token
+if [[ ! -s "$TOKEN_FILE" ]]; then
+  ( umask 077 && openssl rand -hex 32 > "$TOKEN_FILE" )
+  chown lexa:lexa "$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE"
+  echo "  generated $TOKEN_FILE (0600 lexa:lexa)"
+else
+  echo "  $TOKEN_FILE already present — left untouched"
+fi
+if [[ "$ENABLE_API_AUTH" == "1" ]]; then
+  python3 - <<PY
+import json
+path = "/etc/lexa/api.json"
+with open(path) as f:
+    cfg = json.load(f)
+cfg["api_token_file"] = "$TOKEN_FILE"
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PY
+  echo "  api_token_file set → /etc/lexa/api.json; lexa-api will require the bearer token once restarted"
+else
+  echo "  api_token_file left unset — auth still OFF; re-run with --enable-api-auth once the dashboard and metersim carry $TOKEN_FILE's contents"
+fi
+
 # Units: the repo ships its own mosquitto.service for the dev kit; on a Pi we
 # use the distro's, so install only the lexa-* units.
 install -m 644 $D/systemd/lexa-*.service /etc/systemd/system/
@@ -96,5 +140,13 @@ REMOTE
 
 echo
 echo "── Done. Verify from the desktop:"
-echo "   curl http://$PI:9100/status | python3 -m json.tool | head"
-echo "   Then restart the dashboard with -hub http://$PI:9100"
+if [[ "$ENABLE_API_AUTH" == "1" ]]; then
+  echo "   curl -s http://$PI:9100/status                                        # → 401 (auth on)"
+  echo "   curl -s -H \"Authorization: Bearer \$(ssh $SSHUSER@$PI sudo cat /etc/lexa/api.token)\" http://$PI:9100/status | python3 -m json.tool | head"
+  echo "   curl -s http://$PI:9100/healthz                                        # → 200 (never authenticated)"
+  echo "   Then restart the dashboard/metersim with -hub-token-file pointing at a copy of that token (see docs/BENCH.md)."
+else
+  echo "   curl http://$PI:9100/status | python3 -m json.tool | head              # auth still off"
+  echo "   Then restart the dashboard with -hub http://$PI:9100"
+  echo "   When the dashboard/metersim carry the token (scripts/update-sim-pis.sh, bench-up.sh), re-run with --enable-api-auth."
+fi

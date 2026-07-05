@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -30,6 +31,14 @@ type Config struct {
 	// LogBufferSize is the number of recent log lines retained in memory and
 	// replayed to new SSE subscribers. Default 256.
 	LogBufferSize int `json:"log_buffer_size"`
+
+	// APITokenFile, if non-empty, is the path to a file holding the bearer
+	// token that /status and /logs require in an `Authorization: Bearer
+	// <token>` header. Empty (the default, and the repo's example config) ⇒
+	// auth disabled — today's behavior, preserved for the staged rollout
+	// (TASK-014 / AD-008: token support is additive; the bench flips this on
+	// only once every consumer presents the token). /healthz never checks it.
+	APITokenFile string `json:"api_token_file"`
 
 	Devices []DeviceConfig `json:"devices"`
 }
@@ -63,4 +72,24 @@ func loadConfig(path string) (*Config, error) {
 
 func (c *Config) StaleAfter() time.Duration {
 	return time.Duration(c.StaleAfterS) * time.Second
+}
+
+// LoadAPIToken reads the bearer token from APITokenFile. An unset
+// APITokenFile returns ("", nil) — auth disabled, the legacy-open default.
+// A configured-but-unreadable-or-empty file is a startup-time configuration
+// error (fail loud rather than silently run open or silently reject every
+// request with an unusable token).
+func (c *Config) LoadAPIToken() (string, error) {
+	if c.APITokenFile == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(c.APITokenFile)
+	if err != nil {
+		return "", fmt.Errorf("read api_token_file %s: %w", c.APITokenFile, err)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", fmt.Errorf("api_token_file %s is configured but empty", c.APITokenFile)
+	}
+	return token, nil
 }

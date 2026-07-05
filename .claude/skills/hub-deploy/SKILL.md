@@ -19,6 +19,12 @@ bash scripts/deploy-hub-pi.sh 69.0.0.1 dmitri
 The script installs mosquitto + binaries + configs + units and starts everything in
 dependency order. Client certs are staged from `../csip-tls-test/certs/client-staging/`.
 
+**lexa-api bearer-token auth (TASK-014, AD-008):** every plain run above generates
+`/etc/lexa/api.token` (idempotent) but leaves auth off. Only pass
+`--enable-api-auth` once the dashboard/metersim in csip-tls-test already carry that
+token (`scripts/update-sim-pis.sh`, `scripts/bench-up.sh` relay it) — full staged
+rollout in `csip-tls-test/docs/BENCH.md`.
+
 **Lockstep warning**: if this deploy includes a SunSpec register-map change
 (`internal/southbound/sunspec`), the sims in csip-tls-test must be redeployed in the same
 session (audit MTR-4) — otherwise hub and metersim read garbage from each other.
@@ -28,6 +34,9 @@ session (audit MTR-4) — otherwise hub and metersim read garbage from each othe
 ```bash
 ssh dmitri@69.0.0.1 'sudo systemctl is-active mosquitto lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-api lexa-hub'
 curl -s http://69.0.0.1:9100/status        # lexa-api: link state, device readings, EV state
+                                            # (401 if --enable-api-auth is on — add
+                                            # -H "Authorization: Bearer $(ssh dmitri@69.0.0.1 sudo cat /etc/lexa/api.token)")
+curl -s http://69.0.0.1:9100/healthz       # always unauthenticated
 ssh dmitri@69.0.0.1 'sudo journalctl -u lexa-hub -n 20 --no-pager'   # optimizer ticking?
 ```
 A healthy bench also shows the meter balance closing on the dashboard (69.0.0.20:8080).

@@ -36,6 +36,16 @@ func main() {
 		log.Fatalf("lexa-api: load config: %v", err)
 	}
 
+	apiToken, err := cfg.LoadAPIToken()
+	if err != nil {
+		log.Fatalf("lexa-api: %v", err)
+	}
+	if apiToken != "" {
+		log.Printf("lexa-api: bearer-token auth ENABLED on /status,/logs (api_token_file=%s)", cfg.APITokenFile)
+	} else {
+		log.Printf("lexa-api: bearer-token auth disabled (api_token_file unset) — /status,/logs open, staged-rollout default")
+	}
+
 	mc, err := mqttutil.Connect(cfg.MQTTBroker, cfg.MQTTClientID)
 	if err != nil {
 		log.Fatalf("lexa-api: %v", err)
@@ -102,9 +112,11 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	// /healthz is NEVER wrapped — TASK-008's api watchdog self-probe (and any
+	// future load-balancer check) needs an unauthenticated liveness endpoint.
 	mux.HandleFunc("/healthz", healthzHandler)
-	mux.HandleFunc("/status", statusHandler(store))
-	mux.HandleFunc("/logs", logsHandler(lb))
+	mux.HandleFunc("/status", requireBearer(apiToken, statusHandler(store)))
+	mux.HandleFunc("/logs", requireBearer(apiToken, logsHandler(lb)))
 
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: mux}
 	go func() {
