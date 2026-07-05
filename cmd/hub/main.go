@@ -100,8 +100,10 @@ func main() {
 	}
 	defer mc.Disconnect(500)
 
-	// Build the MQTT-backed system reader.
-	reader := newMQTTSystemReader(cfg.Devices)
+	// Build the MQTT-backed system reader. The engine interval sizes the CSIP
+	// expiry debounce (AD-004/TASK-036: utilitytime.DebouncedExpiry) so it means
+	// the same wall-clock seconds at any cadence — see confirmTicksFor in state.go.
+	reader := newMQTTSystemReader(cfg.Devices, cfg.EngineInterval())
 	// lexa_hub_control_adoption_age_seconds (TASK-044): computed at scrape
 	// time from the reader's tracked last-change timestamp (see
 	// MQTTSystemReader.ControlAdoptionAge's doc in state.go).
