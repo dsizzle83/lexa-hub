@@ -9,3 +9,10 @@ bin/
 /telemetry
 /api
 review.txt
+
+# go.work: TASK-024 (AD-003(d)/(e)) retires the committed go.work in favor of
+# proto.pin + vendor/lexa-proto/. Developers may still keep an untracked
+# local go.work (`go work init . ../lexa-proto`) for cross-repo dev against a
+# live lexa-proto checkout — it must never be committed again.
+go.work
+go.work.sum
