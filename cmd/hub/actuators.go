@@ -74,9 +74,10 @@ func (a *MQTTBatteryActuator) ApplyBatteryCommand(cmd orchestrator.BatteryComman
 	}
 
 	msg := bus.BattCommand{
-		Device:  a.device,
-		Connect: cmd.Connect,
-		Ts:      now.Unix(),
+		Envelope: bus.Envelope{V: bus.BattCommandV},
+		Device:   a.device,
+		Connect:  cmd.Connect,
+		Ts:       now.Unix(),
 	}
 	if !math.IsNaN(cmd.SetpointW) {
 		msg.SetpointW = &cmd.SetpointW
@@ -103,8 +104,9 @@ func (a *MQTTSolarActuator) ApplySolarCommand(cmd orchestrator.SolarCommand) err
 	}
 
 	msg := bus.SolarCommand{
-		Device: a.device,
-		Ts:     now.Unix(),
+		Envelope: bus.Envelope{V: bus.SolarCommandV},
+		Device:   a.device,
+		Ts:       now.Unix(),
 	}
 	if !math.IsNaN(cmd.CurtailToW) {
 		msg.CurtailToW = &cmd.CurtailToW
@@ -131,6 +133,7 @@ func (a *MQTTEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECommand) error 
 	}
 
 	msg := bus.EVSECommand{
+		Envelope:    bus.Envelope{V: bus.EVSECommandV},
 		StationID:   cmd.StationID,
 		ConnectorID: cmd.ConnectorID,
 		MaxCurrentA: cmd.MaxCurrentA,

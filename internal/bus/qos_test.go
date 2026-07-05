@@ -52,6 +52,43 @@ func TestPubQoS(t *testing.T) {
 	}
 }
 
+// TestSupportedV covers every topic constant/builder against the per-schema
+// version constants (TASK-018), the same way TestPubQoS covers PubQoS —
+// SupportedV is the single place a concrete topic maps to "which schema
+// version(s) does a subscriber here currently accept," so a wrong mapping
+// would make CheckVersion reject or accept the wrong things for that topic.
+func TestSupportedV(t *testing.T) {
+	cases := []struct {
+		name  string
+		topic string
+		want  int
+	}{
+		{"measurement", MeasurementTopic("inverter-0"), MeasurementV},
+		{"batt metrics", BattMetricsTopic("bat0"), BattMetricsV},
+		{"evse state", EVSEStateTopic("ev0"), EVSEStateV},
+		{"evse command", EVSECommandTopic("ev0"), EVSECommandV},
+		{"ctrl battery", CtrlBatteryTopic("bat0"), BattCommandV},
+		{"ctrl solar", CtrlSolarTopic("solar0"), SolarCommandV},
+		{"csip control", TopicCSIPControl, ActiveControlV},
+		{"csip compliance alert", TopicCSIPComplianceAlert, ComplianceAlertV},
+		{"csip pricing", TopicCSIPPricing, PricingUpdateV},
+		{"csip billing", TopicCSIPBilling, BillingUpdateV},
+		{"csip FR request", TopicCSIPFRRequest, FlowReservationRequestV},
+		{"csip FR status", TopicCSIPFRStatus, FlowReservationStatusV},
+		{"northbound schedule", TopicNorthboundSchedule, DERScheduleV},
+		{"hub plan", TopicHubPlan, PlanLogV},
+		{"unrecognized topic", "lexa/something/unknown", 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SupportedV(tc.topic); got != tc.want {
+				t.Errorf("SupportedV(%q) = %d, want %d", tc.topic, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestPubQoSDeviceNameCollisionSafe guards against a device/station name
 // that happens to end the topic in "/metrics" or "/state" being misclassified
 // as the measurement plane. PubQoS requires both the fixed prefix AND the

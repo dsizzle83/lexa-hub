@@ -5,6 +5,8 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+
+	"lexa-hub/internal/bus"
 )
 
 // neverToken is a mqtt.Token that never completes: Wait/WaitTimeout always
@@ -35,6 +37,10 @@ func (t *neverToken) Error() error          { return nil }
 // behavior fails loudly instead of silently no-opping.
 type fakeClient struct {
 	publishes []fakePublish
+	// subscribed captures the topic/handler pair from the most recent
+	// Subscribe call so a test can drive it directly with a fakeMessage,
+	// without a real broker round trip.
+	subscribed map[string]mqtt.MessageHandler
 }
 
 type fakePublish struct {
@@ -60,8 +66,25 @@ func (f *fakeClient) Publish(topic string, qos byte, retained bool, payload inte
 	return newNeverToken()
 }
 func (f *fakeClient) Subscribe(topic string, qos byte, callback mqtt.MessageHandler) mqtt.Token {
-	panic("not implemented")
+	if f.subscribed == nil {
+		f.subscribed = make(map[string]mqtt.MessageHandler)
+	}
+	f.subscribed[topic] = callback
+	return newDoneToken()
 }
+
+// doneToken is a mqtt.Token that has already completed successfully — the
+// SUBSCRIBE-ack equivalent of the real broker's immediate response. Used by
+// fakeClient.Subscribe so Subscribe[T]'s WaitTimeout(10*time.Second) call
+// returns instantly in tests instead of actually waiting.
+type doneToken struct{}
+
+func newDoneToken() *doneToken                        { return &doneToken{} }
+func (t *doneToken) Wait() bool                       { return true }
+func (t *doneToken) WaitTimeout(d time.Duration) bool { return true }
+func (t *doneToken) Done() <-chan struct{}            { c := make(chan struct{}); close(c); return c }
+func (t *doneToken) Error() error                     { return nil }
+
 func (f *fakeClient) SubscribeMultiple(filters map[string]byte, callback mqtt.MessageHandler) mqtt.Token {
 	panic("not implemented")
 }
@@ -72,6 +95,21 @@ func (f *fakeClient) AddRoute(topic string, callback mqtt.MessageHandler) {
 func (f *fakeClient) OptionsReader() mqtt.ClientOptionsReader {
 	panic("not implemented")
 }
+
+// fakeMessage is a minimal mqtt.Message double carrying just what
+// CheckVersion and json.Unmarshal need: topic and payload.
+type fakeMessage struct {
+	topic   string
+	payload []byte
+}
+
+func (m *fakeMessage) Duplicate() bool   { return false }
+func (m *fakeMessage) Qos() byte         { return 1 }
+func (m *fakeMessage) Retained() bool    { return false }
+func (m *fakeMessage) Topic() string     { return m.topic }
+func (m *fakeMessage) MessageID() uint16 { return 0 }
+func (m *fakeMessage) Payload() []byte   { return m.payload }
+func (m *fakeMessage) Ack()              {}
 
 // TestPublishJSONQoS0DoesNotBlockOnUnackedPublish verifies the core D5 fix:
 // a QoS 0 publish against a client whose token never completes (standing in
@@ -132,4 +170,106 @@ func TestPublishJSONQoS1StillWaitsFullTimeout(t *testing.T) {
 		t.Fatalf("QoS 1 publish returned after %s — want it to wait the full publishTimeout (%s)",
 			elapsed, publishTimeout)
 	}
+}
+
+// deliver invokes the handler Subscribe registered for topic on fc, as if
+// the broker had just delivered payload on that topic — without any real
+// broker round trip. It fails the test if Subscribe was never called for
+// topic, which would otherwise make a bad test pass by never running the
+// handler at all.
+func deliver(t *testing.T, fc *fakeClient, topic string, payload []byte) {
+	t.Helper()
+	h, ok := fc.subscribed[topic]
+	if !ok {
+		t.Fatalf("no handler registered for topic %q (Subscribe was not called with it)", topic)
+	}
+	h(fc, &fakeMessage{topic: topic, payload: payload})
+}
+
+// TestSubscribeVersionGate exercises mqttutil.Subscribe's decode-time
+// version gate (TASK-018): CheckVersion runs before json.Unmarshal, so an
+// unknown-major payload never reaches handler at all, while an absent-v
+// (legacy) or in-range payload does.
+func TestSubscribeVersionGate(t *testing.T) {
+	const topic = "lexa/csip/control" // ActiveControlV == 1
+
+	t.Run("absent v (legacy) reaches handler", func(t *testing.T) {
+		fc := &fakeClient{}
+		var got string
+		if err := Subscribe(fc, topic, func(_ string, msg struct {
+			Source string `json:"source"`
+		}) {
+			got = msg.Source
+		}); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		deliver(t, fc, topic, []byte(`{"source":"event"}`))
+		if got != "event" {
+			t.Errorf("handler.Source = %q, want %q (legacy v0 payload must reach the handler)", got, "event")
+		}
+	})
+
+	t.Run("v within supported reaches handler", func(t *testing.T) {
+		fc := &fakeClient{}
+		var got string
+		if err := Subscribe(fc, topic, func(_ string, msg struct {
+			Source string `json:"source"`
+		}) {
+			got = msg.Source
+		}); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		deliver(t, fc, topic, []byte(`{"v":1,"source":"default"}`))
+		if got != "default" {
+			t.Errorf("handler.Source = %q, want %q (v1 payload must reach the handler)", got, "default")
+		}
+	})
+
+	t.Run("v exceeding supported is dropped and counted, not delivered", func(t *testing.T) {
+		fc := &fakeClient{}
+		called := false
+		if err := Subscribe(fc, topic, func(_ string, msg struct {
+			Source string `json:"source"`
+		}) {
+			called = true
+		}); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		before := bus.VersionRejects()[topic]
+		deliver(t, fc, topic, []byte(`{"v":99,"source":"should-not-arrive"}`))
+		after := bus.VersionRejects()[topic]
+
+		if called {
+			t.Error("handler was called for a v=99 payload; the version gate must drop it before decode")
+		}
+		if after != before+1 {
+			t.Errorf("VersionRejects()[%q] = %d, want %d (exactly one new rejection recorded)", topic, after, before+1)
+		}
+	})
+
+	t.Run("malformed JSON still falls through to the existing log-and-drop, not the version gate", func(t *testing.T) {
+		fc := &fakeClient{}
+		called := false
+		if err := Subscribe(fc, topic, func(_ string, msg struct {
+			Source string `json:"source"`
+		}) {
+			called = true
+		}); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+
+		before := bus.VersionRejects()[topic]
+		deliver(t, fc, topic, []byte(`not json at all`))
+		after := bus.VersionRejects()[topic]
+
+		if called {
+			t.Error("handler was called for malformed JSON")
+		}
+		if after != before {
+			t.Errorf("VersionRejects()[%q] changed (%d -> %d) for malformed JSON; "+
+				"CheckVersion must defer to the real unmarshal's error, not count it as a version rejection",
+				topic, before, after)
+		}
+	})
 }

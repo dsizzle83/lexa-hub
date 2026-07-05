@@ -89,8 +89,8 @@ func (s *stateStore) onMeasurement(_ string, m bus.Measurement) {
 		}
 		d.W = &v
 	}
-	if m.V != nil {
-		v := *m.V
+	if m.VoltageV != nil {
+		v := *m.VoltageV
 		d.V = &v
 	}
 	if m.Hz != nil {

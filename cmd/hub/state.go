@@ -137,8 +137,8 @@ func (r *MQTTSystemReader) onMeasurement(_ string, msg bus.Measurement) {
 		}
 		snap.W = newW
 	}
-	if msg.V != nil {
-		snap.V = *msg.V
+	if msg.VoltageV != nil {
+		snap.V = *msg.VoltageV
 	}
 	if msg.Hz != nil {
 		snap.Hz = *msg.Hz

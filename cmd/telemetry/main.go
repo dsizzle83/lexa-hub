@@ -120,8 +120,8 @@ func main() {
 		if msg.W != nil {
 			m.W = *msg.W
 		}
-		if msg.V != nil {
-			m.V = *msg.V
+		if msg.VoltageV != nil {
+			m.V = *msg.VoltageV
 		}
 		if msg.Hz != nil {
 			m.Hz = *msg.Hz
