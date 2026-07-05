@@ -3,6 +3,7 @@
   "mqtt_client_id": "lexa-telemetry",
   "mqtt_user": "",
   "mqtt_pass_file": "",
+  "metrics_addr": "",
   "server": "69.0.0.20:11111",
   "ca_cert": "/etc/lexa/certs/ca.pem",
   "client_cert": "/etc/lexa/certs/client.pem",

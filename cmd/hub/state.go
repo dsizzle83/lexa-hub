@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
-	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/orchestrator"
+	model "lexa-proto/csipmodel"
 )
 
 // Staleness windows: a snapshot older than this is treated as if the device
@@ -65,6 +65,17 @@ type MQTTSystemReader struct {
 	// Last resolved CSIP active control from lexa-csip
 	lastCSIP    *bus.ActiveControl
 	clockOffset int64
+
+	// lastCSIPMRID/lastCSIPChangedAt back lexa_hub_control_adoption_age_seconds
+	// (TASK-044): the topic is retained and lexa-northbound republishes it on
+	// every discovery cycle even when nothing changed (60 s default), so
+	// "time since the last message" would just track the discovery interval,
+	// not what the metric is actually for — how long the CURRENTLY-ADOPTED
+	// control has been in force. Updated only in onCSIPControl when the
+	// resolved control's identity actually changes (MRID differs, or the
+	// source flips to/from "none"/"default" with no MRID).
+	lastCSIPMRID      string
+	lastCSIPChangedAt time.Time
 	// csipExpiredTicks counts consecutive ticks lastCSIP has been past its
 	// validity window, so a transient (non-monotonic) clock excursion does not
 	// drop a still-valid control. Reset whenever it is back inside the window.
@@ -158,7 +169,26 @@ func (r *MQTTSystemReader) onCSIPControl(_ string, msg bus.ActiveControl) {
 	r.mu.Lock()
 	r.lastCSIP = &msg
 	r.clockOffset = msg.ClockOffset
+	if msg.MRID != r.lastCSIPMRID {
+		r.lastCSIPMRID = msg.MRID
+		r.lastCSIPChangedAt = time.Now()
+	}
 	r.mu.Unlock()
+}
+
+// ControlAdoptionAge returns how long the currently-adopted CSIP control has
+// been in force, as of now (lexa_hub_control_adoption_age_seconds, TASK-044).
+// Returns 0 before any control has ever been resolved (never — Source
+// "none" still carries a stable empty MRID, so the very first message
+// already sets lastCSIPChangedAt); the zero-value case only matters before
+// lexa-northbound has published anything at all, which is startup.
+func (r *MQTTSystemReader) ControlAdoptionAge(now time.Time) time.Duration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.lastCSIPChangedAt.IsZero() {
+		return 0
+	}
+	return now.Sub(r.lastCSIPChangedAt)
 }
 
 func (r *MQTTSystemReader) onEVSEState(_ string, msg bus.EVSEState) {

@@ -24,13 +24,14 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/northbound/identity"
-	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/southbound/device"
 	"lexa-hub/internal/tlsclient"
 	"lexa-hub/internal/watchdog"
 	"lexa-hub/internal/wolfssl"
+	model "lexa-proto/csipmodel"
 )
 
 type mupEntry struct {
@@ -72,15 +73,37 @@ func main() {
 	}
 	log.Printf("lexa-telemetry: LFDI=%s server=%s", lfdi, cfg.Server)
 
+	// TASK-044: metrics registry + standard process gauges, wired before the
+	// MQTT connect below so its instrumentation hooks have counters ready.
+	reg := metrics.New()
+	metrics.StandardGauges(reg)
+	mqttFailCtr := reg.Counter("lexa_mqtt_publish_failures_total")
+	mqttReconnCtr := reg.Counter("lexa_mqtt_reconnects_total")
+	reg.Collect(func(r *metrics.Registry) {
+		var total uint64
+		for _, n := range bus.VersionRejects() {
+			total += n
+		}
+		r.Counter("lexa_bus_decode_failures_total").Set(total)
+	})
+	mupPostsTotalCtr := reg.Counter("lexa_telemetry_mup_posts_total")
+	postFailuresTotalCtr := reg.Counter("lexa_telemetry_post_failures_total")
+	connectedGauge := reg.Gauge("lexa_telemetry_connected")
+
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
 		log.Fatalf("lexa-telemetry: %v", err)
 	}
-	mc, err := mqttutil.ConnectAuth(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass)
+	mc, err := mqttutil.ConnectAuthInstrumented(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass, mqttutil.Instrumentation{
+		OnPublishFail: mqttFailCtr.Inc,
+		OnReconnect:   mqttReconnCtr.Inc,
+	})
 	if err != nil {
 		log.Fatalf("lexa-telemetry: %v", err)
 	}
 	defer mc.Disconnect(500)
+
+	metrics.Serve(cfg.MetricsAddr, reg)
 
 	// Register MUPs for each configured device.
 	var mups []mupEntry
@@ -182,7 +205,16 @@ func main() {
 				ep := &mups[i]
 				m := snap[ep.device]
 				err := postMeasurements(fetcher, ep.device, ep.path, m, offset, cfg.MUPPostRateS)
+				// TASK-044: lexa_telemetry_connected is this service's
+				// "connection state" gauge — telemetry has no persistent
+				// session like OCPP's WS connections, so the closest
+				// equivalent is whether the last POST round to the utility
+				// server succeeded. Set per-device-loop-iteration; the last
+				// device posted each tick wins, matching this task's
+				// no-per-device-labels metric inventory.
 				if err != nil {
+					postFailuresTotalCtr.Inc()
+					connectedGauge.Set(0)
 					ep.fails++
 					if ep.fails >= 3 {
 						log.Printf("lexa-telemetry: re-registering MUP for %s after %d failures", ep.device, ep.fails)
@@ -193,6 +225,8 @@ func main() {
 						}
 					}
 				} else {
+					mupPostsTotalCtr.Inc()
+					connectedGauge.Set(1)
 					ep.fails = 0
 				}
 			}

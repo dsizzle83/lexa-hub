@@ -30,14 +30,15 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
-	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/southbound/battery"
 	"lexa-hub/internal/southbound/device"
 	"lexa-hub/internal/southbound/inverter"
 	"lexa-hub/internal/southbound/meter"
 	"lexa-hub/internal/southbound/registry"
 	"lexa-hub/internal/watchdog"
+	model "lexa-proto/csipmodel"
 )
 
 func main() {
@@ -49,11 +50,33 @@ func main() {
 		log.Fatalf("lexa-modbus: load config: %v", err)
 	}
 
+	// TASK-044: metrics registry (named mreg — "reg" below is already the
+	// southbound device registry) + standard process gauges, wired before
+	// the MQTT connect below so its instrumentation hooks have counters ready.
+	mreg := metrics.New()
+	metrics.StandardGauges(mreg)
+	mqttFailCtr := mreg.Counter("lexa_mqtt_publish_failures_total")
+	mqttReconnCtr := mreg.Counter("lexa_mqtt_reconnects_total")
+	mreg.Collect(func(r *metrics.Registry) {
+		var total uint64
+		for _, n := range bus.VersionRejects() {
+			total += n
+		}
+		r.Counter("lexa_bus_decode_failures_total").Set(total)
+	})
+	pollDurationGauge := mreg.Gauge("lexa_mb_poll_duration_seconds")
+	deviceReconnectsCtr := mreg.Counter("lexa_mb_device_reconnects_total")
+	writeFailuresCtr := mreg.Counter("lexa_mb_write_failures_total")
+	interlockTripsCtr := mreg.Counter("lexa_mb_interlock_trips_total")
+
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
 		log.Fatalf("lexa-modbus: %v", err)
 	}
-	mc, err := mqttutil.ConnectAuth(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass)
+	mc, err := mqttutil.ConnectAuthInstrumented(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass, mqttutil.Instrumentation{
+		OnPublishFail: mqttFailCtr.Inc,
+		OnReconnect:   mqttReconnCtr.Inc,
+	})
 	if err != nil {
 		log.Fatalf("lexa-modbus: %v", err)
 	}
@@ -66,6 +89,7 @@ func main() {
 	// a pack discharging below its reserve while commanded to charge, within one poll
 	// and independent of the hub/broker.
 	interlock := newBatterySafetyInterlock(reg, cfg)
+	interlock.trips = interlockTripsCtr
 
 	// Open each device; log failures but continue so other devices still poll.
 	for _, dc := range cfg.Devices {
@@ -77,7 +101,7 @@ func main() {
 		// Wrap EVERY device so a mid-session drop reconnects, not just ones that
 		// failed the initial open. A device that opened cleanly and later lost its
 		// session would otherwise error forever.
-		rd := &retryDevice{cfg: dc}
+		rd := &retryDevice{cfg: dc, pollDuration: pollDurationGauge, reconnects: deviceReconnectsCtr, writeFailures: writeFailuresCtr}
 		if err != nil {
 			log.Printf("lexa-modbus: device %s (%s): %v — will reconnect on next poll", dc.Name, dc.URL, err)
 		} else {
@@ -98,6 +122,8 @@ func main() {
 	defer reg.Stop()
 
 	go publishMeasurements(mc, cfg, updates, interlock)
+
+	metrics.Serve(cfg.MetricsAddr, mreg)
 
 	// sd_notify READY (TASK-008): the poll loop (reg.Start) and its MQTT
 	// fan-out goroutine (publishMeasurements) are both running — the kick
@@ -349,6 +375,20 @@ type retryDevice struct {
 	// 2026-07-02: release-while-rebooting — a cap released while the inverter
 	// was rebooting left it clamped at the stale ceiling indefinitely).
 	lastCtrl *model.DERControlBase
+
+	// TASK-044 metrics (all nil-safe; every registry_test.go/control_test.go
+	// construction of retryDevice omits them and still works — see
+	// metrics.Counter/Gauge's nil-receiver doc):
+	//   pollDuration  — lexa_mb_poll_duration_seconds, last ReadMeasurements
+	//                   call's wall time across ALL devices (no per-device
+	//                   labels, per this task's metric inventory).
+	//   reconnects    — lexa_mb_device_reconnects_total, one per completed
+	//                   reopen (not the initial open at startup).
+	//   writeFailures — lexa_mb_write_failures_total, one per failed
+	//                   ApplyControl (including the reconnect-reconcile write).
+	pollDuration  *metrics.Gauge
+	reconnects    *metrics.Counter
+	writeFailures *metrics.Counter
 }
 
 // reopen establishes a fresh device connection.
@@ -360,6 +400,12 @@ func (r *retryDevice) reopen() (device.Device, error) {
 }
 
 func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
+	// lexa_mb_poll_duration_seconds (TASK-044): wall time of this call,
+	// including a reconnect + reconcile when one happens — that IS the poll
+	// cost on a poll where the device was dark, not something to exclude.
+	pollStart := time.Now()
+	defer func() { r.pollDuration.Set(time.Since(pollStart).Seconds()) }()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.live == nil {
@@ -368,6 +414,7 @@ func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
 			return device.Measurements{W: math.NaN(), V: math.NaN(), Hz: math.NaN()}, err
 		}
 		r.live = dev
+		r.reconnects.Inc()
 		log.Printf("lexa-modbus: reconnected device %s", r.cfg.Name)
 		// Reconcile-on-reconnect (Phase 4): the device may have missed every
 		// control transition while dark — including a release, which for an
@@ -376,6 +423,7 @@ func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
 		// the first measurement is trusted.
 		if ctrl, why, ok := r.reassertLocked(); ok {
 			if err := r.live.ApplyControl(ctrl); err != nil {
+				r.writeFailures.Inc()
 				log.Printf("lexa-modbus: device %s reconnect reconcile (%s) failed: %v", r.cfg.Name, why, err)
 				r.dropLocked() // suspect session; retry whole sequence next poll
 				return device.Measurements{W: math.NaN(), V: math.NaN(), Hz: math.NaN()}, err
@@ -428,6 +476,7 @@ func (r *retryDevice) ApplyControl(ctrl model.DERControlBase) error {
 	}
 	err := r.live.ApplyControl(ctrl)
 	if err != nil {
+		r.writeFailures.Inc()
 		r.dropLocked()
 	}
 	return err

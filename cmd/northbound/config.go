@@ -26,6 +26,12 @@ type Config struct {
 
 	DiscoveryIntervalS int    `json:"discovery_interval_s"` // default 60
 	ResponseSetPath    string `json:"response_set_path"`    // default "/rsps/0/r"
+
+	// MetricsAddr is the Prometheus /metrics listen address (TASK-044).
+	// Empty ⇒ default "127.0.0.1:9102" (product default: loopback-only); the
+	// literal "off" disables the listener. See cmd/hub/config.go's
+	// MetricsAddr doc for the bench-vs-product bind rationale (AD-008).
+	MetricsAddr string `json:"metrics_addr"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -48,6 +54,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.ResponseSetPath == "" {
 		cfg.ResponseSetPath = "/rsps/0/r"
+	}
+	if cfg.MetricsAddr == "" {
+		cfg.MetricsAddr = "127.0.0.1:9102"
 	}
 	return &cfg, nil
 }

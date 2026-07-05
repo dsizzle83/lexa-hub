@@ -6,8 +6,9 @@ import (
 	"sync"
 
 	"lexa-hub/internal/bus"
-	model "lexa-proto/csipmodel"
+	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/southbound/device"
+	model "lexa-proto/csipmodel"
 )
 
 // controlApplier is the subset of *registry.Registry the interlock needs, so it
@@ -51,6 +52,11 @@ type batterySafetyInterlock struct {
 	reservePct map[string]float64 // device → SOC reserve %
 	chargeCmd  map[string]bool    // device → hub's last command was a charge (not a disconnect)
 	tripped    map[string]bool    // device → currently force-disconnected by the interlock
+
+	// trips counts every protective force-disconnect (lexa_mb_interlock_trips_total,
+	// TASK-044); nil-safe, so tests constructing this struct via
+	// newBatterySafetyInterlock without setting it afterward still work.
+	trips *metrics.Counter
 }
 
 // newBatterySafetyInterlock builds an interlock covering every battery-role
@@ -129,6 +135,7 @@ func (il *batterySafetyInterlock) check(dev string, m device.Measurements) bool 
 	il.mu.Lock()
 	il.tripped[dev] = true
 	il.mu.Unlock()
+	il.trips.Inc() // lexa_mb_interlock_trips_total (TASK-044)
 	log.Printf("lexa-modbus: INTERLOCK TRIP %s — commanded to charge but discharging %.0fW at SOC %.1f%% ≤ reserve+%.0f%% — force-disconnected locally (Tier-0 edge protection)",
 		dev, m.W, m.SOC, interlockReserveMarginPct)
 	return true

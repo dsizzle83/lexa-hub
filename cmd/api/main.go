@@ -8,6 +8,7 @@
 //	GET  /status     — JSON system snapshot (devices, power, EVSE, CSIP control)
 //	GET  /logs       — text/event-stream of MQTT events seen by the API
 //	GET  /healthz    — liveness probe
+//	GET  /metrics    — Prometheus text exposition (TASK-044)
 //
 // Usage:
 //
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/watchdog"
 )
@@ -48,11 +50,29 @@ func main() {
 		log.Printf("lexa-api: bearer-token auth disabled (api_token_file unset) — /status,/logs open, staged-rollout default")
 	}
 
+	// TASK-044: metrics registry + standard process gauges (lexa_up,
+	// goroutines, fds, RSS), wired before the MQTT connect below so the
+	// connect's instrumentation hooks have counters to increment into.
+	reg := metrics.New()
+	metrics.StandardGauges(reg)
+	mqttFailCtr := reg.Counter("lexa_mqtt_publish_failures_total")
+	mqttReconnCtr := reg.Counter("lexa_mqtt_reconnects_total")
+	reg.Collect(func(r *metrics.Registry) {
+		var total uint64
+		for _, n := range bus.VersionRejects() {
+			total += n
+		}
+		r.Counter("lexa_bus_decode_failures_total").Set(total)
+	})
+
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
 		log.Fatalf("lexa-api: %v", err)
 	}
-	mc, err := mqttutil.ConnectAuth(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass)
+	mc, err := mqttutil.ConnectAuthInstrumented(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass, mqttutil.Instrumentation{
+		OnPublishFail: mqttFailCtr.Inc,
+		OnReconnect:   mqttReconnCtr.Inc,
+	})
 	if err != nil {
 		log.Fatalf("lexa-api: %v", err)
 	}
@@ -123,6 +143,13 @@ func main() {
 	mux.HandleFunc("/healthz", healthzHandler)
 	mux.HandleFunc("/status", requireBearer(apiToken, statusHandler(store)))
 	mux.HandleFunc("/logs", requireBearer(apiToken, logsHandler(lb)))
+	// /metrics is NEVER wrapped either (TASK-044): same reasoning as
+	// /healthz — a Prometheus scraper is infra, not a dashboard consumer of
+	// this API's data, and AD-008's bearer-token rollout is scoped to
+	// /status and /logs (see LoadAPIToken's doc and the startup log line
+	// above). This mirrors lexa-api's :9100/metrics being an "existing
+	// listener, new route" per the task: no new auth surface, no new port.
+	mux.Handle("/metrics", reg.Handler())
 
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: mux}
 	go func() {

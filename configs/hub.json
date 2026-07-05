@@ -3,6 +3,7 @@
   "mqtt_client_id": "lexa-hub",
   "mqtt_user": "",
   "mqtt_pass_file": "",
+  "metrics_addr": "",
   "engine_interval_s": 15,
   "debug": false,
   "devices": [

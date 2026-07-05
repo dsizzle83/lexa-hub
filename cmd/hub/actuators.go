@@ -8,6 +8,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/orchestrator"
 )
@@ -60,6 +61,10 @@ type MQTTBatteryActuator struct {
 	mc     mqtt.Client
 	device string
 	dedupe cmdDeduper
+	// dispatches counts successful publishes (lexa_hub_dispatches_total,
+	// TASK-044) — nil-safe (see metrics.Counter's doc) so tests that build
+	// this struct without wiring a registry need no change.
+	dispatches *metrics.Counter
 }
 
 func (a *MQTTBatteryActuator) ApplyBatteryCommand(cmd orchestrator.BatteryCommand) error {
@@ -86,6 +91,7 @@ func (a *MQTTBatteryActuator) ApplyBatteryCommand(cmd orchestrator.BatteryComman
 		a.dedupe = cmdDeduper{} // not delivered; retry next tick
 		return fmt.Errorf("battery actuator %s: %w", a.device, err)
 	}
+	a.dispatches.Inc()
 	return nil
 }
 
@@ -94,6 +100,8 @@ type MQTTSolarActuator struct {
 	mc     mqtt.Client
 	device string
 	dedupe cmdDeduper
+	// dispatches counts successful publishes (lexa_hub_dispatches_total, TASK-044).
+	dispatches *metrics.Counter
 }
 
 func (a *MQTTSolarActuator) ApplySolarCommand(cmd orchestrator.SolarCommand) error {
@@ -115,6 +123,7 @@ func (a *MQTTSolarActuator) ApplySolarCommand(cmd orchestrator.SolarCommand) err
 		a.dedupe = cmdDeduper{}
 		return fmt.Errorf("solar actuator %s: %w", a.device, err)
 	}
+	a.dispatches.Inc()
 	return nil
 }
 
@@ -123,6 +132,8 @@ type MQTTEVSEActuator struct {
 	mc        mqtt.Client
 	stationID string
 	dedupe    cmdDeduper
+	// dispatches counts successful publishes (lexa_hub_dispatches_total, TASK-044).
+	dispatches *metrics.Counter
 }
 
 func (a *MQTTEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECommand) error {
@@ -143,5 +154,6 @@ func (a *MQTTEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECommand) error 
 		a.dedupe = cmdDeduper{}
 		return fmt.Errorf("evse actuator %s: %w", a.stationID, err)
 	}
+	a.dispatches.Inc()
 	return nil
 }

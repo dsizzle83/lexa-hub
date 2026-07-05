@@ -36,6 +36,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/watchdog"
 	"lexa-proto/ocppserver"
@@ -50,11 +51,29 @@ func main() {
 		log.Fatalf("lexa-ocpp: load config: %v", err)
 	}
 
+	// TASK-044: metrics registry + standard process gauges, wired before the
+	// MQTT connect below so its instrumentation hooks have counters ready.
+	reg := metrics.New()
+	metrics.StandardGauges(reg)
+	mqttFailCtr := reg.Counter("lexa_mqtt_publish_failures_total")
+	mqttReconnCtr := reg.Counter("lexa_mqtt_reconnects_total")
+	reg.Collect(func(r *metrics.Registry) {
+		var total uint64
+		for _, n := range bus.VersionRejects() {
+			total += n
+		}
+		r.Counter("lexa_bus_decode_failures_total").Set(total)
+	})
+	transactionsTotalCtr := reg.Counter("lexa_ocpp_transactions_total")
+
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
 		log.Fatalf("lexa-ocpp: %v", err)
 	}
-	mc, err := mqttutil.ConnectAuth(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass)
+	mc, err := mqttutil.ConnectAuthInstrumented(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass, mqttutil.Instrumentation{
+		OnPublishFail: mqttFailCtr.Inc,
+		OnReconnect:   mqttReconnCtr.Inc,
+	})
 	if err != nil {
 		log.Fatalf("lexa-ocpp: %v", err)
 	}
@@ -69,6 +88,15 @@ func main() {
 	})
 
 	bridge := newMQTTBridge(mc, srv.CSMS())
+	bridge.transactionsTotal = transactionsTotalCtr
+
+	// lexa_ocpp_connected_stations (TASK-044): the connection-state gauge for
+	// this service — computed at scrape time from the bridge's own station
+	// map rather than incremented/decremented at each connect/disconnect
+	// handler, so it can never drift from the bridge's actual state.
+	reg.Collect(func(r *metrics.Registry) {
+		r.Gauge("lexa_ocpp_connected_stations").Set(float64(bridge.connectedStationCount()))
+	})
 
 	// Pre-register known station limits.
 	for _, sc := range cfg.Stations {
@@ -83,6 +111,8 @@ func main() {
 	}); err != nil {
 		log.Printf("lexa-ocpp: subscribe evse command: %v", err)
 	}
+
+	metrics.Serve(cfg.MetricsAddr, reg)
 
 	go srv.Start()
 	defer srv.Stop()
@@ -163,6 +193,27 @@ type mqttBridge struct {
 	mc       mqtt.Client
 	csms     ocpp2.CSMS
 	stations map[string]*stationState
+
+	// transactionsTotal counts OCPP transaction Started events
+	// (lexa_ocpp_transactions_total, TASK-044); nil-safe (metrics.Counter's
+	// Inc is a no-op on a nil receiver).
+	transactionsTotal *metrics.Counter
+}
+
+// connectedStationCount returns how many known stations currently have an
+// open OCPP connection (lexa_ocpp_connected_stations, TASK-044). Computed
+// fresh from b.stations rather than tracked incrementally, so it can never
+// drift from the connect/disconnect handlers' own state.
+func (b *mqttBridge) connectedStationCount() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	n := 0
+	for _, s := range b.stations {
+		if s.connected {
+			n++
+		}
+	}
+	return n
 }
 
 func newMQTTBridge(mc mqtt.Client, csms ocpp2.CSMS) *mqttBridge {
@@ -454,6 +505,9 @@ type txForwarder struct{ bridge *mqttBridge }
 // transition). Ended events zero the current so site power drops immediately
 // instead of holding the last sample.
 func (h *txForwarder) OnTransactionEvent(csID string, req *transactions.TransactionEventRequest) (*transactions.TransactionEventResponse, error) {
+	if req.EventType == transactions.TransactionEventStarted {
+		h.bridge.transactionsTotal.Inc() // lexa_ocpp_transactions_total (TASK-044)
+	}
 	h.bridge.mu.Lock()
 	s := h.bridge.getOrCreateLocked(csID)
 	applySamplesLocked(s, req.MeterValue)

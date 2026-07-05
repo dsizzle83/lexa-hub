@@ -38,6 +38,16 @@ type Config struct {
 	MQTTUser     string `json:"mqtt_user"`
 	MQTTPassFile string `json:"mqtt_pass_file"`
 
+	// MetricsAddr is the Prometheus /metrics listen address (TASK-044).
+	// Empty ⇒ default "127.0.0.1:9101" (product default: loopback-only, no
+	// new externally-reachable surface); the literal "off" disables the
+	// listener entirely. The bench scrape config (csip-tls-test
+	// scripts/prometheus-bench.yml) needs the LAN IP, so the bench's
+	// deployed configs/hub.json overrides this to "0.0.0.0:9101" — a
+	// bench-only property (AD-008's framing: bench binds LAN, product
+	// default stays localhost), never the product default.
+	MetricsAddr string `json:"metrics_addr"`
+
 	EngineIntervalS int  `json:"engine_interval_s"` // default 15
 	SafetyIntervalS int  `json:"safety_interval_s"` // fast protection loop; default 1, 0 disables
 	Debug           bool `json:"debug"`
@@ -63,6 +73,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.MQTTClientID == "" {
 		cfg.MQTTClientID = "lexa-hub"
+	}
+	if cfg.MetricsAddr == "" {
+		cfg.MetricsAddr = "127.0.0.1:9101"
 	}
 	if cfg.EngineIntervalS <= 0 {
 		cfg.EngineIntervalS = 15

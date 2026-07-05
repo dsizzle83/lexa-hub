@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/orchestrator"
 	"lexa-hub/internal/watchdog"
@@ -50,11 +51,37 @@ func main() {
 		log.Fatalf("lexa-hub: load config: %v", err)
 	}
 
+	// TASK-044: metrics registry + standard process gauges, wired before the
+	// MQTT connect below so its instrumentation hooks have counters ready.
+	reg := metrics.New()
+	metrics.StandardGauges(reg)
+	mqttFailCtr := reg.Counter("lexa_mqtt_publish_failures_total")
+	mqttReconnCtr := reg.Counter("lexa_mqtt_reconnects_total")
+	reg.Collect(func(r *metrics.Registry) {
+		var total uint64
+		for _, n := range bus.VersionRejects() {
+			total += n
+		}
+		r.Counter("lexa_bus_decode_failures_total").Set(total)
+	})
+	// lexa_hub_tick_overruns_total: registered now with its real source
+	// landing in TASK-046 (no tick-budget accounting exists yet in cmd/hub
+	// or internal/orchestrator) — a registered-but-zero counter is fine per
+	// this task's own prerequisites note.
+	reg.Counter("lexa_hub_tick_overruns_total")
+	tickDurationGauge := reg.Gauge("lexa_hub_tick_duration_seconds")
+	breachActiveGauge := reg.Gauge("lexa_hub_breach_active")
+	breachesTotalCtr := reg.Counter("lexa_hub_breaches_total")
+	dispatchesTotalCtr := reg.Counter("lexa_hub_dispatches_total")
+
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
 		log.Fatalf("lexa-hub: %v", err)
 	}
-	mc, err := mqttutil.ConnectAuth(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass)
+	mc, err := mqttutil.ConnectAuthInstrumented(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass, mqttutil.Instrumentation{
+		OnPublishFail: mqttFailCtr.Inc,
+		OnReconnect:   mqttReconnCtr.Inc,
+	})
 	if err != nil {
 		log.Fatalf("lexa-hub: %v", err)
 	}
@@ -62,6 +89,12 @@ func main() {
 
 	// Build the MQTT-backed system reader.
 	reader := newMQTTSystemReader(cfg.Devices)
+	// lexa_hub_control_adoption_age_seconds (TASK-044): computed at scrape
+	// time from the reader's tracked last-change timestamp (see
+	// MQTTSystemReader.ControlAdoptionAge's doc in state.go).
+	reg.Collect(func(r *metrics.Registry) {
+		r.Gauge("lexa_hub_control_adoption_age_seconds").Set(reader.ControlAdoptionAge(time.Now()).Seconds())
+	})
 
 	// Build the optimizer and engine (before the subscriptions, which need to
 	// poke the engine on urgent controls).
@@ -117,6 +150,17 @@ func main() {
 		// would defeat this entirely by staying alive after the loop dies.
 		watchdog.Kick()
 
+		// lexa_hub_tick_duration_seconds (TASK-044): this closure's own wall
+		// time, NOT the full tick — ReadSystemState/Optimize/executePlan run
+		// inside internal/orchestrator before PlanObserver is invoked, and
+		// that package stays I/O-free / unmodified (05 §1), so their timing
+		// isn't observable from here. This still captures a real synchronous
+		// cost of every tick (the retained TopicHubPlan publish below, plus
+		// the compliance-alert publish on a breach edge) as a proxy pending
+		// TASK-046's full-tick timing.
+		tickStart := time.Now()
+		defer func() { tickDurationGauge.Set(time.Since(tickStart).Seconds()) }()
+
 		// A compliance breach means the measured effect contradicts the
 		// commanded state — the device may have reverted behind the hub's back
 		// (reboot to defaults, installer override), which is exactly the case
@@ -149,11 +193,21 @@ func main() {
 
 		alert, newMRID := breachAlert(activeBreachMRID, plan)
 		activeBreachMRID = newMRID
+		// lexa_hub_breach_active (TASK-044): reflects activeBreachMRID on
+		// EVERY tick (not just alert edges) so the gauge is always current,
+		// including ticks where breachAlert returns nil because nothing
+		// changed this pass.
+		if activeBreachMRID != "" {
+			breachActiveGauge.Set(1)
+		} else {
+			breachActiveGauge.Set(0)
+		}
 		if alert == nil {
 			return // no edge this tick
 		}
 		alert.Ts = time.Now().Unix()
 		if alert.Active {
+			breachesTotalCtr.Inc() // lexa_hub_breaches_total: one per breach EDGE, not per tick
 			log.Printf("lexa-hub: COMPLIANCE BREACH %s limit=%.0fW measured=%.0fW shortfall=%.0fW (%s) mrid=%s",
 				alert.LimitType, alert.LimitW, alert.MeasuredW, alert.ShortfallW, alert.Reason, alert.MRID)
 		} else {
@@ -214,11 +268,11 @@ func main() {
 	for _, dc := range cfg.Devices {
 		switch dc.Role {
 		case "battery":
-			a := &MQTTBatteryActuator{mc: mc, device: dc.Name}
+			a := &MQTTBatteryActuator{mc: mc, device: dc.Name, dispatches: dispatchesTotalCtr}
 			dedupeResets = append(dedupeResets, a.dedupe.reset)
 			eng.RegisterBatteryActuator(dc.Name, a)
 		case "inverter":
-			a := &MQTTSolarActuator{mc: mc, device: dc.Name}
+			a := &MQTTSolarActuator{mc: mc, device: dc.Name, dispatches: dispatchesTotalCtr}
 			dedupeResets = append(dedupeResets, a.dedupe.reset)
 			eng.RegisterSolarActuator(dc.Name, a)
 		}
@@ -226,10 +280,15 @@ func main() {
 
 	// Wire MQTT actuators for known EVSE stations.
 	for _, sc := range cfg.Stations {
-		a := &MQTTEVSEActuator{mc: mc, stationID: sc.ID}
+		a := &MQTTEVSEActuator{mc: mc, stationID: sc.ID, dispatches: dispatchesTotalCtr}
 		dedupeResets = append(dedupeResets, a.dedupe.reset)
 		eng.RegisterEVSEActuator(sc.ID, a)
 	}
+
+	// TASK-044: start serving /metrics before eng.Start() so a scrape during
+	// the earliest ticks still sees the registry (StandardGauges/lexa_up are
+	// already set regardless of engine state).
+	metrics.Serve(cfg.MetricsAddr, reg)
 
 	eng.Start()
 	defer eng.Stop()

@@ -27,6 +27,12 @@ type Config struct {
 	MQTTPassFile  string         `json:"mqtt_pass_file"`  // path to 0600 password file; empty ⇒ anonymous
 	PollIntervalS int            `json:"poll_interval_s"` // default 10
 	Devices       []DeviceConfig `json:"devices"`
+
+	// MetricsAddr is the Prometheus /metrics listen address (TASK-044).
+	// Empty ⇒ default "127.0.0.1:9103" (product default: loopback-only); the
+	// literal "off" disables the listener. See cmd/hub/config.go's
+	// MetricsAddr doc for the bench-vs-product bind rationale (AD-008).
+	MetricsAddr string `json:"metrics_addr"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -46,6 +52,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.PollIntervalS == 0 {
 		cfg.PollIntervalS = 10
+	}
+	if cfg.MetricsAddr == "" {
+		cfg.MetricsAddr = "127.0.0.1:9103"
 	}
 	return &cfg, nil
 }
