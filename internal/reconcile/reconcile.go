@@ -391,13 +391,28 @@ func (r *Reconciler) writeAction(reason string, now time.Time) Action {
 // matches reports whether every commanded field is present in read and within
 // tolerance. complete is false when a commanded field is absent from read (then
 // ok is meaningless and the caller holds the previous assessment).
+//
+// Completeness is checked in a first, standalone pass over every key of
+// r.desiredFields before any tolerance comparison runs. This is deliberate,
+// not a style choice: map iteration order is randomized per Go's spec, and a
+// single combined loop that returns as soon as EITHER "field absent" OR
+// "field diverged" fires would make `complete` depend on which key the
+// runtime happened to visit first — a doc expressing two fields (e.g. a
+// battery's SetpointW AND Connect, ubiquitous in real commands) where only
+// one is ever readable (TASK-027: lexa-modbus has no Connect-state register)
+// would then flip between "hold, incomplete" and "diverged, complete" from
+// call to call with byte-identical inputs. That directly contradicts this
+// package's own documented guarantee (file doc: "field-incomplete samples
+// hold the previous assessment and never provoke a write storm") — found
+// while wiring TASK-027, the first real multi-field consumer.
 func (r *Reconciler) matches(read map[Field]float64) (ok, complete bool) {
-	for f, want := range r.desiredFields {
-		got, present := read[f]
-		if !present {
+	for f := range r.desiredFields {
+		if _, present := read[f]; !present {
 			return false, false
 		}
-		if math.Abs(got-want) > r.tolerance(f) {
+	}
+	for f, want := range r.desiredFields {
+		if math.Abs(read[f]-want) > r.tolerance(f) {
 			return false, true
 		}
 	}

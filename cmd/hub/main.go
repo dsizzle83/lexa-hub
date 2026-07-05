@@ -82,6 +82,10 @@ func main() {
 	breachActiveGauge := reg.Gauge("lexa_hub_breach_active")
 	breachesTotalCtr := reg.Counter("lexa_hub_breaches_total")
 	dispatchesTotalCtr := reg.Counter("lexa_hub_dispatches_total")
+	// desiredPublishesTotalCtr (TASK-027): retained lexa/desired/battery/{device}
+	// publishes actually sent by desiredPublishingBatteryActuator (content-change
+	// gated, not per-tick — see its doc).
+	desiredPublishesTotalCtr := reg.Counter("lexa_hub_desired_publishes_total")
 
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
@@ -285,7 +289,13 @@ func main() {
 		case "battery":
 			a := &MQTTBatteryActuator{mc: mc, device: dc.Name, dispatches: dispatchesTotalCtr}
 			dedupeResets = append(dedupeResets, a.dedupe.reset)
-			eng.RegisterBatteryActuator(dc.Name, a)
+			// TASK-027: wrap (don't replace) the legacy actuator so every
+			// battery command additionally republishes the standing intent
+			// as a retained desired doc for the lexa-modbus shadow
+			// reconciler. dedupeResets stays wired to the LEGACY actuator's
+			// deduper above — unchanged breach-reset behavior (ledger L3).
+			wrapped := newDesiredPublishingBatteryActuator(a, mc, dc.Name, desiredPublishesTotalCtr)
+			eng.RegisterBatteryActuator(dc.Name, wrapped)
 		case "inverter":
 			a := &MQTTSolarActuator{mc: mc, device: dc.Name, dispatches: dispatchesTotalCtr}
 			dedupeResets = append(dedupeResets, a.dedupe.reset)

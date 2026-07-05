@@ -256,6 +256,15 @@ All configs live in `/etc/lexa/`. Edit the copies created by `make install-confi
 | `/etc/lexa/api.json` | lexa-api |
 | `/etc/lexa/certs/` | ca.pem, client.pem, ocpp.crt etc. |
 
+`modbus.json`'s `"reconciler"` key (TASK-027, AD-002/AD-013) maps device class →
+`"off"|"shadow"|"active"`, e.g. `{"battery":"shadow"}`. `"shadow"` runs the
+Device Reconciler (`internal/reconcile`) as a passive recorder alongside the
+legacy control path — zero hardware writes, logs `reconciler[shadow] ...`
+verdict lines and `lexa_mb_shadow_*_total` metrics. `"active"` is rejected at
+load (`log.Fatalf`-equivalent config error) until TASK-028. Editing the Pi's
+copy without updating `configs/modbus.json` in-repo is undone by the next
+deploy (05 §6 discipline).
+
 ## Critical invariants
 
 - **wolfSSL_Init**: process-global C state. `wolfssl.Init()` is called once in
