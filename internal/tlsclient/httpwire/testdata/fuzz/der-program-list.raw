@@ -1,0 +1,34 @@
+HTTP/1.1 200 OK
+Content-Length: 1488
+Content-Type: application/sep+xml
+Date: Sun, 05 Jul 2026 16:01:17 GMT
+Connection: close
+
+<?xml version="1.0" encoding="UTF-8"?>
+<DERProgramList xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/fsa/0/derp" all="3" results="3" pollRate="60">
+  <DERProgram xmlns="urn:ieee:std:2030.5:ns" href="/derp/0">
+    <mRID>DERP-SP-001</mRID>
+    <description>Service Point DER Program</description>
+    <primacy>1</primacy>
+    <DERControlListLink href="/derp/0/derc" all="4"></DERControlListLink>
+    <DERCurveListLink href="/derp/0/dc" all="1"></DERCurveListLink>
+    <DefaultDERControlLink href="/derp/0/dderc"></DefaultDERControlLink>
+    <ActiveDERControlListLink href="/derp/0/actderc" all="1"></ActiveDERControlListLink>
+  </DERProgram>
+  <DERProgram xmlns="urn:ieee:std:2030.5:ns" href="/derp/1">
+    <mRID>DERP-SITE-001</mRID>
+    <description>Site-Level DER Program</description>
+    <primacy>5</primacy>
+    <DERControlListLink href="/derp/1/derc" all="2"></DERControlListLink>
+    <DefaultDERControlLink href="/derp/1/dderc"></DefaultDERControlLink>
+    <ActiveDERControlListLink href="/derp/1/actderc"></ActiveDERControlListLink>
+  </DERProgram>
+  <DERProgram xmlns="urn:ieee:std:2030.5:ns" href="/derp/2">
+    <mRID>DERP-SYS-001</mRID>
+    <description>System-Level DER Program</description>
+    <primacy>10</primacy>
+    <DERControlListLink href="/derp/2/derc" all="1"></DERControlListLink>
+    <DefaultDERControlLink href="/derp/2/dderc"></DefaultDERControlLink>
+    <ActiveDERControlListLink href="/derp/2/actderc"></ActiveDERControlListLink>
+  </DERProgram>
+</DERProgramList>

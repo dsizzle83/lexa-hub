@@ -6,7 +6,7 @@ SVCDIR  := /etc/systemd/system
 SERVICES := hub northbound modbus ocpp telemetry api
 BINS     := $(addprefix $(BINDIR)/lexa-, $(SERVICES))
 
-.PHONY: all build install install-configs install-services clean tidy test test-nocgo
+.PHONY: all build install install-configs install-services clean tidy test test-nocgo fuzz
 
 all: build
 
@@ -124,3 +124,18 @@ test-nocgo:
 
 clean:
 	rm -rf $(BINDIR)
+
+# TASK-047: 15 minutes per go-native fuzz target against the CGo-free
+# httpwire leaf package (the extracted core of the former
+# tlsclient.readResponse — header cap, Content-Length handling, chunked
+# rejection). No wolfSSL sysroot needed: httpwire imports stdlib only,
+# so this runs on any machine, including hosted CI runners (see the
+# nightly `fuzz` job in .github/workflows/ci.yml). Merge gate for
+# TASK-047 is these three runs clean; failures land a crash file under
+# internal/tlsclient/httpwire/testdata/fuzz/<FuzzName>/ that `go test`
+# (no -fuzz) reruns forever after as a regression case.
+FUZZTIME ?= 15m
+fuzz:
+	go test -fuzz=FuzzReadHTTPResponse      -fuzztime=$(FUZZTIME) ./internal/tlsclient/httpwire/
+	go test -fuzz=FuzzResponseContentLength -fuzztime=$(FUZZTIME) ./internal/tlsclient/httpwire/
+	go test -fuzz=FuzzIsChunkedEncoding      -fuzztime=$(FUZZTIME) ./internal/tlsclient/httpwire/

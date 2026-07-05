@@ -14,6 +14,14 @@
 #                   cross-compile. The arm64 cgo pair (northbound, telemetry)
 #                   needs the aarch64 sysroot and stays a desktop-only
 #                   `make build-arm64`.
+#   fuzz            TASK-047, nightly cron only: 15m/target go-native fuzzing
+#                   of internal/tlsclient/httpwire, the CGo-free leaf package
+#                   extracted from tlsclient's former hand-rolled HTTP
+#                   response parser (D9/§10.2). No wolfSSL sysroot needed —
+#                   httpwire imports stdlib only — unlike every other job
+#                   above; not gated on PR/push because 45 min of fuzzing is
+#                   a poor latency trade for a parser that's otherwise unit-
+#                   tested, not because it needs anything special to build.
 #
 # Self-hosted runner fallback: if hosted GitHub runners become unacceptable
 # under an air-gap policy, any of these jobs can move to
@@ -44,7 +52,7 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '17 4 * * *' # nightly vuln scan (UTC); see `vulncheck` job below
+    - cron: '17 4 * * *' # nightly vuln scan + httpwire fuzz (UTC); see `vulncheck`/`fuzz` jobs below
 
 permissions:
   contents: read
@@ -225,3 +233,41 @@ jobs:
         run: |
           set -o pipefail
           bash scripts/ci/govulncheck.sh 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # TASK-047: nightly go-native fuzzing of internal/tlsclient/httpwire, the
+  # CGo-free parsing core extracted from tlsclient's former readResponse
+  # (D9/§10.2 — "hand-rolled HTTP parsing on the untrusted boundary ... fuzz
+  # it or replace it"). Unlike `cgo`/`vulncheck` above, this job needs no
+  # wolfSSL sysroot at all: httpwire imports nothing beyond stdlib, so it's
+  # the cheapest job to run and the whole reason the leaf package exists.
+  # Merge gate for TASK-047 itself is these three runs green; a crasher
+  # found here after merge writes a regression file under
+  # internal/tlsclient/httpwire/testdata/fuzz/<FuzzName>/, which every
+  # subsequent `go test` (no -fuzz needed) reruns as a normal test case —
+  # the artifact upload below is a convenience for grabbing that file out of
+  # a run that failed before anyone noticed on their own machine.
+  fuzz:
+    name: fuzz (nightly, httpwire)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: fuzz httpwire (15m/target, no cgo)
+        run: |
+          set -o pipefail
+          go test -fuzz=FuzzReadHTTPResponse      -fuzztime=15m ./internal/tlsclient/httpwire/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -fuzz=FuzzResponseContentLength -fuzztime=15m ./internal/tlsclient/httpwire/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -fuzz=FuzzIsChunkedEncoding      -fuzztime=15m ./internal/tlsclient/httpwire/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: upload crashers (only present on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: httpwire-fuzz-crashers
+          path: internal/tlsclient/httpwire/testdata/fuzz/*/
+          if-no-files-found: ignore

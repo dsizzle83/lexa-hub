@@ -4,21 +4,27 @@
 package tlsclient
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"net"
 	"os"
-	"strconv"
-	"strings"
 	"syscall"
 	"unsafe"
 
+	"lexa-hub/internal/tlsclient/httpwire"
 	"lexa-hub/internal/wolfssl"
 )
 
 const (
 	maxResponseBody = 10 << 20 // 10 MiB — safe ceiling for embedded targets
+
+	// maxResponseHeader caps the header block readResponse will buffer
+	// before finding "\r\n\r\n" — a server streaming garbage with no header
+	// terminator no longer grows the buffer without bound (TASK-047, D9/
+	// §10.2). 64 KiB comfortably exceeds any real CSIP response: gridsim
+	// sends a handful of headers, verified against the httpwire fuzz corpus
+	// (internal/tlsclient/httpwire/testdata/fuzz/).
+	maxResponseHeader = 64 << 10 // 64 KiB
 )
 
 // Client is a CSIP-compliant mTLS client. It owns a wolfSSL context
@@ -265,100 +271,13 @@ func (c *Client) Get(path string) ([]byte, error) {
 // session. It reads headers until \r\n\r\n, then reads exactly
 // Content-Length body bytes so the connection can be reused.
 // Falls back to read-until-close if Content-Length is absent.
+//
+// The parsing core (header loop, chunked-encoding rejection, Content-Length
+// handling, header/body size caps) lives in the CGo-free httpwire leaf
+// package so it can be fuzzed without a wolfSSL sysroot (TASK-047, D9/
+// §10.2); this is a thin wrapper binding it to the wolfSSL-backed session.
 func (c *Client) readResponse() ([]byte, error) {
-	scratch := make([]byte, 4096)
-	var buf []byte
-	headerEnd := -1
-
-	// Phase 1: buffer until the header block is complete.
-	for headerEnd < 0 {
-		n, err := wolfssl.Read(c.ssl, scratch)
-		if n > 0 {
-			buf = append(buf, scratch[:n]...)
-			if idx := bytes.Index(buf, []byte("\r\n\r\n")); idx >= 0 {
-				headerEnd = idx + 4
-			}
-		}
-		if err != nil || n == 0 {
-			break
-		}
-	}
-	if headerEnd < 0 {
-		return nil, fmt.Errorf("incomplete HTTP response: no header terminator")
-	}
-
-	// Phase 2: read exactly Content-Length body bytes.
-	headers := buf[:headerEnd]
-	if isChunkedEncoding(headers) {
-		return nil, fmt.Errorf("Transfer-Encoding: chunked is not supported")
-	}
-	cl := responseContentLength(headers)
-	if cl < 0 {
-		// No Content-Length: read until server closes, but cap at maxResponseBody.
-		for len(buf) <= maxResponseBody {
-			n, err := wolfssl.Read(c.ssl, scratch)
-			if n > 0 {
-				buf = append(buf, scratch[:n]...)
-			}
-			if err != nil || n == 0 {
-				break
-			}
-		}
-		if len(buf) > maxResponseBody {
-			return nil, fmt.Errorf("response body too large: exceeded %d bytes (no Content-Length)", maxResponseBody)
-		}
-		return buf, nil
-	}
-
-	if cl > maxResponseBody {
-		return nil, fmt.Errorf("response body too large: %d bytes (max %d)", cl, maxResponseBody)
-	}
-
-	need := headerEnd + cl
-	for len(buf) < need {
-		n, err := wolfssl.Read(c.ssl, scratch)
-		if n > 0 {
-			buf = append(buf, scratch[:n]...)
-		}
-		if err != nil || n == 0 {
-			break
-		}
-	}
-	if len(buf) < need {
-		return nil, fmt.Errorf("truncated response: got %d bytes, expected %d", len(buf), need)
-	}
-	return buf[:need], nil
-}
-
-// isChunkedEncoding reports whether the raw HTTP header block contains
-// Transfer-Encoding: chunked (case-insensitive). Our parser does not
-// implement chunked decoding, so callers must reject such responses.
-func isChunkedEncoding(headers []byte) bool {
-	lower := bytes.ToLower(headers)
-	for _, line := range bytes.Split(lower, []byte("\r\n")) {
-		if bytes.HasPrefix(line, []byte("transfer-encoding:")) {
-			val := bytes.TrimSpace(line[len("transfer-encoding:"):])
-			if bytes.Equal(val, []byte("chunked")) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// responseContentLength returns the Content-Length value from a raw
-// HTTP header block (the bytes up to and including \r\n\r\n).
-// Returns -1 if the header is absent or cannot be parsed.
-func responseContentLength(headers []byte) int {
-	lower := bytes.ToLower(headers)
-	for _, line := range bytes.Split(lower, []byte("\r\n")) {
-		if bytes.HasPrefix(line, []byte("content-length:")) {
-			val := bytes.TrimSpace(line[len("content-length:"):])
-			n, err := strconv.Atoi(strings.TrimSpace(string(val)))
-			if err == nil {
-				return n
-			}
-		}
-	}
-	return -1
+	return httpwire.ReadHTTPResponse(func(p []byte) (int, error) {
+		return wolfssl.Read(c.ssl, p)
+	}, maxResponseHeader, maxResponseBody)
 }

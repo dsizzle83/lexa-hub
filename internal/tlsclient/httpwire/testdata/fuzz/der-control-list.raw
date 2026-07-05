@@ -1,0 +1,91 @@
+HTTP/1.1 200 OK
+Content-Length: 2809
+Content-Type: application/sep+xml
+Date: Sun, 05 Jul 2026 16:01:17 GMT
+Connection: close
+
+<?xml version="1.0" encoding="UTF-8"?>
+<DERControlList xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc" all="4" results="4" pollRate="60">
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc/0">
+    <mRID>DERC-SP-001</mRID>
+    <description>Limit export to 3kW (potentially superseded)</description>
+    <creationTime>1783267277</creationTime>
+    <EventStatus>
+      <currentStatus>0</currentStatus>
+      <dateTime>1783267277</dateTime>
+      <potentiallySuperseded>true</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>120</duration>
+      <start>1783267457</start>
+    </interval>
+    <DERControlBase>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>3000</value>
+      </opModExpLimW>
+    </DERControlBase>
+  </DERControl>
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc/1">
+    <mRID>DERC-SP-002</mRID>
+    <description>Limit export to 2.5kW (supersedes SP-001)</description>
+    <creationTime>1783267278</creationTime>
+    <EventStatus>
+      <currentStatus>0</currentStatus>
+      <dateTime>1783267278</dateTime>
+      <potentiallySuperseded>false</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>300</duration>
+      <start>1783267457</start>
+    </interval>
+    <DERControlBase>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>2500</value>
+      </opModExpLimW>
+    </DERControlBase>
+  </DERControl>
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc/2">
+    <mRID>DERC-SP-003</mRID>
+    <description>Cancelled control (client must ignore)</description>
+    <creationTime>1783266677</creationTime>
+    <EventStatus>
+      <currentStatus>6</currentStatus>
+      <dateTime>1783267217</dateTime>
+      <potentiallySuperseded>false</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>120</duration>
+      <start>1783266677</start>
+    </interval>
+    <DERControlBase>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>4000</value>
+      </opModExpLimW>
+    </DERControlBase>
+  </DERControl>
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc/3">
+    <mRID>DERC-SP-004</mRID>
+    <description>Randomized export limit 3.5kW</description>
+    <creationTime>1783267277</creationTime>
+    <EventStatus>
+      <currentStatus>0</currentStatus>
+      <dateTime>1783267277</dateTime>
+      <potentiallySuperseded>false</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>180</duration>
+      <start>1783267877</start>
+    </interval>
+    <DERControlBase>
+      <opModConnect>true</opModConnect>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>3500</value>
+      </opModExpLimW>
+    </DERControlBase>
+    <randomizeStart>30</randomizeStart>
+  </DERControl>
+</DERControlList>

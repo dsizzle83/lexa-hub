@@ -1,0 +1,14 @@
+HTTP/1.1 200 OK
+Content-Length: 418
+Content-Type: application/sep+xml
+Date: Sun, 05 Jul 2026 16:01:17 GMT
+Connection: close
+
+<?xml version="1.0" encoding="UTF-8"?>
+<DeviceCapability xmlns="urn:ieee:std:2030.5:ns" href="/dcap" pollRate="300">
+  <TimeLink href="/tm"></TimeLink>
+  <ResponseSetListLink href="/rsps" all="1"></ResponseSetListLink>
+  <EndDeviceListLink href="/edev" all="3"></EndDeviceListLink>
+  <MirrorUsagePointListLink href="/mup"></MirrorUsagePointListLink>
+  <SelfDeviceLink href="/sdev"></SelfDeviceLink>
+</DeviceCapability>
