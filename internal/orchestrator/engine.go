@@ -7,9 +7,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"lexa-hub/internal/northbound/discovery"
-	"lexa-hub/internal/northbound/scheduler"
 )
 
 // plannerInput holds the external inputs consumed by the daily planner.
@@ -25,8 +22,8 @@ type plannerInput struct {
 //  2. Passes it to the Optimizer
 //  3. Executes the resulting Plan via the registered actuators
 //
-// The Engine is safe for concurrent use: SetCSIPPrograms, SetDERConstraints,
-// and SetPrices may be called from any goroutine while the engine is running.
+// The Engine is safe for concurrent use: SetDERConstraints and SetPrices may be
+// called from any goroutine while the engine is running.
 type Engine struct {
 	reader    SystemReader
 	optimizer Optimizer
@@ -44,12 +41,6 @@ type Engine struct {
 	battActuators  map[string]BatteryActuator
 	solarActuators map[string]SolarActuator
 	evseActuators  map[string]EVSEActuator
-
-	// CSIP state — updated via SetCSIPPrograms, read in the control loop.
-	csipMu      sync.RWMutex
-	programs    []discovery.ProgramState
-	clockOffset int64
-	sched       *scheduler.Scheduler
 
 	// Daily planner — produces 24-hour cost-optimal dispatch plans.
 	planner    *DailyPlanner
@@ -121,7 +112,6 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 		battActuators:  make(map[string]BatteryActuator),
 		solarActuators: make(map[string]SolarActuator),
 		evseActuators:  make(map[string]EVSEActuator),
-		sched:          scheduler.New(),
 		planner:        NewDailyPlanner(),
 		plannerCfg:     cfg.Planner,
 		plannerWake:    make(chan struct{}, 1),
@@ -193,23 +183,6 @@ func (e *Engine) RegisterEVSEActuator(stationID string, a EVSEActuator) {
 	e.actuMu.Lock()
 	e.evseActuators[stationID] = a
 	e.actuMu.Unlock()
-}
-
-// SetCSIPPrograms updates the CSIP program list used by the control loop.
-// Call this from the northbound discovery goroutine whenever programs change.
-// Safe for concurrent use.
-//
-// If any program contains an OpModConnect=false control, the engine wakes
-// immediately rather than waiting for the next ticker interval.
-func (e *Engine) SetCSIPPrograms(programs []discovery.ProgramState, clockOffset int64) {
-	e.csipMu.Lock()
-	e.programs = programs
-	e.clockOffset = clockOffset
-	e.csipMu.Unlock()
-
-	if hasDisconnectControl(programs) {
-		e.Wake()
-	}
 }
 
 // Wake forces an immediate optimization tick instead of waiting for the next
@@ -501,34 +474,17 @@ func (e *Engine) tick() {
 		return
 	}
 
-	// 2. Inject CSIP active control.
+	// 2. Inject daily plan target for the current 5-min interval.
 	//
-	// Precedence: when programs have been provided via SetCSIPPrograms, the
-	// scheduler's evaluation OWNS state.CSIPControl — it overwrites whatever
-	// the reader supplied, including clearing it when no control is active.
-	// Wire a deployment to exactly one source: either SetCSIPPrograms (raw
-	// program walking) or a reader that fills CSIPControl (pre-resolved
-	// control from the bus, as cmd/hub does) — never both.
-	e.csipMu.RLock()
-	programs := e.programs
-	clockOffset := e.clockOffset
-	e.csipMu.RUnlock()
-
-	// Only the SetCSIPPrograms path owns the clock offset and active control.
-	// In a bus-driven deployment (cmd/hub) programs is empty and the reader has
-	// already populated state.ClockOffset / state.CSIPControl from MQTT; do NOT
-	// overwrite the reader's offset with the engine's unused zero, or the
-	// optimizer's serverNow (= Timestamp+ClockOffset) collapses to local time and
-	// TOU evaluation / event timing break — e.g. a replay that warps the utility
-	// clock would no longer shift the hub's peak window.
-	if len(programs) > 0 {
-		state.ClockOffset = clockOffset
-		serverNow := scheduler.ServerNow(clockOffset)
-		active := e.sched.Evaluate(programs, serverNow)
-		state.CSIPControl = FromActiveControl(active)
-	}
-
-	// 3. Inject daily plan target for the current 5-min interval.
+	// The bus-driven reader (cmd/hub's MQTTSystemReader) is the sole source of
+	// state.CSIPControl and state.ClockOffset: it resolves the active CSIP
+	// control from the retained lexa/csip/control message and hands the engine a
+	// state that already carries them. The engine never overwrites the reader's
+	// offset — the optimizer's serverNow (= Timestamp+ClockOffset) must follow
+	// utility (or replayed) time, or TOU evaluation / event timing collapse to
+	// local time (e.g. a replay that warps the utility clock would no longer
+	// shift the hub's peak window).
+	//
 	// Query the plan at CSIP server time so a clock offset selects the same
 	// interval the planner built its window around (and the optimizer evaluates
 	// TOU at). Without this the planned dispatch never lines up with the live
@@ -539,22 +495,22 @@ func (e *Engine) tick() {
 	serverTime := state.Timestamp.Add(time.Duration(state.ClockOffset) * time.Second)
 	state.DailyPlanTarget = dp.CurrentTarget(serverTime)
 
-	// 4. Optimize.
+	// 3. Optimize.
 	plan := e.optimizer.Optimize(state)
 
-	// 5. Notify any observer (e.g. compliance-breach forwarding) before
+	// 4. Notify any observer (e.g. compliance-breach forwarding) before
 	// actuation, then execute the plan.
 	if e.planObserver != nil {
 		e.planObserver(plan)
 	}
 	e.executePlan(plan)
 
-	// 6. Store plan for external inspection (e.g. /status endpoint).
+	// 5. Store plan for external inspection (e.g. /status endpoint).
 	e.planMu.Lock()
 	e.lastPlan = plan
 	e.planMu.Unlock()
 
-	// 7. Log decisions.
+	// 6. Log decisions.
 	if e.Debug || len(plan.Decisions) > 0 {
 		e.logPlan(state, plan)
 	}
@@ -621,27 +577,6 @@ func (e *Engine) executePlan(plan Plan) {
 			log.Printf("[orchestrator] EVSE %s command error: %v", cmd.StationID, err)
 		}
 	}
-}
-
-// hasDisconnectControl returns true if any program in the list contains an
-// OpModConnect=false control (event or default).  Used to decide whether to
-// wake the engine loop immediately instead of waiting for the next ticker.
-func hasDisconnectControl(programs []discovery.ProgramState) bool {
-	for _, ps := range programs {
-		if ps.DefaultControl != nil {
-			if c := ps.DefaultControl.DERControlBase.OpModConnect; c != nil && !*c {
-				return true
-			}
-		}
-		if ps.Controls != nil {
-			for _, ev := range ps.Controls.DERControl {
-				if c := ev.DERControlBase.OpModConnect; c != nil && !*c {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
 
 // logPlan emits a structured summary of the plan to the standard logger.
