@@ -378,6 +378,9 @@ func describeFields(fields map[reconcile.Field]float64) string {
 	if v, ok := fields[reconcile.SetpointW]; ok {
 		parts = append(parts, fmt.Sprintf("SetpointW=%.0f", v))
 	}
+	if v, ok := fields[reconcile.CeilingW]; ok {
+		parts = append(parts, fmt.Sprintf("CeilingW=%.0f", v))
+	}
 	if v, ok := fields[reconcile.Connect]; ok {
 		parts = append(parts, fmt.Sprintf("Connect=%t", v != 0))
 	}
@@ -399,6 +402,11 @@ func describeControl(ctrl model.DERControlBase) string {
 		parts = append(parts, fmt.Sprintf("SetpointW=%.0f", wattsFromActivePower(*ctrl.OpModExpLimW)))
 	case ctrl.OpModImpLimW != nil:
 		parts = append(parts, fmt.Sprintf("SetpointW=%.0f", -wattsFromActivePower(*ctrl.OpModImpLimW)))
+	}
+	// Solar (TASK-029): the inverter ceiling rides on OpModMaxLimW; render it so a
+	// would/legacy pair for an inverter is directly comparable to describeFields.
+	if ctrl.OpModMaxLimW != nil {
+		parts = append(parts, fmt.Sprintf("CeilingW=%.0f", wattsFromActivePower(*ctrl.OpModMaxLimW)))
 	}
 	if ctrl.OpModConnect != nil {
 		parts = append(parts, fmt.Sprintf("Connect=%t", *ctrl.OpModConnect))
