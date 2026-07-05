@@ -5,8 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"lexa-hub/internal/northbound/discovery"
-	"lexa-hub/internal/northbound/model"
 	"lexa-hub/internal/orchestrator"
 )
 
@@ -267,86 +265,59 @@ func TestEngine_MissingActuator_DoesNotPanic(t *testing.T) {
 	eng.Stop() // should not panic
 }
 
-// TestEngine_SetCSIPPrograms_InjectedIntoState checks that CSIP programs are
-// evaluated and the result is available in the state passed to the optimizer.
-func TestEngine_SetCSIPPrograms_InjectedIntoState(t *testing.T) {
-	var capturedState orchestrator.SystemState
-	reader := &mockReader{state: state0()}
+// TestEngine_ReaderCSIPControl_ReachesOptimizer checks that the CSIP control the
+// reader resolves (the bus-driven production path — cmd/hub's MQTTSystemReader
+// fills state.CSIPControl from the retained lexa/csip/control message) is handed
+// to the optimizer unchanged. The engine has no second CSIP-resolution path.
+func TestEngine_ReaderCSIPControl_ReachesOptimizer(t *testing.T) {
+	st := state0()
+	st.Timestamp = time.Now()
+	st.CSIPControl = &orchestrator.CSIPControlState{Source: "event", MRID: "ctrl-1"}
+	reader := &mockReader{state: st}
 	opt := &captureStateOptimizer{}
 
 	eng := orchestrator.New(reader, opt, orchestrator.Config{Interval: 10 * time.Second})
-
-	now := time.Now().Unix()
-	tr := true
-	programs := []discovery.ProgramState{
-		{
-			Program: model.DERProgram{MRID: "prog-1", Primacy: 1},
-			DefaultControl: &model.DefaultDERControl{
-				MRID:           "ddc-1",
-				DERControlBase: model.DERControlBase{OpModConnect: &tr},
-			},
-			Controls: &model.DERControlList{
-				DERControl: []model.DERControl{
-					{
-						MRID:         "ctrl-1",
-						CreationTime: now - 100,
-						Interval: model.DateTimeInterval{
-							Start:    now - 60,
-							Duration: 3600,
-						},
-						DERControlBase: model.DERControlBase{OpModConnect: &tr},
-					},
-				},
-			},
-		},
-	}
-
-	eng.SetCSIPPrograms(programs, 0)
 	eng.Start()
 	time.Sleep(30 * time.Millisecond)
 	eng.Stop()
 
-	capturedState = opt.lastState
-	if capturedState.CSIPControl == nil {
-		t.Fatal("expected CSIPControl to be set from programs")
+	got := opt.lastState.CSIPControl
+	if got == nil {
+		t.Fatal("expected reader-supplied CSIPControl to reach the optimizer")
 	}
-	if capturedState.CSIPControl.Source != "event" && capturedState.CSIPControl.Source != "default" {
-		t.Errorf("unexpected source: %q", capturedState.CSIPControl.Source)
+	if got.Source != "event" || got.MRID != "ctrl-1" {
+		t.Errorf("optimizer saw CSIPControl{Source:%q, MRID:%q}, want {event, ctrl-1}", got.Source, got.MRID)
 	}
 }
 
-// ── Concurrent safety ─────────────────────────────────────────────────────────
-
-func TestEngine_SetCSIPPrograms_ConcurrentSafe(t *testing.T) {
+// TestEngine_Wake_ForcesImmediateTick verifies Wake() runs an optimization tick
+// without waiting out the ticker interval. This backs the live cmd/hub wiring
+// where a CSIP OpModConnect=false control calls eng.Wake() so cease-to-energize
+// is applied within MQTT latency (the disconnect-wake path).
+func TestEngine_Wake_ForcesImmediateTick(t *testing.T) {
 	reader := &mockReader{state: state0()}
 	opt := &mockOptimizer{}
-	eng := orchestrator.New(reader, opt, orchestrator.Config{Interval: 5 * time.Millisecond})
+	// Long interval: without Wake only the single immediate startup tick fires.
+	eng := orchestrator.New(reader, opt, orchestrator.Config{Interval: time.Hour})
 	eng.Start()
+	time.Sleep(20 * time.Millisecond) // let the startup tick land
+	before := opt.calls.Load()
 
-	// Hammer SetCSIPPrograms from multiple goroutines while the engine ticks.
-	done := make(chan struct{})
-	for i := 0; i < 5; i++ {
-		go func() {
-			for j := 0; j < 20; j++ {
-				eng.SetCSIPPrograms(nil, int64(j))
-				time.Sleep(time.Millisecond)
-			}
-			done <- struct{}{}
-		}()
-	}
-	for i := 0; i < 5; i++ {
-		<-done
-	}
+	eng.Wake()
+	time.Sleep(20 * time.Millisecond)
 	eng.Stop()
+
+	if got := opt.calls.Load(); got <= before {
+		t.Fatalf("optimizer calls did not increase after Wake: before=%d after=%d", before, got)
+	}
 }
 
 // TestEngine_PreservesReaderClockOffset is a regression test for the bug where
-// tick() overwrote the reader-supplied CSIP clock offset with the engine's
-// unused zero. Only the SetCSIPPrograms path owns the offset; a bus-driven
-// deployment (no programs) carries the real offset in the state it reads, and
-// the optimizer must see it so serverNow = Timestamp+ClockOffset follows utility
-// (or replayed) time instead of collapsing to local time and killing TOU
-// peak-shaving.
+// tick() overwrote the reader-supplied CSIP clock offset with an engine-local
+// zero. The bus-driven reader is the sole owner of the offset: it carries the
+// real value in the state it reads, and the optimizer must see it so serverNow =
+// Timestamp+ClockOffset follows utility (or replayed) time instead of collapsing
+// to local time and killing TOU peak-shaving.
 func TestEngine_PreservesReaderClockOffset(t *testing.T) {
 	st := state0()
 	st.Timestamp = time.Now()
@@ -356,8 +327,7 @@ func TestEngine_PreservesReaderClockOffset(t *testing.T) {
 	opt := &captureStateOptimizer{}
 
 	eng := orchestrator.New(reader, opt, orchestrator.Config{Interval: 10 * time.Second})
-	// No SetCSIPPrograms call: programs are empty, so the reader's offset must
-	// survive into the optimizer untouched.
+	// The reader's offset must survive into the optimizer untouched.
 	eng.Start()
 	time.Sleep(30 * time.Millisecond)
 	eng.Stop()

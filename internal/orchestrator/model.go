@@ -6,7 +6,7 @@
 //
 // Data flow:
 //
-//	[CSIP scheduler] ──SetCSIPPrograms──► Engine.state
+//	[CSIP control (MQTT)] ──ReadSystemState──► Engine.state
 //	[Modbus registry] ──Subscribe()────► Engine.state
 //	[OCPP tracker] ────EVSEStates()────► Engine.state
 //	                                          │
@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"lexa-hub/internal/northbound/model"
-	"lexa-hub/internal/northbound/scheduler"
 )
 
 // ── Device state snapshots ────────────────────────────────────────────────────
@@ -323,21 +322,6 @@ type Plan struct {
 // AddDecision appends a Decision to the plan's trace.
 func (p *Plan) AddDecision(rule, reason, impact string) {
 	p.Decisions = append(p.Decisions, Decision{Rule: rule, Reason: reason, Impact: impact})
-}
-
-// ── CSIPControlState helpers ──────────────────────────────────────────────────
-
-// FromActiveControl converts a scheduler.ActiveControl to CSIPControlState.
-func FromActiveControl(ac *scheduler.ActiveControl) *CSIPControlState {
-	if ac == nil {
-		return nil
-	}
-	return &CSIPControlState{
-		Source:     ac.Source,
-		MRID:       ac.MRID,
-		Base:       ac.Base,
-		ValidUntil: ac.ValidUntil,
-	}
 }
 
 // ── Default values ────────────────────────────────────────────────────────────
