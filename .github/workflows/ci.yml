@@ -36,6 +36,16 @@
 # reachable findings (paho.mqtt.golang GO-2025-4173, x/net GO-2025-3503) are
 # both cleared — see ../csip-tls-test/docs/refactor/VULN_BASELINE_2026-07-04.md
 # and its TASK-006 addendum.
+#
+# TASK-024: `proto-pin` job -- shared-module (lexa-proto, AD-003) version-pin
+# gate. Checks out csip-tls-test (the peer consumer repo) via a new
+# CSIP_TLS_TEST_RO_TOKEN secret and runs its scripts/check-proto-pin.sh
+# (single implementation, lives in csip-tls-test only) comparing the two
+# repos' committed proto.pin files. This is the mirror image of
+# csip-tls-test's own proto-pin job (which checks out lexa-hub via
+# LEXA_HUB_RO_TOKEN) -- TASK-004's old lockstep gate ran only in
+# csip-tls-test CI, which let an asymmetric bump go undetected on this side;
+# TASK-024 closes that by gating both repos.
 
 name: CI
 
@@ -49,18 +59,16 @@ on:
 permissions:
   contents: read
 
-# TASK-019: lexa-hub committed a go.work (`use (. ../lexa-proto)`) for local
-# development against the in-progress shared module (AD-003). Hosted runners
-# check out only this one repo, so `../lexa-proto` never exists here — Go's
-# automatic go.work discovery would otherwise fail every job in this file.
-# GOWORK=off makes every `go` invocation below behave exactly as it did
-# before go.work existed (single-module mode); safe because no package here
-# imports lexa-proto yet (the skeleton is unreferenced). Comes out together
-# with go.work at TASK-024 once version pinning (proto.pin or its go.mod-
-# pseudo-version successor) is authoritative.
-env:
-  GOWORK: "off"
-
+# TASK-019 committed a go.work (`use (. ../lexa-proto)`) for local dev against
+# the in-progress shared module, with GOWORK=off set here because hosted
+# runners never have a `../lexa-proto` sibling. TASK-024 removes go.work from
+# version control (AD-003(d)/(e)): the build now goes through the committed
+# `require lexa-proto v0.0.0` + `replace lexa-proto => ../lexa-proto` +
+# vendor/lexa-proto/ in go.mod, which Go auto-selects (`-mod=vendor`) whenever
+# vendor/modules.txt is present and consistent — no GOWORK setting needed for
+# that to work, and none exists to turn off since the file isn't committed.
+# Developers may still keep an untracked local go.work (gitignored) for
+# cross-repo dev against a live ../lexa-proto checkout; it never reaches CI.
 jobs:
   vet-build-test:
     name: vet-build-test
@@ -225,3 +233,24 @@ jobs:
         run: |
           set -o pipefail
           bash scripts/ci/govulncheck.sh 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # TASK-024: shared-module version-pin gate (AD-003(c)) -- mirror image of
+  # csip-tls-test's proto-pin job. See the header comment above `on:` for the
+  # PAT/secret rationale.
+  proto-pin:
+    name: proto-pin
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - name: Checkout lexa-hub (this repo)
+        uses: actions/checkout@v4
+
+      - name: Checkout csip-tls-test (peer consumer) read-only
+        uses: actions/checkout@v4
+        with:
+          repository: dsizzle83/csip-tls-test
+          token: ${{ secrets.CSIP_TLS_TEST_RO_TOKEN }}
+          path: csip-tls-test
+
+      - name: proto.pin version-pin check (fails on mismatch -- no allowlist)
+        run: bash csip-tls-test/scripts/check-proto-pin.sh --self . --product csip-tls-test --no-proto-check
