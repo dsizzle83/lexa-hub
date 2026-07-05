@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/northbound/discovery"
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 )
 
 const windowDuration = 24 * time.Hour

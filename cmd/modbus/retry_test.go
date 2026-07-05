@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"lexa-hub/internal/bus"
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/southbound/device"
 )
 

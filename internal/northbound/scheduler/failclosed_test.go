@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"lexa-hub/internal/northbound/discovery"
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 )
 
 // progs wraps a single event in the highest-priority program (primacy 1) with a

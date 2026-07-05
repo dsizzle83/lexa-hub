@@ -40,7 +40,7 @@ import (
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/northbound/discovery"
 	"lexa-hub/internal/northbound/identity"
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/northbound/schedule"
 	"lexa-hub/internal/northbound/scheduler"
 	"lexa-hub/internal/tlsclient"

@@ -3,7 +3,7 @@ package discovery
 import (
 	"fmt"
 
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 )
 
 // VerifyRegistration fetches the Registration resource and validates

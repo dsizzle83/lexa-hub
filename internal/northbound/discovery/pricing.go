@@ -1,6 +1,6 @@
 package discovery
 
-import "lexa-hub/internal/northbound/model"
+import model "lexa-proto/csipmodel"
 
 // ───────────────────────────────────────────────────────────────────────
 // Pricing function set discovery state types

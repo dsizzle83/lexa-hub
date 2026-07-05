@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"lexa-hub/internal/northbound/model"
+	model "lexa-proto/csipmodel"
 )
 
 // ───────────────────────────────────────────────────────────────────────
