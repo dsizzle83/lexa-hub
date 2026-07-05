@@ -23,7 +23,9 @@ Each concern runs as its own process and communicates only via Mosquitto MQTT:
     ├─ lexa-telemetry— subscribes to measurements; POSTs MUP readings to northbound server
     ├─ lexa-ocpp     — OCPP 2.0.1 CSMS for EV chargers
     ├─ lexa-hub      — energy optimizer engine (the "brain")
-    └─ lexa-api      — HTTP /status + /logs on :9100 (legacy dashboard adapter)
+    └─ lexa-api      — HTTP /status + /logs on :9100 (legacy dashboard adapter);
+                        bearer-token auth (`api_token_file`), staged rollout —
+                        empty = open (TASK-014, AD-008); /healthz always open
 ```
 
 ## MQTT topic map

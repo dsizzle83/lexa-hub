@@ -4,6 +4,7 @@
   "listen_addr": ":9100",
   "stale_after_s": 30,
   "log_buffer_size": 256,
+  "api_token_file": "",
   "devices": [
     {"name": "inverter-0", "role": "inverter", "max_w": 5000},
     {"name": "battery-0",  "role": "battery",  "max_w": 5000},
