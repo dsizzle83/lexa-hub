@@ -49,6 +49,18 @@ on:
 permissions:
   contents: read
 
+# TASK-019: lexa-hub committed a go.work (`use (. ../lexa-proto)`) for local
+# development against the in-progress shared module (AD-003). Hosted runners
+# check out only this one repo, so `../lexa-proto` never exists here — Go's
+# automatic go.work discovery would otherwise fail every job in this file.
+# GOWORK=off makes every `go` invocation below behave exactly as it did
+# before go.work existed (single-module mode); safe because no package here
+# imports lexa-proto yet (the skeleton is unreferenced). Comes out together
+# with go.work at TASK-024 once version pinning (proto.pin or its go.mod-
+# pseudo-version successor) is authoritative.
+env:
+  GOWORK: "off"
+
 jobs:
   vet-build-test:
     name: vet-build-test
