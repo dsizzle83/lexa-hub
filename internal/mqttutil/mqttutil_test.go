@@ -298,6 +298,88 @@ func TestApplyAuth_SetsCredentialsOnlyWhenUserNonEmpty(t *testing.T) {
 	}
 }
 
+// TestPublishFailInstrumentationHook is TASK-044's mqttutil instrumentation
+// test: a publish that never gets acked (the same neverToken/fakeClient
+// forced-failure setup as TestPublishJSONQoS0DoesNotBlockOnUnackedPublish)
+// must invoke Instrumentation.OnPublishFail exactly once. The client is
+// wired to instrumentation directly via instrumentations.Store — the same
+// state connect()/ConnectAuthInstrumented would populate — rather than via a
+// real Connect call, since fakeClient doesn't implement a real handshake.
+func TestPublishFailInstrumentationHook(t *testing.T) {
+	fc := &fakeClient{}
+	var fails int
+	instrumentations.Store(fc, &instState{inst: Instrumentation{
+		OnPublishFail: func() { fails++ },
+	}})
+	defer instrumentations.Delete(fc)
+
+	if err := PublishJSONQoS(fc, "lexa/measurements/inv0", 0, map[string]int{"w": 1}); err == nil {
+		t.Fatal("expected a publish error (no ack observed), got nil")
+	}
+	if fails != 1 {
+		t.Fatalf("OnPublishFail called %d times, want 1", fails)
+	}
+}
+
+// TestPublishSuccessDoesNotInvokeOnPublishFail is the control: a QoS 0
+// publish that DOES ack (a client whose Publish returns an already-done
+// token) must not call OnPublishFail at all.
+func TestPublishSuccessDoesNotInvokeOnPublishFail(t *testing.T) {
+	fc := &fakeAckingClient{}
+	var fails int
+	instrumentations.Store(fc, &instState{inst: Instrumentation{
+		OnPublishFail: func() { fails++ },
+	}})
+	defer instrumentations.Delete(fc)
+
+	if err := PublishJSONQoS(fc, "lexa/measurements/inv0", 0, map[string]int{"w": 1}); err != nil {
+		t.Fatalf("unexpected publish error: %v", err)
+	}
+	if fails != 0 {
+		t.Fatalf("OnPublishFail called %d times on a successful publish, want 0", fails)
+	}
+}
+
+// TestPublishFailNilSafeWhenUninstrumented is the nil-safety requirement:
+// publishJSON against a client that was never registered in instrumentations
+// at all (every existing test's fakeClient, and any caller still using plain
+// Connect/ConnectAuth without an instState — impossible today since connect()
+// always stores one, but defensive nonetheless) must not panic.
+func TestPublishFailNilSafeWhenUninstrumented(t *testing.T) {
+	fc := &fakeClient{}
+	if err := PublishJSONQoS(fc, "lexa/measurements/inv0", 0, map[string]int{"w": 1}); err == nil {
+		t.Fatal("expected a publish error (no ack observed), got nil")
+	}
+	// No assertion beyond "did not panic" — reaching this line is the test.
+}
+
+// TestNoteConnectedDistinguishesReconnect covers the initial-connect-vs-
+// reconnect logic connect()'s OnConnectHandler relies on to decide whether
+// to fire OnReconnect: the first call must report false (not a reconnect),
+// every call after must report true.
+func TestNoteConnectedDistinguishesReconnect(t *testing.T) {
+	s := &instState{}
+	if s.noteConnected() {
+		t.Fatal("first noteConnected() call reported reconnect=true, want false (initial connect)")
+	}
+	if !s.noteConnected() {
+		t.Fatal("second noteConnected() call reported reconnect=false, want true")
+	}
+	if !s.noteConnected() {
+		t.Fatal("third noteConnected() call reported reconnect=false, want true")
+	}
+}
+
+// fakeAckingClient is a minimal mqtt.Client double whose Publish returns an
+// already-acked token, standing in for a healthy broker (contrast fakeClient
+// above, whose Publish never acks).
+type fakeAckingClient struct{ fakeClient }
+
+func (f *fakeAckingClient) Publish(topic string, qos byte, retained bool, payload interface{}) mqtt.Token {
+	f.fakeClient.Publish(topic, qos, retained, payload)
+	return newDoneToken()
+}
+
 // TestLoadPassword covers the three states config.go callers rely on: unset
 // (anonymous default), a valid pass-file (trims the trailing newline
 // openssl rand -hex writes), and configured-but-empty (fail loud rather than

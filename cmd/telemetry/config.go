@@ -28,6 +28,12 @@ type Config struct {
 	Devices []string `json:"devices"`
 
 	MUPPostRateS int `json:"mup_post_rate_s"` // default 300
+
+	// MetricsAddr is the Prometheus /metrics listen address (TASK-044).
+	// Empty ⇒ default "127.0.0.1:9105" (product default: loopback-only); the
+	// literal "off" disables the listener. See cmd/hub/config.go's
+	// MetricsAddr doc for the bench-vs-product bind rationale (AD-008).
+	MetricsAddr string `json:"metrics_addr"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -47,6 +53,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.MUPPostRateS == 0 {
 		cfg.MUPPostRateS = 300
+	}
+	if cfg.MetricsAddr == "" {
+		cfg.MetricsAddr = "127.0.0.1:9105"
 	}
 	return &cfg, nil
 }

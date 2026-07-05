@@ -33,6 +33,8 @@ Each concern runs as its own process and communicates only via Mosquitto MQTT:
                         empty = open (TASK-014, AD-008); /healthz always open
 ```
 
+Every service also exposes Prometheus `/metrics` (TASK-044) — see "Metrics" below.
+
 ## MQTT topic map
 
 | Topic | Publisher | Subscribers | QoS |
@@ -100,6 +102,31 @@ an authorization boundary, not a topic map).
 - Localhost-only listener (`listener 1883 localhost`) is unchanged — the ACL
   is defense-in-depth behind it, not a LAN opening.
 
+## Metrics (TASK-044)
+
+Every service serves Prometheus text-exposition `/metrics`: `lexa-hub :9101 ·
+lexa-northbound :9102 · lexa-modbus :9103 · lexa-ocpp :9104 · lexa-telemetry
+:9105 · lexa-api :9100/metrics` (existing listener, new route — unauthenticated,
+same as `/healthz`; AD-008's bearer-token rollout only covers `/status`/`/logs`).
+Config key `metrics_addr` per service JSON: empty ⇒ the port above bound to
+`127.0.0.1` (product default — no new externally-reachable surface); the
+literal `"off"` disables the listener. The bench's deployed configs override
+this to `0.0.0.0` so the desktop can scrape it (AD-008's bench-vs-product bind
+pattern; scrape config + rationale in `../csip-tls-test/scripts/prometheus-bench.yml`
+and `docs/BENCH.md`'s Metrics section).
+
+**Library**: `internal/metrics` is a minimal hand-rolled Prometheus text-exposition
+package (Registry/Counter/Gauge/Handler/Collect), not `prometheus/client_golang` —
+see the package doc for the dependency-posture rationale (same reasoning as
+`internal/watchdog` hand-rolling sd_notify and `cmd/mqttproxy` hand-rolling MQTT
+3.1.1 in the bench repo). `mqttutil.ConnectAuthInstrumented` wires an optional
+`Instrumentation{OnPublishFail, OnReconnect, OnConnectionLost}` — function values,
+not a metrics import, so `internal/mqttutil` stays decoupled from whichever
+metrics implementation a caller wires in.
+
+A registered-but-zero counter is normal and expected for sources not yet wired
+(e.g. `lexa_hub_tick_overruns_total`, real source lands in TASK-046).
+
 ## Directory map
 
 ```
@@ -113,6 +140,8 @@ cmd/
 
 internal/
   bus/        MQTT topic constants + JSON message types (shared by all services)
+  metrics/    Prometheus text-exposition (Registry/Counter/Gauge/Handler) — leaf
+              package, no lexa-hub imports (TASK-044)
   mqttutil/   Thin MQTT client helpers (connect, PublishJSON, Subscribe[T])
   northbound/ IEEE 2030.5 discovery walker, scheduler, identity, DNS-SD
               (model types moved to lexa-proto/csipmodel — TASK-023)

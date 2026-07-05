@@ -37,15 +37,16 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/northbound/discovery"
 	"lexa-hub/internal/northbound/identity"
-	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/northbound/schedule"
 	"lexa-hub/internal/northbound/scheduler"
 	"lexa-hub/internal/tlsclient"
 	"lexa-hub/internal/watchdog"
 	"lexa-hub/internal/wolfssl"
+	model "lexa-proto/csipmodel"
 )
 
 // ── Flow reservation manager ──────────────────────────────────────────────────
@@ -165,20 +166,43 @@ func main() {
 	}
 	log.Printf("lexa-northbound: LFDI=%s server=%s", lfdi, cfg.Server)
 
+	// TASK-044: metrics registry + standard process gauges, wired before the
+	// MQTT connect below so its instrumentation hooks have counters ready.
+	reg := metrics.New()
+	metrics.StandardGauges(reg)
+	mqttFailCtr := reg.Counter("lexa_mqtt_publish_failures_total")
+	mqttReconnCtr := reg.Counter("lexa_mqtt_reconnects_total")
+	reg.Collect(func(r *metrics.Registry) {
+		var total uint64
+		for _, n := range bus.VersionRejects() {
+			total += n
+		}
+		r.Counter("lexa_bus_decode_failures_total").Set(total)
+	})
+	walkDurationGauge := reg.Gauge("lexa_nb_walk_duration_seconds")
+	walkFailuresCtr := reg.Counter("lexa_nb_walk_failures_total")
+	responsesPostedCtr := reg.Counter("lexa_nb_responses_posted_total")
+	clockOffsetGauge := reg.Gauge("lexa_nb_clock_offset_seconds")
+
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
 		log.Fatalf("lexa-northbound: %v", err)
 	}
-	mc, err := mqttutil.ConnectAuth(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass)
+	mc, err := mqttutil.ConnectAuthInstrumented(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass, mqttutil.Instrumentation{
+		OnPublishFail: mqttFailCtr.Inc,
+		OnReconnect:   mqttReconnCtr.Inc,
+	})
 	if err != nil {
 		log.Fatalf("lexa-northbound: %v", err)
 	}
 	defer mc.Disconnect(500)
 
+	metrics.Serve(cfg.MetricsAddr, reg)
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	sched := scheduler.New()
-	respTracker := newResponseTracker(fetcherResp, lfdi, cfg.ResponseSetPath)
+	respTracker := newResponseTracker(fetcherResp, lfdi, cfg.ResponseSetPath, responsesPostedCtr)
 
 	// Flow reservation: a third TLS session dedicated to POSTing reservation
 	// requests received from the hub via MQTT. This keeps it isolated from the
@@ -240,9 +264,11 @@ func main() {
 	// liveness from here on.
 	watchdog.Ready()
 
+	nbm := nbMetrics{walkDuration: walkDurationGauge, walkFailures: walkFailuresCtr, clockOffset: clockOffsetGauge}
+
 	// Run the first discovery immediately, then loop.
 	go func() {
-		runDiscovery(mc, fetcherDisc, lfdi, sched, respTracker, frManager, cfg)
+		runDiscovery(mc, fetcherDisc, lfdi, sched, respTracker, frManager, cfg, nbm)
 		// TASK-008: kick once the initial walk returns, success or fail-closed
 		// — a walk that erred and held last-known-good is still a live,
 		// iterating loop (QA 2026-07-02 northbound-hang/wan-outage-hold: a
@@ -261,7 +287,7 @@ func main() {
 				// runDiscovery's internal errors are handled by its own
 				// fail-closed logging and never prevent reaching this line.
 				watchdog.Kick()
-				runDiscovery(mc, fetcherDisc, lfdi, sched, respTracker, frManager, cfg)
+				runDiscovery(mc, fetcherDisc, lfdi, sched, respTracker, frManager, cfg, nbm)
 			}
 		}
 	}()
@@ -277,6 +303,15 @@ func main() {
 // line and operator triage. Touched only from the single discovery goroutine.
 var discoveryFailures int
 
+// nbMetrics bundles the TASK-044 Prometheus instruments runDiscovery updates
+// on every walk cycle. A small struct rather than three more positional
+// parameters on runDiscovery, which already takes six.
+type nbMetrics struct {
+	walkDuration *metrics.Gauge   // lexa_nb_walk_duration_seconds
+	walkFailures *metrics.Counter // lexa_nb_walk_failures_total (monotonic total; contrast discoveryFailures, which is consecutive-and-resets)
+	clockOffset  *metrics.Gauge   // lexa_nb_clock_offset_seconds
+}
+
 func runDiscovery(
 	mc mqtt.Client,
 	fetcher *tlsclient.WolfSSLFetcher,
@@ -285,7 +320,11 @@ func runDiscovery(
 	rt *responseTracker,
 	frm *flowReservationManager,
 	cfg *Config,
+	nbm nbMetrics,
 ) {
+	walkStart := time.Now()
+	defer func() { nbm.walkDuration.Set(time.Since(walkStart).Seconds()) }()
+
 	walker := discovery.NewWalker(fetcher, lfdi)
 	tree, err := walker.Discover("/dcap")
 	if err != nil {
@@ -301,11 +340,13 @@ func runDiscovery(
 		// resolves no valid control may release — and that path already holds
 		// last-known-good via the scheduler's fail-closed Evaluate.
 		discoveryFailures++
+		nbm.walkFailures.Inc()
 		log.Printf("lexa-northbound: discovery error (consecutive=%d): %v — holding last-published control (fail-closed)",
 			discoveryFailures, err)
 		return
 	}
 	discoveryFailures = 0
+	nbm.clockOffset.Set(float64(tree.ClockOffset))
 
 	serverNow := scheduler.ServerNow(tree.ClockOffset)
 	active := sched.Evaluate(tree.Programs, serverNow)
@@ -721,15 +762,20 @@ type responseTracker struct {
 	// mu guards the tracker: update() runs on the discovery goroutine while
 	// alertCannotComply()/clearAlerts() run on the MQTT subscription goroutine.
 	mu sync.Mutex
+	// responsesPosted counts every successful POST (lexa_nb_responses_posted_total,
+	// TASK-044); nil-safe (metrics.Counter's Inc is a no-op on a nil receiver),
+	// so tests constructing a responseTracker without wiring metrics need no change.
+	responsesPosted *metrics.Counter
 }
 
-func newResponseTracker(p responsePoster, lfdi, path string) *responseTracker {
+func newResponseTracker(p responsePoster, lfdi, path string, responsesPosted *metrics.Counter) *responseTracker {
 	return &responseTracker{
 		poster:          p,
 		lfdi:            lfdi,
 		responseSetPath: path,
 		posted:          make(map[string]uint8),
 		alerted:         make(map[string]bool),
+		responsesPosted: responsesPosted,
 	}
 }
 
@@ -863,6 +909,7 @@ func (rt *responseTracker) postResponse(mrid string, status uint8) {
 		log.Printf("lexa-northbound: POST response (mrid=%s status=%d): %v", mrid, status, err)
 		return
 	}
+	rt.responsesPosted.Inc()
 	names := map[uint8]string{1: "Received", 2: "Started", 3: "Completed", 6: "Cancelled", 7: "Superseded", model.ResponseCannotComply: "CannotComply"}
 	name := names[status]
 	if name == "" {

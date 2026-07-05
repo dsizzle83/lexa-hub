@@ -32,6 +32,12 @@ type Config struct {
 	BasicAuthPass string `json:"basic_auth_pass"`
 
 	Stations []StationConfig `json:"stations"`
+
+	// MetricsAddr is the Prometheus /metrics listen address (TASK-044).
+	// Empty ⇒ default "127.0.0.1:9104" (product default: loopback-only); the
+	// literal "off" disables the listener. See cmd/hub/config.go's
+	// MetricsAddr doc for the bench-vs-product bind rationale (AD-008).
+	MetricsAddr string `json:"metrics_addr"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -51,6 +57,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.Port == 0 {
 		cfg.Port = 8887
+	}
+	if cfg.MetricsAddr == "" {
+		cfg.MetricsAddr = "127.0.0.1:9104"
 	}
 	for i := range cfg.Stations {
 		if cfg.Stations[i].MaxCurrentA == 0 {
