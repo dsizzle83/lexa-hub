@@ -5,7 +5,21 @@ After=network.target mosquitto.service
 Requires=mosquitto.service
 
 [Service]
-Type=simple
+# Type=notify + WatchdogSec (TASK-008, review §11 item 5): lexa-ocpp's main
+# goroutine only ever blocked on signal (srv.Start runs the WS listener in
+# its own goroutine) — no natural liveness point exists. A 10s kick ticker
+# gates on mc.IsConnected() (cmd/ocpp/main.go): liveness = process + MQTT
+# connectivity. OCPP listener health itself is NOT probed here — a stuck WS
+# accept loop with MQTT still up would NOT trip this watchdog (backlog:
+# TASK-044 metrics probes listener health properly).
+#
+# WatchdogSec=60: a sustained MQTT broker outage (> 60s) means this kick
+# gate never fires and the watchdog restarts the service — accepted
+# crash-only behavior (AD-011), not a bug; see PR for the mqtt-broker-restart
+# / mqtt-broker-latency Mayhem reasoning.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 User=lexa
 Group=lexa
 ExecStart=/usr/local/sbin/lexa-ocpp -config /etc/lexa/ocpp.json
@@ -14,6 +28,16 @@ RestartSec=5s
 
 StartLimitIntervalSec=60
 StartLimitBurst=5
+
+# journald rate cap (TASK-009, review §11 flash wear / RSK-14): event-driven
+# logging (StatusNotification/MeterValues/TransactionEvent), one line per
+# OCPP message — an active charging session can push MeterValues every few
+# seconds per station (estimated from evsim's sample cadence — pending
+# on-bench measurement, see lexa-hub/docs/FLASH_BUDGET.md). Burst=300 gives
+# generous headroom over a handful of concurrently-charging stations without
+# suppressing session forensics.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=300
 
 StandardOutput=journal
 StandardError=journal

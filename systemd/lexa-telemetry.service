@@ -6,7 +6,22 @@ Requires=mosquitto.service
 Wants=network-online.target lexa-modbus.service
 
 [Service]
-Type=simple
+# Type=notify + WatchdogSec (TASK-008, review §11 item 5): lexa-telemetry has
+# no tight control loop like northbound/modbus, so this is a weaker liveness
+# signal by design (documented here and in cmd/telemetry/main.go): a 10s kick
+# ticker lives as a case in the SAME select as the MUP post loop, so a
+# wedged postMeasurements blocks the kick too rather than a free-running
+# timer masking it. READY=1 is sent once MUP registration completes — each
+# registerMUP call is a single bounded POST attempt (no internal retry loop),
+# so this cannot hang startup on an unreachable server.
+#
+# WatchdogSec=60 sizing: >= 4x STOCK's 10s kick cadence with generous
+# headroom; MUP posts happen every mup_post_rate_s (60s bench / 300s
+# default), well outside the kick's own cadence since the kick ticker fires
+# independently of the post ticker in the same select.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 User=lexa
 Group=lexa
 ExecStart=/usr/local/sbin/lexa-telemetry -config /etc/lexa/telemetry.json
@@ -15,6 +30,17 @@ RestartSec=10s
 
 StartLimitIntervalSec=120
 StartLimitBurst=5
+
+# journald rate cap (TASK-009, review §11 flash wear / RSK-14): one summary
+# line per device per post (bench MUPPostRate=60s) plus per-quantity POST
+# error lines only on failure — a handful of lines per 30s window at most in
+# normal operation (estimated from mup_post_rate_s cadence — pending
+# on-bench measurement, see lexa-hub/docs/FLASH_BUDGET.md). Burst=150 is
+# generous headroom for a re-registration storm (3-failure threshold in
+# cmd/telemetry/main.go triggers a re-register + its own log line per
+# device) without suppressing that forensic trail.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=150
 
 StandardOutput=journal
 StandardError=journal

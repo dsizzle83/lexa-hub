@@ -5,7 +5,25 @@ After=network.target mosquitto.service
 Requires=mosquitto.service
 
 [Service]
-Type=simple
+# Type=notify + WatchdogSec (TASK-008, review §11 item 5 / RSK-08): a wedged
+# poll loop silently stops updating measurement freshness, which gates
+# everything downstream (optimizer, compliance, telemetry). lexa-modbus
+# sends READY=1 once reg.Start() (the poll loop) and publishMeasurements
+# (the MQTT fan-out goroutine) are both running, and WATCHDOG=1 as the
+# first statement of publishMeasurements' update-drain body
+# (cmd/modbus/main.go) — covering registry, channel, and publish path in one
+# kick site. A device poll error still emits an update each round (upd.Err),
+# so unreachable devices alone do not starve the kick; only a wedged
+# registry/channel does.
+#
+# WatchdogSec=60 sizing: >= 4x STOCK's ~10s poll x 3 devices (worst-case
+# serialized poll round well under 60s in practice; parallel per-device poll
+# keeps a single slow device from stalling the others). Kick wiring lives
+# only in publishMeasurements — do not touch retryDevice/interlock code
+# (radioactive per 05 §12) to add kicks elsewhere.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 User=lexa
 Group=lexa
 ExecStart=/usr/local/sbin/lexa-modbus -config /etc/lexa/modbus.json
@@ -15,6 +33,18 @@ RestartSec=5s
 # Give Modbus connections time to settle before the next restart.
 StartLimitIntervalSec=60
 StartLimitBurst=5
+
+# journald rate cap (TASK-009, review §11 flash wear / RSK-14): normal
+# steady-state logging is sparse (per-poll updates don't log unless
+# upd.Err/REJECT-implausible/publish-error) but the hub re-commands battery
+# setpoints every economic tick (FAST 3s), each logged on apply — ~10
+# lines/30s per battery device baseline (estimated from the FAST tick cadence
+# in CLAUDE.md/task background — pending on-bench measurement, see
+# lexa-hub/docs/FLASH_BUDGET.md). Burst=300 gives >20x headroom for that plus
+# a reconnect/poll-error storm (retryDevice logs on every drop/reconnect)
+# without suppressing genuine fault-storm forensics.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=300
 
 StandardOutput=journal
 StandardError=journal

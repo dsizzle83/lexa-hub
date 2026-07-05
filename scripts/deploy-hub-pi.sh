@@ -35,7 +35,7 @@ echo "── Copying artifacts to $SSHUSER@$PI:/tmp/lexa-deploy/"
 ssh "$SSHUSER@$PI" 'rm -rf /tmp/lexa-deploy && mkdir -p /tmp/lexa-deploy/{bin,configs,systemd,certs}'
 scp -q "$HERE"/bin/arm64/lexa-* "$SSHUSER@$PI:/tmp/lexa-deploy/bin/"
 scp -q "$HERE"/configs/*.json "$SSHUSER@$PI:/tmp/lexa-deploy/configs/"
-scp -q "$HERE"/systemd/lexa-*.service "$HERE"/systemd/mosquitto-lexa.conf "$SSHUSER@$PI:/tmp/lexa-deploy/systemd/"
+scp -q "$HERE"/systemd/lexa-*.service "$HERE"/systemd/mosquitto-lexa.conf "$HERE"/systemd/journald-lexa.conf "$SSHUSER@$PI:/tmp/lexa-deploy/systemd/"
 scp -q "$STAGE/ca-cert.pem"     "$SSHUSER@$PI:/tmp/lexa-deploy/certs/ca.pem"
 scp -q "$STAGE/client-cert.pem" "$SSHUSER@$PI:/tmp/lexa-deploy/certs/client.pem"
 scp -q "$STAGE/client-key.pem"  "$SSHUSER@$PI:/tmp/lexa-deploy/certs/client-key.pem"
@@ -81,6 +81,15 @@ install -m 600 -o lexa -g lexa $D/certs/client-key.pem /etc/lexa/certs/
 # use the distro's, so install only the lexa-* units.
 install -m 644 $D/systemd/lexa-*.service /etc/systemd/system/
 systemctl daemon-reload
+
+# journald size/retention budget (TASK-009, review §11 flash wear / RSK-14):
+# a conf.d drop-in, not an in-place edit of journald.conf, so this stays
+# reproducible from the repo on every deploy. Restarting systemd-journald
+# picks up SystemMaxUse/SystemKeepFree/MaxRetentionSec immediately; per-unit
+# LogRateLimit* lives in each lexa-*.service above instead.
+install -d -m 755 /etc/systemd/journald.conf.d
+install -m 644 $D/systemd/journald-lexa.conf /etc/systemd/journald.conf.d/lexa.conf
+systemctl restart systemd-journald
 
 for s in lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-hub; do
   systemctl enable "$s" >/dev/null

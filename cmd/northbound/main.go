@@ -44,6 +44,7 @@ import (
 	"lexa-hub/internal/northbound/schedule"
 	"lexa-hub/internal/northbound/scheduler"
 	"lexa-hub/internal/tlsclient"
+	"lexa-hub/internal/watchdog"
 	"lexa-hub/internal/wolfssl"
 )
 
@@ -212,9 +213,25 @@ func main() {
 		log.Printf("lexa-northbound: subscribe compliance alert: %v", err)
 	}
 
+	// sd_notify READY (TASK-008): MQTT is connected and both subscriptions
+	// (flow reservation request, compliance alert) are registered — only the
+	// discovery walk goroutine remains to start. Sending Ready here, before
+	// the first walk, matters: a slow or unreachable utility server must not
+	// itself cause a systemd start timeout — runDiscovery's fail-closed
+	// discipline (see below) already handles that case once the process is
+	// up, and the walk loop's own watchdog kicks (also below) are what prove
+	// liveness from here on.
+	watchdog.Ready()
+
 	// Run the first discovery immediately, then loop.
 	go func() {
 		runDiscovery(mc, fetcherDisc, lfdi, sched, respTracker, frManager, cfg)
+		// TASK-008: kick once the initial walk returns, success or fail-closed
+		// — a walk that erred and held last-known-good is still a live,
+		// iterating loop (QA 2026-07-02 northbound-hang/wan-outage-hold: a
+		// server that stops responding must NOT starve this kick, only a
+		// wedged walker/registry should).
+		watchdog.Kick()
 		ticker := time.NewTicker(cfg.DiscoveryInterval())
 		defer ticker.Stop()
 		for {
@@ -222,6 +239,11 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// TASK-008: kick at the top of the loop body — every tick the
+				// loop wakes up at all is itself the liveness signal;
+				// runDiscovery's internal errors are handled by its own
+				// fail-closed logging and never prevent reaching this line.
+				watchdog.Kick()
 				runDiscovery(mc, fetcherDisc, lfdi, sched, respTracker, frManager, cfg)
 			}
 		}

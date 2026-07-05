@@ -130,14 +130,34 @@ All configs live in `/etc/lexa/`. Edit the copies created by `make install-confi
 - **Cross-compile**: lexa-northbound and lexa-telemetry require CGo (wolfSSL headers
   are ARM64-only on the SOM). Build on target or with a proper cross toolchain.
   The other three services are `CGO_ENABLED=0` cross-compilable.
-- **lexa-hub is `Type=notify` with `WatchdogSec=60`** (TASK-007): the keepalive rides
-  the engine tick via `Engine.PlanObserver` (`internal/watchdog`, wired in
-  `cmd/hub/main.go`), not a separate timer — anything that stalls the tick loop
-  (`ReadSystemState`, `Optimize`, `executePlan`'s synchronous MQTT publishes) for
-  >60 s starves the heartbeat and systemd restarts the service (intended; see
-  `systemd/lexa-hub.service` for the sizing math). `NOTIFY_SOCKET` unset (dev/test)
-  makes `Ready`/`Kick` no-ops. Only `cmd/hub` is wired so far — TASK-008 rolls the
-  same package out to the other five services.
+- **All six services are `Type=notify`** (TASK-007 on lexa-hub; TASK-008 on the
+  remaining five), each kicked from its own natural liveness point via the shared
+  `internal/watchdog` package (`Ready`/`Kick` over `NOTIFY_SOCKET`; no-ops when unset,
+  i.e. dev/test). `WatchdogSec` per service:
+
+  | Service | WatchdogSec | Kick site |
+  |---|---|---|
+  | lexa-hub | 60 | `Engine.PlanObserver`, every economic tick + safety pass (`cmd/hub/main.go`) |
+  | lexa-northbound | 120 | walk-loop `for` body top + once after the initial walk (`cmd/northbound/main.go`) — sized ≥4x a legitimate long walk under `northbound-hang` conditions |
+  | lexa-modbus | 60 | first statement of the update-drain body in `publishMeasurements` (`cmd/modbus/main.go`) |
+  | lexa-telemetry | 60 | 10s ticker case in the same `select` as the MUP post loop (`cmd/telemetry/main.go`) |
+  | lexa-ocpp | 60 | 10s ticker gated on `mc.IsConnected()` (`cmd/ocpp/main.go`) — process+MQTT only, OCPP listener health not probed |
+  | lexa-api | 60 | 10s ticker gated on `mc.IsConnected()` AND a loopback `GET /healthz` 200 (`cmd/api/main.go`) |
+
+  lexa-hub/northbound/modbus ride a real control/poll loop — a wedge there starves the
+  kick directly. telemetry/ocpp/api have no tight loop; their kick tickers are either
+  in the same select as the thing that matters (telemetry) or actively probe it
+  (ocpp/api), which is weaker and documented as such in each unit file. A sustained
+  MQTT broker outage restarts ocpp/api (accepted crash-only behavior, AD-011) but must
+  NOT restart northbound/modbus, whose loops keep iterating fail-closed on fetch/poll
+  errors (verify via the `northbound-hang`/`wan-outage-*` Mayhem scenarios before
+  touching any of this).
+- **journald caps** (TASK-009, review §11 flash wear / RSK-14): every `lexa-*.service`
+  sets `LogRateLimitIntervalSec`/`LogRateLimitBurst`, and `systemd/journald-lexa.conf`
+  (installed by `deploy-hub-pi.sh` to `/etc/systemd/journald.conf.d/lexa.conf`) caps the
+  Pi's total journal at `SystemMaxUse=200M`. Rate/size math, per-service estimates, and
+  the wear budget live in `docs/FLASH_BUDGET.md` — read it before changing per-tick
+  logging or raising any cap.
 
 ## Defensive fault-handling (do not strip — each backs a mayhem-QA finding)
 
