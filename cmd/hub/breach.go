@@ -1,0 +1,233 @@
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"lexa-hub/internal/bus"
+	"lexa-hub/internal/orchestrator"
+	"lexa-hub/internal/reconcile"
+)
+
+// breachEpisodes is the named breach-episode component (TASK-031): the single
+// owner of CannotComply episode state and arbitration. It replaces the former
+// `activeBreachMRID` closure variable + standalone breachAlert func in
+// cmd/hub/main.go (05 §4: "if it has a name in a bug report, it needs a name in
+// the code").
+//
+// It merges TWO evidence sources into ONE episode stream so the grid server
+// sees exactly one CannotComply per real episode, not one per source:
+//
+//   - Optimizer meter-level breaches (orchestrator.Plan.Breach): "the SITE is
+//     not meeting the limit", fed by OnPlan on every economic tick.
+//   - Reconciler device-level non-convergence (bus.ReconcileReport
+//     NonConvergedBegin/End): "the HARDWARE won't do what the active control
+//     asked", fed by OnReport off the retained lexa/reconcile/+/+/report topics.
+//
+// Arbitration (deliberately simple and explicit — no debounce here; both
+// sources already damp onset via the optimizer's expOverTicks counters and the
+// reconciler's ConvergeTimeout, and adding a third layer would recreate the
+// guard×guard class): an episode BEGINS when EITHER source reports
+// non-compliance for a control mRID; it ENDS when ALL sources are clear. The
+// meter-level breach, when present, is authoritative for the alert's mRID and
+// its limit/measured/shortfall detail; device evidence supplies the mRID only
+// when no meter breach is active.
+//
+// Edge semantics preserved from the former breachAlert exactly (ledger L5):
+// one Active alert at onset, one Active alert when the breaching control
+// changes to a NEW mRID with no intervening clear (the reject-write/enable-gate
+// fix — an mRID-agnostic latch dropped the second control's breach), one
+// !Active alert when all sources clear, and — critically — a fast-loop safety
+// plan (Plan.Safety) is NOT assessed: its nil Breach must never read as a
+// breach-clear edge (2026-07-03 fix), so OnPlan leaves evidence untouched on
+// safety plans.
+//
+// Concurrency: OnPlan runs on the engine's control goroutine; OnReport runs on
+// the MQTT subscription goroutine. mu serializes them. Both return the edge
+// alerts to publish; the caller (main.go) stamps Ts and publishes outside any
+// lock. One writer per state struct (05 §4).
+//
+// TASK-041 snapshot note: the fields a crash-recovery snapshot must persist to
+// stop the duplicate-begin-after-restart noise (§11) are activeMRID, episodeID,
+// and counter — restoring them lets a restarted hub recognize the still-open
+// episode instead of forming a fresh episodeID for it. The evidence maps
+// (planBreach, deviceReports) are re-seeded live from the retained reconciler
+// reports + the next optimizer tick, so they do NOT need snapshotting; only the
+// episode identity does. (Northbound owns the posted-once flag, in its
+// responseTracker.alerted map.)
+type breachEpisodes struct {
+	mu sync.Mutex
+
+	// activeMRID is the control mRID of the currently-open episode; "" = no
+	// episode active. episodeID is the stable identity formed once at onset and
+	// reused for the whole episode across both sources; counter guarantees
+	// uniqueness across successive episodes. (Snapshot these three — TASK-041.)
+	activeMRID string
+	episodeID  string
+	counter    uint64
+
+	// planBreach is the latest optimizer meter-level breach (nil = the last
+	// non-safety plan assessed no breach). Updated ONLY on non-safety plans.
+	planBreach *orchestrator.ComplianceBreach
+
+	// deviceReports holds the latest convergence state per reconciled device
+	// (keyed by DeviceID). A device contributes to an episode only while
+	// nonConverged AND its mrid is non-empty (an empty-mrid device fault with no
+	// active control is not a CannotComply — it is logged by the shell, not an
+	// episode).
+	deviceReports map[string]deviceEvidence
+}
+
+// deviceEvidence is one reconciled device's latest non-convergence state.
+type deviceEvidence struct {
+	mrid         string
+	nonConverged bool
+	issuedAt     int64 // held desired doc issuedAt — stable half of a device-sourced episode ID
+}
+
+// breachEvidence is the merged "what is breaching now" verdict effectiveBreach
+// hands emit: the mRID plus enough detail to fill an Active alert.
+type breachEvidence struct {
+	mrid       string
+	limitType  string
+	limitW     float64
+	measuredW  float64
+	shortfallW float64
+	reason     string
+	issuedAt   int64 // stable half of the episode ID (device doc issuedAt, or onset time for the optimizer)
+}
+
+func newBreachEpisodes() *breachEpisodes {
+	return &breachEpisodes{deviceReports: make(map[string]deviceEvidence)}
+}
+
+// OnPlan feeds one optimizer plan. Safety plans are not assessed (their nil
+// Breach means "not evaluated", never "compliant") so they leave evidence
+// untouched and never produce an edge. Returns the edge alerts to publish
+// (0 or 1; caller stamps Ts).
+func (b *breachEpisodes) OnPlan(plan orchestrator.Plan, now time.Time) []bus.ComplianceAlert {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if plan.Safety {
+		return nil
+	}
+	b.planBreach = plan.Breach
+	return b.emit(now)
+}
+
+// OnReport feeds one reconciler report. Only the two convergence-state kinds
+// participate in episodes; every other kind (StaleDesired, Rejected*, SeqReset,
+// InterlockHold) is log-only here (the shell already logs it). An empty-mrid
+// NonConvergedBegin is dropped (a device fault with no active control is not a
+// CannotComply). Returns the edge alerts to publish (0 or 1; caller stamps Ts).
+func (b *breachEpisodes) OnReport(rep bus.ReconcileReport, now time.Time) []bus.ComplianceAlert {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch rep.Kind {
+	case reconcile.ReportNonConvergedBegin.String():
+		if rep.MRID == "" {
+			return nil // empty-mrid device fault: log-only, never opens a CSIP episode
+		}
+		b.deviceReports[rep.DeviceID] = deviceEvidence{
+			mrid: rep.MRID, nonConverged: true, issuedAt: rep.IssuedAt,
+		}
+	case reconcile.ReportNonConvergedEnd.String():
+		d := b.deviceReports[rep.DeviceID]
+		d.nonConverged = false
+		b.deviceReports[rep.DeviceID] = d
+	default:
+		return nil
+	}
+	return b.emit(now)
+}
+
+// Active reports whether an episode is currently open (drives the
+// lexa_hub_breach_active gauge).
+func (b *breachEpisodes) Active() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.activeMRID != ""
+}
+
+// emit is the arbitration + edge core. Called with mu held. It computes the
+// effective breaching mRID from all evidence and returns the edge alert(s):
+// an Active alert on onset or mRID-switch, an !Active alert on full clear, or
+// nil when nothing changed this pass (so one episode is reported once, not per
+// tick). Mirrors the former breachAlert's exact edge semantics.
+func (b *breachEpisodes) emit(now time.Time) []bus.ComplianceAlert {
+	ev, breaching := b.effectiveBreach(now)
+	switch {
+	case breaching && ev.mrid != b.activeMRID:
+		// Onset, or a NEW control breaches with no intervening clear: open a new
+		// episode and re-alert. (mRID-switch re-alert — the reject-write/
+		// enable-gate fix; dropping it would drop the second control's breach.)
+		b.counter++
+		b.activeMRID = ev.mrid
+		b.episodeID = fmt.Sprintf("%s@%d#%d", ev.mrid, ev.issuedAt, b.counter)
+		return []bus.ComplianceAlert{{
+			Envelope:   bus.Envelope{V: bus.ComplianceAlertV},
+			MRID:       ev.mrid,
+			LimitType:  ev.limitType,
+			LimitW:     ev.limitW,
+			MeasuredW:  ev.measuredW,
+			ShortfallW: ev.shortfallW,
+			Reason:     ev.reason,
+			Active:     true,
+			EpisodeID:  b.episodeID,
+		}}
+	case !breaching && b.activeMRID != "":
+		// All sources clear: close the episode with one !Active alert.
+		ep := b.episodeID
+		mrid := b.activeMRID
+		b.activeMRID = ""
+		b.episodeID = ""
+		return []bus.ComplianceAlert{{
+			Envelope:  bus.Envelope{V: bus.ComplianceAlertV},
+			MRID:      mrid,
+			Active:    false,
+			EpisodeID: ep,
+		}}
+	default:
+		return nil // no edge this pass (continuing episode, or clear with none active)
+	}
+}
+
+// effectiveBreach merges the evidence into a single verdict. The optimizer's
+// meter-level breach, when present, is authoritative (it carries the mRID and
+// the limit/measured/shortfall detail). Otherwise device-level non-convergence
+// supplies the mRID: episode continuity is preferred (a device still
+// non-converged under the active episode's mRID keeps that mRID), else the
+// lowest mRID among non-converged devices is chosen deterministically.
+func (b *breachEpisodes) effectiveBreach(now time.Time) (breachEvidence, bool) {
+	if b.planBreach != nil {
+		pb := b.planBreach
+		return breachEvidence{
+			mrid: pb.MRID, limitType: pb.LimitType, limitW: pb.LimitW,
+			measuredW: pb.MeasuredW, shortfallW: pb.ShortfallW, reason: pb.Reason,
+			issuedAt: now.Unix(),
+		}, true
+	}
+	best := ""
+	var bestIssued int64
+	for _, dr := range b.deviceReports {
+		if !dr.nonConverged || dr.mrid == "" {
+			continue
+		}
+		if dr.mrid == b.activeMRID {
+			best, bestIssued = dr.mrid, dr.issuedAt
+			break // continuity: keep the active episode's mRID
+		}
+		if best == "" || dr.mrid < best {
+			best, bestIssued = dr.mrid, dr.issuedAt
+		}
+	}
+	if best == "" {
+		return breachEvidence{}, false
+	}
+	return breachEvidence{
+		mrid: best, limitType: "device",
+		reason:   "device not converged (reconciler)",
+		issuedAt: bestIssued,
+	}, true
+}

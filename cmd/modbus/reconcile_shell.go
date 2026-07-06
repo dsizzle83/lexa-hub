@@ -44,8 +44,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/metrics"
+	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/reconcile"
 	"lexa-hub/internal/southbound/device"
 	model "lexa-proto/csipmodel"
@@ -141,6 +144,11 @@ type batteryShell struct {
 	writes         *metrics.Counter // lexa_mb_reconcile_writes_total — applied writes
 	writeFailures  *metrics.Counter // lexa_mb_reconcile_write_failures_total
 	interlockHolds *metrics.Counter // lexa_mb_interlock_holds_total — Tier-0-suppressed connect-restores
+
+	// pub forwards convergence-state reports (NonConvergedBegin/End) to MQTT for
+	// the hub's breach-episode component (TASK-031); nil in shadow mode and in
+	// tests (a no-op then). Set by main.go in active mode.
+	pub func(reconcile.Report)
 }
 
 // newBatteryShadow builds a SHADOW-mode shell (a recorder; no driver, no
@@ -350,6 +358,42 @@ func (s *batteryShell) logDecision(action reconcile.Action, reports []reconcile.
 	for _, rep := range reports {
 		log.Printf("lexa-modbus: reconciler[%s] %s: report=%s episode=%d mrid=%q reject=%s",
 			tag, s.device, rep.Kind, rep.Episode, rep.MRID, rep.Reject)
+		if s.pub != nil {
+			s.pub(rep)
+		}
+	}
+}
+
+// newReconcileReportPublisher returns a shell.pub sink that forwards
+// convergence-state reports to the hub over MQTT (TASK-031). Only
+// NonConvergedBegin/End are published — those two carry the device-level
+// "won't converge under the active control" level the breach-episode component
+// consumes; every other report kind stays shell-log-only. Published RETAINED on
+// lexa/reconcile/{class}/{device}/report (topic derived from the report's own
+// class/device) so the hub re-seeds the current convergence STATE after a
+// restart (latest level wins; the alert EDGE itself is non-retained, published
+// by the hub). Called from the shell's mu-held logDecision, so it inherits the
+// device serialization; the publish is fire-with-timeout (mqttutil).
+func newReconcileReportPublisher(mc mqtt.Client) func(reconcile.Report) {
+	return func(r reconcile.Report) {
+		if r.Kind != reconcile.ReportNonConvergedBegin && r.Kind != reconcile.ReportNonConvergedEnd {
+			return
+		}
+		msg := bus.ReconcileReport{
+			Envelope:    bus.Envelope{V: bus.ReconcileReportV},
+			Kind:        r.Kind.String(),
+			DeviceClass: r.DeviceClass,
+			DeviceID:    r.DeviceID,
+			MRID:        r.MRID,
+			Seq:         r.Seq,
+			IssuedAt:    r.IssuedAt,
+			Episode:     r.Episode,
+			Ts:          r.At.Unix(),
+		}
+		topic := bus.ReconcileReportTopic(r.DeviceClass, r.DeviceID)
+		if err := mqttutil.PublishJSONRetained(mc, topic, msg); err != nil {
+			log.Printf("lexa-modbus: publish reconcile report (%s %s): %v", r.DeviceClass, r.DeviceID, err)
+		}
 	}
 }
 

@@ -71,6 +71,40 @@ type ComplianceAlert struct {
 	Reason     string  `json:"reason"`      // human-readable cause
 	Active     bool    `json:"active"`      // true = breach onset, false = cleared
 	Ts         int64   `json:"ts"`          // Unix seconds
+	// EpisodeID names the breach episode this edge belongs to (TASK-031). The
+	// breach-episode component (cmd/hub/breach.go) forms it once at onset
+	// (mrid@issuedAt) and reuses it for the whole episode, across both evidence
+	// sources (optimizer meter breaches + reconciler non-convergence). The
+	// northbound responseTracker dedupes CannotComply POSTs by this ID when
+	// present (falling back to MRID for pre-TASK-031 publishers and as a
+	// hub-restart safety net), so both sources reporting the same real episode
+	// yield exactly one CannotComply. Additive/omitempty: an alert without it is
+	// a legacy publisher and dedupes by MRID as before.
+	EpisodeID string `json:"episode_id,omitempty"`
+}
+
+// ReconcileReport is the device-level non-convergence evidence a reconciler
+// shell (cmd/modbus battery/solar, cmd/ocpp EVSE) forwards to the hub's
+// breach-episode component (TASK-031). It is the bus projection of an
+// internal/reconcile.Report: "the hardware won't do what the active CSIP
+// control asked", complementary to the optimizer's meter-level breach.
+//
+// Published RETAINED per device on ReconcileReportTopic(class, device) so the
+// hub re-seeds current convergence state after its own restart (state, not an
+// edge — the latest NonConvergedBegin/End wins). Only the two convergence-state
+// kinds are published on this topic; transient/diagnostic report kinds
+// (StaleDesired, Rejected*, SeqReset, InterlockHold) stay shell-log-only for
+// now (TASK-031 scope).
+type ReconcileReport struct {
+	Envelope
+	Kind        string `json:"kind"`                // reconcile.ReportKind.String() (NonConvergedBegin|NonConvergedEnd)
+	DeviceClass string `json:"device_class"`        // battery | solar | evse
+	DeviceID    string `json:"device_id"`           // device / EVSE station ID
+	MRID        string `json:"mrid,omitempty"`      // active CSIP control the held intent derives from
+	Seq         uint64 `json:"seq,omitempty"`       // seq of the held desired document
+	IssuedAt    int64  `json:"issued_at,omitempty"` // held document's publisher wall clock (Unix s)
+	Episode     uint64 `json:"episode"`             // per-reconciler monotonic episode counter
+	Ts          int64  `json:"ts"`                  // report wall-clock time (Unix s)
 }
 
 // BattCommand is published by the hub (orchestrator) to the modbus service.

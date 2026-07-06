@@ -51,6 +51,20 @@ Every service also exposes Prometheus `/metrics` (TASK-044) — see "Metrics" be
 | `lexa/control/battery/{device}` | lexa-hub | lexa-modbus | 1 |
 | `lexa/control/solar/{device}` | lexa-hub | lexa-modbus | 1 |
 | `lexa/evse/{station}/command` | lexa-hub | lexa-ocpp | 1 |
+| `lexa/reconcile/{class}/{device}/report` *(retained)* | lexa-modbus, lexa-ocpp | lexa-hub | 1 |
+| `lexa/csip/compliance/alert` | lexa-hub | lexa-northbound | 1 |
+
+**CannotComply path (3 stages, TASK-031)** — collapsed from the old 5-hop chain:
+(1) *evidence* — the optimizer's meter-level `Plan.Breach` AND the reconcilers'
+device-level non-convergence (`ReconcileReport` NonConvergedBegin/End, retained
+per device so the hub re-seeds state after a restart) — feeds (2) the named
+`breachEpisodes` component (`cmd/hub/breach.go`), the single owner of episode
+state, which merges both sources under one episode ID and emits ONE
+edge-triggered `ComplianceAlert` (non-retained — an edge, not state) per episode
+onset/clear, consumed by (3) northbound's `responseTracker`, which POSTs exactly
+one 2030.5 CannotComply per episode (dedupes on episode ID, falling back to
+MRID). The `activeBreachMRID` closure is gone; episode state is a named,
+snapshot-ready struct (TASK-041).
 
 QoS is enforced by `bus.PubQoS` (`internal/bus/topics.go`), not hardcoded per
 call site — publishers pass `bus.PubQoS(topic)` to

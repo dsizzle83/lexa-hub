@@ -123,7 +123,13 @@ func main() {
 		}
 		shells := make(map[string]*evseShell)
 		for _, sc := range cfg.Stations {
-			shells[sc.ID] = newEVSEShell(sc.ID, reg, mode, drv)
+			sh := newEVSEShell(sc.ID, reg, mode, drv)
+			// TASK-031: forward device-level non-convergence to the hub's
+			// breach-episode component (active mode only).
+			if mode == modeActive {
+				sh.pub = newReconcileReportPublisher(mc)
+			}
+			shells[sc.ID] = sh
 		}
 		bridge.shells = shells
 		if err := mqttutil.Subscribe(mc, bus.SubDesired, func(topic string, doc bus.DesiredState) {
