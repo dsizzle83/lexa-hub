@@ -315,9 +315,40 @@ func publishJSONInner(client mqtt.Client, topic string, qos byte, retained bool,
 }
 
 // Subscribe registers handler for messages on topic (supports MQTT wildcards).
-// handler receives the raw topic string and the JSON-decoded value of type T.
-// The subscription is recorded so that it survives broker reconnects; handler
-// may therefore be invoked again with the retained message after a reconnect.
+// It is SubscribeDecodeErr(client, topic, handler, nil) — see that function's
+// doc for the full decode pipeline (version gate, unmarshal, Finite() check).
+// A nil onErr means every existing Subscribe caller's behavior is exactly
+// what it was before SubscribeDecodeErr existed (TASK-042): the decode-error
+// hook is purely additive and opt-in.
+func Subscribe[T any](client mqtt.Client, topic string, handler func(topic string, msg T)) error {
+	return SubscribeDecodeErr(client, topic, handler, nil)
+}
+
+// SubscribeDecodeErr is like Subscribe but additionally invokes onErr — with
+// the topic, the raw payload, and the error — whenever the decode path drops
+// a message before handler ever sees it: a raw json.Unmarshal failure, or a
+// message that unmarshalled successfully but failed its own Finite() check
+// (GAP-09). onErr is nil-safe (nil simply means "no hook", exactly
+// Subscribe's behavior); it is called synchronously, on the same paho
+// callback goroutine as handler, immediately after the log.Printf/
+// bus.RecordDecodeFailure pair that already runs for that failure — it never
+// replaces or reorders that existing forensic trail, only adds a caller-
+// supplied action alongside it.
+//
+// This does NOT fire for a bus.CheckVersion/RejectAndAlarm reject (AD-006's
+// version gate is a distinct, already-alarmed rejection path with its own
+// counter) — only for the two failure modes bus.RecordDecodeFailure covers:
+// malformed JSON and a non-finite decoded value. TASK-042's motivating case
+// is a corrupted RETAINED control-plane payload (mqtt-malformed-control):
+// today that is a silent-forever drop until the next successful northbound
+// walk republishes; a hub wiring onErr on TopicCSIPControl can instead alarm
+// and request an immediate re-publish (bus.TopicCSIPRewalk) rather than
+// waiting out however long that takes.
+//
+// The subscription is recorded so that it survives broker reconnects; the
+// wrapped handler closure captures onErr, so replay (a reconnect re-issuing
+// SUBSCRIBE) preserves the decode-error hook exactly like every other
+// behavior of the original registered subscription — see subRegistry.replay.
 //
 // Before decoding, every message passes bus.CheckVersion (AD-006, TASK-018):
 // a message whose envelope version exceeds what bus.SupportedV(topic)
@@ -349,7 +380,7 @@ func publishJSONInner(client mqtt.Client, topic string, qos byte, retained bool,
 // the only trace of either — increments a per-topic counter alongside
 // bus.RejectAndAlarm's version-reject counter (GAP-09: today's silent drop
 // on a non-control topic hid a rogue or version-skewed publisher entirely).
-func Subscribe[T any](client mqtt.Client, topic string, handler func(topic string, msg T)) error {
+func SubscribeDecodeErr[T any](client mqtt.Client, topic string, handler func(topic string, msg T), onErr func(topic string, payload []byte, err error)) error {
 	h := func(_ mqtt.Client, m mqtt.Message) {
 		if verr := bus.CheckVersion(m.Topic(), m.Payload(), bus.SupportedV(m.Topic())); verr != nil {
 			if ve, ok := verr.(*bus.VersionError); ok {
@@ -361,12 +392,18 @@ func Subscribe[T any](client mqtt.Client, topic string, handler func(topic strin
 		if err := json.Unmarshal(m.Payload(), &v); err != nil {
 			log.Printf("[mqtt] unmarshal on %s: %v", m.Topic(), err)
 			bus.RecordDecodeFailure(m.Topic(), err)
+			if onErr != nil {
+				onErr(m.Topic(), m.Payload(), err)
+			}
 			return
 		}
 		if fv, ok := any(v).(interface{ Finite() error }); ok {
 			if err := fv.Finite(); err != nil {
 				log.Printf("[mqtt] non-finite value on %s: %v", m.Topic(), err)
 				bus.RecordDecodeFailure(m.Topic(), err)
+				if onErr != nil {
+					onErr(m.Topic(), m.Payload(), err)
+				}
 				return
 			}
 		}
