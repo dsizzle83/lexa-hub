@@ -272,9 +272,9 @@ func (c *Client) Get(path string) ([]byte, error) {
 // Content-Length body bytes so the connection can be reused.
 // Falls back to read-until-close if Content-Length is absent.
 //
-// The parsing core (header loop, chunked-encoding rejection, Content-Length
+// The parsing core (header loop, chunked-transfer decoding, Content-Length
 // handling, header/body size caps) lives in the CGo-free httpwire leaf
-// package so it can be fuzzed without a wolfSSL sysroot (TASK-047, D9/
+// package so it can be fuzzed without a wolfSSL sysroot (TASK-047/069, D9/
 // §10.2); this is a thin wrapper binding it to the wolfSSL-backed session.
 func (c *Client) readResponse() ([]byte, error) {
 	return httpwire.ReadHTTPResponse(func(p []byte) (int, error) {
