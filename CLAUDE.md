@@ -69,7 +69,7 @@ per device so the hub re-seeds state after a restart) — feeds (2) the named
 `breachEpisodes` component (`cmd/hub/breach.go`), the single owner of episode
 state, which merges both sources under one episode ID and emits ONE
 edge-triggered `ComplianceAlert` (non-retained — an edge, not state) per episode
-onset/clear, consumed by (3) northbound's `responseTracker`, which POSTs exactly
+onset/clear, consumed by (3) northbound's `responses.Tracker`, which POSTs exactly
 one 2030.5 CannotComply per episode (dedupes on episode ID, falling back to
 MRID). The `activeBreachMRID` closure is gone; episode state is a named,
 snapshot-ready struct (TASK-041).
@@ -220,6 +220,12 @@ internal/
   mqttutil/   Thin MQTT client helpers (connect, PublishJSON, Subscribe[T])
   northbound/ IEEE 2030.5 discovery walker, scheduler, identity, DNS-SD
               (model types moved to lexa-proto/csipmodel — TASK-023)
+  northbound/{run,publish,responses,flowres} Northbound god-file decomposition
+              (TASK-068, D12/R5): run = walk loop + TASK-042 rewalk
+              single-flight; publish = MQTT publishers/converters; responses
+              = CORE-022/GEN.044 responseTracker (renamed responses.Tracker);
+              flowres = §10.9 flow-reservation manager. cmd/northbound/main.go
+              is wiring only.
   tlsclient/  wolfSSL mTLS client (keep-alive fetcher)
   wolfssl/    CGo wrapper for wolfSSL_Init (call exactly once per process)
   southbound/ Modbus/SunSpec: device interface, inverter, battery, meter, registry
@@ -409,7 +415,8 @@ binary-only deploy + hand-set Pi config (05 §6 discipline).
   rewalk request by immediately republishing its last-published control
   (fresh `Ts`) and triggering an out-of-cadence discovery walk; both sides
   rate-limit independently (hub: `cmd/hub/state.go`'s `rewalkRateLimit`;
-  northbound: `cmd/northbound/main.go`'s `rewalkGate`, `nbRewalkRateLimit`) —
+  northbound: `internal/northbound/run`'s `rewalkGate`, `nbRewalkRateLimit`,
+  TASK-068) —
   10 s floor each — since the retained control-plane topics redeliver on
   every broker reconnect.
 - **Module path**: `lexa-hub` — used in all import paths.
@@ -424,7 +431,7 @@ binary-only deploy + hand-set Pi config (05 §6 discipline).
   | Service | WatchdogSec | Kick site |
   |---|---|---|
   | lexa-hub | 60 | `Engine.PlanObserver`, every economic tick + safety pass (`cmd/hub/main.go`) |
-  | lexa-northbound | 120 | walk-loop `for` body top + once after the initial walk (`cmd/northbound/main.go`) — sized ≥4x a legitimate long walk under `northbound-hang` conditions |
+  | lexa-northbound | 120 | walk-loop `for` body top + once after the initial walk (`internal/northbound/run.Discovery.Loop`, TASK-068) — sized ≥4x a legitimate long walk under `northbound-hang` conditions |
   | lexa-modbus | 60 | first statement of the update-drain body in `publishMeasurements` (`cmd/modbus/main.go`) |
   | lexa-telemetry | 60 | 10s ticker case in the same `select` as the MUP post loop (`cmd/telemetry/main.go`) |
   | lexa-ocpp | 60 | 10s ticker gated on `mc.IsConnected()` (`cmd/ocpp/main.go`) — process+MQTT only, OCPP listener health not probed |
