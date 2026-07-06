@@ -161,11 +161,6 @@ type DefaultOptimizer struct {
 	// the SOC-reserve check alone misses it when SoC is high (audit: battery-wrong-sign).
 	battWrongDirTicks map[string]int
 
-	// genCapActive records whether the previous tick held an active generation
-	// cap, so the release transition (cap → NaN) can emit an explicit uncurtail
-	// (audit: curtailment-release Mode A). See restoreOnGenLimitClear.
-	genCapActive bool
-
 	// tickInterval is the engine cadence. When > 0 it scales the tick-denominated
 	// breach/debounce thresholds so their WALL-CLOCK meaning is constant across
 	// cadences (fast 3 s vs stock 15 s) — the product ships in stock timing but is
@@ -307,9 +302,10 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// Rule 3.1: Generation limit — curtail inverters so total output ≤ MaxLimW.
 	// Always runs (CSIP compliance cannot be skipped).
 	applyGenLimitRule(state.Solar, limits.maxLimitW, &plan)
-	// On the tick the cap is released, emit an explicit uncurtail so no stale
-	// ceiling latches on the inverter (audit: curtailment-release Mode A).
-	o.restoreOnGenLimitClear(state.Solar, limits.maxLimitW, &plan)
+	// TASK-032: the explicit uncurtail on the cap-release edge (formerly
+	// restoreOnGenLimitClear) was deleted — applyRestoreRule (end of pass) emits
+	// the same NaN restore for any inverter left uncommanded once the cap clears,
+	// and the retained desired doc carries it to a dark inverter on reconnect.
 	// Closed-loop check: verify the inverters actually converged to the cap.
 	o.checkGenLimitConvergence(state.Solar, state.Batteries, state.Grid.NetW, limits.maxLimitW, &plan)
 
@@ -1231,51 +1227,6 @@ func (o *DefaultOptimizer) checkExportLimitConvergence(exportLimitW, netW float6
 			fmt.Sprintf("export %.0fW still over cap %.0fW after %d ticks (~%.0fs)",
 				exportW, exportLimitW, o.expOverTicks, float64(o.expOverTicks)*o.tickSeconds()),
 			"reporting CannotComply — site not converging to the export limit")
-	}
-}
-
-// restoreOnGenLimitClear emits an explicit uncurtail (CurtailToW=NaN → WMaxLimPct
-// 100%) on the tick a generation cap is released (was active last tick, now NaN),
-// for each connected inverter with no other command this tick.
-//
-// applyGenLimitRule early-returns on a cleared cap without touching the inverter,
-// leaving the release to applyRestoreRule at the end of the pass. Emitting the
-// restore explicitly at the release edge — ahead of applyRestoreRule and logged as
-// its own decision — makes the transition observable and guarantees the uncurtail
-// is issued the moment the cap clears (audit: curtailment-release Mode A). Only the
-// active→clear edge fires it, so a still-active export limit (which curtails via its
-// own command, already present in plan.SolarCommands) is left untouched.
-//
-// The restore is emitted for DISCONNECTED inverters too: the southbound
-// (lexa-modbus retryDevice) records every command as the device's desired
-// state and re-asserts it when the device reconnects (Phase 4), so a release
-// that happens while the inverter is dark is delivered on its return instead
-// of leaving it latched at the stale ceiling (QA 2026-07-02:
-// release-while-rebooting).
-func (o *DefaultOptimizer) restoreOnGenLimitClear(solar []SolarState, maxLimitW float64, plan *Plan) {
-	if !math.IsNaN(maxLimitW) {
-		o.genCapActive = true
-		return
-	}
-	if !o.genCapActive {
-		return // no cap last tick either — nothing to release
-	}
-	o.genCapActive = false
-	restored := 0
-	for _, sol := range solar {
-		if hasSolarCommand(plan.SolarCommands, sol.Name) {
-			continue
-		}
-		plan.SolarCommands = append(plan.SolarCommands, SolarCommand{
-			Name:       sol.Name,
-			CurtailToW: math.NaN(), // NaN → restore to full nameplate (WMaxLimPct 100%)
-		})
-		restored++
-	}
-	if restored > 0 {
-		plan.AddDecision("csip/gen-limit",
-			"generation cap released — restoring inverters to full output",
-			fmt.Sprintf("uncurtailing %d inverters (WMaxLimPct 100%%) so no stale ceiling latches", restored))
 	}
 }
 
@@ -2216,31 +2167,36 @@ func batteryHeadroomReason(batteries []BatteryState, socReserve float64) string 
 	return "battery discharge headroom exhausted (at MaxDischargeW)"
 }
 
-// applyRestoreRule sends restore commands for devices that received no command this
-// tick so that prior setpoints don't latch in Modbus registers.
-// Solar is restored to full output (NaN = nameplate max).
-// Battery is idled (0 W) and reconnected so a prior disconnect does not persist.
+// applyRestoreRule is the STANDING-INTENT source (ledger L1): it emits restore
+// commands for devices that received no command this tick, so the hub's desired
+// state is always complete. Solar is restored to full output (NaN = nameplate
+// max); battery is idled (0 W) and reconnected so a prior disconnect does not
+// persist. These commands feed the desired-doc publisher (cmd/hub/desired.go),
+// which serializes them into the retained lexa/desired/* documents the
+// reconciler executes — TASK-032 deleted the per-tick QoS 1 command spam this
+// rule used to drive through the legacy actuators, but the RULE itself (the
+// intent) stays: it is what makes "idle enforces the reserve at any SoC" and
+// "restore is an explicit write" true on the wire.
 //
 // When no solar cap is active, the restore is emitted for DISCONNECTED inverters
-// too — this is the export-cap counterpart of restoreOnGenLimitClear's dark-device
-// handling: the southbound (lexa-modbus retryDevice) records every command as the
-// device's desired state even while disconnected and re-asserts it on reconnect
-// (Phase 4), so this restore is what overwrites a stale curtailment latched before
-// the fault. Gating it on Connected meant an inverter that was dark on the ticks
-// after the cap cleared kept the old ceiling as its recorded desired state and
-// returned still clamped, forever (QA 2026-07-03: curtailment-release,
-// clock-jump-forward, release-while-rebooting — 11/21 FAILs).
+// too: the retained desired doc holds it and the reconciler reasserts it on
+// reconnect, so a release that happens while the inverter is dark is delivered on
+// its return instead of leaving it latched at the stale ceiling. Gating it on
+// Connected meant an inverter dark on the ticks after the cap cleared kept the
+// old ceiling as its desired state and returned still clamped, forever (QA
+// 2026-07-03: curtailment-release, clock-jump-forward, release-while-rebooting —
+// 11/21 FAILs).
 //
 // While a solar cap IS active, a dark inverter is deliberately left uncommanded:
-// the cap rules only command connected inverters, so the southbound's recorded
-// desired state still holds the live curtailment — queuing a restore here would
-// overwrite it and a reconnecting inverter would snap to full nameplate under an
-// active cap (e.g. a Modbus fault mid-episode) until the next tick re-curtails.
+// the cap rules only command connected inverters, so the retained desired doc
+// still holds the live curtailment — queuing a restore here would overwrite it
+// and a reconnecting inverter would snap to full nameplate under an active cap
+// until the next tick re-curtails.
 //
 // Batteries keep the Connected gate deliberately: the orchestrator re-commands
 // packs every engine tick once they are connected (this rule idles any uncommanded
-// pack), so a reconnecting battery is reconciled within one tick — and
-// retryDevice's reconnect reassert covers a pack that WAS commanded while dark.
+// pack), so a reconnecting battery is reconciled within one tick — and the
+// reconciler's reassert-on-reconnect covers a pack that WAS commanded while dark.
 // Queuing idle commands for dark packs would add nothing but per-tick MQTT noise.
 func applyRestoreRule(solar []SolarState, batteries []BatteryState, socReserve float64, solarCapActive bool, plan *Plan) {
 	for _, sol := range solar {
