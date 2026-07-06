@@ -43,6 +43,14 @@ type Config struct {
 	// northbound only ever emits cannot_comply_posted + service_start. A
 	// nil/absent "journal" key disables journaling entirely.
 	Journal *JournalConfig `json:"journal,omitempty"`
+
+	// CertExpiryWarnDays is the cert-expiry monitor's WARN threshold in days
+	// remaining (TASK-072/§10.5) — 0/absent defaults to
+	// defaultCertExpiryWarnDays (30, the release-checklist gate). lexa-telemetry
+	// shares these same cert files (its own ca_cert/client_cert paths point at
+	// the same on-disk PEMs) but does not run a second monitor — see
+	// cmd/northbound/certmon.go's package doc.
+	CertExpiryWarnDays int `json:"cert_expiry_warn_days,omitempty"`
 }
 
 // JournalConfig is the on-disk "journal" block — a duplicate of cmd/hub's

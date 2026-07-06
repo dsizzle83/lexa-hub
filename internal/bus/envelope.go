@@ -51,6 +51,7 @@ const (
 	DesiredStateV           = 1 // lexa/desired/{class}/{device}            (DesiredState, AD-013)
 	ReconcileReportV        = 1 // lexa/reconcile/{class}/{device}/report   (ReconcileReport, TASK-031)
 	RewalkRequestV          = 1 // lexa/csip/rewalk                        (RewalkRequest, TASK-042)
+	CertStatusV             = 1 // lexa/northbound/certstatus               (CertStatus, TASK-072)
 )
 
 // LegacyV0Accepted is the transition switch for AD-006's compatibility

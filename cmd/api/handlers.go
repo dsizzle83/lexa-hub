@@ -31,6 +31,26 @@ type statusResp struct {
 	// the last PlanLog ARRIVAL (not the plan's own timestamp — see
 	// planHeartbeat's doc in heartbeat.go).
 	PlanHeartbeat planHeartbeatJSON `json:"plan_heartbeat"`
+	// CertStatus surfaces lexa-northbound's latest client/CA cert-expiry
+	// check (TASK-072/§10.5): omitted entirely (nil) until the first
+	// retained lexa/northbound/certstatus message arrives — additive field,
+	// existing /status consumers that don't know about it are unaffected.
+	CertStatus *certStatusJSON `json:"cert_status,omitempty"`
+}
+
+// certStatusJSON is /status's stable, hand-rolled shape for bus.CertStatus —
+// decoupled from the wire envelope (same pattern planJSON/decisionJSON use
+// for bus.PlanLog) so the bus schema and the HTTP contract can evolve
+// independently.
+type certStatusJSON struct {
+	ClientNotAfter string `json:"client_not_after,omitempty"` // RFC3339, empty if unknown
+	CANotAfter     string `json:"ca_not_after,omitempty"`
+	ClientDaysLeft int    `json:"client_days_left"`
+	CADaysLeft     int    `json:"ca_days_left"`
+	DaysLeft       int    `json:"days_left"`
+	ClientErr      string `json:"client_err,omitempty"`
+	CAErr          string `json:"ca_err,omitempty"`
+	CheckedAt      string `json:"checked_at"` // RFC3339 timestamp of the check (bus.CertStatus.Ts)
 }
 
 type planHeartbeatJSON struct {
@@ -120,6 +140,24 @@ func buildStatus(snap snapshot, hb heartbeatStatus) statusResp {
 			Decisions: []decisionJSON{},
 		},
 		PlanHeartbeat: planHeartbeatJSON{State: string(hb.State), AgeS: hb.AgeS},
+	}
+
+	if cs := snap.certStatus; cs != nil {
+		csj := &certStatusJSON{
+			ClientDaysLeft: cs.ClientDaysLeft,
+			CADaysLeft:     cs.CADaysLeft,
+			DaysLeft:       cs.DaysLeft,
+			ClientErr:      cs.ClientErr,
+			CAErr:          cs.CAErr,
+			CheckedAt:      time.Unix(cs.Ts, 0).UTC().Format(time.RFC3339),
+		}
+		if cs.ClientNotAfter != 0 {
+			csj.ClientNotAfter = time.Unix(cs.ClientNotAfter, 0).UTC().Format(time.RFC3339)
+		}
+		if cs.CANotAfter != 0 {
+			csj.CANotAfter = time.Unix(cs.CANotAfter, 0).UTC().Format(time.RFC3339)
+		}
+		resp.CertStatus = csj
 	}
 
 	// Relay the hub's actual plan trace (TopicHubPlan). The timestamp is the
