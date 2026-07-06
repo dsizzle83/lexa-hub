@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/journal"
 	"lexa-hub/internal/orchestrator"
 	"lexa-hub/internal/reconcile"
 )
@@ -53,7 +55,7 @@ func none(t *testing.T, alerts []bus.ComplianceAlert) {
 // previous control was still breaching (the reject-write/enable-gate-curtail
 // flakiness — an mRID-agnostic latch dropped the second scenario's alert).
 func TestBreachEpisodes_OnsetSwitchClear(t *testing.T) {
-	b := newBreachEpisodes()
+	b := newBreachEpisodes(nil)
 
 	// First breach (control A) → publish Active alert for A, with an episode ID.
 	a := one(t, b.OnPlan(breachPlan("A"), testNow))
@@ -104,7 +106,7 @@ func TestBreachEpisodes_OnsetSwitchClear(t *testing.T) {
 // plan.Safety { return nil }` guard in OnPlan and this test fails — the safety
 // plan's nil Breach would clear the still-open episode A.
 func TestBreachEpisodes_SafetyPlanHoldsEpisode(t *testing.T) {
-	b := newBreachEpisodes()
+	b := newBreachEpisodes(nil)
 	one(t, b.OnPlan(breachPlan("A"), testNow)) // open episode A
 
 	// Safety plan mid-episode: no edge, episode preserved.
@@ -118,7 +120,7 @@ func TestBreachEpisodes_SafetyPlanHoldsEpisode(t *testing.T) {
 	none(t, b.OnPlan(breachPlan("A"), testNow))
 
 	// Safety plan with no episode active is equally a no-op.
-	b2 := newBreachEpisodes()
+	b2 := newBreachEpisodes(nil)
 	none(t, b2.OnPlan(orchestrator.Plan{Safety: true}, testNow))
 	if b2.Active() {
 		t.Fatalf("safety plan with no episode must stay inactive")
@@ -128,7 +130,7 @@ func TestBreachEpisodes_SafetyPlanHoldsEpisode(t *testing.T) {
 // A device that refuses while the meter is fine opens an episode from the
 // reconciler evidence alone, and clears when it converges.
 func TestBreachEpisodes_ReconcilerOnlyEpisode(t *testing.T) {
-	b := newBreachEpisodes()
+	b := newBreachEpisodes(nil)
 
 	a := one(t, b.OnReport(nonConverged("bat0", "X"), testNow))
 	if !a.Active || a.MRID != "X" || a.EpisodeID == "" {
@@ -148,7 +150,7 @@ func TestBreachEpisodes_ReconcilerOnlyEpisode(t *testing.T) {
 // Both sources reporting the same control form ONE episode: one begin, one end
 // only when BOTH have cleared.
 func TestBreachEpisodes_BothSourcesOneEpisode(t *testing.T) {
-	b := newBreachEpisodes()
+	b := newBreachEpisodes(nil)
 
 	// Optimizer opens episode A.
 	a := one(t, b.OnPlan(breachPlan("A"), testNow))
@@ -175,7 +177,7 @@ func TestBreachEpisodes_BothSourcesOneEpisode(t *testing.T) {
 // An empty-mRID device fault (no active control) is NOT a CannotComply: it must
 // not open a CSIP episode.
 func TestBreachEpisodes_EmptyMRIDNoEpisode(t *testing.T) {
-	b := newBreachEpisodes()
+	b := newBreachEpisodes(nil)
 	none(t, b.OnReport(nonConverged("bat0", ""), testNow))
 	if b.Active() {
 		t.Fatalf("empty-mRID device fault must not open an episode")
@@ -184,11 +186,89 @@ func TestBreachEpisodes_EmptyMRIDNoEpisode(t *testing.T) {
 
 // The episode ID formed at onset is reused for the whole episode across sources.
 func TestBreachEpisodes_EpisodeIDStable(t *testing.T) {
-	b := newBreachEpisodes()
+	b := newBreachEpisodes(nil)
 	open := one(t, b.OnPlan(breachPlan("A"), testNow))
 	clear := one(t, b.OnPlan(orchestrator.Plan{Breach: nil}, testNow))
 	if open.EpisodeID != clear.EpisodeID || open.EpisodeID == "" {
 		t.Fatalf("onset and clear must carry the same non-empty episode ID, got %q / %q",
 			open.EpisodeID, clear.EpisodeID)
+	}
+}
+
+// ---------------------------------------------------------------------
+// TASK-040: journal wiring (breach_begin/breach_end, one episode ID shared)
+// ---------------------------------------------------------------------
+
+// TestBreachEpisodes_JournalsBeginEndSameEpisode is the journal-side sibling
+// of TestBreachEpisodes_EpisodeIDStable: the episode ID minted at onset must
+// be the one carried on both the breach_begin AND breach_end journal
+// entries, matching the ComplianceAlert edges above bit-for-bit.
+func TestBreachEpisodes_JournalsBeginEndSameEpisode(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	b := newBreachEpisodes(jw)
+	alert := one(t, b.OnPlan(breachPlan("A"), testNow))
+	one(t, b.OnPlan(orchestrator.Plan{Breach: nil}, testNow))
+
+	events := journalEventsByType(t, dir)
+	begin := events[journal.TypeBreachBegin]
+	end := events[journal.TypeBreachEnd]
+	if len(begin) != 1 || len(end) != 1 {
+		t.Fatalf("breach_begin=%d breach_end=%d, want 1/1", len(begin), len(end))
+	}
+	var bp, ep journal.Breach
+	if err := json.Unmarshal(begin[0].Data, &bp); err != nil {
+		t.Fatalf("unmarshal begin Breach: %v", err)
+	}
+	if err := json.Unmarshal(end[0].Data, &ep); err != nil {
+		t.Fatalf("unmarshal end Breach: %v", err)
+	}
+	if bp.EpisodeID == "" || bp.EpisodeID != ep.EpisodeID || bp.EpisodeID != alert.EpisodeID {
+		t.Fatalf("begin/end/alert episode IDs = %q / %q / %q, want all equal and non-empty",
+			bp.EpisodeID, ep.EpisodeID, alert.EpisodeID)
+	}
+	if bp.MRID != "A" || bp.LimitType != "generation" || bp.LimitW != 1000 {
+		t.Fatalf("begin Breach payload = %+v, want mrid=A limit_type=generation limit_w=1000", bp)
+	}
+}
+
+// TestBreachEpisodes_JournalsNothingOnContinuingEpisode verifies the
+// "one begin per episode, not per tick" write-budget property: a breach that
+// continues across several OnPlan calls must journal exactly one
+// breach_begin, matching the ComplianceAlert edge semantics (no re-alert
+// while the same mRID keeps breaching).
+func TestBreachEpisodes_JournalsNothingOnContinuingEpisode(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	b := newBreachEpisodes(jw)
+	one(t, b.OnPlan(breachPlan("A"), testNow))
+	none(t, b.OnPlan(breachPlan("A"), testNow))
+	none(t, b.OnPlan(breachPlan("A"), testNow))
+
+	events := journalEventsByType(t, dir)
+	if got := len(events[journal.TypeBreachBegin]); got != 1 {
+		t.Fatalf("breach_begin events = %d, want 1 (continuing episode must not re-journal)", got)
+	}
+}
+
+// TestBreachEpisodes_NilJournalIsNoop verifies a nil Writer (no "journal"
+// config block) never panics and leaves the component's own edge semantics
+// untouched — the acceptance criterion that services behave exactly as
+// before with journaling disabled.
+func TestBreachEpisodes_NilJournalIsNoop(t *testing.T) {
+	b := newBreachEpisodes(nil)
+	a := one(t, b.OnPlan(breachPlan("A"), testNow))
+	if !a.Active || a.EpisodeID == "" {
+		t.Fatalf("nil journal must not affect the component's own alert output, got %+v", a)
 	}
 }

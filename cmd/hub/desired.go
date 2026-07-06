@@ -8,6 +8,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/journal"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/orchestrator"
@@ -53,11 +54,16 @@ type desiredPublishingBatteryActuator struct {
 	// publishes counts every retained publish actually sent
 	// (lexa_hub_desired_publishes_total, TASK-044-style); nil-safe.
 	publishes *metrics.Counter
+
+	// jw is the optional TASK-040 event journal; nil disables the dispatch
+	// emit below. Guarded fire-and-forget, same discipline as every other
+	// journal call site in this package.
+	jw *journal.Writer
 }
 
 // newDesiredPublishingBatteryActuator builds the battery actuator for device.
-func newDesiredPublishingBatteryActuator(mc mqtt.Client, device string, publishes *metrics.Counter) *desiredPublishingBatteryActuator {
-	return &desiredPublishingBatteryActuator{mc: mc, device: device, publishes: publishes}
+func newDesiredPublishingBatteryActuator(mc mqtt.Client, device string, publishes *metrics.Counter, jw *journal.Writer) *desiredPublishingBatteryActuator {
+	return &desiredPublishingBatteryActuator{mc: mc, device: device, publishes: publishes, jw: jw}
 }
 
 // ApplyBatteryCommand folds the command into the standing intent, then — only
@@ -108,6 +114,15 @@ func (a *desiredPublishingBatteryActuator) ApplyBatteryCommand(cmd orchestrator.
 	a.lastPublished = &stored
 	a.seq++
 	a.publishes.Inc()
+
+	// TASK-040: dispatch is journaled post-dedupe (this line only runs on
+	// an actual content-changed publish above), so write volume is bounded
+	// by real command changes, not the tick rate.
+	if a.jw != nil {
+		if ev, err := journal.NewDispatchEvent("hub", journal.NewDispatch(a.device, journal.KindBattery, doc.SetpointW, nil, nil, doc.Connect)); err == nil {
+			_ = a.jw.Append(ev)
+		}
+	}
 	return nil
 }
 
@@ -155,10 +170,11 @@ type desiredPublishingSolarActuator struct {
 	lastPublished *bus.DesiredState
 	seq           uint64
 	publishes     *metrics.Counter
+	jw            *journal.Writer
 }
 
-func newDesiredPublishingSolarActuator(mc mqtt.Client, device string, publishes *metrics.Counter) *desiredPublishingSolarActuator {
-	return &desiredPublishingSolarActuator{mc: mc, device: device, publishes: publishes}
+func newDesiredPublishingSolarActuator(mc mqtt.Client, device string, publishes *metrics.Counter, jw *journal.Writer) *desiredPublishingSolarActuator {
+	return &desiredPublishingSolarActuator{mc: mc, device: device, publishes: publishes, jw: jw}
 }
 
 // ApplySolarCommand publishes — only when the derived ceiling differs from the
@@ -196,6 +212,12 @@ func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.Sola
 	a.lastPublished = &stored
 	a.seq++
 	a.publishes.Inc()
+
+	if a.jw != nil {
+		if ev, err := journal.NewDispatchEvent("hub", journal.NewDispatch(a.device, journal.KindSolar, nil, doc.CeilingW, nil, nil)); err == nil {
+			_ = a.jw.Append(ev)
+		}
+	}
 	return nil
 }
 
@@ -219,10 +241,11 @@ type desiredPublishingEVSEActuator struct {
 	lastPublished *bus.DesiredState
 	seq           uint64
 	publishes     *metrics.Counter
+	jw            *journal.Writer
 }
 
-func newDesiredPublishingEVSEActuator(mc mqtt.Client, stationID string, publishes *metrics.Counter) *desiredPublishingEVSEActuator {
-	return &desiredPublishingEVSEActuator{mc: mc, stationID: stationID, publishes: publishes}
+func newDesiredPublishingEVSEActuator(mc mqtt.Client, stationID string, publishes *metrics.Counter, jw *journal.Writer) *desiredPublishingEVSEActuator {
+	return &desiredPublishingEVSEActuator{mc: mc, stationID: stationID, publishes: publishes, jw: jw}
 }
 
 // ApplyEVSECommand publishes a retained desired doc when the current-limit
@@ -256,6 +279,12 @@ func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECo
 	a.lastPublished = &stored
 	a.seq++
 	a.publishes.Inc()
+
+	if a.jw != nil {
+		if ev, err := journal.NewDispatchEvent("hub", journal.NewDispatch(a.stationID, journal.KindEVSE, nil, nil, doc.MaxCurrentA, doc.Connect)); err == nil {
+			_ = a.jw.Append(ev)
+		}
+	}
 	return nil
 }
 

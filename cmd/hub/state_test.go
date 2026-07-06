@@ -1,13 +1,31 @@
 package main
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/journal"
 	"lexa-hub/internal/utilitytime"
 )
+
+// journalEventsByType scans dir's active journal file (TASK-039's default
+// name) and groups events by Type, for TASK-040's journal-wiring tests
+// across this package (state_test.go, desired_test.go, breach_test.go all
+// share this helper — one journal.Writer per test, one temp dir per test).
+func journalEventsByType(t *testing.T, dir string) map[string][]journal.Event {
+	t.Helper()
+	out := make(map[string][]journal.Event)
+	if _, err := journal.Scan(dir, journal.DefaultName, func(e journal.Event) error {
+		out[e.Type] = append(out[e.Type], e)
+		return nil
+	}); err != nil {
+		t.Fatalf("journal.Scan: %v", err)
+	}
+	return out
+}
 
 // decodeAP mirrors the orchestrator's apW: value × 10^multiplier.
 func decodeAP(value int16, multiplier int8) float64 {
@@ -170,7 +188,7 @@ func TestBusToCSIPControlLargeLimits(t *testing.T) {
 // clock jump can't drop a still-valid control (see
 // TestReadSystemState_ClockLurchKeepsControl).
 func TestReadSystemState_ExpiredCSIPControlDropped(t *testing.T) {
-	r := newMQTTSystemReader(nil, testFastInterval)
+	r := newMQTTSystemReader(nil, testFastInterval, nil)
 	expLim := 5000.0
 	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
 		Source:     "event",
@@ -211,7 +229,7 @@ func TestReadSystemState_ExpiredCSIPControlDropped(t *testing.T) {
 // the first forward excursion deleted the control and the back-jump could not
 // restore it, so the hub silently stopped enforcing the cap.
 func TestReadSystemState_ClockLurchKeepsControl(t *testing.T) {
-	r := newMQTTSystemReader(nil, testFastInterval)
+	r := newMQTTSystemReader(nil, testFastInterval, nil)
 	expLim := 5000.0
 	validUntil := time.Now().Unix() + 300 // 5 min out in server time
 
@@ -269,7 +287,7 @@ func TestReadSystemState_LocalStepDoesNotDropControl(t *testing.T) {
 		{"backward -1h local step", -time.Hour},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := newMQTTSystemReader(nil, testFastInterval)
+			r := newMQTTSystemReader(nil, testFastInterval, nil)
 			base := time.Now() // must be time.Now()-derived to carry a monotonic reading
 			fakeNow := base
 			r.utclk = utilitytime.New(utilitytime.Config{Now: func() time.Time { return fakeNow }})
@@ -367,7 +385,7 @@ func TestReadSystemState_ActiveCSIPControlKept(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := newMQTTSystemReader(nil, testFastInterval)
+			r := newMQTTSystemReader(nil, testFastInterval, nil)
 			expLim := 5000.0
 			r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
 				Source:     "event",
@@ -426,7 +444,7 @@ func TestConfirmTicksFor_ScalesToEngineCadence(t *testing.T) {
 // the counter), and only a genuinely sustained 2-in-a-row expiry drops it.
 func TestReadSystemState_ExpiryDebounce_STOCKCadence(t *testing.T) {
 	const stockInterval = 15 * time.Second
-	r := newMQTTSystemReader(nil, stockInterval)
+	r := newMQTTSystemReader(nil, stockInterval, nil)
 	if r.expiry.Confirm != 2 {
 		t.Fatalf("precondition: STOCK confirm = %d, want 2", r.expiry.Confirm)
 	}
@@ -484,7 +502,7 @@ func TestReadSystemState_ExpiryDebounce_STOCKCadence(t *testing.T) {
 // fresh one recovers. (The log lines are the operator-visible surfacing; here we
 // assert the underlying state the logging is gated on.)
 func TestNoteStaleness_EdgeTriggers(t *testing.T) {
-	r := newMQTTSystemReader([]DeviceConfig{{Name: "meter-0", Role: "meter"}}, testFastInterval)
+	r := newMQTTSystemReader([]DeviceConfig{{Name: "meter-0", Role: "meter"}}, testFastInterval, nil)
 	now := time.Now()
 
 	r.noteStaleness("meter-0", measSnapshot{at: time.Time{}}, now)
@@ -502,5 +520,210 @@ func TestNoteStaleness_EdgeTriggers(t *testing.T) {
 	r.noteStaleness("meter-0", measSnapshot{at: now}, now)
 	if r.stale["meter-0"] {
 		t.Fatal("a recovered source must clear stale")
+	}
+}
+
+// ---------------------------------------------------------------------
+// TASK-040: journal wiring (control adoption/release, change-detected)
+// ---------------------------------------------------------------------
+
+// TestOnCSIPControl_JournalsAdoptionOnChangeOnly is the RSK-14 write-budget
+// acceptance criterion for the adoption emit site: lexa-northbound
+// republishes the retained lexa/csip/control topic on every discovery walk
+// (~5 s FAST) even when nothing changed, and onCSIPControl must journal
+// control_adopted only on the FIRST arrival of a given control's identity —
+// two further identical republishes must not append a second/third event.
+func TestOnCSIPControl_JournalsAdoptionOnChangeOnly(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	r := newMQTTSystemReader(nil, testFastInterval, jw)
+	expLim := 5000.0
+	msg := bus.ActiveControl{Source: "event", MRID: "evt-1", ExpLimW: &expLim, Ts: time.Now().Unix()}
+
+	r.onCSIPControl("lexa/csip/control", msg)
+	r.onCSIPControl("lexa/csip/control", msg) // identical republish
+	r.onCSIPControl("lexa/csip/control", msg) // identical republish
+
+	if err := jw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	events := journalEventsByType(t, dir)
+	if got := len(events[journal.TypeControlAdopted]); got != 1 {
+		t.Fatalf("control_adopted events = %d, want 1 (unchanged republish must not journal)", got)
+	}
+	var payload journal.ControlAdopted
+	if err := json.Unmarshal(events[journal.TypeControlAdopted][0].Data, &payload); err != nil {
+		t.Fatalf("unmarshal ControlAdopted: %v", err)
+	}
+	if payload.Source != "event" || payload.MRID != "evt-1" || payload.ExpLimW == nil || *payload.ExpLimW != expLim {
+		t.Fatalf("ControlAdopted payload = %+v, want source=event mrid=evt-1 exp_lim_w=%g", payload, expLim)
+	}
+}
+
+// TestOnCSIPControl_JournalsAdoptionOnRealChange verifies a genuine content
+// change (a new ExpLimW on the SAME mRID) DOES re-journal — the gate is on
+// content equality, not just mRID.
+func TestOnCSIPControl_JournalsAdoptionOnRealChange(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	r := newMQTTSystemReader(nil, testFastInterval, jw)
+	lim1, lim2 := 5000.0, 4000.0
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{Source: "event", MRID: "evt-1", ExpLimW: &lim1, Ts: time.Now().Unix()})
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{Source: "event", MRID: "evt-1", ExpLimW: &lim2, Ts: time.Now().Unix()})
+
+	if err := jw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	events := journalEventsByType(t, dir)
+	if got := len(events[journal.TypeControlAdopted]); got != 2 {
+		t.Fatalf("control_adopted events = %d, want 2 (a real limit change must re-journal)", got)
+	}
+	// Same mRID, no clear in between: must NOT release (the "replaced"
+	// release path only fires on an mRID departure, not an in-place update).
+	if got := len(events[journal.TypeControlReleased]); got != 0 {
+		t.Fatalf("control_released events = %d, want 0 (same mRID, in-place limit change)", got)
+	}
+}
+
+// TestOnCSIPControl_JournalsReleaseOnClear verifies a transition from a real
+// control to Source "none" journals control_released{reason: cleared}
+// (distinct from ReadSystemState's expiry-driven release, tested separately
+// below).
+func TestOnCSIPControl_JournalsReleaseOnClear(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	r := newMQTTSystemReader(nil, testFastInterval, jw)
+	expLim := 5000.0
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{Source: "event", MRID: "evt-1", ExpLimW: &expLim, Ts: time.Now().Unix()})
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{Source: "none", Ts: time.Now().Unix()})
+
+	if err := jw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	events := journalEventsByType(t, dir)
+	if got := len(events[journal.TypeControlAdopted]); got != 1 {
+		t.Fatalf("control_adopted events = %d, want 1", got)
+	}
+	rel := events[journal.TypeControlReleased]
+	if len(rel) != 1 {
+		t.Fatalf("control_released events = %d, want 1", len(rel))
+	}
+	var payload journal.ControlReleased
+	if err := json.Unmarshal(rel[0].Data, &payload); err != nil {
+		t.Fatalf("unmarshal ControlReleased: %v", err)
+	}
+	if payload.Reason != journal.ReasonCleared || payload.MRID != "evt-1" {
+		t.Fatalf("ControlReleased payload = %+v, want reason=%s mrid=evt-1", payload, journal.ReasonCleared)
+	}
+}
+
+// TestOnCSIPControl_JournalsReplaceOnMRIDSwitch verifies a direct switch
+// from one real control to another real control (no intervening "none")
+// journals a release{reason: replaced} for the old mRID, then an adoption
+// for the new one.
+func TestOnCSIPControl_JournalsReplaceOnMRIDSwitch(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	r := newMQTTSystemReader(nil, testFastInterval, jw)
+	lim := 5000.0
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{Source: "event", MRID: "evt-A", ExpLimW: &lim, Ts: time.Now().Unix()})
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{Source: "event", MRID: "evt-B", ExpLimW: &lim, Ts: time.Now().Unix()})
+
+	if err := jw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	events := journalEventsByType(t, dir)
+	if got := len(events[journal.TypeControlAdopted]); got != 2 {
+		t.Fatalf("control_adopted events = %d, want 2", got)
+	}
+	rel := events[journal.TypeControlReleased]
+	if len(rel) != 1 {
+		t.Fatalf("control_released events = %d, want 1", len(rel))
+	}
+	var payload journal.ControlReleased
+	if err := json.Unmarshal(rel[0].Data, &payload); err != nil {
+		t.Fatalf("unmarshal ControlReleased: %v", err)
+	}
+	if payload.Reason != journal.ReasonReplaced || payload.MRID != "evt-A" {
+		t.Fatalf("ControlReleased payload = %+v, want reason=%s mrid=evt-A", payload, journal.ReasonReplaced)
+	}
+}
+
+// TestReadSystemState_ExpiredControlJournalsRelease verifies the
+// expiry-drop branch in ReadSystemState journals control_released{reason:
+// expired} — distinct from onCSIPControl's message-arrival-driven releases,
+// since expiry is detected on tick, not on message arrival.
+func TestReadSystemState_ExpiredControlJournalsRelease(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	r := newMQTTSystemReader(nil, testFastInterval, jw)
+	expLim := 5000.0
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
+		Source: "event", MRID: "expiring", ExpLimW: &expLim,
+		ValidUntil: time.Now().Unix() - 10, Ts: time.Now().Unix(),
+	})
+	for i := 0; i < r.expiry.Confirm; i++ {
+		if _, err := r.ReadSystemState(); err != nil {
+			t.Fatalf("ReadSystemState: %v", err)
+		}
+	}
+
+	if err := jw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	events := journalEventsByType(t, dir)
+	rel := events[journal.TypeControlReleased]
+	if len(rel) != 1 {
+		t.Fatalf("control_released events = %d, want 1", len(rel))
+	}
+	var payload journal.ControlReleased
+	if err := json.Unmarshal(rel[0].Data, &payload); err != nil {
+		t.Fatalf("unmarshal ControlReleased: %v", err)
+	}
+	if payload.Reason != journal.ReasonExpired || payload.MRID != "expiring" {
+		t.Fatalf("ControlReleased payload = %+v, want reason=%s mrid=expiring", payload, journal.ReasonExpired)
+	}
+}
+
+// TestOnCSIPControl_NilJournalIsNoop is the "absent journal block behaves
+// exactly as before" acceptance criterion: a nil Writer must not panic or
+// alter onCSIPControl/ReadSystemState's control resolution in any way (every
+// other test in this file already exercises this path implicitly by passing
+// nil; this test names it explicitly for the record).
+func TestOnCSIPControl_NilJournalIsNoop(t *testing.T) {
+	r := newMQTTSystemReader(nil, testFastInterval, nil)
+	expLim := 5000.0
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{Source: "event", MRID: "evt-1", ExpLimW: &expLim, Ts: time.Now().Unix()})
+	state, err := r.ReadSystemState()
+	if err != nil {
+		t.Fatalf("ReadSystemState: %v", err)
+	}
+	if state.CSIPControl == nil || state.CSIPControl.MRID != "evt-1" {
+		t.Fatalf("nil journal must not affect control resolution, got %+v", state.CSIPControl)
 	}
 }

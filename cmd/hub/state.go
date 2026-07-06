@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/journal"
 	"lexa-hub/internal/orchestrator"
 	"lexa-hub/internal/utilitytime"
 	model "lexa-proto/csipmodel"
@@ -185,6 +186,12 @@ type MQTTSystemReader struct {
 	// Device configuration for role/capacity lookup
 	devices   []DeviceConfig
 	devByName map[string]*DeviceConfig
+
+	// jw is the optional durable event journal (TASK-040). nil disables
+	// journaling entirely — every emit below is `if r.jw != nil`-guarded
+	// fire-and-forget (Append's own edge-triggered log covers failures;
+	// this reader never lets a journal write affect control flow).
+	jw *journal.Writer
 }
 
 type measSnapshot struct {
@@ -220,7 +227,8 @@ func (s evseSnapshot) fresh(now time.Time) bool {
 // is the engine's configured tick cadence (cfg.EngineInterval()) — it sizes the
 // CSIP expiry debounce (expiry.Confirm) so the debounce means the same
 // wall-clock seconds regardless of cadence (see confirmTicksFor, AD-004/TASK-036).
-func newMQTTSystemReader(devices []DeviceConfig, engineInterval time.Duration) *MQTTSystemReader {
+// jw is the optional TASK-040 event journal; nil disables journaling.
+func newMQTTSystemReader(devices []DeviceConfig, engineInterval time.Duration, jw *journal.Writer) *MQTTSystemReader {
 	r := &MQTTSystemReader{
 		lastMeas:    make(map[string]measSnapshot),
 		lastBattMet: make(map[string]bus.BattMetrics),
@@ -230,6 +238,7 @@ func newMQTTSystemReader(devices []DeviceConfig, engineInterval time.Duration) *
 		stale:       make(map[string]bool),
 		expiry:      utilitytime.DebouncedExpiry{Confirm: confirmTicksFor(engineInterval)},
 		utclk:       utilitytime.New(utilitytime.Config{}),
+		jw:          jw,
 	}
 	for i := range devices {
 		d := &devices[i]
@@ -269,6 +278,7 @@ func (r *MQTTSystemReader) onBattMetrics(_ string, msg bus.BattMetrics) {
 
 func (r *MQTTSystemReader) onCSIPControl(_ string, msg bus.ActiveControl) {
 	r.mu.Lock()
+	prev := r.lastCSIP
 	r.lastCSIP = &msg
 	r.clockOffset = msg.ClockOffset
 	// Anchor utility time at this message's arrival (TASK-037). msg.Ts is
@@ -284,7 +294,75 @@ func (r *MQTTSystemReader) onCSIPControl(_ string, msg bus.ActiveControl) {
 		r.lastCSIPMRID = msg.MRID
 		r.lastCSIPChangedAt = time.Now()
 	}
+	r.journalControlChange(prev, &msg)
 	r.mu.Unlock()
+}
+
+// controlIsReal reports whether c represents an actual standing intent
+// (Source "event" or "default", not the "none"/"" no-programs sentinel) —
+// the same absence check busToCSIPControl already applies.
+func controlIsReal(c *bus.ActiveControl) bool {
+	return c != nil && c.Source != "" && c.Source != "none"
+}
+
+// controlChanged reports whether the resolved control identity/limits
+// differ between prev and cur. This is the change-detection gate
+// journalControlChange applies before emitting control_adopted: lexa-
+// northbound republishes the retained lexa/csip/control topic on every
+// discovery walk (~5 s in FAST) even when nothing changed, and journaling
+// each republish would blow the journal's write budget (RSK-14) — see
+// TASK-040's "Common mistakes to avoid".
+func controlChanged(prev, cur *bus.ActiveControl) bool {
+	if prev == nil {
+		return true // the first control this reader has ever seen is always a change
+	}
+	return prev.Source != cur.Source ||
+		prev.MRID != cur.MRID ||
+		!boolPtrEqual(prev.Connect, cur.Connect) ||
+		!floatPtrEqual(prev.ExpLimW, cur.ExpLimW) ||
+		!floatPtrEqual(prev.ImpLimW, cur.ImpLimW) ||
+		!floatPtrEqual(prev.MaxLimW, cur.MaxLimW) ||
+		!floatPtrEqual(prev.FixedW, cur.FixedW) ||
+		prev.ValidUntil != cur.ValidUntil
+}
+
+// journalControlChange emits control_adopted/control_released for a
+// resolved-identity change between prev (the previously-stored control, or
+// nil) and cur (this message). Caller holds r.mu. A no-op when journaling is
+// disabled (r.jw == nil) or nothing changed (controlChanged reports false —
+// the common case, an unchanged retained republish).
+//
+// The expiry-driven release (a control dropped because it aged past
+// ValidUntil with no replacement message ever arriving) is NOT handled
+// here — onCSIPControl only ever sees messages that arrive, never the
+// passage of time — see ReadSystemState's expiry-drop branch, which emits
+// control_released{reason: expired} instead.
+func (r *MQTTSystemReader) journalControlChange(prev, cur *bus.ActiveControl) {
+	if r.jw == nil || !controlChanged(prev, cur) {
+		return
+	}
+	wasReal := controlIsReal(prev)
+	isReal := controlIsReal(cur)
+	srvT := cur.Ts + cur.ClockOffset
+
+	if wasReal && (!isReal || prev.MRID != cur.MRID) {
+		reason := journal.ReasonReplaced
+		if !isReal {
+			reason = journal.ReasonCleared
+		}
+		if ev, err := journal.NewControlReleasedEvent("hub", journal.NewControlReleased(prev.MRID, reason)); err == nil {
+			ev.SrvT = srvT
+			_ = r.jw.Append(ev)
+		}
+	}
+	if isReal {
+		if ev, err := journal.NewControlAdoptedEvent("hub", journal.NewControlAdopted(
+			cur.Source, cur.MRID, cur.ExpLimW, cur.ImpLimW, cur.MaxLimW, cur.FixedW, cur.ValidUntil, cur.ClockOffset,
+		)); err == nil {
+			ev.SrvT = srvT
+			_ = r.jw.Append(ev)
+		}
+	}
 }
 
 // ControlAdoptionAge returns how long the currently-adopted CSIP control has
@@ -523,6 +601,17 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 			"mrid", r.lastCSIP.MRID, "source", r.lastCSIP.Source,
 			"valid_until", r.lastCSIP.ValidUntil, "server_now", serverNow,
 			"confirm_ticks", r.expiry.Confirm)
+		// TASK-040: journal the release BEFORE nilling r.lastCSIP — this is
+		// the "aged out with no replacement message" release path, distinct
+		// from journalControlChange's onCSIPControl-driven releases
+		// (cleared/replaced), which only ever fire on message ARRIVAL and
+		// so can never observe the passage of time on their own.
+		if r.jw != nil {
+			if ev, err := journal.NewControlReleasedEvent("hub", journal.NewControlReleased(r.lastCSIP.MRID, journal.ReasonExpired)); err == nil {
+				ev.SrvT = serverNow
+				_ = r.jw.Append(ev)
+			}
+		}
 		r.lastCSIP = nil
 	}
 	if r.lastCSIP != nil {

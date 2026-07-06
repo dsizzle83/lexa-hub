@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/journal"
 	"lexa-hub/internal/orchestrator"
 	"lexa-hub/internal/reconcile"
 )
@@ -77,6 +78,11 @@ type breachEpisodes struct {
 	// active control is not a CannotComply — it is logged by the shell, not an
 	// episode).
 	deviceReports map[string]deviceEvidence
+
+	// jw is the optional TASK-040 event journal. nil disables the
+	// breach_begin/breach_end emits in emit() below (fire-and-forget,
+	// guarded, matching every other journal call site in cmd/hub).
+	jw *journal.Writer
 }
 
 // deviceEvidence is one reconciled device's latest non-convergence state.
@@ -98,8 +104,12 @@ type breachEvidence struct {
 	issuedAt   int64 // stable half of the episode ID (device doc issuedAt, or onset time for the optimizer)
 }
 
-func newBreachEpisodes() *breachEpisodes {
-	return &breachEpisodes{deviceReports: make(map[string]deviceEvidence)}
+// newBreachEpisodes builds the component. jw is the optional TASK-040 event
+// journal (nil disables journaling); a bare nil is safe to pass everywhere
+// journaling is not being exercised (e.g. every pre-existing test in
+// breach_test.go).
+func newBreachEpisodes(jw *journal.Writer) *breachEpisodes {
+	return &breachEpisodes{deviceReports: make(map[string]deviceEvidence), jw: jw}
 }
 
 // OnPlan feeds one optimizer plan. Safety plans are not assessed (their nil
@@ -165,6 +175,7 @@ func (b *breachEpisodes) emit(now time.Time) []bus.ComplianceAlert {
 		b.counter++
 		b.activeMRID = ev.mrid
 		b.episodeID = fmt.Sprintf("%s@%d#%d", ev.mrid, ev.issuedAt, b.counter)
+		b.journalBegin(ev)
 		return []bus.ComplianceAlert{{
 			Envelope:   bus.Envelope{V: bus.ComplianceAlertV},
 			MRID:       ev.mrid,
@@ -182,6 +193,7 @@ func (b *breachEpisodes) emit(now time.Time) []bus.ComplianceAlert {
 		mrid := b.activeMRID
 		b.activeMRID = ""
 		b.episodeID = ""
+		b.journalEnd(ep, mrid)
 		return []bus.ComplianceAlert{{
 			Envelope:  bus.Envelope{V: bus.ComplianceAlertV},
 			MRID:      mrid,
@@ -191,6 +203,41 @@ func (b *breachEpisodes) emit(now time.Time) []bus.ComplianceAlert {
 	default:
 		return nil // no edge this pass (continuing episode, or clear with none active)
 	}
+}
+
+// journalBegin/journalEnd append breach_begin/breach_end evidence for the
+// episode edge emit just computed (called with b.mu held). Guarded
+// fire-and-forget like every other journal call site; construction
+// (marshal) errors are practically unreachable here (every Breach field is
+// a plain string/float64) so are silently dropped rather than logged twice
+// (Append's own failure path already edge-triggers a log — see
+// internal/journal's doc). Breach transitions are rare and high-value, so
+// — unlike the dispatch/adoption paths — this also forces an immediate
+// Flush (TASK-040's "Common mistakes to avoid": never flush from a
+// tick/dispatch path, but a breach edge is exactly the kind of transition
+// worth the extra fsync).
+func (b *breachEpisodes) journalBegin(ev breachEvidence) {
+	if b.jw == nil {
+		return
+	}
+	e, err := journal.NewBreachBeginEvent("hub", journal.NewBreach(b.episodeID, ev.mrid, ev.limitType, ev.limitW, ev.measuredW, ev.shortfallW, ev.reason))
+	if err != nil {
+		return
+	}
+	_ = b.jw.Append(e)
+	_ = b.jw.Flush()
+}
+
+func (b *breachEpisodes) journalEnd(episodeID, mrid string) {
+	if b.jw == nil {
+		return
+	}
+	e, err := journal.NewBreachEndEvent("hub", journal.NewBreach(episodeID, mrid, "", 0, 0, 0, "cleared"))
+	if err != nil {
+		return
+	}
+	_ = b.jw.Append(e)
+	_ = b.jw.Flush()
 }
 
 // effectiveBreach merges the evidence into a single verdict. The optimizer's
