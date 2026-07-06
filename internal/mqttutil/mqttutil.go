@@ -126,6 +126,15 @@ var instrumentations sync.Map // mqtt.Client → *instState
 // so a late or dropped command is harmless.
 const publishTimeout = 5 * time.Second
 
+// PublishTimeout exports publishTimeout's value for callers harvesting a
+// PendingPub from PublishJSON(Retained)Async (TASK-046): "how long before I
+// give up on this publish" should mean the same thing whether the caller
+// waits synchronously (PublishJSON) or fires-and-harvests (PublishJSONAsync)
+// — a caller switching from one to the other keeps the same effective
+// staleness bound unless it has a specific reason not to (see
+// cmd/hub/desired.go's actuators, which do).
+const PublishTimeout = publishTimeout
+
 // qos0AckTimeout bounds how long a QoS 0 publish waits before returning.
 // QoS 0 has no PUBACK: paho completes the token locally as soon as the
 // message is written to the wire, so this is never a broker round trip —
@@ -264,12 +273,12 @@ func LoadPassword(passFile string) (string, error) {
 // PublishJSON marshals v to JSON and publishes it to topic with QoS 1.
 // Waits at most publishTimeout for the broker's acknowledgement.
 func PublishJSON(client mqtt.Client, topic string, v any) error {
-	return publishJSON(client, topic, 1, false, v)
+	return publishJSON(client, topic, 1, false, publishTimeout, v)
 }
 
 // PublishJSONRetained is like PublishJSON but the message is retained.
 func PublishJSONRetained(client mqtt.Client, topic string, v any) error {
-	return publishJSON(client, topic, 1, true, v)
+	return publishJSON(client, topic, 1, true, publishTimeout, v)
 }
 
 // PublishJSONQoS marshals v to JSON and publishes it to topic at the given
@@ -280,11 +289,28 @@ func PublishJSONRetained(client mqtt.Client, topic string, v any) error {
 // PUBACK — there isn't one — but still bounds the call at qos0AckTimeout so
 // a marshal or send error is not silently swallowed.
 func PublishJSONQoS(client mqtt.Client, topic string, qos byte, v any) error {
-	return publishJSON(client, topic, qos, false, v)
+	wait := publishTimeout
+	if qos == 0 {
+		wait = qos0AckTimeout
+	}
+	return publishJSON(client, topic, qos, false, wait, v)
 }
 
-func publishJSON(client mqtt.Client, topic string, qos byte, retained bool, v any) error {
-	err := publishJSONInner(client, topic, qos, retained, v)
+// PublishJSONTimeout is PublishJSON/PublishJSONRetained with a caller-chosen
+// PUBACK wait bound instead of the package's publishTimeout default
+// (TASK-046). It stays synchronous — unlike PublishJSONAsync, this call does
+// not return until timeout elapses or the broker acks/errors — for the rare
+// publish where waiting is still correct but the full 5s default is too
+// long: the hub's compliance-alert publish (cmd/hub/main.go) uses a 1s bound
+// because that publish is rare and edge-triggered, so ordering/latency
+// against the CannotComply episode matter more than sparing the tick budget
+// (unlike the per-tick actuator/plan-log publishes, which went fully async).
+func PublishJSONTimeout(client mqtt.Client, topic string, retained bool, v any, timeout time.Duration) error {
+	return publishJSON(client, topic, 1, retained, timeout, v)
+}
+
+func publishJSON(client mqtt.Client, topic string, qos byte, retained bool, wait time.Duration, v any) error {
+	err := publishJSONInner(client, topic, qos, retained, wait, v)
 	if err != nil {
 		// TASK-044: nil-safe when the client wasn't created via this package
 		// (Load simply misses) or was created via Connect/ConnectAuth with a
@@ -298,21 +324,130 @@ func publishJSON(client mqtt.Client, topic string, qos byte, retained bool, v an
 	return err
 }
 
-func publishJSONInner(client mqtt.Client, topic string, qos byte, retained bool, v any) error {
+func publishJSONInner(client mqtt.Client, topic string, qos byte, retained bool, wait time.Duration, v any) error {
 	payload, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("mqttutil: marshal %T: %w", v, err)
 	}
 	tok := client.Publish(topic, qos, retained, payload)
-	wait := publishTimeout
-	if qos == 0 {
-		wait = qos0AckTimeout
-	}
 	if !tok.WaitTimeout(wait) {
 		return fmt.Errorf("mqttutil: publish %s: no ack after %s", topic, wait)
 	}
 	return tok.Error()
 }
+
+// PendingPub is an in-flight QoS 1 publish whose completion is checked later
+// ("harvested") instead of waited for synchronously (TASK-046). It exists so
+// a tick-path caller — e.g. cmd/hub's desired-doc actuators — can hand a
+// message to paho and return immediately, deferring the PUBACK wait (and the
+// decision of what a timed-out publish means for its own dedupe state) to
+// the next time it has a natural reason to check, typically the next tick.
+//
+// A PendingPub is single-use: call Harvest once to learn its outcome. It is
+// not safe for concurrent use from multiple goroutines (matches every actual
+// caller today: one PendingPub lives in one actuator, read and written only
+// from the engine's single control goroutine).
+type PendingPub struct {
+	tok    mqtt.Token
+	client mqtt.Client
+	topic  string
+	sentAt time.Time
+}
+
+// PublishJSONAsync is PublishJSON's non-blocking counterpart: it marshals v
+// and hands it to paho's Publish exactly like PublishJSON, but returns as
+// soon as the message is queued rather than waiting up to publishTimeout for
+// the PUBACK. Marshal errors are still returned synchronously (there is
+// nothing to defer — the message was never queued); everything about
+// delivery (ack, timeout, broker-reported error) is discovered later via the
+// returned PendingPub's Harvest method.
+//
+// Use PublishJSON when the caller has nothing better to do than wait (rare)
+// or needs the delivery result before proceeding. Use PublishJSONAsync in any
+// loop that must not stall on a sick-but-alive broker — the tick path is the
+// motivating case (§11): the retained desired-doc is re-issued on convergence
+// mismatch / the next differing command, so a late or dropped async publish
+// is exactly as harmless as a late or dropped synchronous one used to be.
+func PublishJSONAsync(client mqtt.Client, topic string, v any) (*PendingPub, error) {
+	return publishJSONAsync(client, topic, 1, false, v)
+}
+
+// PublishJSONRetainedAsync is PublishJSONAsync with the retained flag set —
+// the async counterpart of PublishJSONRetained, used for every retained
+// control-plane document (AD-013 desired-state docs, the hub plan log).
+func PublishJSONRetainedAsync(client mqtt.Client, topic string, v any) (*PendingPub, error) {
+	return publishJSONAsync(client, topic, 1, true, v)
+}
+
+func publishJSONAsync(client mqtt.Client, topic string, qos byte, retained bool, v any) (*PendingPub, error) {
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("mqttutil: marshal %T: %w", v, err)
+	}
+	tok := client.Publish(topic, qos, retained, payload)
+	return &PendingPub{tok: tok, client: client, topic: topic, sentAt: time.Now()}, nil
+}
+
+// Harvest reports p's completion state without blocking (an already-completed
+// token returns instantly; an in-flight one returns done=false immediately —
+// Harvest never itself waits).
+//
+// It deliberately does NOT use tok.WaitTimeout(0) as its non-blocking check.
+// paho v1.4.3's baseToken.WaitTimeout (vendor/.../token.go) is a select
+// between the token's completion channel and a timer — with a zero timer
+// that fires essentially immediately, an already-complete token can lose the
+// select at random, so WaitTimeout(0) is not a reliable "is it done"
+// primitive despite reading like one. A select with a default case on the
+// same completion channel (Token.Done()) is: exactly one of the two cases can
+// ever be ready without blocking, and there is no race between "already
+// closed" and "about to close". mqttutil_async_test.go exercises this
+// directly against the vendored token so a future paho bump that changes the
+// semantics fails loud here rather than in a flaky bench run.
+//
+// Return shape:
+//   - done=true, err=nil: the broker acknowledged the publish (or, for a
+//     hypothetical QoS 0 caller, paho wrote it to the wire — no PendingPub
+//     helper is QoS 0 today, but Harvest makes no QoS assumption).
+//   - done=true, err!=nil: the publish completed with an error.
+//   - done=false: still in flight. timedOut reports whether it has been in
+//     flight longer than the caller's own timeout budget — the caller's cue
+//     to treat it as failed for its own bookkeeping (dedupe reset, retry)
+//     WITHOUT waiting any further. The publish itself is not cancelled: paho
+//     may still deliver it later (after a reconnect, say), exactly as a
+//     timed-out synchronous PublishJSON leaves it today — see publishTimeout's
+//     doc comment.
+//
+// On a broker-reported error (done=true, err!=nil), Harvest also invokes the
+// client's OnPublishFail instrumentation hook if one was wired via
+// ConnectAuthInstrumented, so lexa_mqtt_publish_failures_total keeps counting
+// every failed publish regardless of which of PublishJSON/PublishJSONAsync
+// sent it. A bare timeout (done=false) does not — the outcome isn't known
+// yet, so it isn't a "failure" the instrumentation hook should count; if it
+// later resolves to an error, a subsequent Harvest call (there won't be one,
+// by construction — see the "single-use" note above) would be needed to see
+// that, which is why callers that give up on a timed-out pending should
+// simply treat the timeout itself as the failure signal (as the actuators do).
+func (p *PendingPub) Harvest(timeout time.Duration) (done bool, timedOut bool, err error) {
+	select {
+	case <-p.tok.Done():
+		err = p.tok.Error()
+		if err != nil {
+			if v, ok := instrumentations.Load(p.client); ok {
+				if cb := v.(*instState).inst.OnPublishFail; cb != nil {
+					cb()
+				}
+			}
+		}
+		return true, false, err
+	default:
+		return false, time.Since(p.sentAt) > timeout, nil
+	}
+}
+
+// Topic returns the topic p was published to — useful for logging a harvested
+// failure/timeout without the caller needing to have kept the topic string
+// itself around.
+func (p *PendingPub) Topic() string { return p.topic }
 
 // Subscribe registers handler for messages on topic (supports MQTT wildcards).
 // It is SubscribeDecodeErr(client, topic, handler, nil) — see that function's
