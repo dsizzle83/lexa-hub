@@ -51,3 +51,72 @@ func TestActivePowerFromWatts_ScalesNotClips(t *testing.T) {
 		}
 	}
 }
+
+// wattEncoderAgreement is the TASK-053 cross-encoder golden table — see the
+// identical copy + full rationale in cmd/hub/state_test.go. Computed once
+// from the shared "divide by 10 until it fits int16" algorithm both
+// activePowerFromWatts (this file) and wattsToActivePower (cmd/hub)
+// implement independently for non-negative watts, the domain where they
+// must agree (MTR-5/GS-1). Keep both copies byte-identical.
+var wattEncoderAgreement = []struct {
+	watts float64
+	value int16
+	mult  int8
+}{
+	{0, 0, 0},
+	{1, 1, 0},
+	{100, 100, 0},
+	{1500, 1500, 0},
+	{32767, 32767, 0},
+	{32768, 3277, 1},
+	{32769, 3277, 1},
+	{50000, 5000, 1},
+	{120000, 12000, 1},
+	{250000, 25000, 1},
+	{500000, 5000, 2},
+	{1_000_000, 10000, 2},
+	{10_000_000, 10000, 3},
+	{100_000_000, 10000, 4},
+	{1_000_000_000, 10000, 5},
+	{123456789, 12346, 4},
+	{999999999, 10000, 5},
+}
+
+// TestActivePowerFromWatts_CrossEncoderAgreement is the step-3 "product's two
+// watt-encoders agree" acceptance criterion (TASK-053) for
+// activePowerFromWatts's half of the pair.
+func TestActivePowerFromWatts_CrossEncoderAgreement(t *testing.T) {
+	for _, tc := range wattEncoderAgreement {
+		ap := activePowerFromWatts(tc.watts)
+		if ap.Value != tc.value || ap.Multiplier != tc.mult {
+			t.Errorf("activePowerFromWatts(%g) = {Value:%d Mult:%d}, want {Value:%d Mult:%d} (cross-encoder golden table)",
+				tc.watts, ap.Value, ap.Multiplier, tc.value, tc.mult)
+		}
+	}
+}
+
+// TestActivePowerFromWatts_Sweep0To1e9 is the step-3 encode-scaling property:
+// across a dense log-scale sweep of watt values from 0 to 1e9, Value must
+// stay in int16 range and Value×10^Multiplier must reconstruct the input
+// within half a scale step.
+func TestActivePowerFromWatts_Sweep0To1e9(t *testing.T) {
+	step := 1.0
+	for w := 0.0; w <= 1e9; w += step {
+		ap := activePowerFromWatts(w)
+		if ap.Value > math.MaxInt16 || ap.Value < math.MinInt16 {
+			t.Fatalf("activePowerFromWatts(%g) value=%d out of int16 range", w, ap.Value)
+		}
+		got := float64(ap.Value) * math.Pow10(int(ap.Multiplier))
+		tol := 0.5 * math.Pow10(int(ap.Multiplier))
+		if math.Abs(got-w) > tol {
+			t.Fatalf("activePowerFromWatts(%g) = {Value:%d Mult:%d} -> %g, want within %g (half scale step)",
+				w, ap.Value, ap.Multiplier, got, tol)
+		}
+		if w > 0 {
+			step = w * 0.001
+			if step < 1 {
+				step = 1
+			}
+		}
+	}
+}

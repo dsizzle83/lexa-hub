@@ -96,6 +96,14 @@ jobs:
       - name: build (cgo-free services)
         run: CGO_ENABLED=0 go build ./cmd/hub ./cmd/modbus ./cmd/ocpp ./cmd/api
 
+      # TASK-053: the generative int16/scale-factor boundary sweep (GAP-07)
+      # needs no new step here — it lands as ordinary _test.go files in
+      # packages already globbed by `make test-nocgo`
+      # (internal/southbound/sunspecsweep runs the shared lexa-proto/sunspec
+      # codec contract against this repo's vendored copy; cmd/hub +
+      # cmd/modbus carry the wattsToActivePower/activePowerFromWatts
+      # encode-scaling + cross-encoder-agreement sweep). Verified locally:
+      # `make test-nocgo` picks up all three without modification.
       - name: "test -race (pure-Go: internal/... + cmd/...)"
         run: make test-nocgo
 

@@ -13,6 +13,84 @@ func decodeAP(value int16, multiplier int8) float64 {
 	return float64(value) * math.Pow10(int(multiplier))
 }
 
+// wattEncoderAgreement is the TASK-053 cross-encoder golden table: computed
+// once from the shared "divide by 10 until it fits int16" algorithm both
+// wattsToActivePower (this file, cmd/hub) and activePowerFromWatts
+// (cmd/modbus/control_test.go) implement independently for non-negative
+// watts — the domain where they must agree (MTR-5/GS-1). The two functions
+// live in separate `package main`s (different binaries) so they cannot be
+// called from one test; this identical literal table, asserted against
+// BOTH encoders in their own package's test file, is the cross-repo-style
+// proof that they agree — a divergence here means one of the two silently
+// drifted off the other's encoding, exactly the W3 bug class TASK-053 exists
+// to catch. Keep both copies of this table byte-identical; if you touch
+// one, touch the other in the same commit.
+var wattEncoderAgreement = []struct {
+	watts float64
+	value int16
+	mult  int8
+}{
+	{0, 0, 0},
+	{1, 1, 0},
+	{100, 100, 0},
+	{1500, 1500, 0},
+	{32767, 32767, 0}, // exactly MaxInt16: no scaling needed
+	{32768, 3277, 1},  // one past MaxInt16: must scale, not wrap
+	{32769, 3277, 1},
+	{50000, 5000, 1},
+	{120000, 12000, 1},
+	{250000, 25000, 1},
+	{500000, 5000, 2},
+	{1_000_000, 10000, 2},
+	{10_000_000, 10000, 3},
+	{100_000_000, 10000, 4},
+	{1_000_000_000, 10000, 5},
+	{123456789, 12346, 4},
+	{999999999, 10000, 5},
+}
+
+// TestWattsToActivePower_CrossEncoderAgreement is the step-3 "product's two
+// watt-encoders agree" acceptance criterion (TASK-053) for wattsToActivePower's
+// half of the pair.
+func TestWattsToActivePower_CrossEncoderAgreement(t *testing.T) {
+	for _, tc := range wattEncoderAgreement {
+		ap := wattsToActivePower(tc.watts)
+		if ap.Value != tc.value || ap.Multiplier != tc.mult {
+			t.Errorf("wattsToActivePower(%g) = {Value:%d Mult:%d}, want {Value:%d Mult:%d} (cross-encoder golden table)",
+				tc.watts, ap.Value, ap.Multiplier, tc.value, tc.mult)
+		}
+	}
+}
+
+// TestWattsToActivePower_Sweep0To1e9 is the step-3 encode-scaling property:
+// across a dense log-scale sweep of watt values from 0 to 1e9, Value must
+// stay in int16 range and Value×10^Multiplier must reconstruct the input
+// within half a scale step (state.go's documented precision bound).
+func TestWattsToActivePower_Sweep0To1e9(t *testing.T) {
+	step := 1.0
+	for w := 0.0; w <= 1e9; w += step {
+		ap := wattsToActivePower(w)
+		if ap.Value > math.MaxInt16 || ap.Value < math.MinInt16 {
+			t.Fatalf("wattsToActivePower(%g) value=%d out of int16 range", w, ap.Value)
+		}
+		got := decodeAP(ap.Value, ap.Multiplier)
+		tol := 0.5 * math.Pow10(int(ap.Multiplier))
+		if math.Abs(got-w) > tol {
+			t.Fatalf("wattsToActivePower(%g) = {Value:%d Mult:%d} -> %g, want within %g (half scale step)",
+				w, ap.Value, ap.Multiplier, got, tol)
+		}
+		// Geometric progression keeps the sweep dense near small values and
+		// still fast out to 1e9 (bounded iteration count, per TASK-053's
+		// "not -fuzz, CI-fast" constraint).
+		if w > 0 {
+			step = w * 0.001
+			if step < 1 {
+				step = 1
+			}
+		}
+	}
+}
+
 // testFastInterval is the bench's FAST engine cadence (bench-up.sh --fast /
 // hub-replay-tune.sh fast). Existing expiry tests below construct their
 // reader at this cadence so confirmTicksFor(testFastInterval) == 3, matching
