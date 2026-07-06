@@ -1,6 +1,7 @@
 package tlsclient
 
 import (
+	"context"
 	"fmt"
 	"sync"
 )
@@ -102,9 +103,28 @@ func (f *WolfSSLFetcher) doPost(path string, body []byte, contentType string) (*
 
 // Get satisfies discovery.Fetcher. Returns the response body on 200 with
 // Content-Type application/sep+xml; any other status/type is an error.
-func (f *WolfSSLFetcher) Get(path string) ([]byte, error) {
+//
+// Cancellation contract (TASK-070, R5): ctx is checked once, after
+// acquiring the session mutex and before dialing or writing any bytes —
+// so a canceled ctx never starts a new request. There is no way to
+// interrupt a request already in flight: wolfSSL performs a blocking
+// read(2)/write(2) directly on the duplicated fd (client.go's
+// SO_RCVTIMEO/SNDTIMEO, set at Dial time), which Go's netpoller-based
+// context plumbing cannot reach without closing the fd out from under
+// wolfSSL mid-read — that is RSK-07 segfault territory and deliberately
+// not attempted here. In practice this means cancellation is honored
+// *between* requests, and any single in-flight request still returns
+// within its configured ReadTimeout regardless of ctx. Callers that walk
+// many resources (internal/northbound/discovery.Walker) get abort
+// granularity of "between fetches," which is the documented, honest
+// contract — not "instantly."
+func (f *WolfSSLFetcher) Get(ctx context.Context, path string) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	resp, err := f.doGet(path)
 	if err != nil {
@@ -119,9 +139,25 @@ func (f *WolfSSLFetcher) Get(path string) ([]byte, error) {
 	return resp.Body, nil
 }
 
+// postResult validates a POST's HTTPResponse and extracts (body, Location).
+// Shared by Post and PostContext so the two never drift on what counts as a
+// successful POST.
+func postResult(path string, resp *HTTPResponse) ([]byte, string, error) {
+	if resp.StatusCode != 201 && resp.StatusCode != 204 {
+		return nil, "", fmt.Errorf("POST %s: status %d", path, resp.StatusCode)
+	}
+	return resp.Body, resp.Location, nil
+}
+
 // Post performs a single HTTP POST over the persistent wolfSSL session.
 // Returns the response body and Location header (for 201 Created).
 // Accepts 201 and 204; any other status is an error.
+//
+// No ctx parameter: Post's callers (internal/northbound/responses.Tracker,
+// internal/northbound/flowres.Manager) are driven by MQTT subscription
+// callbacks and the walk cycle's own fail-closed bookkeeping, not by the
+// service-shutdown ctx this task threads through the discovery walk — see
+// PostContext for the ctx-aware sibling lexa-telemetry's POST loop uses.
 func (f *WolfSSLFetcher) Post(path string, body []byte, contentType string) ([]byte, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -130,15 +166,38 @@ func (f *WolfSSLFetcher) Post(path string, body []byte, contentType string) ([]b
 	if err != nil {
 		return nil, "", err
 	}
-	if resp.StatusCode != 201 && resp.StatusCode != 204 {
-		return nil, "", fmt.Errorf("POST %s: status %d", path, resp.StatusCode)
+	return postResult(path, resp)
+}
+
+// PostContext is Post with the same between-requests cancellation contract
+// documented on Get: ctx is checked once, after acquiring the session mutex
+// and before dialing or writing, so a canceled ctx never starts a new POST.
+// It does not interrupt a POST already in flight (see Get's doc comment for
+// why). Added alongside Post — rather than changing Post's signature — so
+// the two other production Poster consumers (responses.Tracker,
+// flowres.Manager) are untouched by this task (TASK-070's blast radius is
+// lexa-northbound's walker + lexa-telemetry only); lexa-telemetry's MUP POST
+// loop is the one caller.
+func (f *WolfSSLFetcher) PostContext(ctx context.Context, path string, body []byte, contentType string) ([]byte, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
 	}
-	return resp.Body, resp.Location, nil
+
+	resp, err := f.doPost(path, body, contentType)
+	if err != nil {
+		return nil, "", err
+	}
+	return postResult(path, resp)
 }
 
 // GetStatus performs a GET and returns the raw HTTP status code without
 // enforcing that it must be 200. Used by conformance tests that need to
-// verify the server correctly returns 404, 405, etc.
+// verify the server correctly returns 404, 405, etc. Not part of the
+// discovery.Fetcher interface and out of TASK-070's scope — no production
+// caller in this repo holds a ctx at its call site today.
 func (f *WolfSSLFetcher) GetStatus(path string) (int, []byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

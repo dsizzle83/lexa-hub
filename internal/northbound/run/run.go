@@ -12,6 +12,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"log"
 	"log/slog"
 	"sync"
@@ -100,8 +101,16 @@ func (d *Discovery) HandleRewalk(req bus.RewalkRequest) {
 // Loop runs the first discovery walk immediately, then loops on interval
 // (the ticker) and on TASK-042 rewalk pokes, until ctx is cancelled. Callers
 // run this in its own goroutine (it blocks until ctx.Done()).
+//
+// ctx also threads all the way down into the walk itself (TASK-070, R5):
+// RunOnce passes it to discovery.Walker.Discover, which checks it between
+// every fetch. So a shutdown ctx cancel no longer just stops the NEXT walk
+// from starting (the pre-070 behavior, checked only here between ticks) —
+// it also unwinds an in-progress walk between resource fetches, bounding
+// shutdown latency to one fetch's ReadTimeout instead of the whole
+// resource-tree walk.
 func (d *Discovery) Loop(ctx context.Context, interval time.Duration) {
-	d.RunOnce()
+	d.RunOnce(ctx)
 	// TASK-008: kick once the initial walk returns, success or fail-closed —
 	// a walk that erred and held last-known-good is still a live, iterating
 	// loop (QA 2026-07-02 northbound-hang/wan-outage-hold: a server that
@@ -120,7 +129,7 @@ func (d *Discovery) Loop(ctx context.Context, interval time.Duration) {
 			// RunOnce's internal errors are handled by its own fail-closed
 			// logging and never prevent reaching this line.
 			watchdog.Kick()
-			d.RunOnce()
+			d.RunOnce(ctx)
 		case <-d.rewalkChan:
 			// TASK-042: an immediate out-of-cadence walk requested via
 			// lexa/csip/rewalk (HandleRewalk already republished the cached
@@ -132,7 +141,7 @@ func (d *Discovery) Loop(ctx context.Context, interval time.Duration) {
 			// up.
 			slog.Info("lexa-northbound: immediate walk triggered by rewalk request")
 			watchdog.Kick()
-			d.RunOnce()
+			d.RunOnce(ctx)
 		}
 	}
 }
@@ -141,13 +150,34 @@ func (d *Discovery) Loop(ctx context.Context, interval time.Duration) {
 // evaluation, ActiveControl publish, 24h schedule/pricing/billing/flow-
 // reservation publishes, response tracker update, and the flow-reservation
 // manager's request-path refresh.
-func (d *Discovery) RunOnce() {
+//
+// ctx (TASK-070, R5) is passed straight to the walker; RunOnce's only new
+// responsibility is classifying what comes back. A shutdown-cancel walk
+// (errors.Is(err, context.Canceled) or DeadlineExceeded) is NOT a discovery
+// failure — the hub is exiting, not the server refusing to answer — so it
+// must not increment d.failures/WalkFailures or log at the fail-closed WARN
+// level operators and QA diagnosers grep for; that would poison the journal
+// with a false fail-closed alarm on every single clean restart. It IS still
+// a "publish nothing, hold last-known-good" outcome (below), same as any
+// other walk error — cancel-mid-walk is exactly as fail-closed-safe as a
+// wedged server, just for a different, non-alarming reason.
+func (d *Discovery) RunOnce(ctx context.Context) {
 	walkStart := time.Now()
 	defer func() { d.metrics.WalkDuration.Set(time.Since(walkStart).Seconds()) }()
 
 	walker := discovery.NewWalker(d.fetcher, d.lfdi)
-	tree, err := walker.Discover("/dcap")
+	tree, err := walker.Discover(ctx, "/dcap")
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// Shutdown (or a future watchdog-driven cancel), not a failed walk:
+			// hold last-known-good exactly like any other walk error (no
+			// publish below this branch either), but don't count it against
+			// discoveryFailures/lexa_nb_walk_failures_total and log at Info,
+			// not the fail-closed WARN — a clean shutdown must never look like
+			// a WAN outage in the journal.
+			slog.Info("lexa-northbound: discovery walk canceled (shutdown) — holding last-published control", "err", err)
+			return
+		}
 		// FAIL CLOSED on a walk error: publish NOTHING. "Server unreachable /
 		// walk failed" is not "server says there are no controls" — publishing
 		// a retained no-control here actively wiped the enforced cap the moment

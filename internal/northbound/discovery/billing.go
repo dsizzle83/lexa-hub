@@ -1,6 +1,10 @@
 package discovery
 
-import model "lexa-proto/csipmodel"
+import (
+	"context"
+
+	model "lexa-proto/csipmodel"
+)
 
 // ───────────────────────────────────────────────────────────────────────
 // Billing function set discovery state types
@@ -29,44 +33,44 @@ type CustomerAgreementState struct {
 // Billing fetch helpers
 // ───────────────────────────────────────────────────────────────────────
 
-func (w *Walker) fetchCustomerAccountList(path string) (*model.CustomerAccountList, error) {
+func (w *Walker) fetchCustomerAccountList(ctx context.Context, path string) (*model.CustomerAccountList, error) {
 	var r model.CustomerAccountList
-	return &r, w.fetchAndParse(path, &r)
+	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
-func (w *Walker) fetchCustomerAgreementList(path string) (*model.CustomerAgreementList, error) {
+func (w *Walker) fetchCustomerAgreementList(ctx context.Context, path string) (*model.CustomerAgreementList, error) {
 	var r model.CustomerAgreementList
-	return &r, w.fetchAndParse(path, &r)
+	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
-func (w *Walker) fetchBillingPeriodList(path string) (*model.BillingPeriodList, error) {
+func (w *Walker) fetchBillingPeriodList(ctx context.Context, path string) (*model.BillingPeriodList, error) {
 	var r model.BillingPeriodList
-	return &r, w.fetchAndParse(path, &r)
+	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
-func (w *Walker) fetchHistoricalReadingList(path string) (*model.HistoricalReadingList, error) {
+func (w *Walker) fetchHistoricalReadingList(ctx context.Context, path string) (*model.HistoricalReadingList, error) {
 	var r model.HistoricalReadingList
-	return &r, w.fetchAndParse(path, &r)
+	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
-func (w *Walker) fetchProjectionReadingList(path string) (*model.ProjectionReadingList, error) {
+func (w *Walker) fetchProjectionReadingList(ctx context.Context, path string) (*model.ProjectionReadingList, error) {
 	var r model.ProjectionReadingList
-	return &r, w.fetchAndParse(path, &r)
+	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
-func (w *Walker) fetchTargetReadingList(path string) (*model.TargetReadingList, error) {
+func (w *Walker) fetchTargetReadingList(ctx context.Context, path string) (*model.TargetReadingList, error) {
 	var r model.TargetReadingList
-	return &r, w.fetchAndParse(path, &r)
+	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
 // discoverBillingFromFSA walks the CustomerAccountListLink from a single FSA
 // and builds CustomerAccountState entries. Failures are non-fatal.
-func (w *Walker) discoverBillingFromFSA(fsa model.FunctionSetAssignments) []CustomerAccountState {
+func (w *Walker) discoverBillingFromFSA(ctx context.Context, fsa model.FunctionSetAssignments) []CustomerAccountState {
 	if fsa.CustomerAccountListLink == nil {
 		return nil
 	}
 
-	cal, err := w.fetchCustomerAccountList(fsa.CustomerAccountListLink.Href)
+	cal, err := w.fetchCustomerAccountList(ctx, fsa.CustomerAccountListLink.Href)
 	if err != nil {
 		w.logf("billing: fetch CustomerAccountList %s: %v", fsa.CustomerAccountListLink.Href, err)
 		return nil
@@ -80,7 +84,7 @@ func (w *Walker) discoverBillingFromFSA(fsa model.FunctionSetAssignments) []Cust
 			continue
 		}
 
-		agList, err := w.fetchCustomerAgreementList(ca.CustomerAgreementListLink.Href)
+		agList, err := w.fetchCustomerAgreementList(ctx, ca.CustomerAgreementListLink.Href)
 		if err != nil {
 			w.logf("billing: fetch CustomerAgreementList %s: %v", ca.CustomerAgreementListLink.Href, err)
 			states = append(states, cas)
@@ -96,7 +100,7 @@ func (w *Walker) discoverBillingFromFSA(fsa model.FunctionSetAssignments) []Cust
 				periodLink = ag.BillingPeriodListLink
 			}
 			if periodLink != nil {
-				bpl, err := w.fetchBillingPeriodList(periodLink.Href)
+				bpl, err := w.fetchBillingPeriodList(ctx, periodLink.Href)
 				if err != nil {
 					w.logf("billing: fetch BillingPeriodList %s: %v", periodLink.Href, err)
 				} else {
@@ -106,7 +110,7 @@ func (w *Walker) discoverBillingFromFSA(fsa model.FunctionSetAssignments) []Cust
 
 			// Historical readings (metadata only — not the individual BillingReadings).
 			if ag.HistoricalReadingListLink != nil {
-				hrl, err := w.fetchHistoricalReadingList(ag.HistoricalReadingListLink.Href)
+				hrl, err := w.fetchHistoricalReadingList(ctx, ag.HistoricalReadingListLink.Href)
 				if err != nil {
 					w.logf("billing: fetch HistoricalReadingList %s: %v",
 						ag.HistoricalReadingListLink.Href, err)
@@ -117,7 +121,7 @@ func (w *Walker) discoverBillingFromFSA(fsa model.FunctionSetAssignments) []Cust
 
 			// Projection readings (metadata only).
 			if ag.ProjectionReadingListLink != nil {
-				prl, err := w.fetchProjectionReadingList(ag.ProjectionReadingListLink.Href)
+				prl, err := w.fetchProjectionReadingList(ctx, ag.ProjectionReadingListLink.Href)
 				if err != nil {
 					w.logf("billing: fetch ProjectionReadingList %s: %v",
 						ag.ProjectionReadingListLink.Href, err)
@@ -128,7 +132,7 @@ func (w *Walker) discoverBillingFromFSA(fsa model.FunctionSetAssignments) []Cust
 
 			// Target readings (metadata only).
 			if ag.TargetReadingListLink != nil {
-				trl, err := w.fetchTargetReadingList(ag.TargetReadingListLink.Href)
+				trl, err := w.fetchTargetReadingList(ctx, ag.TargetReadingListLink.Href)
 				if err != nil {
 					w.logf("billing: fetch TargetReadingList %s: %v",
 						ag.TargetReadingListLink.Href, err)

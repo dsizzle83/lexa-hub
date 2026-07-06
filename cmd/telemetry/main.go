@@ -10,6 +10,7 @@
 package main
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"encoding/xml"
@@ -111,10 +112,19 @@ func main() {
 
 	metrics.Serve(cfg.MetricsAddr, reg)
 
+	// ctx (TASK-070, R5): canceled by the signal-bridge goroutine below once
+	// SIGINT/SIGTERM arrives. Threaded into every PostContext call in the
+	// per-tick loop so a shutdown mid-tick stops making new MUP POSTs between
+	// devices/quantities instead of finishing the whole tick first — the
+	// same "check ctx before the next request, don't try to interrupt one in
+	// flight" contract as lexa-northbound's walker (see
+	// tlsclient.WolfSSLFetcher.PostContext's doc comment).
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Register MUPs for each configured device.
 	var mups []mupEntry
 	for _, dev := range cfg.Devices {
-		path, err := registerMUP(fetcher, lfdi, dev, cfg.MUPPostRateS)
+		path, err := registerMUP(ctx, fetcher, lfdi, dev, cfg.MUPPostRateS)
 		if err != nil {
 			log.Printf("lexa-telemetry: MUP register %s: %v — skipping", dev, err)
 			continue
@@ -189,10 +199,22 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
+	// TASK-070 (R5): bridge the OS signal to ctx cancellation in its own
+	// goroutine, rather than a `case <-quit:` in the select below. A signal
+	// arriving while the ticker case is mid-flight (looping over every
+	// device's POSTs) cannot be observed by a select until that case
+	// returns — bridging to ctx instead lets the code INSIDE the loop below
+	// (via PostContext's preflight check) notice cancellation between
+	// individual POSTs, not just between ticks.
+	go func() {
+		<-quit
+		log.Println("lexa-telemetry: shutting down")
+		cancel()
+	}()
+
 	for {
 		select {
-		case <-quit:
-			log.Println("lexa-telemetry: shutting down")
+		case <-ctx.Done():
 			return
 
 		case <-kick.C:
@@ -208,9 +230,16 @@ func main() {
 			mu.RUnlock()
 
 			for i := range mups {
+				if ctx.Err() != nil {
+					// Shutdown mid-tick: stop starting new device POSTs.
+					// Between-request granularity only — see PostContext's
+					// doc comment for why a POST already in flight isn't
+					// interrupted early.
+					break
+				}
 				ep := &mups[i]
 				m := snap[ep.device]
-				err := postMeasurements(fetcher, ep.device, ep.path, m, offset, cfg.MUPPostRateS)
+				err := postMeasurements(ctx, fetcher, ep.device, ep.path, m, offset, cfg.MUPPostRateS)
 				// TASK-044: lexa_telemetry_connected is this service's
 				// "connection state" gauge — telemetry has no persistent
 				// session like OCPP's WS connections, so the closest
@@ -224,7 +253,7 @@ func main() {
 					ep.fails++
 					if ep.fails >= 3 {
 						log.Printf("lexa-telemetry: re-registering MUP for %s after %d failures", ep.device, ep.fails)
-						newPath, rerr := registerMUP(fetcher, lfdi, ep.device, cfg.MUPPostRateS)
+						newPath, rerr := registerMUP(ctx, fetcher, lfdi, ep.device, cfg.MUPPostRateS)
 						if rerr == nil {
 							ep.path = newPath
 							ep.fails = 0
@@ -240,7 +269,7 @@ func main() {
 	}
 }
 
-func registerMUP(fetcher *tlsclient.WolfSSLFetcher, lfdi, devName string, rateS int) (string, error) {
+func registerMUP(ctx context.Context, fetcher *tlsclient.WolfSSLFetcher, lfdi, devName string, rateS int) (string, error) {
 	prefix := lfdi
 	if len(prefix) > 8 {
 		prefix = prefix[:8]
@@ -258,7 +287,7 @@ func registerMUP(fetcher *tlsclient.WolfSSLFetcher, lfdi, devName string, rateS 
 	if err != nil {
 		return "", err
 	}
-	_, loc, err := fetcher.Post("/mup", body, "application/sep+xml")
+	_, loc, err := fetcher.PostContext(ctx, "/mup", body, "application/sep+xml")
 	if err != nil {
 		return "", err
 	}
@@ -281,6 +310,7 @@ type quantity struct {
 }
 
 func postMeasurements(
+	ctx context.Context,
 	fetcher *tlsclient.WolfSSLFetcher,
 	devName, mupPath string,
 	m device.Measurements,
@@ -327,7 +357,7 @@ func postMeasurements(
 		if err != nil {
 			return err
 		}
-		if _, _, err = fetcher.Post(mupPath, body, "application/sep+xml"); err != nil {
+		if _, _, err = fetcher.PostContext(ctx, mupPath, body, "application/sep+xml"); err != nil {
 			log.Printf("lexa-telemetry: POST %s %s: %v", devName, q.suffix, err)
 			return err
 		}

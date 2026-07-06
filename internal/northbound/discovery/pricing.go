@@ -1,6 +1,10 @@
 package discovery
 
-import model "lexa-proto/csipmodel"
+import (
+	"context"
+
+	model "lexa-proto/csipmodel"
+)
 
 // ───────────────────────────────────────────────────────────────────────
 // Pricing function set discovery state types
@@ -28,24 +32,24 @@ type RateComponentState struct {
 // Pricing fetch helpers
 // ───────────────────────────────────────────────────────────────────────
 
-func (w *Walker) fetchTariffProfileList(path string) (*model.TariffProfileList, error) {
+func (w *Walker) fetchTariffProfileList(ctx context.Context, path string) (*model.TariffProfileList, error) {
 	var r model.TariffProfileList
-	return &r, w.fetchAndParse(path, &r)
+	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
-func (w *Walker) fetchRateComponentList(path string) (*model.RateComponentList, error) {
+func (w *Walker) fetchRateComponentList(ctx context.Context, path string) (*model.RateComponentList, error) {
 	var r model.RateComponentList
-	return &r, w.fetchAndParse(path, &r)
+	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
-func (w *Walker) fetchTimeTariffIntervalList(path string) (*model.TimeTariffIntervalList, error) {
+func (w *Walker) fetchTimeTariffIntervalList(ctx context.Context, path string) (*model.TimeTariffIntervalList, error) {
 	var r model.TimeTariffIntervalList
-	return &r, w.fetchAndParse(path, &r)
+	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
-func (w *Walker) fetchConsumptionTariffIntervalList(path string) (*model.ConsumptionTariffIntervalList, error) {
+func (w *Walker) fetchConsumptionTariffIntervalList(ctx context.Context, path string) (*model.ConsumptionTariffIntervalList, error) {
 	var r model.ConsumptionTariffIntervalList
-	return &r, w.fetchAndParse(path, &r)
+	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
 // discoverPricingFromFSA walks the TariffProfileListLink from a single FSA
@@ -53,12 +57,12 @@ func (w *Walker) fetchConsumptionTariffIntervalList(path string) (*model.Consump
 //
 // Failures at any step are logged but do not abort discovery — pricing is an
 // optional function set and its absence must not prevent DER control.
-func (w *Walker) discoverPricingFromFSA(fsa model.FunctionSetAssignments) []TariffState {
+func (w *Walker) discoverPricingFromFSA(ctx context.Context, fsa model.FunctionSetAssignments) []TariffState {
 	if fsa.TariffProfileListLink == nil {
 		return nil
 	}
 
-	tpl, err := w.fetchTariffProfileList(fsa.TariffProfileListLink.Href)
+	tpl, err := w.fetchTariffProfileList(ctx, fsa.TariffProfileListLink.Href)
 	if err != nil {
 		w.logf("pricing: fetch TariffProfileList %s: %v", fsa.TariffProfileListLink.Href, err)
 		return nil
@@ -72,7 +76,7 @@ func (w *Walker) discoverPricingFromFSA(fsa model.FunctionSetAssignments) []Tari
 			continue
 		}
 
-		rcl, err := w.fetchRateComponentList(tp.RateComponentListLink.Href)
+		rcl, err := w.fetchRateComponentList(ctx, tp.RateComponentListLink.Href)
 		if err != nil {
 			w.logf("pricing: fetch RateComponentList %s: %v", tp.RateComponentListLink.Href, err)
 			states = append(states, ts)
@@ -84,7 +88,7 @@ func (w *Walker) discoverPricingFromFSA(fsa model.FunctionSetAssignments) []Tari
 
 			// Active intervals — what the device is acting on right now.
 			if rc.ActiveTimeTariffIntervalListLink != nil {
-				attil, err := w.fetchTimeTariffIntervalList(rc.ActiveTimeTariffIntervalListLink.Href)
+				attil, err := w.fetchTimeTariffIntervalList(ctx, rc.ActiveTimeTariffIntervalListLink.Href)
 				if err != nil {
 					w.logf("pricing: fetch ActiveTimeTariffIntervalList %s: %v",
 						rc.ActiveTimeTariffIntervalListLink.Href, err)
@@ -95,7 +99,7 @@ func (w *Walker) discoverPricingFromFSA(fsa model.FunctionSetAssignments) []Tari
 
 			// Full schedule — needed for look-ahead price-responsive dispatch.
 			if rc.TimeTariffIntervalListLink != nil {
-				ttil, err := w.fetchTimeTariffIntervalList(rc.TimeTariffIntervalListLink.Href)
+				ttil, err := w.fetchTimeTariffIntervalList(ctx, rc.TimeTariffIntervalListLink.Href)
 				if err != nil {
 					w.logf("pricing: fetch TimeTariffIntervalList %s: %v",
 						rc.TimeTariffIntervalListLink.Href, err)
