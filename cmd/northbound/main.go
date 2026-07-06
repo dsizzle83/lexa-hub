@@ -287,6 +287,28 @@ func main() {
 		log.Printf("lexa-northbound: subscribe compliance alert: %v", err)
 	}
 
+	// TASK-042 (GAP-01/02 re-request path): lastPub caches the most recent
+	// successfully-published ActiveControl so a rewalk request can repair the
+	// retained lexa/csip/control immediately, even before a full walk
+	// completes (e.g. mid-WAN-outage). rewalkChan pokes the walk loop below
+	// for an immediate out-of-cadence runDiscovery call; buffered size 1 so
+	// repeat requests arriving while a walk is already running coalesce into
+	// one pending poke instead of queuing (single-flight — the walk loop is
+	// the only goroutine that ever calls runDiscovery). rewalkLimiter is this
+	// side's independent rate limit (nbRewalkRateLimit) — the hub already
+	// rate-limits its own publishes (cmd/hub/state.go's rewalkRateLimit), but
+	// the retained control topic (and in principle this one too) can be
+	// redelivered on every broker reconnect, so northbound does not rely
+	// solely on the hub's discipline (05 §12 walk-rate courtesy).
+	lastPub := &lastPublishedStore{}
+	rewalkChan := make(chan struct{}, 1)
+	rewalkLimiter := &rewalkGate{}
+	if err := mqttutil.Subscribe(mc, bus.TopicCSIPRewalk, func(_ string, req bus.RewalkRequest) {
+		handleRewalkRequest(mc, lastPub, rewalkLimiter, rewalkChan, req, time.Now())
+	}); err != nil {
+		log.Printf("lexa-northbound: subscribe rewalk request: %v", err)
+	}
+
 	// sd_notify READY (TASK-008): MQTT is connected and both subscriptions
 	// (flow reservation request, compliance alert) are registered — only the
 	// discovery walk goroutine remains to start. Sending Ready here, before
@@ -301,7 +323,7 @@ func main() {
 
 	// Run the first discovery immediately, then loop.
 	go func() {
-		runDiscovery(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, cfg, nbm)
+		runDiscovery(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, cfg, nbm, lastPub)
 		// TASK-008: kick once the initial walk returns, success or fail-closed
 		// — a walk that erred and held last-known-good is still a live,
 		// iterating loop (QA 2026-07-02 northbound-hang/wan-outage-hold: a
@@ -320,7 +342,19 @@ func main() {
 				// runDiscovery's internal errors are handled by its own
 				// fail-closed logging and never prevent reaching this line.
 				watchdog.Kick()
-				runDiscovery(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, cfg, nbm)
+				runDiscovery(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, cfg, nbm, lastPub)
+			case <-rewalkChan:
+				// TASK-042: an immediate out-of-cadence walk requested via
+				// lexa/csip/rewalk (handleRewalkRequest already republished
+				// the cached control before poking this channel). Runs the
+				// IDENTICAL runDiscovery call the ticker uses — same code
+				// path, same mutexes, nothing to drift out of sync — so
+				// single-flight is free: this goroutine is the only caller of
+				// runDiscovery, and it can only be sitting in this select
+				// (not mid-walk) when it picks this case up.
+				slog.Info("lexa-northbound: immediate walk triggered by rewalk request")
+				watchdog.Kick()
+				runDiscovery(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, cfg, nbm, lastPub)
 			}
 		}
 	}()
@@ -345,6 +379,112 @@ type nbMetrics struct {
 	clockOffset  *metrics.Gauge   // lexa_nb_clock_offset_seconds
 }
 
+// lastPublishedStore caches the most recent bus.ActiveControl this process
+// successfully published to lexa/csip/control (TASK-042, GAP-01/02's
+// re-request mechanism), so a rewalk request (bus.TopicCSIPRewalk) can
+// republish known-good truth immediately — with a fresh Ts — even when the
+// WAN is down and a full discovery walk cannot complete. Written only by
+// runDiscovery's single walk-loop goroutine after a successful publish (see
+// its "else" branch); read by the rewalk MQTT subscription's own goroutine
+// (paho invokes subscription handlers on a goroutine distinct from the walk
+// loop). A small mutex-guarded struct, not a package-level var, so it and
+// rewalkGate are both constructed once in main() and threaded explicitly
+// into runDiscovery/handleRewalkRequest — keeping the whole mechanism
+// exercisable in table-driven unit tests without any shared global state
+// leaking between them.
+type lastPublishedStore struct {
+	mu   sync.Mutex
+	ctrl *bus.ActiveControl
+}
+
+// set stores a copy of ctrl as the current cache.
+func (s *lastPublishedStore) set(ctrl bus.ActiveControl) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := ctrl
+	s.ctrl = &c
+}
+
+// get returns a copy of the cached control, or nil if nothing has been
+// published yet (e.g. every walk so far has failed — northbound's own
+// fail-closed startup case).
+func (s *lastPublishedStore) get() *bus.ActiveControl {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctrl == nil {
+		return nil
+	}
+	c := *s.ctrl
+	return &c
+}
+
+// nbRewalkRateLimit bounds how often lexa-northbound honors a
+// lexa/csip/rewalk request (TASK-042). The hub already rate-limits how
+// often it PUBLISHES one (cmd/hub/state.go's rewalkRateLimit), but this side
+// defends independently rather than trusting the publisher's discipline
+// alone (05 §12 "walk-rate courtesy": an out-of-cadence walk must stay rare
+// even if a hub misbehaves or the retained topic gets redelivered
+// repeatedly on a flapping broker connection, subRegistry.replay).
+const nbRewalkRateLimit = 10 * time.Second
+
+// rewalkGate is the rate-limit state for handleRewalkRequest.
+type rewalkGate struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+// allow reports whether a rewalk request arriving at now should be honored,
+// recording now as the side effect when it is. Split out as its own method
+// (rather than inlined in handleRewalkRequest) so the rate-limit decision is
+// unit-testable in isolation, without a fake MQTT client or channel.
+func (g *rewalkGate) allow(now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.last.IsZero() && now.Sub(g.last) < nbRewalkRateLimit {
+		return false
+	}
+	g.last = now
+	return true
+}
+
+// handleRewalkRequest is bus.TopicCSIPRewalk's subscription handler
+// (TASK-042), factored out from the mqttutil.Subscribe closure in main() so
+// it is unit-testable without a real broker or a live walk loop. Rate-
+// limited via gate.allow; when allowed:
+//
+//  1. If lp has a cached last-published control, republish it retained with
+//     Ts refreshed to now — repairing a stale or corrupted retained value
+//     even while the WAN is dark, without waiting for a walk to succeed.
+//  2. Non-blocking-poke rewalkChan so the walk loop's single goroutine (see
+//     main()) runs an immediate out-of-cadence walk on its own next turn —
+//     single-flight is free there (that goroutine is the only caller of
+//     runDiscovery); the buffered size-1 channel coalesces repeat pokes that
+//     arrive while a walk is already in flight rather than queuing them.
+func handleRewalkRequest(mc mqtt.Client, lp *lastPublishedStore, gate *rewalkGate, rewalkChan chan<- struct{}, req bus.RewalkRequest, now time.Time) {
+	if !gate.allow(now) {
+		slog.Debug("lexa-northbound: rewalk request rate-limited, ignoring", "reason", req.Reason)
+		return
+	}
+	slog.Info("lexa-northbound: rewalk requested — republishing cached control and triggering immediate walk",
+		"reason", req.Reason)
+
+	if cached := lp.get(); cached != nil {
+		refreshed := *cached
+		refreshed.Ts = now.Unix()
+		if err := mqttutil.PublishJSONRetained(mc, bus.TopicCSIPControl, refreshed); err != nil {
+			log.Printf("lexa-northbound: rewalk republish: %v", err)
+		} else {
+			lp.set(refreshed)
+		}
+	}
+
+	select {
+	case rewalkChan <- struct{}{}:
+	default:
+		// A walk trigger is already pending; this request coalesces into it.
+	}
+}
+
 func runDiscovery(
 	mc mqtt.Client,
 	fetcher *tlsclient.WolfSSLFetcher,
@@ -355,6 +495,7 @@ func runDiscovery(
 	frm *flowReservationManager,
 	cfg *Config,
 	nbm nbMetrics,
+	lp *lastPublishedStore,
 ) {
 	walkStart := time.Now()
 	defer func() { nbm.walkDuration.Set(time.Since(walkStart).Seconds()) }()
@@ -428,6 +569,12 @@ func runDiscovery(
 	msg := toActiveControl(active, tree.ClockOffset)
 	if err := mqttutil.PublishJSONRetained(mc, bus.TopicCSIPControl, msg); err != nil {
 		log.Printf("lexa-northbound: publish control: %v", err)
+	} else {
+		// TASK-042: cache the last SUCCESSFULLY published control so a rewalk
+		// request (bus.TopicCSIPRewalk) can repair the retained value
+		// immediately without waiting for a full walk to complete — see
+		// lastPublishedStore's doc and handleRewalkRequest.
+		lp.set(msg)
 	}
 	// 24-hour DER schedule — built from all discovered programs, curves, and
 	// DER resource data. Published retained so lexa-hub always has the full plan.
