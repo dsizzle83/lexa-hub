@@ -407,6 +407,24 @@ binary-only deploy + hand-set Pi config (05 §6 discipline).
 - **Local wall-clock steps** (TASK-037, GAP-04, AD-004 extension): must not move
   utility-time evaluation (`internal/utilitytime`'s monotonic anchoring — `Clock.Anchor`/
   `ServerNow`) nor freshness windows (already monotonic ages, `time.Now()`+`Sub`).
+- **SOM zone must match the tariff zone** (TASK-079, GAP-05): `TOUCostModel.IsPeakHour`/
+  `CurrentRate`/`CurrentPeriodLabel` (`internal/orchestrator/costmodel.go`) and the
+  planner's `localHourOf`/price-shaping helpers (`planner.go:606-651`) all read
+  `t.Hour()` — i.e. hour-of-day in whatever `time.Location` the caller's `time.Time`
+  carries. The optimizer's `serverNow` (`time.Unix(utilitytime.ServerNowAt(now,
+  ClockOffset), 0)`) renders in the **process's configured zone** (the SOM's
+  `/etc/localtime`/`TZ`), which is correct *only if that zone matches the zone the TOU
+  tariff is written in* — utility tariffs are defined in local clock time, so the
+  correct fix is zone-aware evaluation, not zone-free (never collapse this to UTC). A
+  SOM provisioned with the wrong zone (e.g. `TZ=UTC` serving an America/Los_Angeles
+  tariff) silently misprices — and mis-times autonomous peak-shift discharge — every
+  single evening, with no error or alarm anywhere in the stack today.
+  **Deployment requirement: the hub SOM's configured timezone must be set to the
+  tariff's zone at commissioning.** DST transitions (spring-forward gap / fall-back
+  fold) are handled correctly by the hour-of-day arithmetic as long as the zone is
+  right — pinned by `internal/orchestrator/costmodel_test.go` /`planner_test.go`'s DST
+  tables (`TestTOU_UTCvsLA_Divergence_DeploymentHazard` pins the zone-mismatch
+  divergence specifically).
 
 ## Defensive fault-handling (do not strip — each backs a mayhem-QA finding)
 
