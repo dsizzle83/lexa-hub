@@ -8,6 +8,16 @@ factor decodes ~10× over, and the hub must not optimise against it (audit GS-1/
 solar-bad-scale). This is a service-layer plausibility guard, NOT a register-map change,
 so it does **not** require the southbound lockstep with the harness repo.
 
+**GS-1/MTR-1 register-wrap invariant — regression-swept by TASK-053**: the
+int16 watt-field wrap class is now a standing generative property test, not
+just an audit finding. The shared codec's own contract (round-trip,
+wrap/clamp, sentinel) is swept in `lexa-proto/sunspec/scale_sweep_test.go`;
+this repo runs the identical contract against its own vendored copy via
+`internal/southbound/sunspecsweep/`, and the two watt→ActivePower encoders
+(`cmd/hub/state.go:wattsToActivePower`, `cmd/modbus/main.go:activePowerFromWatts`)
+are swept 0..1e9 W and cross-checked against each other in
+`cmd/hub/state_test.go` / `cmd/modbus/control_test.go`.
+
 ## Package map
 ```
 device/    Device interface: ApplyControl, ReadMeasurements, Status, Close.

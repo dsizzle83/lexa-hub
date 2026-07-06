@@ -6,7 +6,7 @@ SVCDIR  := /etc/systemd/system
 SERVICES := hub northbound modbus ocpp telemetry api
 BINS     := $(addprefix $(BINDIR)/lexa-, $(SERVICES))
 
-.PHONY: all build install install-configs install-services clean tidy test test-nocgo fuzz
+.PHONY: all build install install-configs install-services clean tidy test test-nocgo fuzz sweep-sunspec
 
 all: build
 
@@ -121,6 +121,16 @@ test:
 test-nocgo:
 	go test -race $(shell go list ./internal/... | grep -v -e internal/wolfssl -e internal/tlsclient)
 	go test -race $(shell go list ./cmd/... | grep -v -e cmd/northbound -e cmd/telemetry)
+
+# TASK-053 (GAP-07): quick local re-run of just the int16/scale-factor
+# boundary sweep — the shared lexa-proto/sunspec codec contract (against
+# this repo's vendored copy) plus the two watt->ActivePower encoders'
+# encode-scaling + cross-encoder-agreement checks. Already covered by
+# `test-nocgo` / CI; this target is for a fast local loop while iterating.
+sweep-sunspec:
+	go test -race -run 'Sweep' ./internal/southbound/sunspecsweep/...
+	go test -race -run 'WattsToActivePower' ./cmd/hub/...
+	go test -race -run 'ActivePowerFromWatts' ./cmd/modbus/...
 
 clean:
 	rm -rf $(BINDIR)
