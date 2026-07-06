@@ -161,22 +161,75 @@ func main() {
 				}
 			}
 		}
-		if err := mqttutil.Subscribe(mc, bus.SubDesired, func(topic string, doc bus.DesiredState) {
-			if bus.ClassFromDesiredTopic(topic) != bus.DesiredClassBattery {
-				return
-			}
-			if s, ok := battShells[bus.DeviceFromDesiredTopic(topic)]; ok {
-				s.setDesired(doc, time.Now())
-			}
-		}); err != nil {
-			log.Printf("lexa-modbus: subscribe desired (reconciler): %v", err)
-		}
 		go runBatteryShellTicker(battShells, 60*time.Second)
 		log.Printf("lexa-modbus: battery reconciler %s mode active for %d device(s)", battMode, len(battShells))
 	}
 
+	// TASK-029: one solarShell per inverter-role device when the solar
+	// reconciler is shadow or active. Shadow is a recorder; active gives the
+	// reconciler write authority through the SAME registry path legacy solar
+	// used, makes it the single reasserter-on-reconnect (retryDevice's
+	// reassertLocked inverter branch suppressed via reconciledActive), and seeds
+	// each inverter's initial standing desired to the restore ceiling
+	// (Background case 3 — never both the seed and reassertLocked). Legacy solar
+	// commands keep flowing either way (belt and braces).
+	var solarShells map[string]*solarShell
+	solarMode := cfg.ReconcilerMode("solar")
+	solarActive := solarMode == ReconcilerActive
+	if solarMode == ReconcilerShadow || solarMode == ReconcilerActive {
+		mode := modeShadow
+		if solarActive {
+			mode = modeActive
+		}
+		solarShells = make(map[string]*solarShell)
+		now := time.Now()
+		for _, dc := range cfg.Devices {
+			if dc.Role != "inverter" {
+				continue
+			}
+			var drv reconcileDriver
+			if mode == modeActive {
+				drv = registryDriver{reg: reg, dev: dc.Name}
+			}
+			shell := newSolarShell(dc.Name, reconcile.Config{}, mreg, mode, drv)
+			solarShells[dc.Name] = shell
+			if mode == modeActive {
+				// Single reasserter: the shell's Reconnected() replaces
+				// reassertLocked's inverter branch, and the seed replaces its
+				// never-commanded stale-ceiling clear. Suppress reassertLocked
+				// for this device and route reconnects to the shell.
+				if rd := retryDevices[dc.Name]; rd != nil {
+					rd.reconciledActive = true
+					rd.onReconnect = shell.markReconnected
+				}
+				shell.seedRestoreCeiling(now)
+			}
+		}
+		go runSolarShellTicker(solarShells, 60*time.Second)
+		log.Printf("lexa-modbus: solar reconciler %s mode active for %d device(s)", solarMode, len(solarShells))
+	}
+
+	// Single retained-desired subscription routes each class to its shell map.
+	if battShells != nil || solarShells != nil {
+		if err := mqttutil.Subscribe(mc, bus.SubDesired, func(topic string, doc bus.DesiredState) {
+			dev := bus.DeviceFromDesiredTopic(topic)
+			switch bus.ClassFromDesiredTopic(topic) {
+			case bus.DesiredClassBattery:
+				if s, ok := battShells[dev]; ok {
+					s.setDesired(doc, time.Now())
+				}
+			case bus.DesiredClassSolar:
+				if s, ok := solarShells[dev]; ok {
+					s.setDesired(doc, time.Now())
+				}
+			}
+		}); err != nil {
+			log.Printf("lexa-modbus: subscribe desired (reconciler): %v", err)
+		}
+	}
+
 	// Subscribe to control topics before starting the poll loop.
-	subscribeControls(mc, cfg, reg, interlock, battShells, batteryActive)
+	subscribeControls(mc, cfg, reg, interlock, battShells, solarShells, batteryActive, solarActive)
 
 	// Subscribe to the registry and fan out to MQTT.
 	updates, unsub := reg.Subscribe()
@@ -185,7 +238,7 @@ func main() {
 	reg.Start()
 	defer reg.Stop()
 
-	go publishMeasurements(mc, cfg, updates, interlock, battShells)
+	go publishMeasurements(mc, cfg, updates, interlock, battShells, solarShells)
 
 	metrics.Serve(cfg.MetricsAddr, mreg)
 
@@ -221,7 +274,7 @@ func openDevice(dc DeviceConfig) (device.Device, error) {
 
 // publishMeasurements drains the registry subscription channel and publishes
 // measurements (and battery metrics) to MQTT.
-func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.MeasurementUpdate, interlock *batterySafetyInterlock, battShells map[string]*batteryShell) {
+func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.MeasurementUpdate, interlock *batterySafetyInterlock, battShells map[string]*batteryShell, solarShells map[string]*solarShell) {
 	deviceRole := map[string]string{}
 	nameplate := map[string]float64{}
 	for _, dc := range cfg.Devices {
@@ -275,6 +328,13 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 		if s, ok := battShells[upd.Name]; ok {
 			s.observe(m, wPlausible, nowT)
 		}
+		// TASK-029: feed the solar reconciler shell this poll's readback, reusing
+		// the same plausibleW verdict (one-sided over-ceiling divergence lives in
+		// the shell). In active mode this is where an over-ceiling inverter
+		// triggers a corrective write and a just-reconnected inverter reasserts.
+		if s, ok := solarShells[upd.Name]; ok {
+			s.observe(m, wPlausible, nowT)
+		}
 		if !math.IsNaN(m.V) {
 			msg.VoltageV = &m.V
 		}
@@ -307,7 +367,7 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 // flowing (belt and braces for instant rollback) but are ignored on hardware —
 // no interlock.noteControl (intent is fed from the desired doc the reconciler
 // executes), no apply. The solar path is unaffected by battery mode.
-func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry, interlock *batterySafetyInterlock, battShells map[string]*batteryShell, batteryActive bool) {
+func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry, interlock *batterySafetyInterlock, battShells map[string]*batteryShell, solarShells map[string]*solarShell, batteryActive, solarActive bool) {
 	// Build a map from device name → role for quick lookup.
 	roleOf := map[string]string{}
 	for _, dc := range cfg.Devices {
@@ -364,10 +424,30 @@ func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry, inte
 			return
 		}
 		ctrl := solarCommandToControl(cmd)
+		if solarActive {
+			// TASK-029: the solar reconciler owns inverter writes. Keep the
+			// legacy stream flowing (belt and braces for instant rollback) but
+			// ignore it on hardware; log once per change.
+			sig := describeControl(ctrl)
+			ignoreMu.Lock()
+			changed := lastIgnored[dev] != sig
+			if changed {
+				lastIgnored[dev] = sig
+			}
+			ignoreMu.Unlock()
+			if changed {
+				log.Printf("lexa-modbus: legacy solar command ignored (reconciler active) %s: %s", dev, sig)
+			}
+			return
+		}
 		if err := reg.ApplyControlTo(dev, ctrl); err != nil {
 			log.Printf("lexa-modbus: apply solar control %s: %v", dev, err)
 		} else {
 			log.Printf("lexa-modbus: solar %s control applied", dev)
+			// TASK-029: tell the shadow what the legacy path actually wrote.
+			if s, ok := solarShells[dev]; ok {
+				s.observeLegacyWrite(ctrl)
+			}
 		}
 	}); err != nil {
 		log.Printf("lexa-modbus: subscribe solar control: %v", err)

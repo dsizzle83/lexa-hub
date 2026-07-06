@@ -277,6 +277,133 @@ func TestDesiredPublishingBatteryActuator_FailedPublishRetries(t *testing.T) {
 	}
 }
 
+// fakeSolarActuator / fakeEVSEActuator record delegated calls.
+type fakeSolarActuator struct {
+	calls []orchestrator.SolarCommand
+	err   error
+}
+
+func (f *fakeSolarActuator) ApplySolarCommand(cmd orchestrator.SolarCommand) error {
+	f.calls = append(f.calls, cmd)
+	return f.err
+}
+
+type fakeEVSEActuator struct {
+	calls []orchestrator.EVSECommand
+	err   error
+}
+
+func (f *fakeEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECommand) error {
+	f.calls = append(f.calls, cmd)
+	return f.err
+}
+
+// TestDesiredPublishingSolarActuator_RestoreIsExplicitCeiling is the core
+// TASK-029 mapping: restore (CurtailToW == NaN) must publish an EXPLICIT large
+// CeilingW (bus.RestoreCeilingW), never an absent field — the whole Mode-A/B
+// class exists because restore must be a positive opinion on the wire.
+func TestDesiredPublishingSolarActuator_RestoreIsExplicitCeiling(t *testing.T) {
+	inner := &fakeSolarActuator{}
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingSolarActuator(inner, mc, "inverter-0", nil)
+
+	// A cap first, then restore.
+	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 3000}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: math.NaN()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(inner.calls) != 2 {
+		t.Fatalf("legacy actuator must be delegated to for every call, got %d", len(inner.calls))
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("cap then restore must be two publishes, got %d", len(mc.publishes))
+	}
+	var cap, restore bus.DesiredState
+	if err := json.Unmarshal(mc.publishes[0].payload, &cap); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(mc.publishes[1].payload, &restore); err != nil {
+		t.Fatal(err)
+	}
+	if cap.CeilingW == nil || *cap.CeilingW != 3000 {
+		t.Fatalf("cap CeilingW = %v, want 3000", cap.CeilingW)
+	}
+	if restore.CeilingW == nil || *restore.CeilingW != bus.RestoreCeilingW {
+		t.Fatalf("restore CeilingW = %v, want explicit RestoreCeilingW (never absent)", restore.CeilingW)
+	}
+	if restore.DeviceClass != bus.DesiredClassSolar {
+		t.Fatalf("class = %q, want solar", restore.DeviceClass)
+	}
+	if mc.publishes[1].topic != bus.DesiredTopic(bus.DesiredClassSolar, "inverter-0") || !mc.publishes[1].retained {
+		t.Fatalf("solar doc must be retained on the solar topic")
+	}
+}
+
+// TestDesiredPublishingSolarActuator_DelegatesFirst: the legacy actuator's
+// return value is what the caller sees, regardless of the publish.
+func TestDesiredPublishingSolarActuator_DelegatesFirst(t *testing.T) {
+	inner := &fakeSolarActuator{err: errors.New("legacy solar failed")}
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingSolarActuator(inner, mc, "inverter-0", nil)
+	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 1000}); err == nil {
+		t.Fatal("legacy solar error must propagate")
+	}
+}
+
+// TestDesiredPublishingSolarActuator_ContentDedupe: an unchanged ceiling
+// publishes once (the retained doc is standing intent, not a tick stream).
+func TestDesiredPublishingSolarActuator_ContentDedupe(t *testing.T) {
+	inner := &fakeSolarActuator{}
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingSolarActuator(inner, mc, "inverter-0", nil)
+	for i := 0; i < 3; i++ {
+		if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 2000}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("identical ceiling must publish once, got %d", len(mc.publishes))
+	}
+}
+
+// TestDesiredPublishingEVSEActuator_Mapping: MaxCurrentA (incl. 0-suspend) and
+// ConnectorID ride into the doc; the topic is the station's evse desired topic.
+func TestDesiredPublishingEVSEActuator_Mapping(t *testing.T) {
+	inner := &fakeEVSEActuator{}
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingEVSEActuator(inner, mc, "cs-001", nil)
+
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 0}); err != nil {
+		t.Fatal(err) // 0 = explicit suspend, must republish
+	}
+	if len(inner.calls) != 2 {
+		t.Fatalf("legacy EVSE actuator must be delegated to, got %d", len(inner.calls))
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("limit then suspend must be two publishes, got %d", len(mc.publishes))
+	}
+	var limit, suspend bus.DesiredState
+	_ = json.Unmarshal(mc.publishes[0].payload, &limit)
+	_ = json.Unmarshal(mc.publishes[1].payload, &suspend)
+	if limit.MaxCurrentA == nil || *limit.MaxCurrentA != 16 || limit.ConnectorID != 1 {
+		t.Fatalf("limit doc = %+v, want MaxCurrentA=16 connector=1", limit)
+	}
+	if suspend.MaxCurrentA == nil || *suspend.MaxCurrentA != 0 {
+		t.Fatalf("suspend must publish MaxCurrentA=&0 (explicit), got %v", suspend.MaxCurrentA)
+	}
+	if suspend.DeviceClass != bus.DesiredClassEVSE {
+		t.Fatalf("class = %q, want evse", suspend.DeviceClass)
+	}
+	if mc.publishes[0].topic != bus.DesiredTopic(bus.DesiredClassEVSE, "cs-001") || !mc.publishes[0].retained {
+		t.Fatalf("evse doc must be retained on the evse topic")
+	}
+}
+
 func TestDesiredContentEqual(t *testing.T) {
 	base := bus.DesiredState{DeviceClass: "battery", DeviceID: "battery-0", Source: "economic", SetpointW: ptr(-500.0), Connect: ptr(true)}
 	same := base

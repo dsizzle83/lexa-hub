@@ -301,7 +301,13 @@ func main() {
 		case "inverter":
 			a := &MQTTSolarActuator{mc: mc, device: dc.Name, dispatches: dispatchesTotalCtr}
 			dedupeResets = append(dedupeResets, a.dedupe.reset)
-			eng.RegisterSolarActuator(dc.Name, a)
+			// TASK-029: wrap (don't replace) the legacy solar actuator so every
+			// curtailment/restore ALSO republishes an explicit-ceiling retained
+			// desired doc for the lexa-modbus solar reconciler. dedupeResets
+			// stays wired to the LEGACY actuator's deduper — unchanged
+			// breach-reset behavior (ledger L3).
+			wrapped := newDesiredPublishingSolarActuator(a, mc, dc.Name, desiredPublishesTotalCtr)
+			eng.RegisterSolarActuator(dc.Name, wrapped)
 		}
 	}
 
@@ -309,7 +315,10 @@ func main() {
 	for _, sc := range cfg.Stations {
 		a := &MQTTEVSEActuator{mc: mc, stationID: sc.ID, dispatches: dispatchesTotalCtr}
 		dedupeResets = append(dedupeResets, a.dedupe.reset)
-		eng.RegisterEVSEActuator(sc.ID, a)
+		// TASK-030: wrap the legacy EVSE actuator so every current-limit command
+		// ALSO republishes a retained desired doc for the lexa-ocpp reconciler.
+		wrapped := newDesiredPublishingEVSEActuator(a, mc, sc.ID, desiredPublishesTotalCtr)
+		eng.RegisterEVSEActuator(sc.ID, wrapped)
 	}
 
 	// TASK-044: start serving /metrics before eng.Start() so a scrape during

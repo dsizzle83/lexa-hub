@@ -262,9 +262,11 @@ the Device Reconciler (`internal/reconcile`) as a passive recorder alongside the
 legacy control path — zero hardware writes, logs `reconciler[shadow] ...`
 verdict lines and `lexa_mb_shadow_*_total` metrics.
 
-`"active"` (TASK-028) gives the reconciler **write authority** and is legal for
-**`battery` only** (solar/EVSE `active` is still a fatal config error until
-TASK-029/030). In battery-active mode the reconciler owns hardware writes:
+`"active"` gives the reconciler **write authority**. In `lexa-modbus` it is
+legal for **`battery` (TASK-028)** and **`solar` (TASK-029)**; `evse` active is a
+fatal config error in `modbus.json` because the EVSE reconciler lives in
+`lexa-ocpp` (its own scalar `"reconciler"` key in `ocpp.json`, TASK-030). In
+battery-active mode the reconciler owns hardware writes:
 desired-doc → `reconcile.SetDesired` → `battCommandToControl` (the single
 sign-mapping owner, reused) → `registry.ApplyControlTo` — the same registry path
 legacy used; a diverged readback drives a corrective write (`reconciler[active]
@@ -286,6 +288,34 @@ oscillation the program exists to kill. The interlock re-evaluates and clears
 its trip each poll once the fault clears; normal reconciliation resumes then.
 The interlock's charge intent is fed from the desired doc the reconciler
 executes (moved off the legacy subscribe path).
+
+**Solar-active (TASK-029):** the inverter reconciler owns `OpModMaxLimW` writes
+via the same `registry.ApplyControlTo` path, driven by explicit-ceiling desired
+docs (`lexa/desired/solar/{device}`). Two solar-specific rules: (1) divergence is
+**one-sided** — an inverter producing *under* its ceiling (dusk, clouds) is
+compliant; only *over*-ceiling generation writes; (2) **restore is an explicit
+write**, not an absence — a released cap publishes `CeilingW = RestoreCeilingW`
+(clamped to WMax → 100%), reproducing `restoreOnGenLimitClear`. There is no
+Tier-0 interlock for solar. The inverter reconciler is the **single reasserter**:
+`reassertLocked`'s inverter branch is suppressed for an active inverter and
+replaced by the shell's Reconnected() reassert plus an initial-desired **seed**
+(restore ceiling) for the never-commanded case (the seed's startup write is
+dropped — reassertLocked fires on reconnect, not startup). Legacy
+`lexa/control/solar/{device}` keeps flowing but is ignored on hardware
+(`legacy solar command ignored (reconciler active)`).
+
+**EVSE reconciler (`ocpp.json` `"reconciler": "off"|"shadow"|"active"`,
+TASK-030):** lives in `lexa-ocpp`, one shell per station. Active mode owns
+`SetChargingProfile` via the SAME driver the legacy path uses (`bridge.Apply`,
+L11 rejected-as-error reused verbatim); convergence is judged **only from metered
+current, one-sided** (an EV under its limit is compliant; profile-Accepted is a
+write success, *never* convergence — `ev-accept-but-ignore`); suspend (0 A)
+converges at `currentA ≈ 0` (TransactionEvent Ended forces it). It **closes the
+reassert-on-reconnect gap** the legacy path lacked (a reconnecting charger gets
+its standing limit re-sent immediately, not after the 60 s watchdog). Corrective
+re-write backoff starts at 15 s (≥ the 10 s per-call bound, so calls never
+overlap). Legacy `lexa/evse/{station}/command` keeps flowing, ignored on OCPP
+when active. Rollback for either class = set `shadow` and restart the service.
 
 Editing the Pi's copy without updating `configs/modbus.json` in-repo is undone
 by a full `deploy-hub-pi.sh` (it overwrites `/etc/lexa/*.json`); the in-repo

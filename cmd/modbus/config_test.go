@@ -18,10 +18,10 @@ func writeModbusConfig(t *testing.T, body string) string {
 }
 
 // TestLoadConfig_ReconcilerModes covers every value the "reconciler" config
-// map may hold (TASK-027/028): absent/empty/off/shadow load cleanly; battery
-// "active" is now ACCEPTED (TASK-028 made the battery reconciler
-// authoritative); "active" for any non-battery class stays rejected until
-// TASK-029/030 build those write paths; any other value is rejected too.
+// map may hold (TASK-027/028/029): absent/empty/off/shadow load cleanly;
+// battery "active" (TASK-028) and solar "active" (TASK-029) are ACCEPTED;
+// "active" for evse is rejected in THIS process (the EVSE reconciler lives in
+// lexa-ocpp, not modbus); any other value is rejected too.
 func TestLoadConfig_ReconcilerModes(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -33,8 +33,9 @@ func TestLoadConfig_ReconcilerModes(t *testing.T) {
 		{"off", `{"reconciler":{"battery":"off"},"devices":[]}`, ""},
 		{"shadow", `{"reconciler":{"battery":"shadow"},"devices":[]}`, ""},
 		{"battery active accepted", `{"reconciler":{"battery":"active"},"devices":[]}`, ""},
-		{"solar active rejected", `{"reconciler":{"solar":"active"},"devices":[]}`, "battery-only"},
-		{"evse active rejected", `{"reconciler":{"evse":"active"},"devices":[]}`, "battery-only"},
+		{"solar active accepted", `{"reconciler":{"solar":"active"},"devices":[]}`, ""},
+		{"solar shadow accepted", `{"reconciler":{"solar":"shadow"},"devices":[]}`, ""},
+		{"evse active rejected", `{"reconciler":{"evse":"active"},"devices":[]}`, "evse belongs to lexa-ocpp"},
 		{"unknown rejected", `{"reconciler":{"battery":"bogus"},"devices":[]}`, "unknown mode"},
 	}
 	for _, c := range cases {

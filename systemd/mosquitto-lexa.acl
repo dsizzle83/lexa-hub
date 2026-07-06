@@ -32,6 +32,9 @@ topic read lexa/control/solar/+
 # (AD-013). Scoped to battery only: solar/EVSE reconcilers land in
 # TASK-029/030 and get their own grant then.
 topic read lexa/desired/battery/+
+# bus.DesiredTopic("solar", <device>) (retained) — TASK-029 solar reconciler
+# consumes the hub's retained inverter desired-state doc (explicit CeilingW).
+topic read lexa/desired/solar/+
 
 user lexa-northbound
 # bus.TopicCSIPControl (retained) — resolved CSIP DERControl limits.
@@ -60,6 +63,12 @@ topic write lexa/control/battery/+
 # the legacy actuator publish above. Scoped to battery only, matches the
 # lexa-modbus read grant; extend per-class as TASK-029/030 land.
 topic write lexa/desired/battery/+
+# bus.DesiredTopic("solar", <device>) (retained) — TASK-029 hub-side solar
+# desired-doc publisher. Matches the lexa-modbus solar read grant.
+topic write lexa/desired/solar/+
+# bus.DesiredTopic("evse", <station>) (retained) — TASK-030 hub-side EVSE
+# desired-doc publisher. Matches the lexa-ocpp evse read grant.
+topic write lexa/desired/evse/+
 # bus.CtrlSolarTopic("<device>").
 topic write lexa/control/solar/+
 # bus.EVSECommandTopic("<station>").
@@ -88,6 +97,9 @@ user lexa-ocpp
 topic write lexa/evse/+/state
 # bus.SubEVSECommand.
 topic read lexa/evse/+/command
+# bus.DesiredTopic("evse", <station>) (retained) — TASK-030 EVSE reconciler
+# consumes the hub's retained charging-current desired-state doc (AD-013).
+topic read lexa/desired/evse/+
 
 user lexa-telemetry
 # bus.SubMeasurements — telemetry posts MUP measurements upstream over CSIP.

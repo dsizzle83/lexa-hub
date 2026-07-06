@@ -42,6 +42,32 @@ type Config struct {
 	// LogLevel selects the slog level ("debug"|"info"|"warn"|"error");
 	// default "info" (TASK-045). See internal/logutil.ParseLevel.
 	LogLevel string `json:"log_level"`
+
+	// Reconciler selects the EVSE Device Reconciler mode (AD-002/AD-013,
+	// TASK-030): "off" | "shadow" | "active". Missing/empty ⇒ "off". Unlike
+	// lexa-modbus there is exactly ONE class here (evse), so this is a scalar,
+	// not a per-class map. "shadow" runs the reconciler as a passive recorder
+	// alongside the legacy command path (zero SetChargingProfile writes from the
+	// reconciler); "active" makes it own SetChargingProfile writes with
+	// verify-by-readback and reassert-on-reconnect. loadConfig rejects any other
+	// value.
+	Reconciler string `json:"reconciler"`
+}
+
+// Reconciler mode values.
+const (
+	ReconcilerOff    = "off"
+	ReconcilerShadow = "shadow"
+	ReconcilerActive = "active"
+)
+
+// ReconcilerMode returns the configured EVSE reconciler mode, defaulting to
+// ReconcilerOff when empty. loadConfig has already rejected any other value.
+func (c *Config) ReconcilerMode() string {
+	if c.Reconciler == "" {
+		return ReconcilerOff
+	}
+	return c.Reconciler
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -75,6 +101,12 @@ func loadConfig(path string) (*Config, error) {
 		if cfg.Stations[i].VoltageV == 0 {
 			cfg.Stations[i].VoltageV = 230
 		}
+	}
+	switch cfg.Reconciler {
+	case "", ReconcilerOff, ReconcilerShadow, ReconcilerActive:
+		// ok
+	default:
+		return nil, fmt.Errorf("reconciler: unknown mode %q (want off|shadow|active)", cfg.Reconciler)
 	}
 	return &cfg, nil
 }

@@ -135,6 +135,141 @@ func desiredContentEqual(last *bus.DesiredState, cand bus.DesiredState) bool {
 		boolPtrEqual(last.Connect, cand.Connect)
 }
 
+// desiredPublishingSolarActuator wraps a SolarActuator (TASK-029) so every
+// solar command ALSO republishes the standing curtailment intent as a retained
+// bus.DesiredState document on lexa/desired/solar/{device} (AD-013), for the
+// lexa-modbus solar reconciler to consume. Purely additive, exactly like the
+// battery wrapper: the legacy actuator is invoked FIRST, unchanged, and its
+// return value is what this type returns — the desired-doc publish can fail
+// without altering the legacy behavior.
+//
+// The critical solar-specific mapping (ledger L1/L7): restore is a WRITE, not an
+// absence. orchestrator.SolarCommand encodes restore as CurtailToW == NaN; this
+// wrapper translates that to an EXPLICIT CeilingW = bus.RestoreCeilingW (the
+// device clamps it to WMax → 100% output). A real cap value maps to CeilingW =
+// that value. The doc NEVER encodes restore as an absent CeilingW — the whole
+// Mode-A/B class exists because restore must be explicit and connectivity-
+// independent (the retained doc keeps the cap value until the optimizer
+// releases it; the reconciler reasserts it on reconnect regardless of whether
+// the inverter was dark, reproducing the solarCapActive dark-inverter gate
+// without a publisher equivalent).
+type desiredPublishingSolarActuator struct {
+	inner  orchestrator.SolarActuator
+	mc     mqtt.Client
+	device string
+
+	lastPublished *bus.DesiredState
+	seq           uint64
+	publishes     *metrics.Counter
+}
+
+func newDesiredPublishingSolarActuator(inner orchestrator.SolarActuator, mc mqtt.Client, device string, publishes *metrics.Counter) *desiredPublishingSolarActuator {
+	return &desiredPublishingSolarActuator{inner: inner, mc: mc, device: device, publishes: publishes}
+}
+
+// ApplySolarCommand delegates to the legacy actuator first (unchanged path,
+// unchanged return value), then — only when the derived ceiling differs from
+// the last published doc — publishes a retained bus.DesiredState carrying an
+// explicit CeilingW. Unlike the battery wrapper there is no "carry the last
+// value forward" bookkeeping: a SolarCommand always expresses a full ceiling
+// opinion (NaN CurtailToW is restore, a real value is the cap), so every call
+// yields a complete CeilingW.
+func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.SolarCommand) error {
+	err := a.inner.ApplySolarCommand(cmd)
+
+	ceiling := bus.RestoreCeilingW // NaN CurtailToW ⇒ restore is an explicit large ceiling
+	if !math.IsNaN(cmd.CurtailToW) {
+		ceiling = math.Max(0, cmd.CurtailToW)
+	}
+
+	doc := bus.DesiredState{
+		Envelope:    bus.Envelope{V: bus.DesiredStateV},
+		DeviceClass: bus.DesiredClassSolar,
+		DeviceID:    a.device,
+		CeilingW:    &ceiling,
+		Source:      "economic",
+	}
+
+	if desiredContentEqual(a.lastPublished, doc) {
+		return err
+	}
+
+	now := time.Now()
+	doc.IssuedAt = now.Unix()
+	doc.Seq = a.seq
+
+	if pubErr := mqttutil.PublishJSONRetained(a.mc, bus.DesiredTopic(bus.DesiredClassSolar, a.device), doc); pubErr != nil {
+		log.Printf("lexa-hub: publish desired solar %s: %v", a.device, pubErr)
+		return err
+	}
+	stored := doc
+	a.lastPublished = &stored
+	a.seq++
+	a.publishes.Inc()
+	return err
+}
+
+// desiredPublishingEVSEActuator wraps an EVSEActuator (TASK-030) so every EVSE
+// command ALSO republishes the standing current-limit intent as a retained
+// bus.DesiredState document on lexa/desired/evse/{station} (AD-013), for the
+// lexa-ocpp reconciler to consume. Additive, same pattern.
+//
+// orchestrator.EVSECommand.MaxCurrentA == 0 is an explicit suspend (not "no
+// opinion"), so it is published as MaxCurrentA == &0 — the reconciler maps that
+// to a 0 A SetChargingProfile. ConnectorID rides inside the document (the EVSE
+// keeps one retained doc per station, topic device == stationID). Connect is
+// reserved for future disconnect semantics and always published true (TASK-030
+// blast-radius note: connect=false is a follow-up, not this task).
+type desiredPublishingEVSEActuator struct {
+	inner     orchestrator.EVSEActuator
+	mc        mqtt.Client
+	stationID string
+
+	lastPublished *bus.DesiredState
+	seq           uint64
+	publishes     *metrics.Counter
+}
+
+func newDesiredPublishingEVSEActuator(inner orchestrator.EVSEActuator, mc mqtt.Client, stationID string, publishes *metrics.Counter) *desiredPublishingEVSEActuator {
+	return &desiredPublishingEVSEActuator{inner: inner, mc: mc, stationID: stationID, publishes: publishes}
+}
+
+// ApplyEVSECommand delegates to the legacy actuator first, then publishes a
+// retained desired doc when the current-limit intent's content changes.
+func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECommand) error {
+	err := a.inner.ApplyEVSECommand(cmd)
+
+	maxA := cmd.MaxCurrentA
+	connect := true
+	doc := bus.DesiredState{
+		Envelope:    bus.Envelope{V: bus.DesiredStateV},
+		DeviceClass: bus.DesiredClassEVSE,
+		DeviceID:    a.stationID,
+		MaxCurrentA: &maxA,
+		ConnectorID: cmd.ConnectorID,
+		Connect:     &connect,
+		Source:      "economic",
+	}
+
+	if desiredContentEqual(a.lastPublished, doc) {
+		return err
+	}
+
+	now := time.Now()
+	doc.IssuedAt = now.Unix()
+	doc.Seq = a.seq
+
+	if pubErr := mqttutil.PublishJSONRetained(a.mc, bus.DesiredTopic(bus.DesiredClassEVSE, a.stationID), doc); pubErr != nil {
+		log.Printf("lexa-hub: publish desired evse %s: %v", a.stationID, pubErr)
+		return err
+	}
+	stored := doc
+	a.lastPublished = &stored
+	a.seq++
+	a.publishes.Inc()
+	return err
+}
+
 func floatPtrEqual(a, b *float64) bool {
 	if a == nil || b == nil {
 		return a == b

@@ -107,8 +107,62 @@ func main() {
 		bridge.setStationConfig(sc.ID, sc.MaxCurrentA, sc.VoltageV)
 	}
 
-	// Subscribe to EVSE command topic from the hub (orchestrator).
+	// TASK-030: one reconciler shell per configured station when the EVSE
+	// reconciler is shadow or active. Shadow is a recorder (no SetChargingProfile
+	// from the reconciler); active makes it own the profile via the SAME driver
+	// (bridge.Apply) and adds reassert-on-reconnect. Legacy commands keep
+	// flowing either way (belt and braces for instant rollback).
+	evseMode := cfg.ReconcilerMode()
+	evseActive := evseMode == ReconcilerActive
+	if evseMode == ReconcilerShadow || evseMode == ReconcilerActive {
+		mode := modeShadow
+		var drv profileDriver
+		if evseActive {
+			mode = modeActive
+			drv = bridge
+		}
+		shells := make(map[string]*evseShell)
+		for _, sc := range cfg.Stations {
+			shells[sc.ID] = newEVSEShell(sc.ID, reg, mode, drv)
+		}
+		bridge.shells = shells
+		if err := mqttutil.Subscribe(mc, bus.SubDesired, func(topic string, doc bus.DesiredState) {
+			if bus.ClassFromDesiredTopic(topic) != bus.DesiredClassEVSE {
+				return
+			}
+			if sh, ok := shells[bus.DeviceFromDesiredTopic(topic)]; ok {
+				sh.setDesired(doc, time.Now())
+			}
+		}); err != nil {
+			log.Printf("lexa-ocpp: subscribe desired (reconciler): %v", err)
+		}
+		go runEVSEShellTicker(shells, 60*time.Second)
+		log.Printf("lexa-ocpp: EVSE reconciler %s mode for %d station(s)", evseMode, len(shells))
+	}
+
+	// Subscribe to EVSE command topic from the hub (orchestrator). When the
+	// reconciler is active it OWNS SetChargingProfile: keep the legacy stream
+	// flowing but ignore it on OCPP (log once per change); in shadow mode record
+	// what legacy applied for the reconciler's verdict line.
+	var ignoreMu sync.Mutex
+	lastIgnored := map[string]string{}
 	if err := mqttutil.Subscribe(mc, bus.SubEVSECommand, func(topic string, cmd bus.EVSECommand) {
+		if evseActive {
+			sig := fmt.Sprintf("%d|%g", cmd.ConnectorID, cmd.MaxCurrentA)
+			ignoreMu.Lock()
+			changed := lastIgnored[cmd.StationID] != sig
+			if changed {
+				lastIgnored[cmd.StationID] = sig
+			}
+			ignoreMu.Unlock()
+			if changed {
+				log.Printf("lexa-ocpp: legacy EVSE command ignored (reconciler active) %s: MaxCurrentA=%g", cmd.StationID, cmd.MaxCurrentA)
+			}
+			return
+		}
+		if sh, ok := bridge.shells[cmd.StationID]; ok {
+			sh.observeLegacyCommand(cmd.MaxCurrentA)
+		}
 		if err := bridge.applyCommand(cmd); err != nil {
 			log.Printf("lexa-ocpp: apply command %s: %v", cmd.StationID, err)
 		}
@@ -202,6 +256,13 @@ type mqttBridge struct {
 	// (lexa_ocpp_transactions_total, TASK-044); nil-safe (metrics.Counter's
 	// Inc is a no-op on a nil receiver).
 	transactionsTotal *metrics.Counter
+
+	// shells is the per-station TASK-030 reconciler map (nil when reconciler is
+	// off). The meter/transaction forwarders tap it (after releasing mu) to feed
+	// metered current as an Observe, and the connect handler signals reconnects.
+	// Set once at startup before any OCPP connection is accepted, then read-only,
+	// so it needs no lock of its own.
+	shells map[string]*evseShell
 }
 
 // connectedStationCount returns how many known stations currently have an
@@ -233,6 +294,13 @@ func newMQTTBridge(mc mqtt.Client, csms ocpp2.CSMS) *mqttBridge {
 		s.connected = true
 		b.mu.Unlock()
 		log.Printf("[ocpp] connected: %s addr=%s", cs.ID(), cs.RemoteAddr())
+		// TASK-030: reassert-on-reconnect — signal the reconciler (outside mu) so
+		// a charger that dropped and returned gets its standing current limit
+		// re-sent immediately instead of waiting on the hub's 60 s watchdog. This
+		// is the gap the legacy path never closed (it only publishes state here).
+		if sh, ok := b.shells[cs.ID()]; ok {
+			sh.markReconnected()
+		}
 		b.publishAll(cs.ID())
 		go b.triggerStatusNotification(cs.ID())
 	})
@@ -346,19 +414,45 @@ func (b *mqttBridge) publishAll(stationID string) {
 	}
 }
 
+// observeShell feeds one folded metered-current sample to the station's
+// reconciler shell, if any. Called from the meter/transaction forwarders AFTER
+// bridge.mu is released (the shell's own apply path takes bridge.mu). No-op when
+// the reconciler is off or the station has no shell.
+func (b *mqttBridge) observeShell(stationID string, currentA, maxA float64, connected bool) {
+	sh, ok := b.shells[stationID]
+	if !ok {
+		return
+	}
+	sh.observe(currentA, !implausibleCurrent(currentA, maxA), connected, time.Now())
+}
+
+// applyCommand is the LEGACY EVSE command path: it delegates to the shared
+// profile driver so both the legacy subscription and the TASK-030 reconciler
+// send byte-identical SetChargingProfile calls (including L11 rejected-as-error).
 func (b *mqttBridge) applyCommand(cmd bus.EVSECommand) error {
+	return b.Apply(cmd.StationID, cmd.ConnectorID, cmd.MaxCurrentA)
+}
+
+// Apply implements profileDriver (TASK-030): send a TxDefaultProfile capping the
+// station's connector at limitA. Shared verbatim by the legacy path and the
+// reconciler shell. A disconnected station is a silent no-op (nil) — the charger
+// is not present to command, and the reconnect reassert re-sends when it returns
+// (matching the legacy path's prior behavior). A delivered-but-REJECTED profile
+// is an error, not success (ledger L11): the charger kept its previous limit.
+// Each call is bounded at 10 s (OCPP timeout); an active-mode backoff must be ≥
+// that so calls to one station never overlap.
+func (b *mqttBridge) Apply(stationID string, evseID int, limitA float64) error {
 	b.mu.RLock()
-	s, ok := b.stations[cmd.StationID]
+	s, ok := b.stations[stationID]
 	connected := ok && s.connected
 	b.mu.RUnlock()
 	if !connected {
 		return nil
 	}
-	evseID := cmd.ConnectorID
 	if evseID == 0 {
 		evseID = 1
 	}
-	limit := cmd.MaxCurrentA
+	limit := limitA
 	period := types.NewChargingSchedulePeriod(0, limit)
 	schedule := types.NewChargingSchedule(1, types.ChargingRateUnitAmperes, period)
 	profile := types.NewChargingProfile(
@@ -373,7 +467,7 @@ func (b *mqttBridge) applyCommand(cmd bus.EVSECommand) error {
 	}
 	resCh := make(chan spResult, 1)
 	callErr := b.csms.SetChargingProfile(
-		cmd.StationID,
+		stationID,
 		func(resp *smartcharging.SetChargingProfileResponse, err error) {
 			r := spResult{err: err}
 			if resp != nil {
@@ -384,23 +478,23 @@ func (b *mqttBridge) applyCommand(cmd bus.EVSECommand) error {
 		evseID, profile,
 	)
 	if callErr != nil {
-		return fmt.Errorf("SetChargingProfile %s evse=%d call failed: %w", cmd.StationID, evseID, callErr)
+		return fmt.Errorf("SetChargingProfile %s evse=%d call failed: %w", stationID, evseID, callErr)
 	}
 	t := time.NewTimer(10 * time.Second)
 	defer t.Stop()
 	select {
 	case r := <-resCh:
 		if r.err != nil {
-			return fmt.Errorf("SetChargingProfile %s evse=%d failed: %w", cmd.StationID, evseID, r.err)
+			return fmt.Errorf("SetChargingProfile %s evse=%d failed: %w", stationID, evseID, r.err)
 		}
 		// A delivered-but-rejected profile is a failure, not success: the EVSE
 		// kept its previous limit. Surface it instead of assuming convergence.
 		if r.status != smartcharging.ChargingProfileStatusAccepted {
-			return fmt.Errorf("SetChargingProfile %s evse=%d rejected: status=%q", cmd.StationID, evseID, r.status)
+			return fmt.Errorf("SetChargingProfile %s evse=%d rejected: status=%q", stationID, evseID, r.status)
 		}
 		return nil
 	case <-t.C:
-		return fmt.Errorf("SetChargingProfile %s evse=%d timed out after 10s", cmd.StationID, evseID)
+		return fmt.Errorf("SetChargingProfile %s evse=%d timed out after 10s", stationID, evseID)
 	}
 }
 
@@ -495,7 +589,13 @@ func (h *meterForwarder) OnMeterValues(csID string, req *meter.MeterValuesReques
 	s := h.bridge.getOrCreateLocked(csID)
 	applySamplesLocked(s, req.MeterValue)
 	currentA, soc, energyWh := s.currentA, s.soc, s.energyWh
+	connected, maxA := s.connected, s.maxCurrentA
 	h.bridge.mu.Unlock()
+	// TASK-030: feed the folded metered current to the reconciler (outside mu, so
+	// the shell's apply path — which takes bridge.mu — never inverts lock order).
+	// currentA is post-L11 (applySamplesLocked already rejected any implausible
+	// sample and kept last-good), so it is by construction plausible.
+	h.bridge.observeShell(csID, currentA, maxA, connected)
 	// TASK-045 per-tick demotion: bare MeterValues arrives on every sample
 	// (~10 s during an active session) — steady-state, not a transition (the
 	// invariant per CLAUDE.md is the TransactionEvent lifecycle, not this).
@@ -522,7 +622,11 @@ func (h *txForwarder) OnTransactionEvent(csID string, req *transactions.Transact
 		s.currentA = 0
 	}
 	currentA, soc, energyWh := s.currentA, s.soc, s.energyWh
+	connected, maxA := s.connected, s.maxCurrentA
 	h.bridge.mu.Unlock()
+	// TASK-030: feed the reconciler (outside mu). Ended has already zeroed
+	// currentA above, so the 0 A suspend case converges via this same path.
+	h.bridge.observeShell(csID, currentA, maxA, connected)
 	// TASK-045: Started/Ended are real session lifecycle edges (CLAUDE.md's
 	// OCPP-1 invariant) and stay at Info; Updated repeats through the whole
 	// session (often on a periodic MeterValuePeriodic trigger) and is
