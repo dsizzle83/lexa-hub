@@ -7,6 +7,8 @@
   "port": 8887,
   "cert_path": "",
   "key_path": "",
+  "basic_auth_user": "",
+  "basic_auth_pass": "",
   "reconciler": "active",
   "stations": [
     {

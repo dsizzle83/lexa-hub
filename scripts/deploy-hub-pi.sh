@@ -2,14 +2,17 @@
 # Deploys the full lexa-hub service set to a Raspberry Pi (interim hub while
 # the ConnectCore dev kit is unavailable).
 #
-# Usage:   bash scripts/deploy-hub-pi.sh <pi-ip> [ssh-user] [--enable-api-auth] [--enable-mqtt-acl]
+# Usage:   bash scripts/deploy-hub-pi.sh <pi-ip> [ssh-user] [--enable-api-auth] [--enable-mqtt-acl] [--enable-ocpp-sp2]
 # Example: bash scripts/deploy-hub-pi.sh 69.0.0.14 pi
-#          bash scripts/deploy-hub-pi.sh 69.0.0.1 dmitri --enable-api-auth --enable-mqtt-acl
+#          bash scripts/deploy-hub-pi.sh 69.0.0.1 dmitri --enable-api-auth --enable-mqtt-acl --enable-ocpp-sp2
 #
 # Prereqs (already done if you're following the bench bring-up):
 #   - make build-arm64 (bin/arm64/lexa-* present, incl. northbound/telemetry)
 #   - client certs staged in ../csip-tls-test/certs/client-staging/
 #   - key-based SSH to the Pi with passwordless sudo (or run with -t and type it)
+#   - for --enable-ocpp-sp2: ../csip-tls-test/certs/ev-server-cert.pem +
+#     certs/vault/ev-server-key.pem must exist — run
+#     `bash scripts/gen-ev-cert.sh <hub-ip>` in csip-tls-test first (TASK-074)
 #
 # What it does on the Pi:
 #   - installs distro mosquitto + the lexa localhost listener conf
@@ -29,19 +32,29 @@
 #     when --enable-mqtt-acl is passed — staged rollout, mirrors
 #     --enable-api-auth. Re-run with --enable-mqtt-acl only after confirming
 #     (journal evidence) every service reconnected using its username.
+#   - stages the OCPP CSMS TLS cert/key + generates an idempotent Basic Auth
+#     secret (/etc/lexa/ocpp-auth.pass, 0600 lexa:lexa) and wires
+#     cert_path/key_path/basic_auth_user/basic_auth_pass into ocpp.json —
+#     ONLY when --enable-ocpp-sp2 is passed (TASK-074 / AD-008 / 09 Security
+#     hard gate). LOCKSTEP: evsim must flip to wss:// in the SAME session —
+#     see csip-tls-test's `scripts/update-sim-pis.sh --enable-ocpp-sp2`, or
+#     lexa-ocpp starts requiring TLS+auth while evsim still dials plain
+#     ws://, which blinds every EV Mayhem scenario instantly.
 #   - enables + starts: mosquitto → lexa-modbus, lexa-ocpp, lexa-api,
 #     lexa-northbound, lexa-telemetry → lexa-hub
 set -euo pipefail
 
-PI="${1:?usage: deploy-hub-pi.sh <pi-ip> [ssh-user] [--enable-api-auth] [--enable-mqtt-acl]}"
+PI="${1:?usage: deploy-hub-pi.sh <pi-ip> [ssh-user] [--enable-api-auth] [--enable-mqtt-acl] [--enable-ocpp-sp2]}"
 shift
 SSHUSER="pi"
 ENABLE_API_AUTH=0
 ENABLE_MQTT_ACL=0
+ENABLE_OCPP_SP2=0
 for arg in "$@"; do
   case "$arg" in
     --enable-api-auth) ENABLE_API_AUTH=1 ;;
     --enable-mqtt-acl) ENABLE_MQTT_ACL=1 ;;
+    --enable-ocpp-sp2) ENABLE_OCPP_SP2=1 ;;
     *) SSHUSER="$arg" ;;
   esac
 done
@@ -55,6 +68,10 @@ done
 for f in ca-cert.pem client-cert.pem client-key.pem; do
   [[ -f "$STAGE/$f" ]] || { echo "missing $STAGE/$f — run gen-client-cert.sh"; exit 1; }
 done
+if [[ "$ENABLE_OCPP_SP2" == "1" ]]; then
+  [[ -f "$CSIP/certs/ev-server-cert.pem" ]] || { echo "missing $CSIP/certs/ev-server-cert.pem — run: bash scripts/gen-ev-cert.sh $PI (in csip-tls-test)"; exit 1; }
+  [[ -f "$CSIP/certs/vault/ev-server-key.pem" ]] || { echo "missing $CSIP/certs/vault/ev-server-key.pem — run: bash scripts/gen-ev-cert.sh $PI (in csip-tls-test)"; exit 1; }
+fi
 
 echo "── Copying artifacts to $SSHUSER@$PI:/tmp/lexa-deploy/"
 ssh "$SSHUSER@$PI" 'rm -rf /tmp/lexa-deploy && mkdir -p /tmp/lexa-deploy/{bin,configs,systemd,certs}'
@@ -64,13 +81,18 @@ scp -q "$HERE"/systemd/lexa-*.service "$HERE"/systemd/mosquitto-lexa.conf "$HERE
 scp -q "$STAGE/ca-cert.pem"     "$SSHUSER@$PI:/tmp/lexa-deploy/certs/ca.pem"
 scp -q "$STAGE/client-cert.pem" "$SSHUSER@$PI:/tmp/lexa-deploy/certs/client.pem"
 scp -q "$STAGE/client-key.pem"  "$SSHUSER@$PI:/tmp/lexa-deploy/certs/client-key.pem"
+if [[ "$ENABLE_OCPP_SP2" == "1" ]]; then
+  scp -q "$CSIP/certs/ev-server-cert.pem"      "$SSHUSER@$PI:/tmp/lexa-deploy/certs/ocpp-cert.pem"
+  scp -q "$CSIP/certs/vault/ev-server-key.pem" "$SSHUSER@$PI:/tmp/lexa-deploy/certs/ocpp-key.pem"
+fi
 
 echo "── Installing on the Pi (sudo)"
-ssh "$SSHUSER@$PI" "sudo bash -s -- $ENABLE_API_AUTH $ENABLE_MQTT_ACL" <<'REMOTE'
+ssh "$SSHUSER@$PI" "sudo bash -s -- $ENABLE_API_AUTH $ENABLE_MQTT_ACL $ENABLE_OCPP_SP2" <<'REMOTE'
 set -euo pipefail
 D=/tmp/lexa-deploy
 ENABLE_API_AUTH="${1:-0}"
 ENABLE_MQTT_ACL="${2:-0}"
+ENABLE_OCPP_SP2="${3:-0}"
 SERVICES="modbus ocpp api northbound telemetry hub"
 PASSWD_FILE=/etc/mosquitto/lexa-passwd
 ACL_FILE=/etc/mosquitto/lexa-acl
@@ -216,6 +238,56 @@ else
   echo "  api_token_file left unset — auth still OFF; re-run with --enable-api-auth once the dashboard and metersim carry $TOKEN_FILE's contents"
 fi
 
+# OCPP Security Profile 2 (TASK-074 / AD-008 / 09 Security hard gate: "OCPP
+# security profile ≥2; ws:// disabled in product config"). Same staged-rollout
+# shape as api-token/mqtt-acl above: the config install just overwrote
+# ocpp.json from the repo's example (cert_path/key_path/basic_auth_user/
+# basic_auth_pass all ""), so enabling has to happen AFTER install, patched
+# in — never re-declared wholesale. Only runs when --enable-ocpp-sp2 is
+# passed; a plain deploy leaves lexa-ocpp on ws://, no auth (bench-only
+# fallback, never the product default).
+#
+# LOCKSTEP WARNING: once this patches ocpp.json and lexa-ocpp restarts below,
+# any evsim still dialing ws:// is instantly rejected (TLS handshake failure)
+# — re-run csip-tls-test's `scripts/update-sim-pis.sh <hub-ip> <ssh-user>
+# --enable-ocpp-sp2` in THIS SAME SESSION (05 §11 same-session rule, same
+# class as MTR-4).
+OCPP_AUTH_USER="evse-bench"
+if [[ "$ENABLE_OCPP_SP2" == "1" ]]; then
+  install -m 644 -o lexa -g lexa "$D/certs/ocpp-cert.pem" /etc/lexa/certs/ocpp-cert.pem
+  install -m 600 -o lexa -g lexa "$D/certs/ocpp-key.pem"  /etc/lexa/certs/ocpp-key.pem
+
+  OCPP_AUTH_PASS_FILE=/etc/lexa/ocpp-auth.pass
+  if [[ ! -s "$OCPP_AUTH_PASS_FILE" ]]; then
+    ( umask 077 && openssl rand -hex 16 > "$OCPP_AUTH_PASS_FILE" )
+    chown lexa:lexa "$OCPP_AUTH_PASS_FILE"
+    chmod 600 "$OCPP_AUTH_PASS_FILE"
+    echo "  generated $OCPP_AUTH_PASS_FILE (0600 lexa:lexa)"
+  else
+    echo "  $OCPP_AUTH_PASS_FILE already present — left untouched (secret is stable across redeploys)"
+  fi
+  OCPP_AUTH_PASS="$(cat "$OCPP_AUTH_PASS_FILE")"
+
+  python3 - "$OCPP_AUTH_USER" "$OCPP_AUTH_PASS" <<'PY'
+import json, sys
+auth_user, auth_pass = sys.argv[1], sys.argv[2]
+path = "/etc/lexa/ocpp.json"
+with open(path) as f:
+    cfg = json.load(f)
+cfg["cert_path"] = "/etc/lexa/certs/ocpp-cert.pem"
+cfg["key_path"] = "/etc/lexa/certs/ocpp-key.pem"
+cfg["basic_auth_user"] = auth_user
+cfg["basic_auth_pass"] = auth_pass
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PY
+  echo "  cert_path/key_path/basic_auth_user/basic_auth_pass set → /etc/lexa/ocpp.json; lexa-ocpp will require TLS+auth once restarted"
+else
+  echo "  OCPP Security Profile 2 left OFF (ws://, no auth) — re-run with --enable-ocpp-sp2 once"
+  echo "  csip-tls-test/certs/ev-server-cert.pem + certs/vault/ev-server-key.pem exist (gen-ev-cert.sh)"
+fi
+
 # Units: the repo ships its own mosquitto.service for the dev kit; on a Pi we
 # use the distro's, so install only the lexa-* units.
 install -m 644 $D/systemd/lexa-*.service /etc/systemd/system/
@@ -264,4 +336,16 @@ else
   echo "   credentials (/etc/lexa/mqtt/lexa-<svc>.pass). Confirm each connected with its username:"
   echo "   ssh $SSHUSER@$PI sudo journalctl -u lexa-modbus -n 20 --no-pager | grep 'broker user='"
   echo "   Then re-run with --enable-mqtt-acl to flip allow_anonymous off and install password_file/acl_file."
+fi
+echo
+if [[ "$ENABLE_OCPP_SP2" == "1" ]]; then
+  echo "── OCPP Security Profile 2: TLS + Basic Auth live on :8887."
+  echo "   ssh $SSHUSER@$PI sudo journalctl -u lexa-ocpp -n 20 --no-pager | grep 'TLS enabled'   # want: 1 line"
+  echo "   LOCKSTEP — do this in THE SAME SESSION or every EV Mayhem scenario goes BLIND:"
+  echo "   bash ~/projects/csip-tls-test/scripts/update-sim-pis.sh $PI $SSHUSER --enable-ocpp-sp2"
+  echo "   Negative-auth check (from the desktop, needs a WS client — see docs/BENCH.md OCPP SP2 runbook"
+  echo "   for the wscat form; unit-level equivalent: 'go test ./cmd/ocpp/... -run TestOCPPSecurityProfile2_BasicAuth')."
+else
+  echo "── OCPP: still ws://, no auth (bench-only fallback, staged rollout) — re-run with --enable-ocpp-sp2"
+  echo "   once ../csip-tls-test/certs/ev-server-cert.pem is provisioned (gen-ev-cert.sh $PI)."
 fi
