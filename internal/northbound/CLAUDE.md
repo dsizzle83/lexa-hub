@@ -7,7 +7,21 @@ discovery/  Link walker starting at /dcap. Follows href attributes — never har
 identity/   LFDI = leftmost 160 bits of SHA-256(cert DER). SFDI = first 36 bits decimal.
 scheduler/  DER event state machine (cancelled, superseded, randomized-start, primacy, default fallback).
 dnssd/      mDNS browse for _ieee2030._tls._tcp. TXT "path=X" overrides /dcap default.
+run/        The discovery walk loop (Discovery.Loop/RunOnce) + TASK-042 rewalk
+            single-flight (lastPublishedStore/rewalkGate/handleRewalkRequest).
+            Owns the fail-closed walk-error hold — see RunOnce's doc comment.
+publish/    Converts discovered resource state to bus messages and publishes
+            retained (Schedule/Pricing/Billing/FlowReservations/ToActiveControl).
+responses/  CORE-022/GEN.044 Response state machine (Tracker) — one
+            CannotComply per breach episode (TASK-031 dedupe).
+flowres/    §10.9 Flow Reservation client (Manager) — decodes hub requests,
+            POSTs FlowReservationRequest.
 ```
+`run`/`publish`/`responses`/`flowres` were extracted from the former
+`cmd/northbound/main.go` god-file (TASK-068, D12/R5) as pure moves — no
+behavior change. `cmd/northbound/main.go` is wiring only (config, TLS
+fetchers, MQTT connect/subscribe, signal handling); it constructs one
+`run.Discovery` and runs `discovery.Loop` in its own goroutine.
 
 ## Fetcher interface
 `discovery.Fetcher`: `Get(path) ([]byte, error)` only. Keeps discovery decoupled from TLS.
