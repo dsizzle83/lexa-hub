@@ -15,7 +15,7 @@ const eps = 1e-9
 func TestPlantDefaults_ReproduceBenchConstants(t *testing.T) {
 	tick := tunedTickInterval.Seconds() // 3 s — the cadence the constants encode
 
-	inv := InverterPlant{}.withDefaults()
+	inv := InverterPlant{}.WithDefaults()
 	// MaxRampDownWPerS × tick must recover maxDropW = 1500 W/tick (optimizer.go).
 	if got := inv.MaxRampDownWPerS * tick; math.Abs(got-1500.0) > eps {
 		t.Errorf("MaxRampDownWPerS*%.0fs = %v, want 1500 (optimizer maxDropW)", tick, got)
@@ -28,7 +28,7 @@ func TestPlantDefaults_ReproduceBenchConstants(t *testing.T) {
 		t.Errorf("Inverter ControlLatencyS = %v, want 3 (one tuned tick)", inv.ControlLatencyS)
 	}
 
-	bat := BatteryPlant{}.withDefaults()
+	bat := BatteryPlant{}.WithDefaults()
 	if math.Abs(bat.CapacityKWh-10.0) > eps {
 		t.Errorf("CapacityKWh = %v, want 10 (bench pack)", bat.CapacityKWh)
 	}
@@ -45,10 +45,10 @@ func TestPlantDefaults_ReproduceBenchConstants(t *testing.T) {
 		t.Errorf("TaperCurve = %v, want nil (empty = linear taper default)", bat.TaperCurve)
 	}
 
-	if got := (MeterPlant{}).withDefaults().MeterLagS; math.Abs(got-5.0) > eps {
+	if got := (MeterPlant{}).WithDefaults().MeterLagS; math.Abs(got-5.0) > eps {
 		t.Errorf("Meter MeterLagS = %v, want 5 (bench meter cadence)", got)
 	}
-	if got := (EVSEPlant{}).withDefaults().MeterLagS; math.Abs(got-10.0) > eps {
+	if got := (EVSEPlant{}).WithDefaults().MeterLagS; math.Abs(got-10.0) > eps {
 		t.Errorf("EVSE MeterLagS = %v, want 10 (OCPP MeterValues cadence)", got)
 	}
 }
@@ -56,7 +56,7 @@ func TestPlantDefaults_ReproduceBenchConstants(t *testing.T) {
 // TestPlantDefaults_PreserveExplicitValues verifies withDefaults only fills
 // zero fields — a partially-populated plant keeps every value it set.
 func TestPlantDefaults_PreserveExplicitValues(t *testing.T) {
-	inv := InverterPlant{MaxRampDownWPerS: 42}.withDefaults()
+	inv := InverterPlant{MaxRampDownWPerS: 42}.WithDefaults()
 	if inv.MaxRampDownWPerS != 42 {
 		t.Errorf("explicit MaxRampDownWPerS overwritten: got %v", inv.MaxRampDownWPerS)
 	}
@@ -65,7 +65,7 @@ func TestPlantDefaults_PreserveExplicitValues(t *testing.T) {
 	}
 
 	curve := []TaperPoint{{SOCPct: 80, Frac: 1}, {SOCPct: 100, Frac: 0}}
-	bat := BatteryPlant{CapacityKWh: 20, TaperCurve: curve}.withDefaults()
+	bat := BatteryPlant{CapacityKWh: 20, TaperCurve: curve}.WithDefaults()
 	if bat.CapacityKWh != 20 {
 		t.Errorf("explicit CapacityKWh overwritten: got %v", bat.CapacityKWh)
 	}

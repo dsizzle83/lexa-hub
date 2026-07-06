@@ -23,7 +23,7 @@ package orchestrator
 //     is cadence-independent and scaled to ticks only at the consuming edge.
 //   - Each field's doc names the optimizer.go constant it will replace and its
 //     provenance ("bench-calibrated").
-//   - A zero/absent field means "use the bench default"; withDefaults() fills
+//   - A zero/absent field means "use the bench default"; WithDefaults() fills
 //     it. The defaults reproduce today's constants EXACTLY (per-second defaults
 //     multiplied back by tunedTickInterval recover the legacy per-tick values).
 //
@@ -93,7 +93,7 @@ type InverterPlant struct {
 
 // withDefaults returns a copy with any zero/absent field filled with the bench
 // calibration, so the result reproduces today's optimizer.go constants exactly.
-func (p InverterPlant) withDefaults() InverterPlant {
+func (p InverterPlant) WithDefaults() InverterPlant {
 	if p.MaxRampDownWPerS == 0 {
 		p.MaxRampDownWPerS = benchCeilingDropWPerTick / tunedTickInterval.Seconds()
 	}
@@ -146,7 +146,7 @@ type BatteryPlant struct {
 	ControlLatencyS float64 `json:"control_latency_s"`
 }
 
-func (p BatteryPlant) withDefaults() BatteryPlant {
+func (p BatteryPlant) WithDefaults() BatteryPlant {
 	if p.CapacityKWh == 0 {
 		p.CapacityKWh = benchBatteryCapacityKWh
 	}
@@ -173,7 +173,7 @@ type MeterPlant struct {
 	MeterLagS float64 `json:"meter_lag_s"`
 }
 
-func (p MeterPlant) withDefaults() MeterPlant {
+func (p MeterPlant) WithDefaults() MeterPlant {
 	if p.MeterLagS == 0 {
 		p.MeterLagS = benchMeterLagS
 	}
@@ -189,7 +189,7 @@ type EVSEPlant struct {
 	MeterLagS float64 `json:"meter_lag_s"`
 }
 
-func (p EVSEPlant) withDefaults() EVSEPlant {
+func (p EVSEPlant) WithDefaults() EVSEPlant {
 	if p.MeterLagS == 0 {
 		p.MeterLagS = benchEVSEMeterLagS
 	}
