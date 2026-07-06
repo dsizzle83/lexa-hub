@@ -80,42 +80,7 @@ func (failedToken) WaitTimeout(time.Duration) bool { return true }
 func (failedToken) Done() <-chan struct{}          { c := make(chan struct{}); close(c); return c }
 func (failedToken) Error() error                   { return errors.New("no ack") }
 
-// fakeBatteryActuator is a legacy-actuator double recording every call, so
-// tests can assert the wrapper delegates FIRST and unconditionally.
-type fakeBatteryActuator struct {
-	calls []orchestrator.BatteryCommand
-	err   error
-}
-
-func (f *fakeBatteryActuator) ApplyBatteryCommand(cmd orchestrator.BatteryCommand) error {
-	f.calls = append(f.calls, cmd)
-	return f.err
-}
-
 func ptr[T any](v T) *T { return &v }
-
-// TestDesiredPublishingBatteryActuator_DelegatesFirst verifies the legacy
-// actuator is invoked (and its error/return value is what the caller sees)
-// regardless of the desired-doc publish outcome — the whole point of
-// "additive, zero-risk" shadow mode (ledger L1–L4 stay byte-for-byte legacy).
-func TestDesiredPublishingBatteryActuator_DelegatesFirst(t *testing.T) {
-	inner := &fakeBatteryActuator{}
-	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(inner, mc, "battery-0", nil)
-
-	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
-	if err := a.ApplyBatteryCommand(cmd); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(inner.calls) != 1 || inner.calls[0] != cmd {
-		t.Fatalf("legacy actuator not invoked with the exact command: %+v", inner.calls)
-	}
-
-	inner.err = errors.New("legacy publish failed")
-	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -600, Connect: ptr(true)}); err == nil {
-		t.Fatal("expected the legacy actuator's error to propagate")
-	}
-}
 
 // TestDesiredPublishingBatteryActuator_ContentChangeDedupe verifies the
 // retained doc is republished only when the standing intent's CONTENT (not
@@ -124,9 +89,8 @@ func TestDesiredPublishingBatteryActuator_DelegatesFirst(t *testing.T) {
 // intent, not a tick stream; a per-tick publish would defeat the point of
 // "retained").
 func TestDesiredPublishingBatteryActuator_ContentChangeDedupe(t *testing.T) {
-	inner := &fakeBatteryActuator{}
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(inner, mc, "battery-0", nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
 
 	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
 	if err := a.ApplyBatteryCommand(cmd); err != nil {
@@ -159,9 +123,8 @@ func TestDesiredPublishingBatteryActuator_ContentChangeDedupe(t *testing.T) {
 // field on the wire means "no opinion" (AD-013), which is a different thing
 // from "same opinion as last time".
 func TestDesiredPublishingBatteryActuator_LeaveUnchanged(t *testing.T) {
-	inner := &fakeBatteryActuator{}
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(inner, mc, "battery-0", nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
 
 	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}); err != nil {
 		t.Fatal(err)
@@ -193,9 +156,8 @@ func TestDesiredPublishingBatteryActuator_LeaveUnchanged(t *testing.T) {
 // case, disambiguated on the consumer side by a strictly-newer IssuedAt
 // (reconcile's SeqReset path, covered in internal/reconcile's own tests).
 func TestDesiredPublishingBatteryActuator_SeqMonotonic(t *testing.T) {
-	inner := &fakeBatteryActuator{}
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(inner, mc, "battery-0", nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
 
 	for i, w := range []float64{-100, -200, -300} {
 		if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: w, Connect: ptr(true)}); err != nil {
@@ -213,7 +175,7 @@ func TestDesiredPublishingBatteryActuator_SeqMonotonic(t *testing.T) {
 		}
 	}
 
-	fresh := newDesiredPublishingBatteryActuator(inner, mc, "battery-0", nil)
+	fresh := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
 	if err := fresh.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -400, Connect: ptr(true)}); err != nil {
 		t.Fatal(err)
 	}
@@ -229,9 +191,8 @@ func TestDesiredPublishingBatteryActuator_SeqMonotonic(t *testing.T) {
 // TestDesiredPublishingBatteryActuator_Retained verifies the publish is
 // retained and on the AD-013 topic lexa/desired/battery/{device}.
 func TestDesiredPublishingBatteryActuator_Retained(t *testing.T) {
-	inner := &fakeBatteryActuator{}
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(inner, mc, "battery-0", nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
 
 	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}); err != nil {
 		t.Fatal(err)
@@ -251,18 +212,17 @@ func TestDesiredPublishingBatteryActuator_Retained(t *testing.T) {
 	}
 }
 
-// TestDesiredPublishingBatteryActuator_FailedPublishRetries verifies a
-// failed publish does not update the dedupe baseline, so the identical
-// content is retried on the very next tick (mirrors cmdDeduper's own
-// "not delivered; retry next tick" convention).
+// TestDesiredPublishingBatteryActuator_FailedPublishRetries verifies a failed
+// publish surfaces as the actuator error (the desired-doc publish IS the command
+// now, TASK-032) AND does not update the dedupe baseline, so the identical
+// content is retried on the very next tick.
 func TestDesiredPublishingBatteryActuator_FailedPublishRetries(t *testing.T) {
-	inner := &fakeBatteryActuator{}
 	mc := &fakeHubMQTTClient{failNext: true}
-	a := newDesiredPublishingBatteryActuator(inner, mc, "battery-0", nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
 
 	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
-	if err := a.ApplyBatteryCommand(cmd); err != nil {
-		t.Fatal(err) // legacy actuator itself did not fail
+	if err := a.ApplyBatteryCommand(cmd); err == nil {
+		t.Fatal("a failed desired publish must surface as the actuator error")
 	}
 	if len(mc.publishes) != 1 {
 		t.Fatalf("got %d publish attempts, want 1", len(mc.publishes))
@@ -277,35 +237,13 @@ func TestDesiredPublishingBatteryActuator_FailedPublishRetries(t *testing.T) {
 	}
 }
 
-// fakeSolarActuator / fakeEVSEActuator record delegated calls.
-type fakeSolarActuator struct {
-	calls []orchestrator.SolarCommand
-	err   error
-}
-
-func (f *fakeSolarActuator) ApplySolarCommand(cmd orchestrator.SolarCommand) error {
-	f.calls = append(f.calls, cmd)
-	return f.err
-}
-
-type fakeEVSEActuator struct {
-	calls []orchestrator.EVSECommand
-	err   error
-}
-
-func (f *fakeEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECommand) error {
-	f.calls = append(f.calls, cmd)
-	return f.err
-}
-
 // TestDesiredPublishingSolarActuator_RestoreIsExplicitCeiling is the core
 // TASK-029 mapping: restore (CurtailToW == NaN) must publish an EXPLICIT large
 // CeilingW (bus.RestoreCeilingW), never an absent field — the whole Mode-A/B
 // class exists because restore must be a positive opinion on the wire.
 func TestDesiredPublishingSolarActuator_RestoreIsExplicitCeiling(t *testing.T) {
-	inner := &fakeSolarActuator{}
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingSolarActuator(inner, mc, "inverter-0", nil)
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil)
 
 	// A cap first, then restore.
 	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 3000}); err != nil {
@@ -313,9 +251,6 @@ func TestDesiredPublishingSolarActuator_RestoreIsExplicitCeiling(t *testing.T) {
 	}
 	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: math.NaN()}); err != nil {
 		t.Fatal(err)
-	}
-	if len(inner.calls) != 2 {
-		t.Fatalf("legacy actuator must be delegated to for every call, got %d", len(inner.calls))
 	}
 	if len(mc.publishes) != 2 {
 		t.Fatalf("cap then restore must be two publishes, got %d", len(mc.publishes))
@@ -341,23 +276,21 @@ func TestDesiredPublishingSolarActuator_RestoreIsExplicitCeiling(t *testing.T) {
 	}
 }
 
-// TestDesiredPublishingSolarActuator_DelegatesFirst: the legacy actuator's
-// return value is what the caller sees, regardless of the publish.
-func TestDesiredPublishingSolarActuator_DelegatesFirst(t *testing.T) {
-	inner := &fakeSolarActuator{err: errors.New("legacy solar failed")}
-	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingSolarActuator(inner, mc, "inverter-0", nil)
+// TestDesiredPublishingSolarActuator_FailedPublishError: a failed publish
+// surfaces as the actuator error (the desired-doc publish IS the command now).
+func TestDesiredPublishingSolarActuator_FailedPublishError(t *testing.T) {
+	mc := &fakeHubMQTTClient{failNext: true}
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil)
 	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 1000}); err == nil {
-		t.Fatal("legacy solar error must propagate")
+		t.Fatal("a failed desired publish must surface as the actuator error")
 	}
 }
 
 // TestDesiredPublishingSolarActuator_ContentDedupe: an unchanged ceiling
 // publishes once (the retained doc is standing intent, not a tick stream).
 func TestDesiredPublishingSolarActuator_ContentDedupe(t *testing.T) {
-	inner := &fakeSolarActuator{}
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingSolarActuator(inner, mc, "inverter-0", nil)
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil)
 	for i := 0; i < 3; i++ {
 		if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 2000}); err != nil {
 			t.Fatal(err)
@@ -371,18 +304,14 @@ func TestDesiredPublishingSolarActuator_ContentDedupe(t *testing.T) {
 // TestDesiredPublishingEVSEActuator_Mapping: MaxCurrentA (incl. 0-suspend) and
 // ConnectorID ride into the doc; the topic is the station's evse desired topic.
 func TestDesiredPublishingEVSEActuator_Mapping(t *testing.T) {
-	inner := &fakeEVSEActuator{}
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingEVSEActuator(inner, mc, "cs-001", nil)
+	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil)
 
 	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16}); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 0}); err != nil {
 		t.Fatal(err) // 0 = explicit suspend, must republish
-	}
-	if len(inner.calls) != 2 {
-		t.Fatalf("legacy EVSE actuator must be delegated to, got %d", len(inner.calls))
 	}
 	if len(mc.publishes) != 2 {
 		t.Fatalf("limit then suspend must be two publishes, got %d", len(mc.publishes))

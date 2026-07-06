@@ -48,10 +48,17 @@ Every service also exposes Prometheus `/metrics` (TASK-044) — see "Metrics" be
 | `lexa/battery/{device}/metrics` | lexa-modbus | lexa-hub | 0 |
 | `lexa/csip/control` *(retained)* | lexa-northbound | lexa-hub, lexa-telemetry | 1 |
 | `lexa/evse/{station}/state` | lexa-ocpp | lexa-hub | 0 |
-| `lexa/control/battery/{device}` | lexa-hub | lexa-modbus | 1 |
-| `lexa/control/solar/{device}` | lexa-hub | lexa-modbus | 1 |
-| `lexa/evse/{station}/command` | lexa-hub | lexa-ocpp | 1 |
+| `lexa/desired/{class}/{device}` *(retained, AD-013)* | lexa-hub | lexa-modbus, lexa-ocpp | 1 |
+| ~~`lexa/control/battery/{device}`~~ | — | — | — |
+| ~~`lexa/control/solar/{device}`~~ | — | — | — |
+| ~~`lexa/evse/{station}/command`~~ | — | — | — |
 | `lexa/reconcile/{class}/{device}/report` *(retained)* | lexa-modbus, lexa-ocpp | lexa-hub | 1 |
+
+The three struck-through `lexa/control/*` / `lexa/evse/+/command` legacy command
+topics were **removed in TASK-032**: the retained `lexa/desired/{class}/{device}`
+document (AD-013) is now the sole command path, executed by the device
+reconcilers. The topic-name constants remain in `internal/bus/topics.go` marked
+`Deprecated` for one release (external tooling), with no producer or consumer.
 | `lexa/csip/compliance/alert` | lexa-hub | lexa-northbound | 1 |
 
 **CannotComply path (3 stages, TASK-031)** — collapsed from the old 5-hop chain:
@@ -286,12 +293,12 @@ sign-mapping owner, reused) → `registry.ApplyControlTo` — the same registry 
 legacy used; a diverged readback drives a corrective write (`reconciler[active]
 … applied …` journal lines, `lexa_mb_reconcile_writes_total`), and a reconnected
 pack reasserts the standing desired (`reconcile.Reconnected`, ledger L4). The
-reconciler is the **single reasserter**: `retryDevice.lastCtrl` recording/replay
-is suppressed for an active-reconciled battery (solar keeps it). The legacy
-`lexa/control/battery/{device}` topic **keeps publishing and being subscribed**
-(belt and braces for instant rollback) but is ignored on hardware when active
-(`legacy battery command ignored (reconciler active)`); rollback = set `shadow`
-and restart lexa-modbus, legacy writes resume immediately.
+reconciler is the **single reasserter**: TASK-032 deleted the transport-side
+`retryDevice.lastCtrl` replay entirely, leaving the reconciler's
+reassert-on-reconnect (via `retryDevice.onReconnect`) as the only one. TASK-032
+also **deleted** the legacy `lexa/control/battery/{device}` command path; the
+retained desired doc is the sole battery command path (config
+`reconciler.battery` MUST be `"active"` — off/shadow is a fatal config error).
 
 **Interlock seniority (critical):** the Tier-0 battery interlock
 (`cmd/modbus/interlock.go`, ledger L8) stays **senior to the reconciler**. While
@@ -309,14 +316,15 @@ docs (`lexa/desired/solar/{device}`). Two solar-specific rules: (1) divergence i
 **one-sided** — an inverter producing *under* its ceiling (dusk, clouds) is
 compliant; only *over*-ceiling generation writes; (2) **restore is an explicit
 write**, not an absence — a released cap publishes `CeilingW = RestoreCeilingW`
-(clamped to WMax → 100%), reproducing `restoreOnGenLimitClear`. There is no
-Tier-0 interlock for solar. The inverter reconciler is the **single reasserter**:
-`reassertLocked`'s inverter branch is suppressed for an active inverter and
-replaced by the shell's Reconnected() reassert plus an initial-desired **seed**
-(restore ceiling) for the never-commanded case (the seed's startup write is
-dropped — reassertLocked fires on reconnect, not startup). Legacy
-`lexa/control/solar/{device}` keeps flowing but is ignored on hardware
-(`legacy solar command ignored (reconciler active)`).
+(clamped to WMax → 100%). The optimizer-side `restoreOnGenLimitClear` edge
+emission was **deleted in TASK-032** as redundant (`applyRestoreRule` emits the
+same NaN restore end-of-pass; the retained desired doc carries it to a dark
+inverter on reconnect). There is no Tier-0 interlock for solar. The inverter
+reconciler is the **single reasserter**: TASK-032 deleted `reassertLocked`, so
+reassert-on-reconnect is the shell's Reconnected() plus an initial-desired
+**seed** (restore ceiling) for the never-commanded case. TASK-032 **deleted** the
+legacy `lexa/control/solar/{device}` command path (config `reconciler.solar` MUST
+be `"active"`).
 
 **EVSE reconciler (`ocpp.json` `"reconciler": "off"|"shadow"|"active"`,
 TASK-030):** lives in `lexa-ocpp`, one shell per station. Active mode owns
@@ -328,8 +336,10 @@ converges at `currentA ≈ 0` (TransactionEvent Ended forces it). It **closes th
 reassert-on-reconnect gap** the legacy path lacked (a reconnecting charger gets
 its standing limit re-sent immediately, not after the 60 s watchdog). Corrective
 re-write backoff starts at 15 s (≥ the 10 s per-call bound, so calls never
-overlap). Legacy `lexa/evse/{station}/command` keeps flowing, ignored on OCPP
-when active. Rollback for either class = set `shadow` and restart the service.
+overlap). TASK-032 **deleted** the legacy `lexa/evse/{station}/command` path
+(config `reconciler` MUST be `"active"` when stations are configured). Rollback
+is now `git revert` of the relevant TASK-032 commit + redeploy — the config-flip
+rollback ended with the legacy-path deletion.
 
 Editing the Pi's copy without updating `configs/modbus.json` in-repo is undone
 by a full `deploy-hub-pi.sh` (it overwrites `/etc/lexa/*.json`); the in-repo
@@ -402,6 +412,16 @@ survive; the guards below are deliberate, not redundant. Keep them when refactor
   (suspect scale factor); `cmd/ocpp` rejects MeterValues current over the station rating.
 - **Battery reserve safety**: `checkBatterySafety` force-disconnects a pack measured
   discharging at/below its SOC reserve (a device inverting its setpoint).
+- **Converge the device to the desired state** (the Device Reconciler,
+  `internal/reconcile` + the modbus/ocpp shells): this is now the SINGLE owner of
+  "make the device match what the hub wants." Verify-by-readback + write-on-diff
+  (bounded by the poll/readback interval) and reassert-on-reconnect from the
+  retained desired doc replaced the legacy convergence machinery — the actuator
+  `cmdDeduper` + 60 s watchdog + breach-reset, and the transport-side
+  `retryDevice.lastCtrl` reassert — all **deleted in TASK-032** (behaviors
+  preserved; see `docs/refactor/PRESERVATION_LEDGER.md` L1–L4). Do not re-introduce
+  a second writer/reasserter — a split-brain writer is the W6/D3 foot-gun this
+  deletion closed.
 - These hold the cap / surface the fault; the matching regression tests are
   `*_test.go` next to each (`convergence_test.go`, `failclosed_test.go`, etc.).
 

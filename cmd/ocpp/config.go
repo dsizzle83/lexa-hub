@@ -43,14 +43,13 @@ type Config struct {
 	// default "info" (TASK-045). See internal/logutil.ParseLevel.
 	LogLevel string `json:"log_level"`
 
-	// Reconciler selects the EVSE Device Reconciler mode (AD-002/AD-013,
-	// TASK-030): "off" | "shadow" | "active". Missing/empty ⇒ "off". Unlike
-	// lexa-modbus there is exactly ONE class here (evse), so this is a scalar,
-	// not a per-class map. "shadow" runs the reconciler as a passive recorder
-	// alongside the legacy command path (zero SetChargingProfile writes from the
-	// reconciler); "active" makes it own SetChargingProfile writes with
-	// verify-by-readback and reassert-on-reconnect. loadConfig rejects any other
-	// value.
+	// Reconciler selects the EVSE Device Reconciler mode (AD-002/AD-013):
+	// "off" | "shadow" | "active", a scalar (exactly one class, evse). TASK-032
+	// deleted the legacy lexa/evse/{station}/command write path, so with any
+	// station configured the mode MUST be "active" — loadConfig rejects
+	// off/shadow/empty because no legacy path remains to fall back to. "active"
+	// makes the reconciler own SetChargingProfile writes with verify-by-readback
+	// and reassert-on-reconnect.
 	Reconciler string `json:"reconciler"`
 }
 
@@ -104,9 +103,16 @@ func loadConfig(path string) (*Config, error) {
 	}
 	switch cfg.Reconciler {
 	case "", ReconcilerOff, ReconcilerShadow, ReconcilerActive:
-		// ok
+		// value syntax ok; migrated-class requirement checked below
 	default:
 		return nil, fmt.Errorf("reconciler: unknown mode %q (want off|shadow|active)", cfg.Reconciler)
+	}
+	// TASK-032: the legacy lexa/evse/{station}/command path was deleted, so EVSE
+	// is reconciler-only. If stations are configured, the reconciler MUST be
+	// "active": off/shadow (or empty) would leave no write path and silently
+	// disable charging control — a pre-032 backup config must fail loud here.
+	if len(cfg.Stations) > 0 && cfg.ReconcilerMode() != ReconcilerActive {
+		return nil, fmt.Errorf("reconciler must be \"active\" (got %q): the legacy command path was deleted in TASK-032; off/shadow would silently disable EVSE actuation", cfg.ReconcilerMode())
 	}
 	return &cfg, nil
 }

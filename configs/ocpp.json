@@ -7,7 +7,7 @@
   "port": 8887,
   "cert_path": "",
   "key_path": "",
-  "reconciler": "off",
+  "reconciler": "active",
   "stations": [
     {
       "id": "cs-001",
