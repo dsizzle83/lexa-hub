@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"lexa-hub/internal/journal"
 )
 
 // Config is the JSON configuration for lexa-northbound.
@@ -36,6 +38,34 @@ type Config struct {
 	// LogLevel selects the slog level ("debug"|"info"|"warn"|"error");
 	// default "info" (TASK-045). See internal/logutil.ParseLevel.
 	LogLevel string `json:"log_level"`
+
+	// Journal is the optional durable event-journal block (TASK-040): here,
+	// northbound only ever emits cannot_comply_posted + service_start. A
+	// nil/absent "journal" key disables journaling entirely.
+	Journal *JournalConfig `json:"journal,omitempty"`
+}
+
+// JournalConfig is the on-disk "journal" block — a duplicate of cmd/hub's
+// JournalConfig (same shape, same rationale for not embedding
+// internal/journal.Config directly; see that copy's doc comment). Not
+// shared between the two: cmd/* packages don't import each other (05 §1).
+type JournalConfig struct {
+	Dir            string `json:"dir"`
+	MaxBytes       int64  `json:"max_bytes"`
+	MaxFiles       int    `json:"max_files"`
+	FlushEvery     int    `json:"flush_every"`
+	FlushIntervalS int    `json:"flush_interval_s"`
+}
+
+// ToLibrary converts jc into a journal.Config for journal.Open.
+func (jc *JournalConfig) ToLibrary() journal.Config {
+	return journal.Config{
+		Dir:           jc.Dir,
+		MaxBytes:      jc.MaxBytes,
+		MaxFiles:      jc.MaxFiles,
+		FlushEvery:    jc.FlushEvery,
+		FlushInterval: time.Duration(jc.FlushIntervalS) * time.Second,
+	}
 }
 
 func loadConfig(path string) (*Config, error) {
