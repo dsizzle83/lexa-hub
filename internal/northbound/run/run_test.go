@@ -1,4 +1,4 @@
-package main
+package run
 
 import (
 	"testing"
@@ -234,5 +234,31 @@ func TestHandleRewalkRequest_RepeatedPokesCoalesce(t *testing.T) {
 	case <-rewalkChan:
 		t.Fatal("a second poke queued; expected coalescing into one")
 	default:
+	}
+}
+
+// TestDiscovery_HandleRewalk_WiresIntoOwnState verifies Discovery.HandleRewalk
+// (the exported entry point main() wires the MQTT subscription to) drives
+// the Discovery's own lastPub/rewalkChan/rewalkGate — i.e. the constructor
+// wiring, not just the free function tested above.
+func TestDiscovery_HandleRewalk_WiresIntoOwnState(t *testing.T) {
+	fc := &fakeNBClient{}
+	d := &Discovery{
+		mc:         fc,
+		lastPub:    &lastPublishedStore{},
+		rewalkChan: make(chan struct{}, 1),
+		rewalkGate: &rewalkGate{},
+	}
+	d.lastPub.set(bus.ActiveControl{Source: "event", MRID: "evt-1", Ts: 100})
+
+	d.HandleRewalk(bus.RewalkRequest{Reason: "stale"})
+
+	if len(fc.publishes) != 1 {
+		t.Fatalf("Publish called %d times, want 1", len(fc.publishes))
+	}
+	select {
+	case <-d.rewalkChan:
+	default:
+		t.Fatal("Discovery's own rewalkChan was not poked")
 	}
 }
