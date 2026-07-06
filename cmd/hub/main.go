@@ -31,6 +31,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"log"
 	"log/slog"
@@ -41,6 +44,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/journal"
 	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
@@ -63,6 +67,23 @@ func main() {
 	// this handler. log.Printf call sites this task does not migrate keep
 	// working unchanged (slog does not touch the "log" package's output).
 	logutil.Setup("lexa-hub", logutil.ParseLevel(cfg.LogLevel))
+
+	// TASK-040: the durable event journal. A nil cfg.Journal (no "journal"
+	// block in hub.json) leaves jw nil — every emit call site below is
+	// `if jw != nil`-guarded, so this is a true no-op rollout default, not a
+	// degraded one. Opened before anything that might emit (MQTT connect,
+	// the reader, actuators, breach episodes) so no early transition is lost.
+	var jw *journal.Writer
+	if cfg.Journal != nil {
+		jw, err = journal.Open(cfg.Journal.ToLibrary())
+		if err != nil {
+			log.Fatalf("lexa-hub: open journal: %v", err)
+		}
+		defer jw.Close()
+		if ev, everr := journal.NewServiceStartEvent("hub", journal.NewServiceStart("", configFingerprint(cfg))); everr == nil {
+			_ = jw.Append(ev)
+		}
+	}
 
 	// TASK-044: metrics registry + standard process gauges, wired before the
 	// MQTT connect below so its instrumentation hooks have counters ready.
@@ -114,7 +135,7 @@ func main() {
 	// Build the MQTT-backed system reader. The engine interval sizes the CSIP
 	// expiry debounce (AD-004/TASK-036: utilitytime.DebouncedExpiry) so it means
 	// the same wall-clock seconds at any cadence — see confirmTicksFor in state.go.
-	reader := newMQTTSystemReader(cfg.Devices, cfg.EngineInterval())
+	reader := newMQTTSystemReader(cfg.Devices, cfg.EngineInterval(), jw)
 	// lexa_hub_control_adoption_age_seconds (TASK-044): computed at scrape
 	// time from the reader's tracked last-change timestamp (see
 	// MQTTSystemReader.ControlAdoptionAge's doc in state.go).
@@ -155,7 +176,7 @@ func main() {
 	// exactly one CannotComply Response per real episode rather than one per source
 	// or one per tick. It replaces the former activeBreachMRID closure variable +
 	// standalone breachAlert func (05 §4: named, testable episode state).
-	episodes := newBreachEpisodes()
+	episodes := newBreachEpisodes(jw)
 	// emitAlerts publishes the component's edge alerts and updates the breach
 	// observability (lexa_hub_breaches_total per Active edge, lexa_hub_breach_active
 	// gauge). Shared by both feed paths (plan observer + report subscription), which
@@ -308,15 +329,15 @@ func main() {
 	for _, dc := range cfg.Devices {
 		switch dc.Role {
 		case "battery":
-			eng.RegisterBatteryActuator(dc.Name, newDesiredPublishingBatteryActuator(mc, dc.Name, desiredPublishesTotalCtr))
+			eng.RegisterBatteryActuator(dc.Name, newDesiredPublishingBatteryActuator(mc, dc.Name, desiredPublishesTotalCtr, jw))
 		case "inverter":
-			eng.RegisterSolarActuator(dc.Name, newDesiredPublishingSolarActuator(mc, dc.Name, desiredPublishesTotalCtr))
+			eng.RegisterSolarActuator(dc.Name, newDesiredPublishingSolarActuator(mc, dc.Name, desiredPublishesTotalCtr, jw))
 		}
 	}
 
 	// Wire actuators for known EVSE stations (desired-doc publisher only).
 	for _, sc := range cfg.Stations {
-		eng.RegisterEVSEActuator(sc.ID, newDesiredPublishingEVSEActuator(mc, sc.ID, desiredPublishesTotalCtr))
+		eng.RegisterEVSEActuator(sc.ID, newDesiredPublishingEVSEActuator(mc, sc.ID, desiredPublishesTotalCtr, jw))
 	}
 
 	// TASK-044: start serving /metrics before eng.Start() so a scrape during
@@ -341,6 +362,21 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("lexa-hub: shutting down")
+}
+
+// configFingerprint returns a short, deterministic hash of cfg's JSON
+// encoding for the journal's service_start ConfigHash field (TASK-040):
+// there is no build-version string in this repo yet, so a hash of the
+// effective (post-default) config is the cheapest "what was I running with"
+// breadcrumb a journal reader can use to notice a config change between
+// restarts, without needing to diff /etc/lexa/hub.json by hand.
+func configFingerprint(cfg *Config) string {
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 // derConstraintsFromSchedule converts a DERScheduleMsg into per-step

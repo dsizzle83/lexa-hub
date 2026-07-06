@@ -10,5 +10,10 @@
   "client_key": "/etc/lexa/certs/client-key.pem",
   "lfdi": "",
   "discovery_interval_s": 20,
-  "response_set_path": "/rsps/0/r"
+  "response_set_path": "/rsps/0/r",
+  "journal": {
+    "dir": "/var/lib/lexa/journal/northbound",
+    "max_bytes": 1048576,
+    "max_files": 4
+  }
 }

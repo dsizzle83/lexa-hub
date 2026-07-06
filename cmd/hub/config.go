@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"lexa-hub/internal/journal"
 	"lexa-hub/internal/orchestrator"
 )
 
@@ -61,6 +62,43 @@ type Config struct {
 
 	// Planner holds the 24-hour cost-optimal dispatch configuration.
 	Planner orchestrator.PlannerCfg `json:"planner"`
+
+	// Journal is the optional durable event-journal block (TASK-040):
+	// control adoptions/releases, dispatches, breach episodes, and (on the
+	// northbound side) CannotComply POSTs. A nil/absent "journal" key
+	// disables journaling entirely — every emit site in cmd/hub is guarded
+	// by `if jw != nil`, so this is a true no-op, not a degraded default.
+	Journal *JournalConfig `json:"journal,omitempty"`
+}
+
+// JournalConfig is the on-disk "journal" block. It intentionally has its
+// own JSON tags (snake_case, matching this repo's config convention —
+// PlannerCfg is the precedent) rather than embedding internal/journal.Config
+// directly: that library type carries a `Now func() time.Time` and a
+// `*Metrics` field with no sensible JSON representation, and its own field
+// names (MaxBytes, MaxFiles) don't match the snake_case wire keys
+// (`max_bytes`, `max_files`) without added tags — which would mean editing
+// TASK-039's package for a JSON concern it was never designed to carry.
+// ToLibrary converts this into the journal.Config Open() wants.
+type JournalConfig struct {
+	Dir            string `json:"dir"`              // required; journal.Open MkdirAlls it
+	MaxBytes       int64  `json:"max_bytes"`        // 0 → journal.DefaultMaxBytes
+	MaxFiles       int    `json:"max_files"`        // 0 → journal.DefaultMaxFiles
+	FlushEvery     int    `json:"flush_every"`      // 0 → journal.DefaultFlushEvery
+	FlushIntervalS int    `json:"flush_interval_s"` // 0 → journal.DefaultFlushInterval
+}
+
+// ToLibrary converts jc into a journal.Config for journal.Open. jc == nil
+// (no "journal" block) is never called — callers gate construction on
+// cfg.Journal != nil first.
+func (jc *JournalConfig) ToLibrary() journal.Config {
+	return journal.Config{
+		Dir:           jc.Dir,
+		MaxBytes:      jc.MaxBytes,
+		MaxFiles:      jc.MaxFiles,
+		FlushEvery:    jc.FlushEvery,
+		FlushInterval: time.Duration(jc.FlushIntervalS) * time.Second,
+	}
 }
 
 func loadConfig(path string) (*Config, error) {

@@ -10,6 +10,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/journal"
 	"lexa-hub/internal/orchestrator"
 )
 
@@ -90,7 +91,7 @@ func ptr[T any](v T) *T { return &v }
 // "retained").
 func TestDesiredPublishingBatteryActuator_ContentChangeDedupe(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
 
 	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
 	if err := a.ApplyBatteryCommand(cmd); err != nil {
@@ -124,7 +125,7 @@ func TestDesiredPublishingBatteryActuator_ContentChangeDedupe(t *testing.T) {
 // from "same opinion as last time".
 func TestDesiredPublishingBatteryActuator_LeaveUnchanged(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
 
 	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}); err != nil {
 		t.Fatal(err)
@@ -157,7 +158,7 @@ func TestDesiredPublishingBatteryActuator_LeaveUnchanged(t *testing.T) {
 // (reconcile's SeqReset path, covered in internal/reconcile's own tests).
 func TestDesiredPublishingBatteryActuator_SeqMonotonic(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
 
 	for i, w := range []float64{-100, -200, -300} {
 		if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: w, Connect: ptr(true)}); err != nil {
@@ -175,7 +176,7 @@ func TestDesiredPublishingBatteryActuator_SeqMonotonic(t *testing.T) {
 		}
 	}
 
-	fresh := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
+	fresh := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
 	if err := fresh.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -400, Connect: ptr(true)}); err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +193,7 @@ func TestDesiredPublishingBatteryActuator_SeqMonotonic(t *testing.T) {
 // retained and on the AD-013 topic lexa/desired/battery/{device}.
 func TestDesiredPublishingBatteryActuator_Retained(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
 
 	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}); err != nil {
 		t.Fatal(err)
@@ -218,7 +219,7 @@ func TestDesiredPublishingBatteryActuator_Retained(t *testing.T) {
 // content is retried on the very next tick.
 func TestDesiredPublishingBatteryActuator_FailedPublishRetries(t *testing.T) {
 	mc := &fakeHubMQTTClient{failNext: true}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
 
 	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
 	if err := a.ApplyBatteryCommand(cmd); err == nil {
@@ -243,7 +244,7 @@ func TestDesiredPublishingBatteryActuator_FailedPublishRetries(t *testing.T) {
 // class exists because restore must be a positive opinion on the wire.
 func TestDesiredPublishingSolarActuator_RestoreIsExplicitCeiling(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil)
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil)
 
 	// A cap first, then restore.
 	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 3000}); err != nil {
@@ -280,7 +281,7 @@ func TestDesiredPublishingSolarActuator_RestoreIsExplicitCeiling(t *testing.T) {
 // surfaces as the actuator error (the desired-doc publish IS the command now).
 func TestDesiredPublishingSolarActuator_FailedPublishError(t *testing.T) {
 	mc := &fakeHubMQTTClient{failNext: true}
-	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil)
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil)
 	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 1000}); err == nil {
 		t.Fatal("a failed desired publish must surface as the actuator error")
 	}
@@ -290,7 +291,7 @@ func TestDesiredPublishingSolarActuator_FailedPublishError(t *testing.T) {
 // publishes once (the retained doc is standing intent, not a tick stream).
 func TestDesiredPublishingSolarActuator_ContentDedupe(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil)
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil)
 	for i := 0; i < 3; i++ {
 		if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 2000}); err != nil {
 			t.Fatal(err)
@@ -305,7 +306,7 @@ func TestDesiredPublishingSolarActuator_ContentDedupe(t *testing.T) {
 // ConnectorID ride into the doc; the topic is the station's evse desired topic.
 func TestDesiredPublishingEVSEActuator_Mapping(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil)
+	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, nil)
 
 	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16}); err != nil {
 		t.Fatal(err)
@@ -350,5 +351,144 @@ func TestDesiredContentEqual(t *testing.T) {
 
 	if desiredContentEqual(nil, base) {
 		t.Fatal("nil last must never compare equal")
+	}
+}
+
+// ---------------------------------------------------------------------
+// TASK-040: journal wiring (dispatch, post-dedupe only)
+// ---------------------------------------------------------------------
+
+// TestDesiredPublishingBatteryActuator_JournalsDispatchPostDedupeOnly is the
+// "post-dedupe" acceptance criterion: a dispatch is journaled only when the
+// desired-doc publish actually happens (content changed), never on a
+// dedupe-suppressed repeat tick with unchanged content.
+func TestDesiredPublishingBatteryActuator_JournalsDispatchPostDedupeOnly(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, jw)
+	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
+
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ApplyBatteryCommand(cmd); err != nil { // dedupe-suppressed repeat
+		t.Fatal(err)
+	}
+	if err := jw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	events := journalEventsByType(t, dir)
+	d := events[journal.TypeDispatch]
+	if len(d) != 1 {
+		t.Fatalf("dispatch events = %d, want 1 (dedupe-suppressed repeat must not journal)", len(d))
+	}
+	var payload journal.Dispatch
+	if err := json.Unmarshal(d[0].Data, &payload); err != nil {
+		t.Fatalf("unmarshal Dispatch: %v", err)
+	}
+	if payload.Kind != journal.KindBattery || payload.Device != "battery-0" ||
+		payload.SetpointW == nil || *payload.SetpointW != -500 {
+		t.Fatalf("Dispatch payload = %+v, want kind=battery device=battery-0 setpoint_w=-500", payload)
+	}
+}
+
+// TestDesiredPublishingBatteryActuator_FailedPublishDoesNotJournal verifies a
+// publish that returns an error (the retained-doc publish IS the command,
+// TASK-032) never journals a dispatch — only a publish that actually took.
+func TestDesiredPublishingBatteryActuator_FailedPublishDoesNotJournal(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	mc := &fakeHubMQTTClient{failNext: true}
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, jw)
+	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}); err == nil {
+		t.Fatal("expected the actuator to surface the failed publish as an error")
+	}
+	if err := jw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	events := journalEventsByType(t, dir)
+	if got := len(events[journal.TypeDispatch]); got != 0 {
+		t.Fatalf("dispatch events = %d, want 0 (a failed publish must not journal)", got)
+	}
+}
+
+// TestDesiredPublishingSolarActuator_JournalsDispatch verifies the solar
+// actuator's dispatch payload carries CeilingW (not SetpointW) and the solar
+// Kind.
+func TestDesiredPublishingSolarActuator_JournalsDispatch(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, jw)
+	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 3000}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	events := journalEventsByType(t, dir)
+	d := events[journal.TypeDispatch]
+	if len(d) != 1 {
+		t.Fatalf("dispatch events = %d, want 1", len(d))
+	}
+	var payload journal.Dispatch
+	if err := json.Unmarshal(d[0].Data, &payload); err != nil {
+		t.Fatalf("unmarshal Dispatch: %v", err)
+	}
+	if payload.Kind != journal.KindSolar || payload.CeilingW == nil || *payload.CeilingW != 3000 {
+		t.Fatalf("Dispatch payload = %+v, want kind=solar ceiling_w=3000", payload)
+	}
+}
+
+// TestDesiredPublishingEVSEActuator_JournalsDispatch verifies the EVSE
+// actuator's dispatch payload carries MaxCurrentA and the evse Kind.
+func TestDesiredPublishingEVSEActuator_JournalsDispatch(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, jw)
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	events := journalEventsByType(t, dir)
+	d := events[journal.TypeDispatch]
+	if len(d) != 1 {
+		t.Fatalf("dispatch events = %d, want 1", len(d))
+	}
+	var payload journal.Dispatch
+	if err := json.Unmarshal(d[0].Data, &payload); err != nil {
+		t.Fatalf("unmarshal Dispatch: %v", err)
+	}
+	if payload.Kind != journal.KindEVSE || payload.Device != "cs-001" ||
+		payload.MaxCurrentA == nil || *payload.MaxCurrentA != 16 {
+		t.Fatalf("Dispatch payload = %+v, want kind=evse device=cs-001 max_current_a=16", payload)
 	}
 }

@@ -20,7 +20,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"encoding/xml"
@@ -29,6 +31,7 @@ import (
 	"log"
 	"log/slog"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -38,6 +41,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/journal"
 	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
@@ -140,6 +144,22 @@ func main() {
 	}
 	logutil.Setup("lexa-northbound", logutil.ParseLevel(cfg.LogLevel)) // TASK-045
 
+	// TASK-040: the durable event journal. nil cfg.Journal ⇒ jw stays nil,
+	// and alertCannotComply's emit is `if rt.jw != nil`-guarded — a true
+	// no-op rollout default. Opened as early as possible so service_start
+	// is the first event on a fresh journal.
+	var jw *journal.Writer
+	if cfg.Journal != nil {
+		jw, err = journal.Open(cfg.Journal.ToLibrary())
+		if err != nil {
+			log.Fatalf("lexa-northbound: open journal: %v", err)
+		}
+		defer jw.Close()
+		if ev, everr := journal.NewServiceStartEvent("northbound", journal.NewServiceStart("", configFingerprint(cfg))); everr == nil {
+			_ = jw.Append(ev)
+		}
+	}
+
 	wolfssl.Init()
 	defer wolfssl.Cleanup()
 
@@ -215,7 +235,7 @@ func main() {
 	// serverNow computation reads it back through clk.ServerNow — the same
 	// arithmetic as scheduler.ServerNow(tree.ClockOffset), now single-owned.
 	clk := utilitytime.New(utilitytime.Config{})
-	respTracker := newResponseTracker(fetcherResp, lfdi, cfg.ResponseSetPath, clk, responsesPostedCtr)
+	respTracker := newResponseTracker(fetcherResp, lfdi, cfg.ResponseSetPath, clk, responsesPostedCtr, jw)
 
 	// Flow reservation: a third TLS session dedicated to POSTing reservation
 	// requests received from the hub via MQTT. This keeps it isolated from the
@@ -773,6 +793,20 @@ func apW(ap *model.ActivePower) float64 {
 	return float64(ap.Value) * math.Pow10(int(ap.Multiplier))
 }
 
+// configFingerprint returns a short, deterministic hash of cfg's JSON
+// encoding for the journal's service_start ConfigHash field (TASK-040) — see
+// cmd/hub/main.go's configFingerprint for the "no build-version string yet"
+// rationale; duplicated here rather than shared for the same reason
+// JournalConfig is duplicated (cmd/* packages don't import each other).
+func configFingerprint(cfg *Config) string {
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])[:12]
+}
+
 func lfdiFromCert(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -825,9 +859,13 @@ type responseTracker struct {
 	// TASK-044); nil-safe (metrics.Counter's Inc is a no-op on a nil receiver),
 	// so tests constructing a responseTracker without wiring metrics need no change.
 	responsesPosted *metrics.Counter
+
+	// jw is the optional TASK-040 event journal; nil disables the
+	// cannot_comply_posted emit in alertCannotComply below.
+	jw *journal.Writer
 }
 
-func newResponseTracker(p responsePoster, lfdi, path string, clk *utilitytime.Clock, responsesPosted *metrics.Counter) *responseTracker {
+func newResponseTracker(p responsePoster, lfdi, path string, clk *utilitytime.Clock, responsesPosted *metrics.Counter, jw *journal.Writer) *responseTracker {
 	return &responseTracker{
 		poster:          p,
 		lfdi:            lfdi,
@@ -836,6 +874,7 @@ func newResponseTracker(p responsePoster, lfdi, path string, clk *utilitytime.Cl
 		posted:          make(map[string]uint8),
 		alerted:         make(map[string]bool),
 		responsesPosted: responsesPosted,
+		jw:              jw,
 	}
 }
 
@@ -861,7 +900,24 @@ func (rt *responseTracker) alertCannotComply(mrid, episodeID string) {
 	if episodeID != "" {
 		rt.alerted[episodeID] = true
 	}
-	rt.postResponse(mrid, model.ResponseCannotComply)
+	posted := rt.postResponse(mrid, model.ResponseCannotComply)
+
+	// TASK-040: journal only the successful POST (the err == nil branch) —
+	// this dedupe guard already ensures at most one attempt per episode, so
+	// a failed POST here is not retried and must not leave a false
+	// "posted" record in the evidence trail.
+	if posted && rt.jw != nil {
+		// The CSIP responseSet endpoint always answers 201 Created for a
+		// well-formed Response (verified against csip-tls-test's
+		// sim/gridsim/server.go handleResponsePost; responsePoster.Post
+		// itself only ever treats 201/204 as success either way) —
+		// responsePoster does not surface the raw status code to its
+		// caller, so 201 is recorded here rather than widening the
+		// interface for one observability field.
+		if ev, everr := journal.NewCannotComplyPostedEvent("northbound", journal.NewCannotComplyPosted(episodeID, mrid, http.StatusCreated)); everr == nil {
+			_ = rt.jw.Append(ev)
+		}
+	}
 }
 
 // clearAlerts ends the current breach episode so a future breach re-alerts.
@@ -958,13 +1014,23 @@ func (rt *responseTracker) completeActive() {
 	rt.activeMRID = ""
 }
 
-// set posts a Response and records it as the latest status for mrid.
+// set posts a Response and records it as the latest status for mrid. Its
+// idempotency contract is unchanged by TASK-040: posted[mrid] is recorded
+// unconditionally (the caller never sees, or acts on, postResponse's success
+// return) — a failed POST here was already silently swallowed before this
+// task, and stays that way.
 func (rt *responseTracker) set(mrid string, status uint8) {
 	rt.postResponse(mrid, status)
 	rt.posted[mrid] = status
 }
 
-func (rt *responseTracker) postResponse(mrid string, status uint8) {
+// postResponse POSTs a Response for mrid/status and reports whether it
+// succeeded. The bool return is TASK-040's addition — solely so
+// alertCannotComply can gate its journal emit on "the err == nil branch"
+// without duplicating this method's marshal/POST/log logic; every other
+// call site (set, above) still discards it, preserving the pre-TASK-040
+// behavior bit-for-bit.
+func (rt *responseTracker) postResponse(mrid string, status uint8) bool {
 	resp := model.Response{
 		CreatedDateTime: rt.clk.ServerNow(),
 		EndDeviceLFDI:   rt.lfdi,
@@ -974,11 +1040,11 @@ func (rt *responseTracker) postResponse(mrid string, status uint8) {
 	body, err := xml.Marshal(&resp)
 	if err != nil {
 		log.Printf("lexa-northbound: marshal Response: %v", err)
-		return
+		return false
 	}
 	if _, _, err = rt.poster.Post(rt.responseSetPath, body, "application/sep+xml"); err != nil {
 		log.Printf("lexa-northbound: POST response (mrid=%s status=%d): %v", mrid, status, err)
-		return
+		return false
 	}
 	rt.responsesPosted.Inc()
 	names := map[uint8]string{1: "Received", 2: "Started", 3: "Completed", 6: "Cancelled", 7: "Superseded", model.ResponseCannotComply: "CannotComply"}
@@ -989,4 +1055,5 @@ func (rt *responseTracker) postResponse(mrid string, status uint8) {
 	// TASK-045: migrated to slog. Each call is already a lifecycle edge (this
 	// function is only reached from update()'s transition logic, never per-tick).
 	slog.Info("lexa-northbound: response posted", "status_name", name, "status", status, "mrid", mrid)
+	return true
 }

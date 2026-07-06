@@ -13,5 +13,10 @@
   ],
   "stations": [
     {"id": "cs-001", "max_current_a": 32.0}
-  ]
+  ],
+  "journal": {
+    "dir": "/var/lib/lexa/journal/hub",
+    "max_bytes": 1048576,
+    "max_files": 4
+  }
 }
