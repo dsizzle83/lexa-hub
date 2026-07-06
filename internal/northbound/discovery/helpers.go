@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"fmt"
 
 	model "lexa-proto/csipmodel"
@@ -9,12 +10,12 @@ import (
 // VerifyRegistration fetches the Registration resource and validates
 // the PIN. Per BASIC-001 and CORE-009, the client must verify the PIN.
 // For CSIP conformance testing, PIN is always 111115 (spec section 3.2.3).
-func (w *Walker) VerifyRegistration(ed *model.EndDevice, expectedPIN uint32) (*model.Registration, error) {
+func (w *Walker) VerifyRegistration(ctx context.Context, ed *model.EndDevice, expectedPIN uint32) (*model.Registration, error) {
 	if ed.RegistrationLink == nil {
 		return nil, fmt.Errorf("EndDevice has no RegistrationLink")
 	}
 	var reg model.Registration
-	if err := w.fetchAndParse(ed.RegistrationLink.Href, &reg); err != nil {
+	if err := w.fetchAndParse(ctx, ed.RegistrationLink.Href, &reg); err != nil {
 		return nil, fmt.Errorf("fetch Registration: %w", err)
 	}
 	if reg.PIN != expectedPIN {

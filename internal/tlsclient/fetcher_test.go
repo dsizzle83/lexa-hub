@@ -3,6 +3,8 @@
 package tlsclient
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -26,7 +28,7 @@ func TestWolfSSLFetcher_Get_ReturnsBodyOnly(t *testing.T) {
 	}
 	defer fetcher.Free()
 
-	body, err := fetcher.Get("/dcap")
+	body, err := fetcher.Get(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -54,7 +56,7 @@ func TestWolfSSLFetcher_Get_SequentialCalls(t *testing.T) {
 	defer fetcher.Free()
 
 	for i := 0; i < 3; i++ {
-		body, err := fetcher.Get("/dcap")
+		body, err := fetcher.Get(context.Background(), "/dcap")
 		if err != nil {
 			t.Fatalf("Get call %d: %v", i+1, err)
 		}
@@ -92,7 +94,7 @@ func TestWolfSSLFetcher_PersistentConnection(t *testing.T) {
 
 	const n = 5
 	for i := 0; i < n; i++ {
-		body, err := fetcher.Get("/dcap")
+		body, err := fetcher.Get(context.Background(), "/dcap")
 		if err != nil {
 			t.Fatalf("Get call %d: %v", i+1, err)
 		}
@@ -120,11 +122,69 @@ func TestWolfSSLFetcher_Get_ErrorOn404(t *testing.T) {
 	}
 	defer fetcher.Free()
 
-	_, err = fetcher.Get("/does-not-exist")
+	_, err = fetcher.Get(context.Background(), "/does-not-exist")
 	if err == nil {
 		t.Fatal("expected error for 404, got nil")
 	}
 	if !strings.Contains(err.Error(), "status 404") {
 		t.Errorf("error should mention status 404, got: %v", err)
+	}
+}
+
+// TestWolfSSLFetcher_Get_CtxPreflight_NoDial (TASK-070, R5) verifies the
+// documented cancellation contract: a Get called with an already-canceled
+// ctx returns ctx.Err() immediately and never dials — proven here by never
+// starting a server at all. A regression that dropped the preflight check
+// (or moved it after ensureDialed) would hang or panic on a nil/refused
+// connection instead of returning promptly.
+func TestWolfSSLFetcher_Get_CtxPreflight_NoDial(t *testing.T) {
+	// A config pointing at a closed port: if Get ever tried to dial, this
+	// would fail slowly (connection refused) or, on some platforms, hang —
+	// either way, not the fast ctx.Err() return this test requires.
+	cfg := goodClientConfig("127.0.0.1:1")
+	fetcher, err := NewWolfSSLFetcher(cfg)
+	if err != nil {
+		t.Fatalf("NewWolfSSLFetcher: %v", err)
+	}
+	defer fetcher.Free()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already Done before Get is ever called
+
+	_, err = fetcher.Get(ctx, "/dcap")
+	if err == nil {
+		t.Fatal("Get with an already-canceled ctx returned nil error, want context.Canceled")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Get error = %v, want errors.Is(err, context.Canceled)", err)
+	}
+	if fetcher.client.ssl != nil {
+		t.Error("Get dialed (ssl session non-nil) despite an already-canceled ctx — preflight check did not run before ensureDialed")
+	}
+}
+
+// TestWolfSSLFetcher_PostContext_CtxPreflight_NoDial mirrors the Get
+// preflight test above for PostContext (lexa-telemetry's ctx-aware POST
+// path, TASK-070 step 5) — same contract, same "never dials" proof.
+func TestWolfSSLFetcher_PostContext_CtxPreflight_NoDial(t *testing.T) {
+	cfg := goodClientConfig("127.0.0.1:1")
+	fetcher, err := NewWolfSSLFetcher(cfg)
+	if err != nil {
+		t.Fatalf("NewWolfSSLFetcher: %v", err)
+	}
+	defer fetcher.Free()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err = fetcher.PostContext(ctx, "/mup", []byte("<x/>"), "application/sep+xml")
+	if err == nil {
+		t.Fatal("PostContext with an already-canceled ctx returned nil error, want context.Canceled")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("PostContext error = %v, want errors.Is(err, context.Canceled)", err)
+	}
+	if fetcher.client.ssl != nil {
+		t.Error("PostContext dialed despite an already-canceled ctx")
 	}
 }

@@ -1,9 +1,12 @@
 package discovery
 
 import (
+	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	model "lexa-proto/csipmodel"
 )
@@ -25,13 +28,41 @@ func (m *mockFetcher) serve(path string, resource interface{}) {
 	m.responses[path] = resource
 }
 
-func (m *mockFetcher) Get(path string) ([]byte, error) {
+// Get ignores ctx (beyond the interface signature) — every real cancellation
+// check for these tests lives in fetchAndParse/Discover's own ctx.Err()
+// checks, which run before Get is ever called. blockingFetcher (below) is
+// the fake that actually blocks on ctx, for the cancel-mid-walk test.
+func (m *mockFetcher) Get(ctx context.Context, path string) ([]byte, error) {
 	m.getCalls = append(m.getCalls, path)
 	r, ok := m.responses[path]
 	if !ok {
 		return nil, fmt.Errorf("404: no resource at %s", path)
 	}
 	return xml.Marshal(r)
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// blockingFetcher — a Fetcher whose Get hangs until ctx is canceled, then
+// returns ctx.Err(). Stands in for a wedged/stalling utility server (the
+// northbound-hang QA scenario) to prove Discover unwinds promptly once its
+// ctx is canceled, rather than waiting out the whole walk (TASK-070, R5).
+// ───────────────────────────────────────────────────────────────────────
+
+type blockingFetcher struct {
+	// served lets the first N paths succeed normally (mirroring a walk that
+	// gets partway through the resource tree before the server wedges);
+	// anything past that blocks on ctx.Done().
+	served   map[string]interface{}
+	getCalls []string
+}
+
+func (b *blockingFetcher) Get(ctx context.Context, path string) ([]byte, error) {
+	b.getCalls = append(b.getCalls, path)
+	if r, ok := b.served[path]; ok {
+		return xml.Marshal(r)
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -191,7 +222,7 @@ func TestFullDiscoveryWalk(t *testing.T) {
 	buildFullResourceTree(m)
 
 	w := NewWalker(m, testLFDI)
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover failed: %v", err)
 	}
@@ -292,7 +323,7 @@ func TestDiscoveryNoUrlHardcoding(t *testing.T) {
 	buildFullResourceTree(m)
 
 	w := NewWalker(m, testLFDI)
-	_, err := w.Discover("/dcap")
+	_, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover failed: %v", err)
 	}
@@ -316,7 +347,7 @@ func TestDiscoveryLFDINotFound(t *testing.T) {
 	buildFullResourceTree(m)
 
 	w := NewWalker(m, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF")
-	_, err := w.Discover("/dcap")
+	_, err := w.Discover(context.Background(), "/dcap")
 	if err == nil {
 		t.Fatal("expected error when LFDI not found")
 	}
@@ -331,7 +362,7 @@ func TestDiscoveryLFDICaseInsensitive(t *testing.T) {
 	buildFullResourceTree(m)
 
 	w := NewWalker(m, "ab12cd34ef56789012345678901234567890abcd")
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover with lowercase LFDI failed: %v", err)
 	}
@@ -353,7 +384,7 @@ func TestDiscoveryMissingEndDeviceListLink(t *testing.T) {
 	m.serve("/tm", &model.Time{Resource: model.Resource{Href: "/tm"}, CurrentTime: 1700000000, Quality: 7})
 
 	w := NewWalker(m, testLFDI)
-	_, err := w.Discover("/dcap")
+	_, err := w.Discover(context.Background(), "/dcap")
 	if err == nil {
 		t.Fatal("expected error when EndDeviceListLink missing")
 	}
@@ -378,7 +409,7 @@ func TestDiscoveryMissingFSALink(t *testing.T) {
 	})
 
 	w := NewWalker(m, testLFDI)
-	_, err := w.Discover("/dcap")
+	_, err := w.Discover(context.Background(), "/dcap")
 	if err == nil {
 		t.Fatal("expected error when FSAListLink missing")
 	}
@@ -438,7 +469,7 @@ func TestDiscoveryMultiplePrograms(t *testing.T) {
 		Resource: model.Resource{Href: "/derp/sp/derc"}, All: 0, Results: 0})
 
 	w := NewWalker(m, testLFDI)
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover failed: %v", err)
 	}
@@ -461,7 +492,7 @@ func TestPollRatePreserved(t *testing.T) {
 	buildFullResourceTree(m)
 
 	w := NewWalker(m, testLFDI)
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover failed: %v", err)
 	}
@@ -486,7 +517,7 @@ func TestDiscoveryGETSequence(t *testing.T) {
 	buildFullResourceTree(m)
 
 	w := NewWalker(m, testLFDI)
-	_, err := w.Discover("/dcap")
+	_, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover failed: %v", err)
 	}
@@ -506,13 +537,13 @@ func TestDiscover_ResponseSetPath_Populated(t *testing.T) {
 	buildFullResourceTree(m)
 	// dcap points to /rsps (the list), not the POST target directly.
 	m.serve("/dcap", &model.DeviceCapability{
-		Resource:         model.Resource{Href: "/dcap"},
-		PollRate:         300,
-		TimeLink:         &model.Link{Href: "/tm"},
-		EndDeviceListLink: &model.ListLink{Link: model.Link{Href: "/edev"}, All: 3},
+		Resource:                 model.Resource{Href: "/dcap"},
+		PollRate:                 300,
+		TimeLink:                 &model.Link{Href: "/tm"},
+		EndDeviceListLink:        &model.ListLink{Link: model.Link{Href: "/edev"}, All: 3},
 		MirrorUsagePointListLink: &model.ListLink{Link: model.Link{Href: "/mup"}, All: 0},
-		ResponseSetListLink: &model.ListLink{Link: model.Link{Href: "/rsps"}, All: 1},
-		SelfDeviceLink:   &model.Link{Href: "/sdev"},
+		ResponseSetListLink:      &model.ListLink{Link: model.Link{Href: "/rsps"}, All: 1},
+		SelfDeviceLink:           &model.Link{Href: "/sdev"},
 	})
 	// /rsps → ResponseSetList → ResponseSet[0].ResponseList.Href is the POST target.
 	m.serve("/rsps", &model.ResponseSetList{
@@ -526,7 +557,7 @@ func TestDiscover_ResponseSetPath_Populated(t *testing.T) {
 	})
 
 	w := NewWalker(m, testLFDI)
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -542,7 +573,7 @@ func TestDiscover_ResponseSetPath_EmptyWhenAbsent(t *testing.T) {
 	// buildFullResourceTree serves /dcap without ResponseSetListLink.
 
 	w := NewWalker(m, testLFDI)
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -624,7 +655,7 @@ func TestDiscover_PricingFunctionSet(t *testing.T) {
 	buildPricingResources(m)
 
 	w := NewWalker(m, testLFDI)
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -660,7 +691,7 @@ func TestDiscover_PricingAbsent_NoError(t *testing.T) {
 	buildFullResourceTree(m)
 
 	w := NewWalker(m, testLFDI)
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -729,7 +760,7 @@ func TestDiscover_BillingFunctionSet(t *testing.T) {
 	buildBillingResources(m)
 
 	w := NewWalker(m, testLFDI)
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -795,7 +826,7 @@ func buildFlowReservationResources(m *mockFetcher) {
 				CurrentStatus: model.FlowRespStatusScheduled,
 				DateTime:      1379869260,
 			},
-			Interval: model.DateTimeInterval{Duration: 15600, Start: 1379898000},
+			Interval:        model.DateTimeInterval{Duration: 15600, Start: 1379898000},
 			EnergyAvailable: &model.UnitValue{Multiplier: 0, Value: 12000},
 			PowerAvailable:  &model.UnitValue{Multiplier: 0, Value: 3000},
 			Subject:         "68512866203db3b10000e566",
@@ -809,7 +840,7 @@ func TestDiscover_FlowReservation(t *testing.T) {
 	buildFlowReservationResources(m)
 
 	w := NewWalker(m, testLFDI)
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -845,7 +876,7 @@ func TestDiscover_FlowReservation_AbsentIsNonFatal(t *testing.T) {
 	buildFullResourceTree(m)
 
 	w := NewWalker(m, testLFDI)
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover failed when FR absent: %v", err)
 	}
@@ -854,5 +885,69 @@ func TestDiscover_FlowReservation_AbsentIsNonFatal(t *testing.T) {
 	}
 	if tree.FlowReservationRequestPath != "" {
 		t.Error("FlowReservationRequestPath should be empty when EndDevice has no link")
+	}
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Test: cancel-mid-walk (TASK-070, R5) — a Discover blocked on a stalling
+// server must unwind promptly once its ctx is canceled, instead of hanging
+// until some much longer test timeout / real ReadTimeout. Mirrors the
+// northbound-hang QA scenario at walker granularity: the walk gets past
+// /dcap and /tm (server responds), then wedges on /edev (server stops
+// responding) — cancellation must be observed there, between fetches, not
+// mid-fetch (that granularity is documented as out of reach — see the
+// Fetcher interface's doc comment).
+// ───────────────────────────────────────────────────────────────────────
+
+func TestDiscover_CancelMidWalk_ReturnsPromptly(t *testing.T) {
+	served := map[string]interface{}{
+		"/dcap": &model.DeviceCapability{
+			Resource:          model.Resource{Href: "/dcap"},
+			TimeLink:          &model.Link{Href: "/tm"},
+			EndDeviceListLink: &model.ListLink{Link: model.Link{Href: "/edev"}, All: 1},
+		},
+		"/tm": &model.Time{Resource: model.Resource{Href: "/tm"}, CurrentTime: 1700000000, Quality: 7},
+		// deliberately no "/edev" entry — blockingFetcher.Get hangs there
+		// until ctx.Done(), the stand-in for a wedged server.
+	}
+	b := &blockingFetcher{served: served}
+	w := NewWalker(b, testLFDI)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	done := make(chan struct{})
+	var tree *ResourceTree
+	var err error
+	start := time.Now()
+	go func() {
+		tree, err = w.Discover(ctx, "/dcap")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Discover did not return within 2s of ctx cancellation — walk is not honoring ctx between fetches")
+	}
+	elapsed := time.Since(start)
+
+	if tree != nil {
+		t.Error("Discover returned a non-nil tree on cancellation; fail-closed requires nil + error (hold last-known-good, never publish from a canceled walk)")
+	}
+	if err == nil {
+		t.Fatal("Discover returned nil error on cancellation, want a wrapped context.Canceled")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Discover error = %v, want errors.Is(err, context.Canceled) so callers can distinguish shutdown from a genuine walk failure", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Discover took %v to return after cancel, want well under 2s (bench acceptance: systemctl stop mid-walk <2s)", elapsed)
+	}
+	if len(b.getCalls) == 0 || b.getCalls[len(b.getCalls)-1] != "/edev" {
+		t.Errorf("getCalls = %v, want the walk to have reached the wedged /edev fetch before canceling", b.getCalls)
 	}
 }

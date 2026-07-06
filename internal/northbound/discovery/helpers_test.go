@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"testing"
 
 	model "lexa-proto/csipmodel"
@@ -11,12 +12,12 @@ func TestVerifyRegistrationPIN(t *testing.T) {
 	buildFullResourceTree(m)
 
 	w := NewWalker(m, testLFDI)
-	tree, err := w.Discover("/dcap")
+	tree, err := w.Discover(context.Background(), "/dcap")
 	if err != nil {
 		t.Fatalf("Discover failed: %v", err)
 	}
 
-	reg, err := w.VerifyRegistration(tree.SelfDevice, 111115)
+	reg, err := w.VerifyRegistration(context.Background(), tree.SelfDevice, 111115)
 	if err != nil {
 		t.Fatalf("VerifyRegistration failed: %v", err)
 	}
@@ -24,7 +25,7 @@ func TestVerifyRegistrationPIN(t *testing.T) {
 		t.Errorf("PIN = %d, want 111115", reg.PIN)
 	}
 
-	_, err = w.VerifyRegistration(tree.SelfDevice, 999999)
+	_, err = w.VerifyRegistration(context.Background(), tree.SelfDevice, 999999)
 	if err == nil {
 		t.Fatal("expected error for wrong PIN")
 	}
@@ -34,7 +35,7 @@ func TestVerifyRegistrationNoLink(t *testing.T) {
 	m := newMockFetcher()
 	w := NewWalker(m, testLFDI)
 	ed := &model.EndDevice{}
-	_, err := w.VerifyRegistration(ed, 111115)
+	_, err := w.VerifyRegistration(context.Background(), ed, 111115)
 	if err == nil {
 		t.Fatal("expected error when RegistrationLink missing")
 	}
