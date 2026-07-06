@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/utilitytime"
 )
 
 // deviceSnap is the per-device state aggregated from MQTT.
@@ -46,6 +47,17 @@ type stateStore struct {
 	csipPrograms int
 	clockOffsetS int64
 
+	// utclk anchors utility (server) time to a monotonic instant on every
+	// bus.ActiveControl arrival (onCSIPControl), mirroring cmd/hub's
+	// MQTTSystemReader.utclk (TASK-037/AD-004 extension): a LOCAL wall-clock
+	// step between control arrivals must not move /status's reporting-grace
+	// evaluation (buildStatus's utilitytime.ReportGrace check) any more than
+	// it may move the hub's own enforcement. clockOffsetS above is still
+	// updated on every message (unchanged, cheap fallback for before the
+	// first control/schedule ever arrives); snapshot() overrides it with the
+	// anchored derivation once utclk has anchored at least once.
+	utclk *utilitytime.Clock
+
 	// lastPlan is the hub's most recent plan trace (TopicHubPlan, retained).
 	// nil until the first message — /status then reports an empty decision
 	// list, which after this field's introduction genuinely means "no plan
@@ -60,6 +72,7 @@ func newStateStore(devices []DeviceConfig, staleAfter time.Duration) *stateStore
 		devices:    make(map[string]*deviceSnap),
 		evses:      make(map[string]*evseSnap),
 		staleAfter: staleAfter,
+		utclk:      utilitytime.New(utilitytime.Config{}),
 	}
 	for _, d := range devices {
 		s.devices[d.Name] = &deviceSnap{Name: d.Name, Role: d.Role, MaxW: d.MaxW}
@@ -130,6 +143,12 @@ func (s *stateStore) onCSIPControl(_ string, c bus.ActiveControl) {
 		s.csipControl = &cc
 	}
 	s.clockOffsetS = c.ClockOffset
+	// Anchor utility time at this message's arrival (TASK-037), same
+	// same-host assumption and rationale as cmd/hub's onCSIPControl: c.Ts is
+	// stamped by lexa-northbound with time.Now().Unix() at publish
+	// (toActiveControl), so c.Ts+c.ClockOffset is server time AT PUBLISH —
+	// valid because lexa-api and lexa-northbound share the hub Pi/SOM clock.
+	s.utclk.Anchor(c.Ts + c.ClockOffset)
 }
 
 func (s *stateStore) onEVSEState(_ string, e bus.EVSEState) {
@@ -182,6 +201,17 @@ func (s *stateStore) snapshot() snapshot {
 		clockOffsetS: s.clockOffsetS,
 		staleAfter:   s.staleAfter,
 		now:          time.Now(),
+	}
+	// TASK-037: once a control has ever anchored utclk, prefer the DERIVED
+	// offset (utclk.ServerNow() minus THIS snapshot's now) over the raw
+	// s.clockOffsetS — bit-identical under a stable local clock (both equal
+	// server-minus-local), but immune to a local wall-clock step occurring
+	// between control arrivals, matching cmd/hub's ReadSystemState. Before
+	// the first control ever arrives, utclk is unanchored and this is
+	// skipped, leaving the pre-existing s.clockOffsetS fallback (0, or
+	// whatever onSchedule last set) untouched.
+	if s.utclk.Anchored() {
+		out.clockOffsetS = s.utclk.ServerNow() - out.now.Unix()
 	}
 	for name, d := range s.devices {
 		out.devices[name] = *d

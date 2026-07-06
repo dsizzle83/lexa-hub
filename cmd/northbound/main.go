@@ -371,11 +371,28 @@ func runDiscovery(
 		slog.Info("lexa-northbound: utility clock stepped", "offset_s", tree.ClockOffset)
 	}
 
-	// serverNow now reads from the single-owner Clock (AD-004, TASK-035).
-	// clk.ServerNow() == time.Now().Unix() + clk.offset, and clk.offset was just
-	// set to tree.ClockOffset above, so this is arithmetically identical to the
-	// former scheduler.ServerNow(tree.ClockOffset). Computed ONCE per walk and
-	// shared across Evaluate/Build/SupersededMRIDs, exactly as before.
+	// Re-anchor the Clock's monotonic reference at this successful walk
+	// (TASK-037/AD-004 extension): utilitytime.ServerNowAt(time.Now(), ...)
+	// is the raw formula (local + this walk's fresh offset), computed once
+	// here and locked in as the new anchor. Between now and the NEXT
+	// successful walk, clk.ServerNow() derives purely from monotonic elapsed
+	// time since this instant, making the responseTracker's CreatedDateTime
+	// arithmetic (and every other ServerNow reader sharing this Clock) immune
+	// to a LOCAL wall-clock step during a WAN outage/discovery gap — the
+	// exposure GAP-04 identified (today's fallback holds last-known-good
+	// indefinitely on a walk failure; a local step during that holdover used
+	// to shift every subsequent ServerNow read by the step size). A stable
+	// local clock makes this bit-identical to the pre-TASK-037 formula: the
+	// anchor is reset to the same raw value every walk, so nothing changes
+	// under the common case this task's "must not change" list protects.
+	clk.Anchor(utilitytime.ServerNowAt(time.Now(), tree.ClockOffset))
+
+	// serverNow now reads from the single-owner, now-anchored Clock (AD-004,
+	// TASK-035/037). Immediately after Anchor above this is arithmetically
+	// identical to the former scheduler.ServerNow(tree.ClockOffset); it only
+	// diverges from that raw formula between walks, and only under a local
+	// wall-clock step (see the Anchor call's comment). Computed ONCE per walk
+	// and shared across Evaluate/Build/SupersededMRIDs, exactly as before.
 	serverNow := clk.ServerNow()
 	active := sched.Evaluate(tree.Programs, serverNow)
 

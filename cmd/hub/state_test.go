@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/utilitytime"
 )
 
 // decodeAP mirrors the orchestrator's apW: value × 10^multiplier.
@@ -176,6 +177,7 @@ func TestReadSystemState_ExpiredCSIPControlDropped(t *testing.T) {
 		MRID:       "expired-evt",
 		ExpLimW:    &expLim,
 		ValidUntil: time.Now().Unix() - 10, // already past in server time
+		Ts:         time.Now().Unix(),      // TASK-037: anchors r.utclk to server-now at arrival
 	})
 
 	// During the confirm window the cap is STILL enforced — a sustained expiry,
@@ -211,25 +213,147 @@ func TestReadSystemState_ExpiredCSIPControlDropped(t *testing.T) {
 func TestReadSystemState_ClockLurchKeepsControl(t *testing.T) {
 	r := newMQTTSystemReader(nil, testFastInterval)
 	expLim := 5000.0
-	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
-		Source:     "event",
-		MRID:       "lurch-evt",
-		ExpLimW:    &expLim,
-		ValidUntil: time.Now().Unix() + 300, // 5 min out in server time
-	})
+	validUntil := time.Now().Unix() + 300 // 5 min out in server time
 
-	// Alternate a +2h offset (server-now past ValidUntil) with a normal offset,
-	// many times. The control must be enforced on every tick.
+	// Alternate a +2h offset (server-now past ValidUntil) with a normal
+	// offset, many times, RE-PUBLISHING the control each tick — this is how
+	// a real server-side clock lurch actually reaches the hub post-TASK-037:
+	// lexa-northbound republishes bus.ActiveControl (with a fresh Ts) on
+	// every discovery walk, and onCSIPControl re-anchors r.utclk on each
+	// arrival (mutating the unexported r.clockOffset directly, as this test
+	// did pre-TASK-037, no longer feeds ReadSystemState's expiry check at
+	// all — it now reads exclusively from r.utclk). The control must stay
+	// enforced on every tick regardless.
 	for i := 0; i < 12; i++ {
+		offset := int64(0) // settled, well inside the window
 		if i%2 == 0 {
-			r.clockOffset = 7200 // lurch forward, past ValidUntil
-		} else {
-			r.clockOffset = 0 // settled, well inside the window
+			offset = 7200 // lurch forward, past ValidUntil
 		}
+		r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
+			Source:      "event",
+			MRID:        "lurch-evt",
+			ExpLimW:     &expLim,
+			ValidUntil:  validUntil,
+			ClockOffset: offset,
+			Ts:          time.Now().Unix(),
+		})
 		state, _ := r.ReadSystemState()
 		if state.CSIPControl == nil {
 			t.Fatalf("control dropped during clock lurch (tick %d) — the cap must stay enforced", i)
 		}
+	}
+}
+
+// TestReadSystemState_LocalStepDoesNotDropControl is TASK-037/GAP-04's core
+// acceptance criterion: a LOCAL (SOM) wall-clock step — as opposed to the
+// SERVER-side clock lurch TestReadSystemState_ClockLurchKeepsControl covers —
+// must not drop an active control, because r.utclk anchors ServerNow to the
+// monotonic instant of the last onCSIPControl arrival (msg.Ts+msg.ClockOffset)
+// rather than re-deriving from a live wall-clock read every tick.
+//
+// A genuine wall-vs-monotonic desync cannot be constructed through the public
+// time.Time API in a unit test (see internal/utilitytime's package doc), so
+// this test proves the two halves of the claim separately: (1) fed the TRUE
+// elapsed time since anchoring, r.utclk-derived serverNow lands within 1s of
+// ground truth and the control survives; (2) contrasted against what the
+// PRE-TASK-037 raw formula (now.Unix()+clockOffset) would have produced had
+// the wall clock ALSO stepped by ±1h during that same window — a value that
+// diverges from ground truth by exactly the simulated step, which is the
+// GAP-04 exposure this task closes.
+func TestReadSystemState_LocalStepDoesNotDropControl(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		stepDur time.Duration
+	}{
+		{"forward +1h local step", time.Hour},
+		{"backward -1h local step", -time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newMQTTSystemReader(nil, testFastInterval)
+			base := time.Now() // must be time.Now()-derived to carry a monotonic reading
+			fakeNow := base
+			r.utclk = utilitytime.New(utilitytime.Config{Now: func() time.Time { return fakeNow }})
+
+			expLim := 5000.0
+			validUntil := base.Unix() + 300 // 5 min out in server time
+			r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
+				Source: "event", MRID: "step-evt", ExpLimW: &expLim,
+				ValidUntil: validUntil, Ts: base.Unix(), ClockOffset: 0,
+			})
+
+			// A few real engine ticks worth of TRUE elapsed time pass —
+			// what the monotonic clock actually advances by in production,
+			// regardless of any wall-clock step happening in between.
+			trueElapsed := 5 * time.Second
+			fakeNow = base.Add(trueElapsed)
+
+			state, err := r.ReadSystemState()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.CSIPControl == nil {
+				t.Fatal("control dropped despite only true elapsed time passing — anchored ServerNow must not react to a wall step")
+			}
+
+			// Recover this tick's anchored serverNow from state.ClockOffset
+			// (= serverNow − state.Timestamp.Unix(), see ReadSystemState) and
+			// check it against ground truth.
+			gotServerNow := state.ClockOffset + state.Timestamp.Unix()
+			truth := base.Unix() + int64(trueElapsed.Seconds())
+			if d := gotServerNow - truth; d < -1 || d > 1 {
+				t.Errorf("anchored serverNow = %d, want within 1s of truth %d (diff %ds)", gotServerNow, truth, d)
+			}
+
+			// Contrast against the pre-TASK-037 formula fed a wall clock
+			// that had ALSO stepped by tc.stepDur during this same window.
+			steppedNow := base.Add(trueElapsed + tc.stepDur)
+			legacyServerNow := utilitytime.ServerNowAt(steppedNow, r.clockOffset)
+			if diff := legacyServerNow - gotServerNow; diff != int64(tc.stepDur.Seconds()) {
+				t.Errorf("legacy-vs-anchored divergence = %ds, want %ds (the simulated step size)", diff, int64(tc.stepDur.Seconds()))
+			}
+		})
+	}
+}
+
+// TestLocalStepEdge_LogsExactlyOncePerStep is TASK-037's edge-trigger
+// acceptance criterion: the local-step log fires exactly once per
+// forward/backward transition, not once per tick for the duration of the
+// step, and a cleared transition logs once too. localStepEdge is factored out
+// of ReadSystemState specifically so this state machine is directly
+// testable (see its doc comment for why: a genuine wall/monotonic desync
+// can't be driven through utilitytime.Clock's public API in a unit test).
+func TestLocalStepEdge_LogsExactlyOncePerStep(t *testing.T) {
+	type step struct {
+		stepped     bool
+		drift       int64
+		wantStepped bool
+		wantAction  localStepLogAction
+	}
+	seq := []step{
+		{stepped: false, drift: 0, wantStepped: false, wantAction: localStepLogNone},
+		{stepped: false, drift: 0, wantStepped: false, wantAction: localStepLogNone},
+		// Forward step begins: logs once on the edge...
+		{stepped: true, drift: 45, wantStepped: true, wantAction: localStepLogForward},
+		// ...and NOT again while it persists, even across many ticks.
+		{stepped: true, drift: 46, wantStepped: true, wantAction: localStepLogNone},
+		{stepped: true, drift: 50, wantStepped: true, wantAction: localStepLogNone},
+		// Clears: logs once on the falling edge.
+		{stepped: false, drift: 0, wantStepped: false, wantAction: localStepLogCleared},
+		// Steady again: no more logs.
+		{stepped: false, drift: 0, wantStepped: false, wantAction: localStepLogNone},
+		// A BACKWARD step begins: logs once, classified by drift's sign.
+		{stepped: true, drift: -60, wantStepped: true, wantAction: localStepLogBackward},
+		{stepped: true, drift: -61, wantStepped: true, wantAction: localStepLogNone},
+		{stepped: false, drift: 0, wantStepped: false, wantAction: localStepLogCleared},
+	}
+	prevStepped := false
+	for i, s := range seq {
+		newStepped, action := localStepEdge(prevStepped, s.stepped, s.drift)
+		if newStepped != s.wantStepped || action != s.wantAction {
+			t.Errorf("tick %d: localStepEdge(prev=%v, stepped=%v, drift=%d) = (%v, %v), want (%v, %v)",
+				i, prevStepped, s.stepped, s.drift, newStepped, action, s.wantStepped, s.wantAction)
+		}
+		prevStepped = newStepped
 	}
 }
 
@@ -250,6 +374,7 @@ func TestReadSystemState_ActiveCSIPControlKept(t *testing.T) {
 				MRID:       "live-evt",
 				ExpLimW:    &expLim,
 				ValidUntil: tc.validUntil,
+				Ts:         time.Now().Unix(),
 			})
 			state, err := r.ReadSystemState()
 			if err != nil {
@@ -313,6 +438,7 @@ func TestReadSystemState_ExpiryDebounce_STOCKCadence(t *testing.T) {
 		MRID:       "stock-expired",
 		ExpLimW:    &expLim,
 		ValidUntil: validUntil,
+		Ts:         time.Now().Unix(),
 	})
 
 	// Tick 1 of 2: expired, but not yet confirmed — control held.
