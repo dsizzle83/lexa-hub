@@ -173,3 +173,51 @@ func VersionRejects() map[string]uint64 {
 	})
 	return out
 }
+
+// decodeFailCounters holds one *uint64 per topic that has ever had a decode
+// failure recorded by RecordDecodeFailure. Same sync.Map rationale as
+// rejectCounters just above: rare new keys, frequent increments to existing
+// ones, called from arbitrary subscriber goroutines. Kept as a distinct map
+// (a sibling of rejectCounters, not a shared one) because a version reject
+// and a decode/finite failure are different failure modes worth telling
+// apart in a topic's history, even though both are meant to roll up into the
+// same lexa_bus_decode_failures_total total.
+var decodeFailCounters sync.Map // topic string -> *uint64
+
+// RecordDecodeFailure records one decode failure for topic: either a raw
+// json.Unmarshal error, or a message that unmarshalled successfully but
+// failed its own Finite() check (GAP-09 — a non-finite numeric value that
+// slipped past a lax decode path). It is mqttutil.Subscribe's sibling to
+// RejectAndAlarm — same rate-limited counter+log shape — for the failure
+// mode CheckVersion/RejectAndAlarm does not cover: today, a plain
+// json.Unmarshal failure on a non-control topic is only ever log.Printf'd
+// (mqttutil.go), invisible to anything scraping metrics. This turns that
+// silent drop into a counted, alarmed one, matching the treatment a version
+// rejection already gets.
+func RecordDecodeFailure(topic string, err error) {
+	if err == nil {
+		return
+	}
+	v, _ := decodeFailCounters.LoadOrStore(topic, new(uint64))
+	n := atomic.AddUint64(v.(*uint64), 1)
+	if n == 1 || n%logEveryN == 0 {
+		slog.Warn("[bus] REJECT decode failure",
+			"topic", topic, "err", err, "count", n)
+	}
+}
+
+// DecodeFailures returns a snapshot of the per-topic decode-failure counters
+// maintained by RecordDecodeFailure. Sibling of VersionRejects; a caller
+// wiring lexa_bus_decode_failures_total (TASK-044) should sum both this and
+// VersionRejects — today only VersionRejects feeds that metric (see each
+// service's main.go Collect callback), which is exactly the GAP-09 gap this
+// task exists to close. Wiring the sum into those six main.go files is a
+// follow-up outside this task's internal/bus + mqttutil lane.
+func DecodeFailures() map[string]uint64 {
+	out := make(map[string]uint64)
+	decodeFailCounters.Range(func(k, v any) bool {
+		out[k.(string)] = atomic.LoadUint64(v.(*uint64))
+		return true
+	})
+	return out
+}
