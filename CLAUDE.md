@@ -53,6 +53,7 @@ Every service also exposes Prometheus `/metrics` (TASK-044) — see "Metrics" be
 | ~~`lexa/control/solar/{device}`~~ | — | — | — |
 | ~~`lexa/evse/{station}/command`~~ | — | — | — |
 | `lexa/reconcile/{class}/{device}/report` *(retained)* | lexa-modbus, lexa-ocpp | lexa-hub | 1 |
+| `lexa/csip/rewalk` *(TASK-042)* | lexa-hub | lexa-northbound | 1 |
 
 The three struck-through `lexa/control/*` / `lexa/evse/+/command` legacy command
 topics were **removed in TASK-032**: the retained `lexa/desired/{class}/{device}`
@@ -376,6 +377,22 @@ binary-only deploy + hand-set Pi config (05 §6 discipline).
   wired into `mqttutil.Subscribe` and counted via `bus.RecordDecodeFailure`).
 - **CSIP control is retained**: lexa-northbound publishes `lexa/csip/control` with
   retain=true so lexa-hub gets the last value immediately on (re)start.
+- **Retained control adoption is staleness-checked; corrupt retained control
+  triggers re-request — never silent** (TASK-042, §8.3/GAP-01/GAP-02): a
+  retained `lexa/csip/control` older than `retained_adoption_max_age_s`
+  (default 300, config `cmd/hub/config.go`) at ADOPTION time is still
+  enforced unchanged (enforce-but-verify, never fail-open — a stale-but-
+  decodable cap is never dropped) but raises an alarm and publishes
+  `lexa/csip/rewalk` (`bus.TopicCSIPRewalk`, hub→northbound, QoS 1, not
+  retained). A retained payload that fails to decode at all (previously a
+  silent log-and-drop, `mqttutil.Subscribe`) now does the same via
+  `mqttutil.SubscribeDecodeErr`'s decode-error hook. lexa-northbound honors a
+  rewalk request by immediately republishing its last-published control
+  (fresh `Ts`) and triggering an out-of-cadence discovery walk; both sides
+  rate-limit independently (hub: `cmd/hub/state.go`'s `rewalkRateLimit`;
+  northbound: `cmd/northbound/main.go`'s `rewalkGate`, `nbRewalkRateLimit`) —
+  10 s floor each — since the retained control-plane topics redeliver on
+  every broker reconnect.
 - **Module path**: `lexa-hub` — used in all import paths.
 - **Cross-compile**: lexa-northbound and lexa-telemetry require CGo (wolfSSL headers
   are ARM64-only on the SOM). Build on target or with a proper cross toolchain.

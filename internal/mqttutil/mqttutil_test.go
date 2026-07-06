@@ -416,3 +416,108 @@ func TestLoadPassword(t *testing.T) {
 		t.Fatal("missing pass-file: want an error, got nil")
 	}
 }
+
+// TestSubscribeDecodeErr_OnErrFiresOnMalformedJSON is TASK-042's mqttutil
+// hook test: a payload that fails json.Unmarshal must invoke onErr with the
+// topic and the raw payload, in addition to the existing log.Printf/
+// bus.RecordDecodeFailure behavior (unchanged, asserted by
+// TestSubscribeVersionGate's malformed-JSON subtest already). This is the
+// GAP-02 mechanism's building block: mqtt-malformed-control today silently
+// drops forever; a caller wiring onErr on TopicCSIPControl (cmd/hub/main.go)
+// can alarm and request an immediate re-publish instead.
+func TestSubscribeDecodeErr_OnErrFiresOnMalformedJSON(t *testing.T) {
+	const topic = "lexa/csip/control"
+	fc := &fakeClient{}
+	var handlerCalled bool
+	var errTopic string
+	var errPayload []byte
+	var errCalls int
+
+	if err := SubscribeDecodeErr(fc, topic, func(_ string, msg struct {
+		Source string `json:"source"`
+	}) {
+		handlerCalled = true
+	}, func(topic string, payload []byte, err error) {
+		errCalls++
+		errTopic = topic
+		errPayload = payload
+		if err == nil {
+			t.Error("onErr called with nil err")
+		}
+	}); err != nil {
+		t.Fatalf("SubscribeDecodeErr: %v", err)
+	}
+
+	bad := []byte("not json at all")
+	deliver(t, fc, topic, bad)
+
+	if handlerCalled {
+		t.Error("handler was called for malformed JSON")
+	}
+	if errCalls != 1 {
+		t.Fatalf("onErr called %d times, want 1", errCalls)
+	}
+	if errTopic != topic {
+		t.Errorf("onErr topic = %q, want %q", errTopic, topic)
+	}
+	if string(errPayload) != string(bad) {
+		t.Errorf("onErr payload = %q, want %q", errPayload, bad)
+	}
+}
+
+// TestSubscribeDecodeErr_OnErrNotCalledOnVersionReject confirms the
+// documented boundary: a version-gate rejection (CheckVersion/RejectAndAlarm)
+// is a distinct, already-alarmed path and must NOT also invoke onErr —
+// onErr is scoped to the two RecordDecodeFailure failure modes only.
+func TestSubscribeDecodeErr_OnErrNotCalledOnVersionReject(t *testing.T) {
+	const topic = "lexa/csip/control" // ActiveControlV == 1
+	fc := &fakeClient{}
+	errCalls := 0
+	if err := SubscribeDecodeErr(fc, topic, func(_ string, msg struct {
+		Source string `json:"source"`
+	}) {
+	}, func(topic string, payload []byte, err error) {
+		errCalls++
+	}); err != nil {
+		t.Fatalf("SubscribeDecodeErr: %v", err)
+	}
+	deliver(t, fc, topic, []byte(`{"v":99,"source":"nope"}`))
+	if errCalls != 0 {
+		t.Errorf("onErr called %d times for a version-gate reject, want 0", errCalls)
+	}
+}
+
+// TestSubscribeDecodeErr_NilOnErrIsIdenticalToSubscribe is the byte-identical
+// requirement from the task's "common mistakes": SubscribeDecodeErr(...,
+// nil) must behave exactly like Subscribe for a normal in-range message
+// (handler reached) and for a malformed one (dropped, no panic from a nil
+// onErr).
+func TestSubscribeDecodeErr_NilOnErrIsIdenticalToSubscribe(t *testing.T) {
+	const topic = "lexa/csip/control"
+	fc := &fakeClient{}
+	var got string
+	if err := SubscribeDecodeErr(fc, topic, func(_ string, msg struct {
+		Source string `json:"source"`
+	}) {
+		got = msg.Source
+	}, nil); err != nil {
+		t.Fatalf("SubscribeDecodeErr: %v", err)
+	}
+	deliver(t, fc, topic, []byte(`{"source":"event"}`))
+	if got != "event" {
+		t.Errorf("handler.Source = %q, want %q", got, "event")
+	}
+
+	// Malformed payload with nil onErr must not panic and must not reach handler.
+	fc2 := &fakeClient{}
+	called := false
+	if err := SubscribeDecodeErr(fc2, topic, func(_ string, msg struct{}) {
+		called = true
+	}, nil); err != nil {
+		t.Fatalf("SubscribeDecodeErr: %v", err)
+	}
+	deliver(t, fc2, topic, []byte("not json"))
+	if called {
+		t.Error("handler was called for malformed JSON with nil onErr")
+	}
+}

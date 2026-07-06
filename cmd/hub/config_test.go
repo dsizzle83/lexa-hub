@@ -151,6 +151,40 @@ func TestLoadConfig_PlantTypeMismatchFails(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_RetainedAdoptionMaxAgeDefault verifies TASK-042's rollout
+// default: a config file with no "retained_adoption_max_age_s" key gets 300s
+// (RetainedAdoptionMaxAge() == 5m), not zero — an absent/zero bound must
+// never silently disable the staleness check.
+func TestLoadConfig_RetainedAdoptionMaxAgeDefault(t *testing.T) {
+	path := writeTempConfig(t, `{"mqtt_broker":"tcp://localhost:1883"}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.RetainedAdoptionMaxAgeS != 300 {
+		t.Fatalf("RetainedAdoptionMaxAgeS = %d, want default 300", cfg.RetainedAdoptionMaxAgeS)
+	}
+	if cfg.RetainedAdoptionMaxAge() != 5*time.Minute {
+		t.Fatalf("RetainedAdoptionMaxAge() = %s, want 5m", cfg.RetainedAdoptionMaxAge())
+	}
+}
+
+// TestLoadConfig_RetainedAdoptionMaxAgeOverride verifies an explicit,
+// positive value in the config file is honored instead of the default.
+func TestLoadConfig_RetainedAdoptionMaxAgeOverride(t *testing.T) {
+	path := writeTempConfig(t, `{"mqtt_broker":"tcp://localhost:1883","retained_adoption_max_age_s":60}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.RetainedAdoptionMaxAgeS != 60 {
+		t.Fatalf("RetainedAdoptionMaxAgeS = %d, want 60 (explicit override)", cfg.RetainedAdoptionMaxAgeS)
+	}
+	if cfg.RetainedAdoptionMaxAge() != 60*time.Second {
+		t.Fatalf("RetainedAdoptionMaxAge() = %s, want 60s", cfg.RetainedAdoptionMaxAge())
+	}
+}
+
 // writeTempConfig writes body to a temp file and returns its path — a tiny
 // helper so the two loadConfig tests above don't each hand-roll os.CreateTemp.
 func writeTempConfig(t *testing.T, body string) string {

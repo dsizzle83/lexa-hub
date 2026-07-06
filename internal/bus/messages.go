@@ -57,6 +57,19 @@ type ActiveControl struct {
 	Ts          int64    `json:"ts"`
 }
 
+// RewalkRequest is published by lexa-hub on TopicCSIPRewalk (TASK-042, not
+// retained, QoS 1) to ask lexa-northbound to refresh the retained
+// lexa/csip/control message immediately, outside its normal discovery
+// cadence. Reason is "stale" (a retained control was adopted with an age —
+// measured against its own Ts — exceeding the hub's configured
+// retained_adoption_max_age_s) or "decode" (the retained payload failed to
+// unmarshal at all). See TopicCSIPRewalk's doc for the full mechanism.
+type RewalkRequest struct {
+	Envelope
+	Reason string `json:"reason"` // "stale" | "decode"
+	Ts     int64  `json:"ts"`
+}
+
 // ComplianceAlert is published by the hub (orchestrator) on
 // TopicCSIPComplianceAlert when it cannot meet an active CSIP control limit.
 // Active distinguishes the onset (true) from the clear (false) of a breach so

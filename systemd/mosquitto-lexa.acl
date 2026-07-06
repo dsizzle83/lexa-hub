@@ -54,6 +54,10 @@ topic read lexa/csip/compliance/alert
 # requests the same way a missing compliance/alert grant silently drops
 # CannotComply).
 topic read lexa/csip/flowreservation/request
+# bus.TopicCSIPRewalk — hub → northbound (TASK-042): a missing grant here
+# silently drops the retained-control re-request the same way a missing
+# compliance/alert or FR-request grant silently drops those (RSK-09 pattern).
+topic read lexa/csip/rewalk
 
 user lexa-hub
 # bus.CtrlBatteryTopic("<device>").
@@ -79,6 +83,8 @@ topic write lexa/hub/plan
 topic write lexa/csip/compliance/alert
 # bus.TopicCSIPFRRequest — see lexa-northbound's matching read grant (RSK-09).
 topic write lexa/csip/flowreservation/request
+# bus.TopicCSIPRewalk (TASK-042) — see lexa-northbound's matching read grant.
+topic write lexa/csip/rewalk
 # bus.SubMeasurements.
 topic read lexa/measurements/+
 # bus.SubBattMetrics.
