@@ -3,7 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"reflect"
+	"strings"
 	"time"
 
 	"lexa-hub/internal/journal"
@@ -16,12 +19,33 @@ type DeviceConfig struct {
 	Name string  `json:"name"`
 	Role string  `json:"role"`  // "inverter" | "battery" | "meter"
 	MaxW float64 `json:"max_w"` // nameplate capacity (W)
+
+	// Plant is the optional per-device physical-response block (TASK-057,
+	// AD-007): ramp/latency/taper/lag parameters that will replace the
+	// bench-calibrated optimizer globals. Absent block ⇒ nil ⇒ the orchestrator
+	// uses its bench defaults. Decoded per Role into exactly one of the typed
+	// fields below.
+	Plant json.RawMessage `json:"plant,omitempty"`
+
+	// Decoded plant model. loadConfig fills the field matching Role from Plant;
+	// the others stay zero. UNUSED downstream until TASK-064 wires it — this is
+	// the config half of the unwired vocabulary. Bench defaults are applied at
+	// consume time (orchestrator withDefaults), not here, so a partial block
+	// keeps its explicit values and legacy files stay byte-for-byte valid.
+	InverterPlant orchestrator.InverterPlant `json:"-"`
+	BatteryPlant  orchestrator.BatteryPlant  `json:"-"`
+	MeterPlant    orchestrator.MeterPlant    `json:"-"`
 }
 
 // StationConfig describes an EV charging station known to the hub.
 type StationConfig struct {
 	ID          string  `json:"id"`
 	MaxCurrentA float64 `json:"max_current_a"` // hardware limit (A); default 32
+
+	// Plant is the optional EVSE plant block (TASK-057) — currently just the
+	// OCPP MeterValues lag. Same rules as DeviceConfig.Plant.
+	Plant     json.RawMessage        `json:"plant,omitempty"`
+	EVSEPlant orchestrator.EVSEPlant `json:"-"` // decoded; unused until TASK-064
 }
 
 // Config is the JSON configuration for lexa-hub (orchestrator).
@@ -135,7 +159,90 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
+	if err := decodePlantBlocks(&cfg); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
+}
+
+// decodePlantBlocks decodes each device/station's optional "plant" object into
+// the typed plant field matching its role (TASK-057). Unknown keys are warned
+// (05 §6) but never fail the load, so legacy hub.json files — which have no
+// plant blocks at all — parse byte-for-byte unchanged. A genuine type mismatch
+// inside a plant block IS an error (an authoring bug in a new-style file), not
+// a silent default.
+func decodePlantBlocks(cfg *Config) error {
+	for i := range cfg.Devices {
+		d := &cfg.Devices[i]
+		if len(d.Plant) == 0 {
+			continue
+		}
+		ctx := fmt.Sprintf("device %q (role %q)", d.Name, d.Role)
+		var dst any
+		switch d.Role {
+		case "inverter":
+			dst = &d.InverterPlant
+		case "battery":
+			dst = &d.BatteryPlant
+		case "meter":
+			dst = &d.MeterPlant
+		default:
+			log.Printf("lexa-hub config: %s: plant block on role with no plant model, ignored", ctx)
+			continue
+		}
+		warnUnknownPlantKeys(d.Plant, dst, ctx)
+		if err := json.Unmarshal(d.Plant, dst); err != nil {
+			return fmt.Errorf("parse plant for %s: %w", ctx, err)
+		}
+	}
+	for i := range cfg.Stations {
+		s := &cfg.Stations[i]
+		if len(s.Plant) == 0 {
+			continue
+		}
+		ctx := fmt.Sprintf("station %q", s.ID)
+		warnUnknownPlantKeys(s.Plant, &s.EVSEPlant, ctx)
+		if err := json.Unmarshal(s.Plant, &s.EVSEPlant); err != nil {
+			return fmt.Errorf("parse plant for %s: %w", ctx, err)
+		}
+	}
+	return nil
+}
+
+// warnUnknownPlantKeys logs (but tolerates) any key in raw not present on the
+// destination plant struct's JSON tags — the 05 §6 "unknown keys warn, never
+// fail" rule. A malformed object is left for the typed Unmarshal to surface.
+func warnUnknownPlantKeys(raw json.RawMessage, dst any, ctx string) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return
+	}
+	known := jsonTagSet(dst)
+	for k := range m {
+		if !known[k] {
+			log.Printf("lexa-hub config: %s: ignoring unknown plant key %q (05 §6)", ctx, k)
+		}
+	}
+}
+
+// jsonTagSet returns the set of wire keys (json tag names) on the struct dst
+// points to, so unknown-key warnings track the schema without a hand-kept list.
+func jsonTagSet(dst any) map[string]bool {
+	t := reflect.TypeOf(dst)
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	set := make(map[string]bool, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		tag := t.Field(i).Tag.Get("json")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		if name := strings.Split(tag, ",")[0]; name != "" {
+			set[name] = true
+		}
+	}
+	return set
 }
 
 func (c *Config) EngineInterval() time.Duration {

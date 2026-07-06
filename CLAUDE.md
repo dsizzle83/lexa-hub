@@ -277,6 +277,18 @@ All configs live in `/etc/lexa/`. Edit the copies created by `make install-confi
 | `/etc/lexa/api.json` | lexa-api |
 | `/etc/lexa/certs/` | ca.pem, client.pem, ocpp.crt etc. |
 
+`hub.json`'s `devices[]`/`stations[]` entries accept an optional per-entry
+`"plant"` block (TASK-057, AD-007): the device's physical-response parameters —
+inverter `max_ramp_{down,up}_w_per_s` + `control_latency_s`, battery
+`capacity_kwh`/`soc_taper_start_pct`/`converge_frac`/`control_latency_s`
+(+ optional `taper_curve`), meter/EVSE `meter_lag_s`. Fields are unit-suffixed and
+wall-clock (per-second, not per-tick). Types live in
+`internal/orchestrator/plantmodel.go`; the shipped example values equal today's
+bench calibration. **The block is optional and currently UNWIRED** — nothing reads
+it until TASK-064 swaps the bench-calibrated optimizer globals for these
+parameters; a missing block ⇒ bench defaults (`withDefaults`), an unknown key
+warns but never fails load, so pre-TASK-057 hub.json files parse unchanged.
+
 `modbus.json`'s `"reconciler"` key (TASK-027/028, AD-002/AD-013) maps device
 class → `"off"|"shadow"|"active"`, e.g. `{"battery":"shadow"}`. `"shadow"` runs
 the Device Reconciler (`internal/reconcile`) as a passive recorder alongside the
