@@ -201,6 +201,17 @@ func main() {
 	certMon := NewMonitor(mc, cfg.ClientCert, cfg.CACert, cfg.CertExpiryWarnDays, reg)
 	go certMon.Run(ctx, certCheckInterval)
 
+	// TASK-073/§10.5/§8.6/RSK-07: staged cert-rotation controller — its own
+	// owned goroutine (05 §4), watching cfg.CertRotateSentinel for an
+	// operator-staged rotation request (scripts/rotate-cert.sh) and, on
+	// finding one, rotating all three fetchers off-tick via each one's own
+	// probe-then-commit Reload (internal/tlsclient/fetcher.go). onCommit
+	// forces an immediate certstatus re-check (TASK-072) so the new NotAfter
+	// is visible without waiting for the next scheduled 24h check.
+	rotator := NewRotationController(cfg.CertRotateSentinel, tlsCfg, lfdi, fetcherDisc, fetcherResp, fetcherFR,
+		func() { certMon.CheckOnce() }, reg)
+	go rotator.Run(ctx, cfg.CertRotatePollInterval())
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit

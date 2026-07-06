@@ -51,6 +51,20 @@ type Config struct {
 	// the same on-disk PEMs) but does not run a second monitor — see
 	// cmd/northbound/certmon.go's package doc.
 	CertExpiryWarnDays int `json:"cert_expiry_warn_days,omitempty"`
+
+	// CertRotateSentinel is the path RotationController (TASK-073/§10.5)
+	// polls for a staged cert-rotation request — empty defaults to
+	// defaultCertRotateSentinel (/etc/lexa/certs/rotate.request). Written by
+	// scripts/rotate-cert.sh; see rotate.go's package doc and
+	// docs/CERT_ROTATION_RUNBOOK.md.
+	CertRotateSentinel string `json:"cert_rotate_sentinel,omitempty"`
+
+	// CertRotatePollIntervalS is how often (seconds) RotationController
+	// checks for a pending sentinel — 0/absent defaults to
+	// defaultCertRotatePollInterval (5s). Short by design: a rotation
+	// request should be picked up promptly, and an idle stat() of one file
+	// every few seconds costs nothing.
+	CertRotatePollIntervalS int `json:"cert_rotate_poll_interval_s,omitempty"`
 }
 
 // JournalConfig is the on-disk "journal" block — a duplicate of cmd/hub's
@@ -108,4 +122,12 @@ func loadConfig(path string) (*Config, error) {
 
 func (c *Config) DiscoveryInterval() time.Duration {
 	return time.Duration(c.DiscoveryIntervalS) * time.Second
+}
+
+// CertRotatePollInterval returns the configured sentinel poll interval, or
+// zero if unset — RotationController.Run treats <=0 as "use its own
+// default" (defaultCertRotatePollInterval), the same convention
+// DiscoveryInterval/Loop and certCheckInterval/Monitor.Run already use.
+func (c *Config) CertRotatePollInterval() time.Duration {
+	return time.Duration(c.CertRotatePollIntervalS) * time.Second
 }

@@ -160,9 +160,29 @@ label dimension (see certmon.go's `Monitor` doc). lexa-telemetry points its
 own config at the SAME cert files but does not run a second monitor — one
 inspection of the shared file's content is enough. An unreadable/unparsable
 cert file is itself reported (fail-closed: `client_err`/`ca_err` populated on
-the bus message and in `/status`) rather than a silent gap. TASK-073
-(rotation, not yet built) will use this monitor's `days_left`/error state as
-its own verification signal.
+the bus message and in `/status`) rather than a silent gap.
+
+**Cert rotation (TASK-073/§10.5/§8.6/RSK-07)**: `tlsclient.WolfSSLFetcher`
+has a `Reload(cfg, probePath) error` seam (`internal/tlsclient/fetcher.go`) —
+the rotation mechanism this monitor's `days_left` is meant to trigger. It
+builds a brand-new wolfSSL context+session from the new cert/key, dials and
+probes it (a real `GET` — status must be 200, not just "no transport error",
+since a cert signed by the right CA for the WRONG device passes the
+handshake and only 403s at the CSIP layer) fully BEFORE touching the
+fetcher's live session, then swaps the pointer and frees the old one (Close
+→ FreeSSL → FreeCtx) under the SAME mutex `Get`/`Post`/`GetStatus` already
+take — no new locking scheme. A failed probe costs nothing: the new session
+is torn down and the old one is untouched. `cmd/northbound/rotate.go`'s
+`RotationController` is the trigger — a sentinel-file watch
+(`cfg.cert_rotate_sentinel`), not SIGHUP — that rotates the discovery/
+response/flow-reservation fetchers one at a time and republishes certstatus
+via `certMon.CheckOnce` once all three commit. Any future TLS-session owner
+gets rotation for free by calling `Reload` the same way. Operator procedure:
+`scripts/rotate-cert.sh` + `docs/CERT_ROTATION_RUNBOOK.md` (includes the
+"re-enrollment vs rotation" LFDI caveat — this codebase's LFDI hashes the
+FULL DER cert, so even a same-CN/same-key reissue changes it). The 24h
+reconnect-churn soak is bench time, deferred (see the runbook + csip-tls-test
+`docs/CERT_ROTATION_SOAK_RUNBOOK.md`) — code-complete, soak-pending.
 
 **Library**: `internal/metrics` is a minimal hand-rolled Prometheus text-exposition
 package (Registry/Counter/Gauge/Handler/Collect), not `prometheus/client_golang` —
