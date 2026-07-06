@@ -196,14 +196,17 @@ func main() {
 	var shadowDivergences func() uint64
 	if cfg.ConstraintShadow {
 		// The Stack carries the per-device plant models from hub.json (TASK-057)
-		// and, as of TASK-060, the ExportConstraint (TierCompliance). In shadow
+		// and the compliance constraints: Export (TASK-060) + Gen + Import
+		// (TASK-061), all TierCompliance. In shadow
 		// the candidate now authors the solar-ceiling / battery-setpoint / export-
 		// breach axes; the diff becomes meaningful on exactly those axes while the
 		// legacy cascade stays authoritative (the wrapper still returns opt's plan).
 		// This is the first non-empty candidate — the RSK-03 shadow gate the export
 		// flip is validated against.
 		stack := constraint.NewStack(buildConstraintPlant(cfg), cfg.EngineInterval(),
-			constraint.NewExportConstraint())
+			constraint.NewExportConstraint(),
+			constraint.NewGenLimitConstraint(),
+			constraint.NewImportLimitConstraint())
 		reg.Counter("lexa_constraint_shadow_divergence_total")
 		wrapper := constraint.Wrap(opt, stack, constraint.Options{
 			Now: time.Now,

@@ -206,3 +206,14 @@ func (p Plant) ExportDetectionWindowTicks(inverter string, tickSeconds float64) 
 	ip := p.Inverters[inverter]
 	return DetectionWindowTicks(ip.ControlLatencyS, p.Meter.MeterLagS, tickSeconds)
 }
+
+// ImportDetectionWindowTicks sizes the import-breach detection window for one
+// battery from ITS control latency and the site meter's lag (AD-007) — the
+// import lever is battery discharge, so this is the per-device derivation the
+// import compliance path uses in place of the fixed importBreachTicks. A battery
+// absent from the map contributes a zero latency (the wiring layer pre-defaults
+// the map), and the floor of 2 in DetectionWindowTicks keeps the window sane.
+func (p Plant) ImportDetectionWindowTicks(battery string, tickSeconds float64) int {
+	bp := p.Batteries[battery]
+	return DetectionWindowTicks(bp.ControlLatencyS, p.Meter.MeterLagS, tickSeconds)
+}
