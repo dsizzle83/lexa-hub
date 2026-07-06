@@ -416,3 +416,33 @@ type PlanDecision struct {
 	Reason string `json:"reason"`
 	Impact string `json:"impact"`
 }
+
+// ─── Certificate expiry status (northbound → api) ────────────────────────────
+
+// CertStatus is published retained on TopicNorthboundCertStatus by
+// lexa-northbound's cert-expiry monitor (TASK-072, §10.5): the result of
+// inspecting the configured client and CA PEM files' leaf NotAfter, at
+// startup and every 24h thereafter. lexa-telemetry points at the same cert
+// files (its own config carries its own ca_cert/client_cert paths) but does
+// not run a second monitor — one inspection of the shared file is enough;
+// see cmd/northbound/certmon.go's package doc.
+//
+// *NotAfter fields are 0 (with the matching *Err populated) when that PEM
+// file could not be read or parsed — fail-closed REPORTING, not a crash: an
+// unreadable cert file is itself the alarm-worthy condition, not a reason to
+// go silent. DaysLeft is the binding constraint: whichever of the two certs
+// expires first, since either one expiring independently breaks the mTLS
+// handshake (a well-formed chain has the CA outlive the leaf, never the
+// reverse, but this does not assume that — it takes the minimum of whichever
+// days-left values are known).
+type CertStatus struct {
+	Envelope
+	ClientNotAfter int64  `json:"client_not_after,omitempty"` // Unix seconds; 0 if unknown (see ClientErr)
+	CANotAfter     int64  `json:"ca_not_after,omitempty"`
+	ClientDaysLeft int    `json:"client_days_left"`
+	CADaysLeft     int    `json:"ca_days_left"`
+	DaysLeft       int    `json:"days_left"` // min(ClientDaysLeft, CADaysLeft) among the certs successfully inspected
+	ClientErr      string `json:"client_err,omitempty"`
+	CAErr          string `json:"ca_err,omitempty"`
+	Ts             int64  `json:"ts"` // Unix seconds this check ran
+}

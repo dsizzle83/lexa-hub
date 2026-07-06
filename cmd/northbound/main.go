@@ -193,6 +193,14 @@ func main() {
 
 	go discovery.Loop(ctx, cfg.DiscoveryInterval())
 
+	// TASK-072/§10.5: cert-expiry monitor — its own owned goroutine, no
+	// shared state with the discovery walk loop (05 §4). Run performs its
+	// startup inspection immediately (before its first 24h tick), so the
+	// very first WARN/ERROR alarm (if any) lands within moments of process
+	// start rather than up to a day later.
+	certMon := NewMonitor(mc, cfg.ClientCert, cfg.CACert, cfg.CertExpiryWarnDays, reg)
+	go certMon.Run(ctx, certCheckInterval)
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit

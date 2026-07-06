@@ -54,6 +54,7 @@ Every service also exposes Prometheus `/metrics` (TASK-044) — see "Metrics" be
 | ~~`lexa/evse/{station}/command`~~ | — | — | — |
 | `lexa/reconcile/{class}/{device}/report` *(retained)* | lexa-modbus, lexa-ocpp | lexa-hub | 1 |
 | `lexa/csip/rewalk` *(TASK-042)* | lexa-hub | lexa-northbound | 1 |
+| `lexa/northbound/certstatus` *(retained, TASK-072)* | lexa-northbound | lexa-api | 1 |
 
 The three struck-through `lexa/control/*` / `lexa/evse/+/command` legacy command
 topics were **removed in TASK-032**: the retained `lexa/desired/{class}/{device}`
@@ -141,6 +142,27 @@ literal `"off"` disables the listener. The bench's deployed configs override
 this to `0.0.0.0` so the desktop can scrape it (AD-008's bench-vs-product bind
 pattern; scrape config + rationale in `../csip-tls-test/scripts/prometheus-bench.yml`
 and `docs/BENCH.md`'s Metrics section).
+
+**Cert expiry monitoring (TASK-072/§10.5)**: lexa-northbound inspects its
+configured `client_cert`/`ca_cert` PEM files (leaf NotAfter, via `crypto/x509`
+— pure PEM inspection, no wolfSSL/cgo involvement) at startup and every 24h
+(`cmd/northbound/certmon.go`). Results publish retained on
+`lexa/northbound/certstatus` (`bus.CertStatus`), fold into `GET /status`'s
+`cert_status` field (`cmd/api`), and log a WARN once `days_left` (the sooner
+of the client/CA cert, whichever is more binding) falls to
+`cert_expiry_warn_days` (config key, default 30) or an ERROR once either cert
+has expired. Gauges: `lexa_cert_expiry_client_seconds` /
+`lexa_cert_expiry_ca_seconds` (seconds to NotAfter, negative once expired)
+and `lexa_cert_expiring_client` / `lexa_cert_expiring_ca` (1 once inside the
+warn window or unreadable, else 0) — two flat gauge names rather than a
+single `lexa_cert_expiry_seconds{cert=...}` because `internal/metrics` has no
+label dimension (see certmon.go's `Monitor` doc). lexa-telemetry points its
+own config at the SAME cert files but does not run a second monitor — one
+inspection of the shared file's content is enough. An unreadable/unparsable
+cert file is itself reported (fail-closed: `client_err`/`ca_err` populated on
+the bus message and in `/status`) rather than a silent gap. TASK-073
+(rotation, not yet built) will use this monitor's `days_left`/error state as
+its own verification signal.
 
 **Library**: `internal/metrics` is a minimal hand-rolled Prometheus text-exposition
 package (Registry/Counter/Gauge/Handler/Collect), not `prometheus/client_golang` —

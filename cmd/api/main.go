@@ -138,6 +138,13 @@ func main() {
 		log.Fatalf("lexa-api: subscribe schedule: %v", err)
 	}
 
+	if err := mqttutil.Subscribe(mc, bus.TopicNorthboundCertStatus, func(topic string, c bus.CertStatus) {
+		store.onCertStatus(topic, c)
+		lb.Emit(fmt.Sprintf("[cert] days_left=%d client_err=%q ca_err=%q", c.DaysLeft, c.ClientErr, c.CAErr))
+	}); err != nil {
+		log.Fatalf("lexa-api: subscribe cert status: %v", err)
+	}
+
 	if err := mqttutil.Subscribe(mc, bus.TopicHubPlan, func(topic string, p bus.PlanLog) {
 		store.onPlanLog(topic, p)
 		// TASK-045: arrival stamping — time.Now() here, not p.Ts. See

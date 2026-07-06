@@ -64,6 +64,13 @@ type stateStore struct {
 	// received", not the historical always-empty stub.
 	lastPlan *bus.PlanLog
 
+	// certStatus is lexa-northbound's latest cert-expiry check
+	// (TopicNorthboundCertStatus, retained, TASK-072/§10.5). nil until the
+	// first message arrives (older northbound builds, or the topic not yet
+	// retained on a fresh broker) — /status omits "cert_status" entirely in
+	// that case rather than reporting a fabricated OK.
+	certStatus *bus.CertStatus
+
 	staleAfter time.Duration
 }
 
@@ -133,6 +140,12 @@ func (s *stateStore) onPlanLog(_ string, p bus.PlanLog) {
 	s.mu.Unlock()
 }
 
+func (s *stateStore) onCertStatus(_ string, c bus.CertStatus) {
+	s.mu.Lock()
+	s.certStatus = &c
+	s.mu.Unlock()
+}
+
 func (s *stateStore) onCSIPControl(_ string, c bus.ActiveControl) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -188,6 +201,7 @@ type snapshot struct {
 	csipPrograms int
 	clockOffsetS int64
 	lastPlan     *bus.PlanLog
+	certStatus   *bus.CertStatus
 	staleAfter   time.Duration
 	now          time.Time
 }
@@ -223,6 +237,10 @@ func (s *stateStore) snapshot() snapshot {
 	if s.lastPlan != nil {
 		pl := *s.lastPlan
 		out.lastPlan = &pl
+	}
+	if s.certStatus != nil {
+		cs := *s.certStatus
+		out.certStatus = &cs
 	}
 	// Stable order: sort by stationID, then connector.
 	keys := make([]string, 0, len(s.evses))

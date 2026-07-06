@@ -12,6 +12,7 @@
 //	lexa/csip/flowreservation/request         hub          → northbound (QoS 1)
 //	lexa/csip/rewalk                          hub          → northbound (QoS 1, TASK-042)
 //	lexa/northbound/schedule                  northbound   → hub (retained)
+//	lexa/northbound/certstatus                northbound   → api (retained, TASK-072)
 //	lexa/evse/{station}/state                 ocpp         → hub
 //	lexa/desired/{class}/{device}             hub          → modbus/ocpp (retained, AD-013)
 //	lexa/hub/plan                             hub          → api (retained)
@@ -123,6 +124,8 @@ func SupportedV(topic string) int {
 		return FlowReservationStatusV
 	case topic == TopicNorthboundSchedule:
 		return DERScheduleV
+	case topic == TopicNorthboundCertStatus:
+		return CertStatusV
 	case topic == TopicHubPlan:
 		return PlanLogV
 	case strings.HasPrefix(topic, "lexa/desired/"):
@@ -183,6 +186,15 @@ const TopicCSIPRewalk = "lexa/csip/rewalk"
 // TopicNorthboundSchedule is published by lexa-northbound after each discovery
 // walk. It carries the resolved 24-hour DER control schedule (retained, QoS 1).
 const TopicNorthboundSchedule = "lexa/northbound/schedule"
+
+// TopicNorthboundCertStatus is published by lexa-northbound's cert-expiry
+// monitor (retained, QoS 1, TASK-072/§10.5) after every inspection of the
+// configured client + CA PEM files (startup, then every 24h). lexa-api
+// subscribes it and folds the latest CertStatus into GET /status's
+// "cert_status" field so an expiring certificate is visible to the dashboard
+// and QA harness instead of surfacing only as a silent discovery-error loop
+// once the utility server starts rejecting the handshake.
+const TopicNorthboundCertStatus = "lexa/northbound/certstatus"
 
 // TopicHubPlan carries the optimizer's most recent plan trace (decision log +
 // timestamp), published by lexa-hub on every engine pass — economic tick and
