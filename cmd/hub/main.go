@@ -187,10 +187,6 @@ func main() {
 			breachActiveGauge.Set(0)
 		}
 	}
-	// dedupeResets clears every actuator's command deduper; populated when the
-	// actuators are wired below (before the engine starts, so no race — the
-	// observer and executePlan both run on the engine's control goroutine).
-	var dedupeResets []func()
 	planObserver := func(plan orchestrator.Plan) {
 		// systemd watchdog keepalive (TASK-007). Must stay the first thing
 		// this closure does, before any publish: the engine calls
@@ -214,21 +210,13 @@ func main() {
 		tickStart := time.Now()
 		defer func() { tickDurationGauge.Set(time.Since(tickStart).Seconds()) }()
 
-		// A compliance breach means the measured effect contradicts the
-		// commanded state — the device may have reverted behind the hub's back
-		// (reboot to defaults, installer override), which is exactly the case
-		// the dedupers' "already sent" assumption gets wrong. Reset them so
-		// this tick's commands publish unconditionally (the observer runs
-		// before executePlan). Self-limiting: fires only while a breach
-		// persists; without it a reverted device saw no corrective write for
-		// up to reassertEvery even as the hub posted CannotComply about it
-		// (QA 2026-07-03: a 0 W ceiling dedupe-suppressed for 30 s against an
-		// uncurtailed inverter).
-		if plan.Breach != nil {
-			for _, reset := range dedupeResets {
-				reset()
-			}
-		}
+		// TASK-032: the breach-triggered actuator dedupe reset (ledger L3) was
+		// deleted with cmdDeduper. A device that reverts while the commanded value
+		// is unchanged is now corrected by the reconciler's verify-by-readback +
+		// write-on-diff (bounded by the poll/readback interval, not a 60 s
+		// watchdog), and device-level non-convergence rides the breachEpisodes
+		// component via lexa/reconcile/+/+/report.
+
 		// Surface the plan trace on the bus so lexa-api's /status last_plan is
 		// real data instead of the historical empty stub (the QA harness's
 		// decision introspection depends on it). Published on EVERY pass —
