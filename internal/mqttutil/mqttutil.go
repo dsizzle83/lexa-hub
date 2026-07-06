@@ -329,6 +329,26 @@ func publishJSONInner(client mqtt.Client, topic string, qos byte, retained bool,
 // retained pre-envelope message at boot (the exact §8.3 hazard this rollout
 // exists to prevent). CheckVersion never flags malformed JSON itself (that
 // stays the real json.Unmarshal's job, immediately below, unchanged).
+//
+// After a successful Unmarshal (GAP-09, TASK-055), if T implements
+// interface{ Finite() error } — every message type in internal/bus that
+// carries a *float64 does — its Finite() is called and a non-finite result
+// (a NaN/±Inf that slipped past json.Unmarshal via some future lax decode
+// path; stdlib itself already rejects bare/quoted NaN/Infinity into a typed
+// numeric field, see internal/bus/nan_reject_test.go) is treated exactly
+// like a malformed payload: logged, counted, dropped before handler ever
+// sees it. A NaN ActiveControl limit is the safety-critical instance of
+// this — it must never reach the optimizer, only ever cause the message to
+// be dropped so the last-known-good control holds. T types with no Finite()
+// method take neither branch — this type assertion adds nothing for them,
+// so Subscribe's behavior for a caller that hasn't opted in (by giving its
+// T a Finite() method) is unchanged.
+//
+// Both a plain unmarshal failure and a Finite() failure now also call
+// bus.RecordDecodeFailure, which — unlike the log.Printf alone, previously
+// the only trace of either — increments a per-topic counter alongside
+// bus.RejectAndAlarm's version-reject counter (GAP-09: today's silent drop
+// on a non-control topic hid a rogue or version-skewed publisher entirely).
 func Subscribe[T any](client mqtt.Client, topic string, handler func(topic string, msg T)) error {
 	h := func(_ mqtt.Client, m mqtt.Message) {
 		if verr := bus.CheckVersion(m.Topic(), m.Payload(), bus.SupportedV(m.Topic())); verr != nil {
@@ -340,7 +360,15 @@ func Subscribe[T any](client mqtt.Client, topic string, handler func(topic strin
 		var v T
 		if err := json.Unmarshal(m.Payload(), &v); err != nil {
 			log.Printf("[mqtt] unmarshal on %s: %v", m.Topic(), err)
+			bus.RecordDecodeFailure(m.Topic(), err)
 			return
+		}
+		if fv, ok := any(v).(interface{ Finite() error }); ok {
+			if err := fv.Finite(); err != nil {
+				log.Printf("[mqtt] non-finite value on %s: %v", m.Topic(), err)
+				bus.RecordDecodeFailure(m.Topic(), err)
+				return
+			}
 		}
 		handler(m.Topic(), v)
 	}

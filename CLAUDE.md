@@ -342,7 +342,12 @@ binary-only deploy + hand-set Pi config (05 §6 discipline).
   `main()` of lexa-northbound and lexa-telemetry only. The other three services are
   pure Go and never touch wolfSSL.
 - **Cipher**: `ECDHE-ECDSA-AES128-CCM-8 TLSv1.2` only (CSIP §5.2.1.1).
-- **Bus messages**: `math.NaN()` never appears in JSON — use `*float64` (nil = absent).
+- **Bus messages**: `math.NaN()` never appears in JSON — use `*float64` (nil = absent),
+  and the DECODE layer rejects non-finite numeric input (NaN/Inf, quoted or bare) with
+  an alarm; a NaN limit never reaches the optimizer (GAP-09, TASK-055: stdlib already
+  refuses NaN/Inf into typed float64 fields — internal/bus/nan_reject_test.go pins that
+  — plus a `Finite()` defense-in-depth check on every `*float64`-bearing message type,
+  wired into `mqttutil.Subscribe` and counted via `bus.RecordDecodeFailure`).
 - **CSIP control is retained**: lexa-northbound publishes `lexa/csip/control` with
   retain=true so lexa-hub gets the last value immediately on (re)start.
 - **Module path**: `lexa-hub` — used in all import paths.
