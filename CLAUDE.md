@@ -229,8 +229,13 @@ internal/
               implements orchestrator.Optimizer. Also the shadow harness (TASK-059,
               shadow.go): Wrap(legacy, candidate) runs both per tick, diffs FINAL
               per-device outputs under tolerance bands, counts+logs divergences,
-              returns the LEGACY plan unmodified. The cascade in optimizer.go stays
-              the live path; the Stack is observe-only until TASK-060 flips export.
+              returns the LEGACY plan unmodified. TASK-060 wired the first real
+              constraint — ExportConstraint (export.go/export_session.go: ports
+              applyExportLimitRule+expGuard and checkExportLimitConvergence+
+              expOverTicks with the two reset cadences kept separate; adaptive
+              detection window). The cascade in optimizer.go stays the AUTHORITATIVE
+              live path; the export logic runs in the Stack in SHADOW only (0 diff
+              gate passed) until the `export: active` flip.
 
 systemd/     Unit files + mosquitto config fragment
 configs/     Example JSON configs for each service
@@ -470,7 +475,10 @@ survive; the guards below are deliberate, not redundant. Keep them when refactor
   a device can ACK a write and ignore it. `checkGenLimitConvergence` (cross-checked against an
   independent meter floor `gen ≥ export − batteryDischarge`), `checkImportConvergence`, and the
   export rule's battery-absorption guard all compare commanded vs MEASURED effect and, on a
-  sustained gap, curtail another lever or post a 2030.5 CannotComply.
+  sustained gap, curtail another lever or post a 2030.5 CannotComply. The export convergence
+  backstop (`checkExportLimitConvergence`/`expOverTicks`, session-scoped) is also ported to
+  `orchestrator/constraint/export.go` (TASK-060) running in SHADOW; the optimizer.go copy stays
+  authoritative until the `export: active` flip — do not strip either.
 - **Fail closed on bad CSIP**: the scheduler holds last-known-good on an empty/malformed
   resource (see `internal/northbound/CLAUDE.md` rule 6).
 - **Plausibility-gate ingested telemetry**: `cmd/modbus` withholds power over nameplate
