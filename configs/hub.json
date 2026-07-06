@@ -9,7 +9,9 @@
   "constraint_shadow": false,
   "devices": [
     {
-      "name": "inverter-0", "role": "inverter", "max_w": 10000,
+      "name": "inverter-0",
+      "role": "inverter",
+      "max_w": 10000,
       "plant": {
         "max_ramp_down_w_per_s": 500.0,
         "max_ramp_up_w_per_s": 166.6666666667,
@@ -17,7 +19,9 @@
       }
     },
     {
-      "name": "battery-0", "role": "battery", "max_w": 5000,
+      "name": "battery-0",
+      "role": "battery",
+      "max_w": 5000,
       "plant": {
         "capacity_kwh": 10.0,
         "soc_taper_start_pct": 80.0,
@@ -26,7 +30,9 @@
       }
     },
     {
-      "name": "meter-0", "role": "meter", "max_w": 0,
+      "name": "meter-0",
+      "role": "meter",
+      "max_w": 0,
       "plant": {
         "meter_lag_s": 5.0
       }
@@ -34,7 +40,8 @@
   ],
   "stations": [
     {
-      "id": "cs-001", "max_current_a": 32.0,
+      "id": "cs-001",
+      "max_current_a": 32.0,
       "plant": {
         "meter_lag_s": 10.0
       }
@@ -49,5 +56,6 @@
     "enabled": false,
     "path": "/var/lib/lexa/snapshot/hub.json",
     "max_age_s": 300
-  }
+  },
+  "retained_adoption_max_age_s": 300
 }
