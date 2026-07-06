@@ -6,8 +6,8 @@
   "metrics_addr": "",
   "poll_interval_s": 10,
   "reconciler": {
-    "battery": "off",
-    "solar": "off"
+    "battery": "active",
+    "solar": "active"
   },
   "devices": [
     {
