@@ -46,6 +46,18 @@ func NewStack(plant Plant, tickInterval time.Duration, constraints ...Constraint
 	return s
 }
 
+// SessionNames returns the constraint names in the Stack's fixed evaluation
+// order. The shadow harness (TASK-059) records these on a divergence so triage
+// can see which candidate constraints were live when the stack disagreed with
+// the legacy cascade. Order is the construction order, so it is deterministic.
+func (s *Stack) SessionNames() []string {
+	names := make([]string, 0, len(s.constraints))
+	for _, c := range s.constraints {
+		names = append(names, c.Name())
+	}
+	return names
+}
+
 // tickSeconds is the wall-clock length of one tick (tuned cadence when unset).
 func (s *Stack) tickSeconds() float64 {
 	if s.tickInterval <= 0 {

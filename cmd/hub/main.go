@@ -49,6 +49,7 @@ import (
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/orchestrator"
+	"lexa-hub/internal/orchestrator/constraint"
 	"lexa-hub/internal/watchdog"
 )
 
@@ -164,6 +165,45 @@ func main() {
 		opt.EVImportCooldownCycles = cycles
 	} else {
 		opt.EVImportCooldownCycles = 4
+	}
+
+	// TASK-059: the constraint-stack shadow harness. When cfg.ConstraintShadow
+	// is false (the default) NOTHING here runs — the engine drives opt directly
+	// and behaviour is byte-identical. When true, wrap opt so every economic
+	// tick ALSO runs the candidate constraint Stack (observe-only), diffs the
+	// two plans, counts divergences, and logs one rate-limited JSON line per
+	// divergent tick. The wrapper ALWAYS returns opt's plan; the candidate's is
+	// discarded (never actuated) — the legacy cascade stays authoritative until
+	// TASK-060 flips the export constraint active. shadowDivergences is nil when
+	// the flag is off, so the plan-log field below stays absent.
+	var optimizer orchestrator.Optimizer = opt
+	var shadowDivergences func() uint64
+	if cfg.ConstraintShadow {
+		// The Stack carries the per-device plant models from hub.json (TASK-057)
+		// but has NO concrete constraints yet — TASK-060 adds the export
+		// constraint. An empty Stack expresses no per-axis opinion, so the diff
+		// is inert (~0 divergences) until then, which is the intended shadow
+		// baseline this task validates on the bench.
+		stack := constraint.NewStack(buildConstraintPlant(cfg), cfg.EngineInterval())
+		reg.Counter("lexa_constraint_shadow_divergence_total")
+		wrapper := constraint.Wrap(opt, stack, constraint.Options{
+			Now: time.Now,
+			OnDiverge: func(d constraint.Divergence) {
+				if b, err := json.Marshal(d); err == nil {
+					// One structured JSON line per divergent tick; the wrapper
+					// has already rate-limited to ≤1/min per signature (05 §9).
+					slog.Warn("constraint-shadow divergence", "diff", string(b))
+				}
+			},
+		})
+		optimizer = wrapper
+		shadowDivergences = wrapper.Divergences
+		// Mirror the wrapper's running count into the metric at scrape time
+		// (Counter.Set mirrors an external monotonic source — metrics.go).
+		reg.Collect(func(r *metrics.Registry) {
+			r.Counter("lexa_constraint_shadow_divergence_total").Set(wrapper.Divergences())
+		})
+		log.Printf("lexa-hub: constraint shadow ENABLED (observe-only; legacy cascade authoritative)")
 	}
 
 	// Compliance-breach reporting (TASK-031). The named breachEpisodes component
@@ -309,6 +349,12 @@ func main() {
 		// decisions or not — so the timestamp doubles as an engine heartbeat.
 		// Retained: lexa-api restarting mid-episode still sees the latest plan.
 		pl := bus.PlanLog{Envelope: bus.Envelope{V: bus.PlanLogV}, Ts: plan.Timestamp.Unix()}
+		// TASK-059: surface the running shadow-divergence count on every plan
+		// publish so the dashboard/QA can watch the diff rate without scraping
+		// /metrics. Nil closure (flag off) ⇒ field stays zero ⇒ omitted.
+		if shadowDivergences != nil {
+			pl.ShadowDivergences = shadowDivergences()
+		}
 		for _, dec := range plan.Decisions {
 			pl.Decisions = append(pl.Decisions, bus.PlanDecision{
 				Rule: dec.Rule, Reason: dec.Reason, Impact: dec.Impact,
@@ -326,7 +372,7 @@ func main() {
 		emitAlerts(episodes.OnPlan(plan, time.Now()))
 	}
 
-	eng := orchestrator.New(reader, opt, orchestrator.Config{
+	eng := orchestrator.New(reader, optimizer, orchestrator.Config{
 		Interval:       cfg.EngineInterval(),
 		SafetyInterval: cfg.SafetyInterval(),
 		Debug:          cfg.Debug,
@@ -442,6 +488,36 @@ func configFingerprint(cfg *Config) string {
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])[:12]
+}
+
+// buildConstraintPlant assembles the constraint.Plant (TASK-057 plant models,
+// keyed by device/station name) the shadow Stack reads, from the decoded plant
+// blocks in hub.json. Devices without a plant block contribute a zero-value
+// plant; the constraint layer applies its bench defaults at consume time
+// (plantmodel withDefaults), so a partial or absent block is safe. The Stack is
+// constraint-free today, so this map is unused until TASK-060 wires the export
+// constraint — building it now keeps the shadow harness ready to carry real
+// plant physics into that flip's bench session with no further wiring.
+func buildConstraintPlant(cfg *Config) constraint.Plant {
+	p := constraint.Plant{
+		Inverters: map[string]orchestrator.InverterPlant{},
+		Batteries: map[string]orchestrator.BatteryPlant{},
+		EVSEs:     map[string]orchestrator.EVSEPlant{},
+	}
+	for _, d := range cfg.Devices {
+		switch d.Role {
+		case "inverter":
+			p.Inverters[d.Name] = d.InverterPlant
+		case "battery":
+			p.Batteries[d.Name] = d.BatteryPlant
+		case "meter":
+			p.Meter = d.MeterPlant
+		}
+	}
+	for _, s := range cfg.Stations {
+		p.EVSEs[s.ID] = s.EVSEPlant
+	}
+	return p
 }
 
 // derConstraintsFromSchedule converts a DERScheduleMsg into per-step
