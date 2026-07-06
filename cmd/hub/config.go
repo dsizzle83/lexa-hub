@@ -69,6 +69,17 @@ type Config struct {
 	// disables journaling entirely — every emit site in cmd/hub is guarded
 	// by `if jw != nil`, so this is a true no-op, not a degraded default.
 	Journal *JournalConfig `json:"journal,omitempty"`
+
+	// Snapshot is the optional breach-episode snapshot block (TASK-041,
+	// AD-005 second half). A nil/absent "snapshot" key, or one with an empty
+	// path, disables snapshot writing entirely (true no-op, matching
+	// Journal's rollout shape). When Path is set but Enabled is false (the
+	// shipped default for one full campaign — see TASK-041's "Implementation
+	// strategy"), the hub still WRITES a snapshot on every breach begin/end
+	// and every 60 s while a breach is open, but never reads one back at
+	// start: a write-only soak before an ops-only config flip turns restore
+	// on (no code change accompanies that flip).
+	Snapshot *SnapshotConfig `json:"snapshot,omitempty"`
 }
 
 // JournalConfig is the on-disk "journal" block. It intentionally has its
