@@ -965,7 +965,14 @@ func TestScenario_S2_EV_BlockedDuringImportGuardTransient(t *testing.T) {
 	opt.EVImportCooldownCycles = 3
 
 	s := state0()
-	s.Solar = []orchestrator.SolarState{solar("pv-0", 1000, 3000)}
+	// No PV: an import-limit episode is a low/no-solar condition, and zeroing PV is
+	// what makes the cooldown-gate LIFT observable as plan output. With no solar
+	// surplus the EV charging rule falls to its grid-charge branch, which resumes
+	// the EV at full rate the moment the gate clears — so tick 5 flips from 0 A
+	// (gate up) to a positive current (gate down). With PV present the resume stays
+	// at 0 A for lack of surplus and the gate lift would show only in the decision
+	// text (the old string oracle); zeroing PV keeps the tick-5 assertion behavioral
+	// without perturbing the cooldown mechanics (evSafeCount tracks netW only).
 	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 75, 5000)}
 	s.EVSEs = []orchestrator.EVSEState{evse("cs-001", true, 0, 32.0, 230.0)}
 	s.Grid.NetW = 2380 // EV just started, site way over 500 W cap
@@ -1006,31 +1013,25 @@ func TestScenario_S2_EV_BlockedDuringImportGuardTransient(t *testing.T) {
 	}
 
 	// Tick 5 — cooldown complete (3 positive-import-under-cap ticks seen).
-	// EV charging rule runs normally; with surplusW < 0 it will likely stay at 0A,
-	// but the suppression flag must be gone (decision should not say "cooldown").
+	// The suppression gate is now down, so the EV charging rule resumes the EV.
+	// Behavioral oracle: the plan must now command the EV to a positive current
+	// (the export-limit-active-but-importing branch charges at full rate). While
+	// the gate was up (ticks 1–4) every EV command was 0 A; the gate lift is what
+	// flips the plan output — we assert that flip, not the decision wording.
 	plan5 := opt.Optimize(s)
-	for _, d := range plan5.Decisions {
-		if d.Rule == "import-limit" && len(d.Reason) > 0 {
-			// "cooldown" is in the suspension message from evImportSuppressed
-			if contains(d.Reason, "cooldown") {
-				t.Errorf("tick 5 (cooldown expired): EV still suppressed by cooldown gate: %s", d.Reason)
-			}
+	var evCmd5 *orchestrator.EVSECommand
+	for i := range plan5.EVSECommands {
+		if plan5.EVSECommands[i].StationID == "cs-001" {
+			evCmd5 = &plan5.EVSECommands[i]
 		}
+	}
+	if evCmd5 == nil {
+		t.Fatal("tick 5 (cooldown expired): expected an EV command once the gate lifted, got none")
+	}
+	if evCmd5.MaxCurrentA <= 0 {
+		t.Errorf("tick 5 (cooldown expired): EV still held at 0 A — cooldown gate did not lift; got %.1fA", evCmd5.MaxCurrentA)
 	}
 	logDecisions(t, plan5)
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(s) > 0 && containsStr(s, sub))
-}
-
-func containsStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
 
 // ── Stuck-curtailment-on-reconnect + export convergence (QA 2026-07-03) ────────

@@ -18,6 +18,11 @@
 //
 // Concurrency model: a single goroutine owns all state mutation; external
 // callers only push through channels or call thread-safe setters.
+//
+// Testing convention (TASK-056): orchestrator tests assert plan contents
+// (commands, setpoints, ceilings, breaches) and invariant outcomes — never the
+// human-readable Decision strings (`Reason`/`Impact`). Decisions are recorded
+// for operators to read, but rewording them must not break a test.
 package orchestrator
 
 import (

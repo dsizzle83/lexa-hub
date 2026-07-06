@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"math"
-	"strings"
 	"testing"
 )
 
@@ -12,15 +11,6 @@ import (
 func hasCurtailingSolarCommand(p *Plan, nameplateW float64) bool {
 	for _, c := range p.SolarCommands {
 		if !math.IsNaN(c.CurtailToW) && c.CurtailToW < nameplateW*0.9 {
-			return true
-		}
-	}
-	return false
-}
-
-func hasDecisionContaining(p *Plan, substr string) bool {
-	for _, d := range p.Decisions {
-		if strings.Contains(d.Reason, substr) || strings.Contains(d.Impact, substr) {
 			return true
 		}
 	}
@@ -46,11 +36,12 @@ func TestExportLimit_BatteryStallCurtailsSolar(t *testing.T) {
 		last = p
 	}
 
-	if !hasDecisionContaining(last, "battery not absorbing") {
-		t.Errorf("expected a battery-stall decision after %d ticks; decisions=%+v", battBreachTicks, last.Decisions)
-	}
+	// Behavioral oracle: the phantom-absorption discredit is observable as a real
+	// solar curtailment (feed-forward drops from crediting the commanded ~4400 W
+	// absorb to crediting the measured 0 W), holding the export cap. We assert the
+	// plan CURTAILS the inverter, not the wording of the decision.
 	if !hasCurtailingSolarCommand(last, 4800) {
-		t.Errorf("expected solar curtailment once the stall was declared; solarCommands=%+v", last.SolarCommands)
+		t.Errorf("expected solar curtailment once the stall was declared after %d ticks; solarCommands=%+v", battBreachTicks, last.SolarCommands)
 	}
 }
 
@@ -75,8 +66,11 @@ func TestExportLimit_BatteryStallToleratesBlip(t *testing.T) {
 		last = &Plan{}
 		o.applyExportLimitRule(sol, nil, 0, limits, netW, 95, surplus, bats, last)
 	}
-	if !hasDecisionContaining(last, "battery not absorbing") {
-		t.Errorf("a stall with one absorb-blip must still curtail (leaky counter); decisions=%+v", last.Decisions)
+	// Leaky counter: the single absorb-blip only decrements the stall count, so by
+	// the final tick the discredit still trips and the plan curtails solar. Assert
+	// the curtailment (the behavior), not the decision string.
+	if !hasCurtailingSolarCommand(last, 4800) {
+		t.Errorf("a stall with one absorb-blip must still curtail solar (leaky counter); solarCommands=%+v", last.SolarCommands)
 	}
 }
 
@@ -94,8 +88,11 @@ func TestExportLimit_BatteryAbsorbingDoesNotTrip(t *testing.T) {
 		p := &Plan{}
 		// Meter shows ~0 export because the battery is soaking the surplus.
 		o.applyExportLimitRule(sol, nil, 0, limits, 0, 95, 0, bats, p)
-		if hasDecisionContaining(p, "battery not absorbing") {
-			t.Fatalf("tick %d: stall falsely declared while battery is absorbing", i)
+		// A genuinely absorbing pack keeps the feed-forward credit, so the inverter
+		// is never curtailed. Assert the absence of a curtail command (the behavior),
+		// not the absence of a decision string.
+		if hasCurtailingSolarCommand(p, 4800) {
+			t.Fatalf("tick %d: solar curtailed while battery is absorbing (false stall); solarCommands=%+v", i, p.SolarCommands)
 		}
 	}
 }
