@@ -43,5 +43,10 @@
     "dir": "/var/lib/lexa/journal/hub",
     "max_bytes": 1048576,
     "max_files": 4
+  },
+  "snapshot": {
+    "enabled": false,
+    "path": "/var/lib/lexa/snapshot/hub.json",
+    "max_age_s": 300
   }
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -83,6 +84,13 @@ type breachEpisodes struct {
 	// breach_begin/breach_end emits in emit() below (fire-and-forget,
 	// guarded, matching every other journal call site in cmd/hub).
 	jw *journal.Writer
+
+	// snapPath is the TASK-041 snapshot file path ("" disables snapshot
+	// writing entirely — no "snapshot" block, or an empty path, in
+	// hub.json). Writing is unconditional on snapPath being set; it does NOT
+	// depend on the restore-enabled flag (main.go gates restore separately),
+	// so the rollout can run a write-only soak campaign first.
+	snapPath string
 }
 
 // deviceEvidence is one reconciled device's latest non-convergence state.
@@ -107,9 +115,122 @@ type breachEvidence struct {
 // newBreachEpisodes builds the component. jw is the optional TASK-040 event
 // journal (nil disables journaling); a bare nil is safe to pass everywhere
 // journaling is not being exercised (e.g. every pre-existing test in
-// breach_test.go).
-func newBreachEpisodes(jw *journal.Writer) *breachEpisodes {
-	return &breachEpisodes{deviceReports: make(map[string]deviceEvidence), jw: jw}
+// breach_test.go). snapPath is the optional TASK-041 snapshot file path ("" —
+// the zero value every pre-existing test passes implicitly via the two-arg
+// call sites below — disables snapshot writing).
+func newBreachEpisodes(jw *journal.Writer, snapPath string) *breachEpisodes {
+	return &breachEpisodes{deviceReports: make(map[string]deviceEvidence), jw: jw, snapPath: snapPath}
+}
+
+// Restore seeds the episode identity from a validated TASK-041 snapshot, so
+// the first breaching tick after a restart recognizes the still-open episode
+// instead of forming a new one and re-publishing a duplicate Active=true
+// alert. Callers must invoke this once, before OnPlan/OnReport are ever
+// called (main.go calls it right after construction, before the MQTT
+// subscriptions and eng.Start() — no ordering assumption is made about the
+// retained-control re-seed racing this).
+//
+// Only identity is seeded (activeMRID/episodeID/counter) — never the
+// evidence maps (planBreach/deviceReports); those re-seed live from the next
+// optimizer tick and the retained reconciler reports respectively (see the
+// "TASK-041 snapshot note" on the struct doc above). If the restored
+// episode's underlying breach turns out to already be gone (plan.Breach ==
+// nil on the first tick), the normal clear edge fires correctly: the breach
+// may have ended while the hub was down, and northbound's clearAlerts then
+// unlatches its own dedupe.
+//
+// counter is folded in with max(), never overwritten downward: a restored
+// counter lower than one this process has already minted (e.g. a very stale
+// but still-within-max_age_s snapshot racing a fresh onset) must never cause
+// a future episode ID to collide with one already used this process
+// lifetime.
+func (b *breachEpisodes) Restore(mrid, episodeID string, counter uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if mrid == "" || episodeID == "" {
+		return
+	}
+	b.activeMRID = mrid
+	b.episodeID = episodeID
+	if counter > b.counter {
+		b.counter = counter
+	}
+}
+
+// snapshotLocked builds the current hubSnapshot. Must be called with mu
+// held.
+func (b *breachEpisodes) snapshotLocked() hubSnapshot {
+	snap := hubSnapshot{WrittenAt: time.Now().Unix()}
+	if b.activeMRID != "" {
+		snap.ActiveBreach = &breachSnapshot{
+			EpisodeID: b.episodeID,
+			MRID:      b.activeMRID,
+			Counter:   b.counter,
+		}
+	}
+	return snap
+}
+
+// ResaveIfActive rewrites the snapshot with a fresh written_at while an
+// episode is open (called by main.go's 60 s ticker — TASK-041's "every 60 s
+// while a breach is active" cadence). This exists solely so a legitimately
+// long-running breach's snapshot does not go stale against max_age_s (a
+// breach can easily outlast the default 300 s); it is NOT a per-tick write
+// path (RSK-14's "Common mistakes to avoid" — writing on every tick — is
+// exactly what this fixed, independent 60 s wall-clock cadence avoids). A
+// no-op when no episode is active or no snapshot path is configured.
+func (b *breachEpisodes) ResaveIfActive() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.activeMRID == "" || b.snapPath == "" {
+		return
+	}
+	b.writeSnapshotLocked()
+}
+
+// writeSnapshotLocked atomically writes the component's current snapshot
+// state and journals snapshot_written on success. Must be called with mu
+// held. A save failure is logged (edge case: disk full/read-only) but never
+// propagated — a snapshot write failing must not affect the breach-episode
+// state machine or its bus-facing alerts (mirrors the journal package's own
+// "never crash on a journal/snapshot failure" stance, AD-011).
+func (b *breachEpisodes) writeSnapshotLocked() {
+	if b.snapPath == "" {
+		return
+	}
+	snap := b.snapshotLocked()
+	if err := saveHubSnapshot(b.snapPath, snap); err != nil {
+		slog.Warn("breach snapshot: save failed", "path", b.snapPath, "err", err)
+		return
+	}
+	b.journalSnapshotWritten(snap)
+}
+
+// journalSnapshotWritten appends a snapshot_written event for the snapshot
+// just saved (called with b.mu held). Guarded fire-and-forget like every
+// other journal call site in this file. Forces an immediate Flush, exactly
+// like journalBegin/journalEnd above: this only runs on a begin/end
+// transition (never per-tick — writeSnapshotLocked's only callers are the
+// two emit() edges and the 60 s while-active resave), so it is the same
+// "rare and high-value" class of write those two force-flush for, and
+// batching it separately from the breach_begin/breach_end event it
+// accompanies would leave a window where a crash could lose the
+// snapshot_written record while the breach_begin/end it corresponds to
+// already made it to disk.
+func (b *breachEpisodes) journalSnapshotWritten(snap hubSnapshot) {
+	if b.jw == nil {
+		return
+	}
+	episode := ""
+	if snap.ActiveBreach != nil {
+		episode = snap.ActiveBreach.EpisodeID
+	}
+	e, err := journal.NewSnapshotWrittenEvent("hub", journal.NewSnapshot(b.snapPath, episode))
+	if err != nil {
+		return
+	}
+	_ = b.jw.Append(e)
+	_ = b.jw.Flush()
 }
 
 // OnPlan feeds one optimizer plan. Safety plans are not assessed (their nil
@@ -176,6 +297,7 @@ func (b *breachEpisodes) emit(now time.Time) []bus.ComplianceAlert {
 		b.activeMRID = ev.mrid
 		b.episodeID = fmt.Sprintf("%s@%d#%d", ev.mrid, ev.issuedAt, b.counter)
 		b.journalBegin(ev)
+		b.writeSnapshotLocked()
 		return []bus.ComplianceAlert{{
 			Envelope:   bus.Envelope{V: bus.ComplianceAlertV},
 			MRID:       ev.mrid,
@@ -194,6 +316,7 @@ func (b *breachEpisodes) emit(now time.Time) []bus.ComplianceAlert {
 		b.activeMRID = ""
 		b.episodeID = ""
 		b.journalEnd(ep, mrid)
+		b.writeSnapshotLocked()
 		return []bus.ComplianceAlert{{
 			Envelope:  bus.Envelope{V: bus.ComplianceAlertV},
 			MRID:      mrid,

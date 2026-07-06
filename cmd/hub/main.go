@@ -176,7 +176,72 @@ func main() {
 	// exactly one CannotComply Response per real episode rather than one per source
 	// or one per tick. It replaces the former activeBreachMRID closure variable +
 	// standalone breachAlert func (05 §4: named, testable episode state).
-	episodes := newBreachEpisodes(jw)
+	//
+	// TASK-041: snapPath ("" if cfg.Snapshot is nil/empty) makes the component
+	// WRITE an atomic snapshot on every begin/end transition regardless of the
+	// restore-enabled flag below — snapshot files appearing with restore still
+	// off is the intended write-only soak for one full campaign.
+	var snapPath string
+	if cfg.Snapshot != nil {
+		snapPath = cfg.Snapshot.Path
+	}
+	episodes := newBreachEpisodes(jw, snapPath)
+
+	// TASK-041 restore-on-start: gated behind cfg.Snapshot.Enabled (default
+	// false — see SnapshotConfig's doc). This MUST run before the reconciler
+	// report subscription and eng.Start() below, and it seeds identity ONLY
+	// (activeMRID/episodeID/counter) — never a device command path (grep:
+	// nothing here touches an actuator). No ordering assumption is made
+	// against the retained-control MQTT re-seed; it arrives whenever it
+	// arrives, same as any other restart.
+	if cfg.Snapshot != nil && cfg.Snapshot.Enabled && snapPath != "" {
+		snap, serr := loadHubSnapshot(snapPath, cfg.Snapshot.maxAge(), time.Now())
+		switch {
+		case serr == nil && snap.ActiveBreach != nil:
+			episodes.Restore(snap.ActiveBreach.MRID, snap.ActiveBreach.EpisodeID, snap.ActiveBreach.Counter)
+			log.Printf("lexa-hub: restored breach episode %s (mrid=%s) from snapshot %s",
+				snap.ActiveBreach.EpisodeID, snap.ActiveBreach.MRID, snapPath)
+			if jw != nil {
+				if ev, everr := journal.NewSnapshotRestoredEvent("hub",
+					journal.NewSnapshot(snapPath, snap.ActiveBreach.EpisodeID)); everr == nil {
+					_ = jw.Append(ev)
+					_ = jw.Flush()
+				}
+			}
+		case serr == nil:
+			// A valid, fresh snapshot with no active episode: nothing to seed,
+			// but still worth journaling that restore ran (forensics parity
+			// with the seeded case).
+			if jw != nil {
+				if ev, everr := journal.NewSnapshotRestoredEvent("hub", journal.NewSnapshot(snapPath, "")); everr == nil {
+					_ = jw.Append(ev)
+					_ = jw.Flush()
+				}
+			}
+		case os.IsNotExist(serr):
+			// First boot, or a fresh volume: not an error, nothing to log.
+		default:
+			// Corrupt, wrong version, or stale/future-dated: never trusted
+			// (§8.3 stale-state hazard) — the hub starts as if no snapshot
+			// existed at all.
+			slog.Warn("lexa-hub: snapshot restore skipped", "path", snapPath, "err", serr)
+		}
+	}
+	// TASK-041: refresh the breach snapshot's written_at every 60 s while an
+	// episode is open, so a breach that legitimately outlasts max_age_s (the
+	// 300 s default) doesn't go stale in the eyes of a LATER restart's
+	// staleness check. Independent fixed-cadence goroutine, not a per-tick
+	// hook (RSK-14) — ResaveIfActive itself is a cheap no-op whenever no
+	// snapshot path is configured or no episode is open.
+	if snapPath != "" {
+		go func() {
+			ticker := time.NewTicker(60 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				episodes.ResaveIfActive()
+			}
+		}()
+	}
 	// emitAlerts publishes the component's edge alerts and updates the breach
 	// observability (lexa_hub_breaches_total per Active edge, lexa_hub_breach_active
 	// gauge). Shared by both feed paths (plan observer + report subscription), which
