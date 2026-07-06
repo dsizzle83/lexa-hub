@@ -45,8 +45,8 @@ func DefaultTOUCostModel() *TOUCostModel {
 			{StartHour: 21, EndHour: 24, RatePerKwh: 0.10, Label: "off-peak"},
 			{StartHour: 0, EndHour: 7, RatePerKwh: 0.10, Label: "off-peak"},
 		},
-		0.18,  // default rate
-		0.30,  // rates >= 0.30 are "peak"
+		0.18, // default rate
+		0.30, // rates >= 0.30 are "peak"
 	)
 }
 
@@ -99,10 +99,25 @@ func (m *TOUCostModel) OptimalChargeWindow(now time.Time, durationHours int) int
 	bestHour := now.Hour()
 
 	for startHour := 0; startHour < 24; startHour++ {
+		// Anchor the window at a real wall-clock instant for startHour, then
+		// advance by real elapsed hours via Time.Add, not by reconstructing a
+		// wall-clock hour label with time.Date on every step. On a DST-forward
+		// day the local hour that does not exist (e.g. 02:00 America/Los_Angeles
+		// on 2026-03-08) collapses under time.Date to the same instant as the
+		// hour before it (Go's documented spring-forward-gap behavior), so the
+		// old per-step `time.Date(..., (startHour+h)%24, ...)` construction
+		// silently duplicated a hour's rate and dropped the real next hour for
+		// any window straddling the gap — undercounting the true cost of a
+		// window that runs through the transition (GAP-05, TASK-079; see
+		// TestTOU_OptimalChargeWindow_DSTForward_NoHourCollapse). Add()
+		// operates on the absolute instant, so it steps through the gap/fold
+		// correctly and is bit-for-bit identical to the old construction on
+		// every non-transition day (TestTOU_OptimalChargeWindow_NormalDay_AddEquivalence).
+		anchor := time.Date(now.Year(), now.Month(), now.Day(),
+			startHour, 0, 0, 0, now.Location())
 		var totalCost float64
 		for h := 0; h < durationHours; h++ {
-			t := time.Date(now.Year(), now.Month(), now.Day(),
-				(startHour+h)%24, 0, 0, 0, now.Location())
+			t := anchor.Add(time.Duration(h) * time.Hour)
 			totalCost += m.CurrentRate(t)
 		}
 		if totalCost < bestCost {

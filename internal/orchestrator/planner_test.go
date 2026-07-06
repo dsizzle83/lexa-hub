@@ -462,3 +462,194 @@ func TestDiurnalSolarForecast(t *testing.T) {
 		t.Errorf("solar-noon forecast = %v, want %v", v, peak)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// TASK-079 (GAP-05): localHourOf / price-shaping DST coverage.
+//
+// localHourOf and planStepImportPrice/planStepExportPrice all read
+// time.Unix(unix, 0).Local() — the PROCESS's configured zone, exactly like
+// the optimizer's serverNow rendering (CLAUDE.md, AD-004). To pin this
+// deterministically against an explicit zone (never the test runner's own,
+// which varies between a dev laptop and a UTC CI box), these tests
+// temporarily repoint the package-level time.Local variable at
+// America/Los_Angeles. This is a test-only technique — no production API
+// change — and is safe here because this package's tests never call
+// t.Parallel() (verified: no other test in this package does, and Plan()/
+// the helpers under test spawn no goroutines that could race on time.Local
+// concurrently with a test's own goroutine).
+// ─────────────────────────────────────────────────────────────────────────
+
+// dstForwardYear/dstBackYear/normalYear and friends mirror the same 2026
+// America/Los_Angeles dates used in costmodel_test.go (that file is package
+// orchestrator_test, this one is package orchestrator — the constants can't
+// be shared, so they're duplicated here deliberately).
+const (
+	dstForwardYear, dstForwardMonth, dstForwardDay = 2026, time.March, 8
+	dstBackYear, dstBackMonth, dstBackDay          = 2026, time.November, 1
+	normalYear, normalMonth, normalDay             = 2026, time.June, 15
+)
+
+// withLocalZone temporarily repoints time.Local for the duration of the
+// test (restored via t.Cleanup). Must not be used from a t.Parallel() test.
+func withLocalZone(t *testing.T, loc *time.Location) {
+	t.Helper()
+	old := time.Local
+	time.Local = loc
+	t.Cleanup(func() { time.Local = old })
+}
+
+func laLocationForPlanner(t *testing.T) *time.Location {
+	t.Helper()
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Fatalf("LoadLocation(America/Los_Angeles): %v (tzdata missing on this runner?)", err)
+	}
+	return loc
+}
+
+// TestLocalHourOf_AcrossDSTForward pins localHourOf's behavior across the
+// spring-forward gap (2026-03-08, 02:00 PST -> 03:00 PDT): it must never
+// report an hour-of-day in [2,3) (that local hour does not exist), and must
+// advance monotonically with real elapsed time up to and through the gap.
+func TestLocalHourOf_AcrossDSTForward(t *testing.T) {
+	loc := laLocationForPlanner(t)
+	withLocalZone(t, loc)
+
+	anchor := time.Date(dstForwardYear, dstForwardMonth, dstForwardDay, 1, 0, 0, 0, loc)
+	prev := localHourOf(anchor.Unix())
+	if prev < 1 || prev >= 2 {
+		t.Fatalf("localHourOf(01:00) = %v, want in [1,2)", prev)
+	}
+	sawInGap := false
+	for i := 1; i <= 4*60; i++ { // 01:00 -> 05:00 real elapsed minutes, 1-min resolution
+		ti := anchor.Add(time.Duration(i) * time.Minute)
+		h := localHourOf(ti.Unix())
+		if h >= 2 && h < 3 {
+			sawInGap = true
+		}
+		// Monotonic non-decreasing except for the single expected jump
+		// across the gap (from ~1.98 straight to 3.0) and the ordinary
+		// hour-24 wrap (not reached in this 4h window).
+		if h < prev-1e-9 && !(prev > 20 && h < 4) { // guard against a midnight wrap this window never reaches
+			t.Errorf("t=%s: localHourOf went backwards (%v -> %v)", ti.Format(time.RFC3339), prev, h)
+		}
+		prev = h
+	}
+	if sawInGap {
+		t.Error("localHourOf reported an hour inside [2,3) on the spring-forward gap day — that local hour does not exist")
+	}
+	if prev < 4 {
+		t.Errorf("after the gap, localHourOf should have advanced past hour 4, got %v", prev)
+	}
+}
+
+// TestLocalHourOf_AcrossDSTBack pins the fall-back fold (2026-11-01, 02:00
+// PDT -> 01:00 PST): the repeated local hour 01:00-01:59 renders as the same
+// fractional-hour RANGE twice (a real, expected non-monotonicity — this is
+// documented, not a bug: the wall clock genuinely reads 01:00-01:59 twice),
+// and the eventual advance past hour 2 must still happen exactly once.
+func TestLocalHourOf_AcrossDSTBack(t *testing.T) {
+	loc := laLocationForPlanner(t)
+	withLocalZone(t, loc)
+
+	anchor := time.Date(dstBackYear, dstBackMonth, dstBackDay, 1, 0, 0, 0, loc)
+	first := localHourOf(anchor.Unix())
+	if first < 1 || first >= 2 {
+		t.Fatalf("localHourOf(01:00 first pass) = %v, want in [1,2)", first)
+	}
+
+	sawFold := false
+	sawHour2 := false
+	prev := first
+	for i := 1; i <= 3*60; i++ { // 01:00 -> 04:00 real elapsed minutes
+		ti := anchor.Add(time.Duration(i) * time.Minute)
+		h := localHourOf(ti.Unix())
+		if h < prev-1e-9 { // fractional hour went backwards -> the fold repeating 01:xx
+			sawFold = true
+		}
+		if h >= 2 && h < 3 {
+			sawHour2 = true
+		}
+		prev = h
+	}
+	if !sawFold {
+		t.Error("never observed localHourOf go backwards (the repeated 01:xx range) across the fall-back fold")
+	}
+	if !sawHour2 {
+		t.Error("never observed localHourOf reach hour 2 after the fold")
+	}
+}
+
+// TestPlanStepPrice_ContinuityAcrossDSTTransitions walks a full planSteps
+// (24h, 5-min resolution) planning horizon starting at local midnight on
+// each of a normal day and both 2026 DST transition days, using
+// planStepImportPrice with FallbackTOU=DefaultTOUCostModel() (no explicit
+// ImportPricePerKwh slice, matching production's fallback path — see
+// planner.go:631). It asserts the number of rate CHANGES across the day
+// equals exactly 3 (the default schedule's 07:00/16:00/21:00 edges) on every
+// day, including the transition days: no double-priced or skipped step
+// introduced by the gap/fold, since all three tariff edges sit far from the
+// 02:00 DST transition.
+func TestPlanStepPrice_ContinuityAcrossDSTTransitions(t *testing.T) {
+	loc := laLocationForPlanner(t)
+	withLocalZone(t, loc)
+
+	cases := []struct {
+		name string
+		y    int
+		mo   time.Month
+		d    int
+	}{
+		{"normal", normalYear, normalMonth, normalDay},
+		{"dst-forward", dstForwardYear, dstForwardMonth, dstForwardDay},
+		{"dst-back", dstBackYear, dstBackMonth, dstBackDay},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ws := time.Date(c.y, c.mo, c.d, 0, 0, 0, 0, loc).Unix()
+			p := plannerTestBase()
+			p.WindowStart = ws
+
+			var changes int
+			var rates []float64
+			prevRate := planStepImportPrice(p, 0, ws)
+			rates = append(rates, prevRate)
+			for step := 1; step < planSteps; step++ {
+				stepT := ws + int64(step)*planStepSec
+				rate := planStepImportPrice(p, step, stepT)
+				rates = append(rates, rate)
+				if rate != prevRate {
+					changes++
+				}
+				prevRate = rate
+			}
+			if changes != 3 {
+				t.Errorf("%s: saw %d rate changes across the 24h plan horizon, want exactly 3 (07:00/16:00/21:00 edges); rates=%v", c.name, changes, rates)
+			}
+			// Every rate must be one of the DefaultTOUCostModel period rates
+			// (or its default) — no NaN/zero/garbage value from a
+			// mis-rendered instant near the transition.
+			valid := map[float64]bool{0.10: true, 0.18: true, 0.38: true}
+			for i, r := range rates {
+				if !valid[r] {
+					t.Errorf("%s: step %d rate=%v is not a recognized DefaultTOUCostModel rate", c.name, i, r)
+				}
+			}
+		})
+	}
+}
+
+// TestPlanStepExportPrice_NoImplicitTZDependency confirms
+// planStepExportPrice (which only reads p.ExportPricePerKwh, never a
+// FallbackTOU) is unaffected by the DST-day/zone concerns above — it takes
+// no local-time-dependent path at all. Documented here so a future change
+// that adds a zone-dependent fallback to export pricing gets a test to
+// extend.
+func TestPlanStepExportPrice_NoImplicitTZDependency(t *testing.T) {
+	p := plannerTestBase()
+	p.ExportPricePerKwh = nil
+	if got := planStepExportPrice(p, 0, 0); got != 0 {
+		t.Errorf("planStepExportPrice with nil ExportPricePerKwh = %v, want 0 (no TOU fallback exists for export)", got)
+	}
+}
