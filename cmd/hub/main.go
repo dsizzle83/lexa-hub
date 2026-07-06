@@ -102,12 +102,23 @@ func main() {
 		}
 		r.Counter("lexa_bus_decode_failures_total").Set(total)
 	})
-	// lexa_hub_tick_overruns_total: registered now with its real source
-	// landing in TASK-046 (no tick-budget accounting exists yet in cmd/hub
-	// or internal/orchestrator) — a registered-but-zero counter is fine per
-	// this task's own prerequisites note.
-	reg.Counter("lexa_hub_tick_overruns_total")
+	// lexa_hub_tick_overruns_total (TASK-046): fires from planObserver below
+	// when a pass's measured duration (this pass's own synchronous work plus
+	// the PRIOR pass's actuator Apply* time — see tickTiming's doc) exceeds
+	// tickBudget. Phase 4 exit criterion: zero under the mqtt-broker-latency
+	// scenario in FAST mode, now that the tick path no longer waits on
+	// PUBACKs.
+	tickOverrunsCtr := reg.Counter("lexa_hub_tick_overruns_total")
 	tickDurationGauge := reg.Gauge("lexa_hub_tick_duration_seconds")
+	// lexa_hub_desired_publish_failures_total (TASK-046): every desired-doc
+	// actuator's harvested async-publish failure or timeout (see
+	// desired.go's harvestPending) — the async-era equivalent of the
+	// synchronous publish error engine.go used to log straight from
+	// ApplyBatteryCommand/ApplySolarCommand/ApplyEVSECommand's return.
+	desiredPublishFailuresCtr := reg.Counter("lexa_hub_desired_publish_failures_total")
+	// tickTiming accumulates actuator Apply* durations across one pass; see
+	// its doc in desired.go for why planObserver reads it one pass lagged.
+	tickTime := &tickTiming{}
 	breachActiveGauge := reg.Gauge("lexa_hub_breach_active")
 	breachesTotalCtr := reg.Counter("lexa_hub_breaches_total")
 	// lexa_hub_dispatches_total counted the legacy lexa/control/* command
@@ -310,6 +321,19 @@ func main() {
 	// run on different goroutines; the component itself is internally locked, and
 	// the mqtt client and metrics counters are goroutine-safe, so publishing here
 	// (outside the component lock) is race-free.
+	//
+	// TASK-046: this publish stays SYNCHRONOUS, unlike the plan log below and
+	// every actuator publish — but bounded at complianceAlertTimeout (1s), not
+	// mqttutil's 5s default. A compliance alert is rare (one per breach EDGE)
+	// and its ordering/latency against the CannotComply episode matters more
+	// than sparing this pass's tick budget: the northbound service's Response
+	// POST depends on seeing Active=true promptly and exactly once per
+	// episode (see the "must NOT change" note on breach alert edge semantics
+	// in TASK-046's task file). A 5s worst case on a rare, already-alerted
+	// edge is an acceptable trade against reintroducing that stall on every
+	// tick's actuator publishes; 1s bounds even that rare case tighter than
+	// today's default did.
+	const complianceAlertTimeout = 1 * time.Second
 	emitAlerts := func(alerts []bus.ComplianceAlert) {
 		for i := range alerts {
 			alert := alerts[i]
@@ -323,7 +347,7 @@ func main() {
 			} else {
 				slog.Info("compliance breach cleared", "mrid", alert.MRID, "episode", alert.EpisodeID)
 			}
-			if err := mqttutil.PublishJSON(mc, bus.TopicCSIPComplianceAlert, alert); err != nil {
+			if err := mqttutil.PublishJSONTimeout(mc, bus.TopicCSIPComplianceAlert, false, alert, complianceAlertTimeout); err != nil {
 				log.Printf("lexa-hub: publish compliance alert: %v", err)
 			}
 		}
@@ -335,6 +359,24 @@ func main() {
 			breachActiveGauge.Set(0)
 		}
 	}
+
+	// planLogPending is the previous pass's plan-log publish, harvested at
+	// the top of the NEXT pass (TASK-046) — see the harvest call below.
+	// Owned entirely by planObserver, which the engine only ever calls from
+	// its single control goroutine (tick()/safetyTick()), so no lock is
+	// needed even though it is closed over here.
+	var planLogPending *mqttutil.PendingPub
+
+	// tickBudget is this task's Phase 4 exit-criterion threshold: half the
+	// economic engine interval. Exceeding it — measured as this pass's own
+	// synchronous work plus the PRIOR pass's actuator Apply* time, see
+	// tickTiming's doc in desired.go — increments lexa_hub_tick_overruns_total.
+	// 50% leaves headroom for the read/optimize/plan work internal/orchestrator
+	// does BEFORE calling PlanObserver (unmeasured here — that package stays
+	// I/O-free and unmodified, 05 §1) while still catching a publish path
+	// that has started eating meaningfully into the tick.
+	tickBudget := time.Duration(float64(cfg.EngineInterval()) * 0.5)
+
 	planObserver := func(plan orchestrator.Plan) {
 		// systemd watchdog keepalive (TASK-007). Must stay the first thing
 		// this closure does, before any publish: the engine calls
@@ -347,16 +389,32 @@ func main() {
 		// would defeat this entirely by staying alive after the loop dies.
 		watchdog.Kick()
 
-		// lexa_hub_tick_duration_seconds (TASK-044): this closure's own wall
-		// time, NOT the full tick — ReadSystemState/Optimize/executePlan run
-		// inside internal/orchestrator before PlanObserver is invoked, and
-		// that package stays I/O-free / unmodified (05 §1), so their timing
-		// isn't observable from here. This still captures a real synchronous
-		// cost of every tick (the retained TopicHubPlan publish below, plus
-		// the compliance-alert publish on a breach edge) as a proxy pending
-		// TASK-046's full-tick timing.
+		// lexa_hub_tick_duration_seconds / lexa_hub_tick_overruns_total
+		// (TASK-044/TASK-046): ownElapsed is this closure's own wall time —
+		// ReadSystemState/Optimize/executePlan run inside internal/orchestrator
+		// before PlanObserver is invoked, and that package stays I/O-free /
+		// unmodified (05 §1), so their timing isn't observable from here.
+		// actuatorElapsed is the PRIOR pass's total actuator Apply* time (this
+		// pass's own executePlan — which calls Apply* — hasn't run yet; see
+		// engine.go tick()/safetyTick() calling PlanObserver BEFORE
+		// executePlan). The reported total is therefore one pass lagged
+		// relative to a single contiguous measurement, which is unavoidable
+		// without touching internal/orchestrator; a sustained wedge still
+		// shows up within one extra pass, which an overrun COUNTER (as
+		// opposed to a hard deadline) can tolerate.
 		tickStart := time.Now()
-		defer func() { tickDurationGauge.Set(time.Since(tickStart).Seconds()) }()
+		defer func() {
+			ownElapsed := time.Since(tickStart)
+			actuatorElapsed := tickTime.takeReset()
+			total := ownElapsed + actuatorElapsed
+			tickDurationGauge.Set(total.Seconds())
+			if total > tickBudget {
+				tickOverrunsCtr.Inc()
+				slog.Warn("lexa-hub: tick budget exceeded",
+					"duration", total, "budget", tickBudget,
+					"own", ownElapsed, "actuator_prior_pass", actuatorElapsed)
+			}
+		}()
 
 		// TASK-032: the breach-triggered actuator dedupe reset (ledger L3) was
 		// deleted with cmdDeduper. A device that reverts while the commanded value
@@ -382,8 +440,29 @@ func main() {
 				Rule: dec.Rule, Reason: dec.Reason, Impact: dec.Impact,
 			})
 		}
-		if err := mqttutil.PublishJSONRetained(mc, bus.TopicHubPlan, pl); err != nil {
+		// TASK-046: async, harvested at the top of the NEXT pass — the plan
+		// log carries no dedupe baseline to roll back (it publishes
+		// unconditionally every pass, decisions or not), so a harvested
+		// failure/timeout is just logged: a dropped/late plan log is
+		// refreshed at most one pass later (retained topic, last write
+		// wins), which is already the observability contract ("the
+		// timestamp doubles as an engine heartbeat" above) — a single
+		// missed heartbeat, not a missed command.
+		if planLogPending != nil {
+			if done, timedOut, err := planLogPending.Harvest(mqttutil.PublishTimeout); done || timedOut {
+				switch {
+				case err != nil:
+					log.Printf("lexa-hub: publish plan log: %v (async)", err)
+				case timedOut:
+					log.Printf("lexa-hub: publish plan log: no ack after %s (async)", mqttutil.PublishTimeout)
+				}
+				planLogPending = nil
+			}
+		}
+		if pp, err := mqttutil.PublishJSONRetainedAsync(mc, bus.TopicHubPlan, pl); err != nil {
 			log.Printf("lexa-hub: publish plan log: %v", err)
+		} else {
+			planLogPending = pp
 		}
 
 		// Feed this plan's meter-level breach evidence to the episode component
@@ -473,15 +552,15 @@ func main() {
 	for _, dc := range cfg.Devices {
 		switch dc.Role {
 		case "battery":
-			eng.RegisterBatteryActuator(dc.Name, newDesiredPublishingBatteryActuator(mc, dc.Name, desiredPublishesTotalCtr, jw))
+			eng.RegisterBatteryActuator(dc.Name, newDesiredPublishingBatteryActuator(mc, dc.Name, desiredPublishesTotalCtr, desiredPublishFailuresCtr, tickTime, jw))
 		case "inverter":
-			eng.RegisterSolarActuator(dc.Name, newDesiredPublishingSolarActuator(mc, dc.Name, desiredPublishesTotalCtr, jw))
+			eng.RegisterSolarActuator(dc.Name, newDesiredPublishingSolarActuator(mc, dc.Name, desiredPublishesTotalCtr, desiredPublishFailuresCtr, tickTime, jw))
 		}
 	}
 
 	// Wire actuators for known EVSE stations (desired-doc publisher only).
 	for _, sc := range cfg.Stations {
-		eng.RegisterEVSEActuator(sc.ID, newDesiredPublishingEVSEActuator(mc, sc.ID, desiredPublishesTotalCtr, jw))
+		eng.RegisterEVSEActuator(sc.ID, newDesiredPublishingEVSEActuator(mc, sc.ID, desiredPublishesTotalCtr, desiredPublishFailuresCtr, tickTime, jw))
 	}
 
 	// TASK-044: start serving /metrics before eng.Start() so a scrape during

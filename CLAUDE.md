@@ -154,6 +154,42 @@ metrics implementation a caller wires in.
 A registered-but-zero counter is normal and expected for sources not yet wired
 (e.g. `lexa_hub_tick_overruns_total`, real source lands in TASK-046).
 
+### Async actuator publishes + tick budget (TASK-046)
+
+The tick path must never block on a PUBACK: `cmd/hub/desired.go`'s three
+`desiredPublishing*Actuator` types and `main.go`'s plan-log publish use
+`mqttutil.PublishJSON(Retained)Async`, which hands the message to paho and
+returns immediately (`*mqttutil.PendingPub`). Completion is checked later
+("harvested") — non-blocking, via `PendingPub.Harvest` — at the START of the
+NEXT call on the same actuator/publisher: a confirmed delivery leaves the
+optimistic state alone; a broker error or a harvest past
+`mqttutil.PublishTimeout` (5 s) rolls the actuator's dedupe baseline back to
+what it was before the publish was fired, so the identical content is
+retried on the next call — the same "late/dropped commands are harmless
+because they're re-issued" contract `mqttutil.publishTimeout`'s doc comment
+has always described, just discovered a call later instead of synchronously.
+Each actuator also does one FREE opportunistic harvest immediately after
+firing (Harvest never blocks) so an already-resolved ack/error is caught
+without waiting a whole extra tick. Per-device publish ORDER is preserved
+by paho (one client, one connection, calls serialized in call order) even
+when a second, content-different command is fired while an earlier one for
+the same device is still pending — see `desiredPublishingBatteryActuator`'s
+field docs for the "one-slot pending" reasoning.
+
+The ONE publish that stays fully synchronous is the compliance alert
+(`main.go`'s `emitAlerts`), via `mqttutil.PublishJSONTimeout` bounded at 1 s
+instead of the 5 s default: it is rare, edge-triggered, and its
+ordering/latency against the CannotComply episode matter more than sparing
+this pass's tick budget.
+
+Tick budget: `main.go`'s planObserver measures its own wall time plus the
+PRIOR pass's total actuator `Apply*Command` time (a shared `*tickTiming` in
+`desired.go`, since `PlanObserver` fires before `executePlan` — see
+engine.go — so this pass's actuator time isn't known until the next call;
+`internal/orchestrator` stays untouched, 05 §1). Exceeding 50% of the engine
+interval sets `lexa_hub_tick_overruns_total` (Phase 4 exit criterion: zero
+under the mqtt-broker-latency scenario in FAST mode) and logs edge-triggered.
+
 ## Logging & the plan heartbeat (TASK-045)
 
 All six services install a `log/slog` default (`internal/logutil.Setup`, first

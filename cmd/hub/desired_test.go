@@ -31,6 +31,14 @@ func (fakePublishToken) Error() error                   { return nil }
 type fakeHubMQTTClient struct {
 	publishes []fakeHubPublish
 	failNext  bool
+
+	// nextToken, when set, is returned by the NEXT Publish call instead of
+	// the failNext/fakePublishToken default, then cleared — lets a test hand
+	// back a controllable token (e.g. latentToken) for exactly one publish,
+	// to exercise the genuine "still in flight, resolved only by a LATER
+	// call's harvest" path (TASK-046), distinct from failNext's
+	// already-resolved failedToken.
+	nextToken mqtt.Token
 }
 
 type fakeHubPublish struct {
@@ -53,6 +61,11 @@ func (f *fakeHubMQTTClient) Publish(topic string, qos byte, retained bool, paylo
 		b = []byte(p)
 	}
 	f.publishes = append(f.publishes, fakeHubPublish{topic: topic, qos: qos, retained: retained, payload: b})
+	if f.nextToken != nil {
+		tok := f.nextToken
+		f.nextToken = nil
+		return tok
+	}
 	if f.failNext {
 		f.failNext = false
 		return &failedToken{}
@@ -73,13 +86,52 @@ func (f *fakeHubMQTTClient) OptionsReader() mqtt.ClientOptionsReader {
 	panic("not implemented")
 }
 
-// failedToken stands in for a publish that never got a PUBACK / errored.
+// failedToken stands in for a publish that already errored by the time the
+// caller checks (Done() closed immediately, Error() non-nil) — the
+// synchronous-failure fake the ORIGINAL (pre-TASK-046) tests used, still
+// useful for exercising the actuators' OPPORTUNISTIC immediate post-fire
+// check (see desired.go's ApplyBatteryCommand: firing calls harvestPending
+// once right away, cheaply, in case the ack — or, as here, the error — is
+// already sitting there; a genuinely in-flight publish just leaves it
+// pending for the next call, which is what latentToken below exercises).
 type failedToken struct{}
 
 func (failedToken) Wait() bool                     { return true }
 func (failedToken) WaitTimeout(time.Duration) bool { return true }
 func (failedToken) Done() <-chan struct{}          { c := make(chan struct{}); close(c); return c }
 func (failedToken) Error() error                   { return errors.New("no ack") }
+
+// latentToken is a mqtt.Token that stays incomplete until resolve is called
+// — standing in for a real broker round trip that hasn't come back yet, so a
+// test can drive the genuine "still pending now, harvested on some LATER
+// call" path (TASK-046) instead of failedToken's instantly-resolved one.
+// Not safe for concurrent use (matches every actuator's single-goroutine
+// assumption — see desiredPublishingBatteryActuator.pending's doc).
+type latentToken struct {
+	done chan struct{}
+	err  error
+}
+
+func newLatentToken() *latentToken { return &latentToken{done: make(chan struct{})} }
+
+func (t *latentToken) Wait() bool { <-t.done; return true }
+func (t *latentToken) WaitTimeout(d time.Duration) bool {
+	select {
+	case <-t.done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+func (t *latentToken) Done() <-chan struct{} { return t.done }
+func (t *latentToken) Error() error          { return t.err }
+
+// resolve completes t as if the broker had just responded (err == nil for a
+// PUBACK, non-nil for a broker-reported failure).
+func (t *latentToken) resolve(err error) {
+	t.err = err
+	close(t.done)
+}
 
 func ptr[T any](v T) *T { return &v }
 
@@ -91,7 +143,7 @@ func ptr[T any](v T) *T { return &v }
 // "retained").
 func TestDesiredPublishingBatteryActuator_ContentChangeDedupe(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, nil)
 
 	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
 	if err := a.ApplyBatteryCommand(cmd); err != nil {
@@ -125,7 +177,7 @@ func TestDesiredPublishingBatteryActuator_ContentChangeDedupe(t *testing.T) {
 // from "same opinion as last time".
 func TestDesiredPublishingBatteryActuator_LeaveUnchanged(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, nil)
 
 	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}); err != nil {
 		t.Fatal(err)
@@ -158,7 +210,7 @@ func TestDesiredPublishingBatteryActuator_LeaveUnchanged(t *testing.T) {
 // (reconcile's SeqReset path, covered in internal/reconcile's own tests).
 func TestDesiredPublishingBatteryActuator_SeqMonotonic(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, nil)
 
 	for i, w := range []float64{-100, -200, -300} {
 		if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: w, Connect: ptr(true)}); err != nil {
@@ -176,7 +228,7 @@ func TestDesiredPublishingBatteryActuator_SeqMonotonic(t *testing.T) {
 		}
 	}
 
-	fresh := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
+	fresh := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, nil)
 	if err := fresh.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -400, Connect: ptr(true)}); err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +245,7 @@ func TestDesiredPublishingBatteryActuator_SeqMonotonic(t *testing.T) {
 // retained and on the AD-013 topic lexa/desired/battery/{device}.
 func TestDesiredPublishingBatteryActuator_Retained(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, nil)
 
 	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}); err != nil {
 		t.Fatal(err)
@@ -214,16 +266,23 @@ func TestDesiredPublishingBatteryActuator_Retained(t *testing.T) {
 }
 
 // TestDesiredPublishingBatteryActuator_FailedPublishRetries verifies a failed
-// publish surfaces as the actuator error (the desired-doc publish IS the command
-// now, TASK-032) AND does not update the dedupe baseline, so the identical
-// content is retried on the very next tick.
+// publish does NOT update the dedupe baseline (TASK-046: the async harvest's
+// rollback reproduces the old synchronous contract), so the identical
+// content is retried on the very next call. It uses failedToken, which
+// resolves to an error IMMEDIATELY — this actuator's opportunistic
+// post-fire check (see harvestPending's doc) therefore catches the failure
+// within the SAME ApplyBatteryCommand call that fired it, which is why this
+// call returns nil rather than an error: with an async publish there is no
+// synchronous broker round trip left to surface as a return value at all
+// (the return is reserved for a marshal failure, see the doc on
+// ApplyBatteryCommand/harvestPending) — only what got harvested, when.
 func TestDesiredPublishingBatteryActuator_FailedPublishRetries(t *testing.T) {
 	mc := &fakeHubMQTTClient{failNext: true}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, nil)
 
 	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
-	if err := a.ApplyBatteryCommand(cmd); err == nil {
-		t.Fatal("a failed desired publish must surface as the actuator error")
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatalf("an async publish failure must never surface as a return error: %v", err)
 	}
 	if len(mc.publishes) != 1 {
 		t.Fatalf("got %d publish attempts, want 1", len(mc.publishes))
@@ -238,13 +297,139 @@ func TestDesiredPublishingBatteryActuator_FailedPublishRetries(t *testing.T) {
 	}
 }
 
+// TestDesiredPublishingBatteryActuator_PendingHarvestedNextCall_FailureRetries
+// is FailedPublishRetries's twin using latentToken instead of failedToken: the
+// publish stays genuinely IN FLIGHT (not yet resolved) across one whole extra
+// call — the real motivating scenario (a slow-but-alive broker) — before
+// resolving to a failure, exercising the "harvested at the START of the NEXT
+// call" path the opportunistic immediate check above never gets to touch.
+// This is also the mutation-test case from the task: comment out
+// harvestPending's rollback (`a.lastPublished = a.pendingPrev`) and this test
+// must fail, because the second identical-content call would then wrongly
+// dedupe-suppress instead of retrying.
+func TestDesiredPublishingBatteryActuator_PendingHarvestedNextCall_FailureRetries(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	lt := newLatentToken()
+	mc.nextToken = lt
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, nil)
+
+	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("got %d publishes, want 1", len(mc.publishes))
+	}
+
+	// Still pending: a repeat identical command must not publish again — the
+	// one-slot-pending rule suppresses a duplicate in-flight send for
+	// unchanged content (TASK-046).
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("got %d publishes while the first is still pending with identical content, want still 1 (no duplicate in-flight)", len(mc.publishes))
+	}
+
+	// The broker now reports failure. The NEXT call harvests it (this is the
+	// genuine one-tick-later path) and, since the intent is unchanged, retries.
+	lt.resolve(errors.New("no ack"))
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("got %d publishes after the pending publish resolved to a failure, want 2 (retry)", len(mc.publishes))
+	}
+}
+
+// TestDesiredPublishingBatteryActuator_DifferingCommandsPublishInOrderWhilePending
+// verifies TASK-046's ordering argument directly: a genuinely different
+// command must still publish even while an earlier one for the same device
+// is still pending (paho preserves per-client publish order regardless of
+// ack timing), and the two publishes must appear on the wire in call order.
+func TestDesiredPublishingBatteryActuator_DifferingCommandsPublishInOrderWhilePending(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	mc.nextToken = newLatentToken() // first publish never resolves during this test
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, nil)
+
+	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -100, Connect: ptr(true)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("got %d publishes, want 1", len(mc.publishes))
+	}
+
+	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -900, Connect: ptr(true)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("got %d publishes for a content-different command while the first is still pending, want 2", len(mc.publishes))
+	}
+
+	var first, second bus.DesiredState
+	if err := json.Unmarshal(mc.publishes[0].payload, &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(mc.publishes[1].payload, &second); err != nil {
+		t.Fatal(err)
+	}
+	if first.SetpointW == nil || *first.SetpointW != -100 {
+		t.Fatalf("first publish SetpointW = %v, want -100", first.SetpointW)
+	}
+	if second.SetpointW == nil || *second.SetpointW != -900 {
+		t.Fatalf("second publish SetpointW = %v, want -900 (order preserved)", second.SetpointW)
+	}
+}
+
+// TestTickTiming_AccumulatesAcrossActuators verifies the TASK-046 tick-budget
+// accumulator: every actuator kind's Apply call adds its own wall time into
+// the SAME shared *tickTiming, and takeReset both returns the total and
+// zeroes it for the next pass.
+func TestTickTiming_AccumulatesAcrossActuators(t *testing.T) {
+	tt := &tickTiming{}
+	mc := &fakeHubMQTTClient{}
+	batt := newDesiredPublishingBatteryActuator(mc, "b0", nil, nil, tt, nil)
+	sol := newDesiredPublishingSolarActuator(mc, "inv0", nil, nil, tt, nil)
+
+	if err := batt.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "b0", SetpointW: -100, Connect: ptr(true)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sol.ApplySolarCommand(orchestrator.SolarCommand{Name: "inv0", CurtailToW: 500}); err != nil {
+		t.Fatal(err)
+	}
+
+	total := tt.takeReset()
+	if total <= 0 {
+		t.Fatal("expected accumulated actuator time to be > 0 after two Apply calls")
+	}
+	if again := tt.takeReset(); again != 0 {
+		t.Fatalf("takeReset must zero the accumulator, got %s on the second read", again)
+	}
+}
+
+// TestTickTiming_OverrunDecision pins the arithmetic planObserver uses in
+// main.go to decide lexa_hub_tick_overruns_total (total > tickBudget):
+// tickTiming itself is unit-testable in isolation, but the counter increment
+// lives inline in main()'s planObserver closure and is exercised at the
+// bench gate (mqtt-broker-latency scenario, metric curl evidence) rather
+// than here.
+func TestTickTiming_OverrunDecision(t *testing.T) {
+	tt := &tickTiming{}
+	tt.add(2 * time.Second)
+	budget := 1 * time.Second
+	total := tt.takeReset()
+	if total <= budget {
+		t.Fatalf("2s accumulated against a 1s budget must count as an overrun, got total=%s budget=%s", total, budget)
+	}
+}
+
 // TestDesiredPublishingSolarActuator_RestoreIsExplicitCeiling is the core
 // TASK-029 mapping: restore (CurtailToW == NaN) must publish an EXPLICIT large
 // CeilingW (bus.RestoreCeilingW), never an absent field — the whole Mode-A/B
 // class exists because restore must be a positive opinion on the wire.
 func TestDesiredPublishingSolarActuator_RestoreIsExplicitCeiling(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil)
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil, nil, nil)
 
 	// A cap first, then restore.
 	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 3000}); err != nil {
@@ -277,13 +462,28 @@ func TestDesiredPublishingSolarActuator_RestoreIsExplicitCeiling(t *testing.T) {
 	}
 }
 
-// TestDesiredPublishingSolarActuator_FailedPublishError: a failed publish
-// surfaces as the actuator error (the desired-doc publish IS the command now).
-func TestDesiredPublishingSolarActuator_FailedPublishError(t *testing.T) {
+// TestDesiredPublishingSolarActuator_AsyncFailureRetries: a failed publish
+// (opportunistically caught the same call, see the battery twin's doc) never
+// surfaces as a return error (TASK-046: nothing left to synchronously
+// return), does not update the dedupe baseline, and is retried on the very
+// next call with identical content.
+func TestDesiredPublishingSolarActuator_AsyncFailureRetries(t *testing.T) {
 	mc := &fakeHubMQTTClient{failNext: true}
-	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil)
-	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 1000}); err == nil {
-		t.Fatal("a failed desired publish must surface as the actuator error")
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil, nil, nil)
+	cmd := orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 1000}
+
+	if err := a.ApplySolarCommand(cmd); err != nil {
+		t.Fatalf("an async publish failure must never surface as a return error: %v", err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("got %d publish attempts, want 1", len(mc.publishes))
+	}
+
+	if err := a.ApplySolarCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("got %d publish attempts after a failed first publish, want 2 (retry)", len(mc.publishes))
 	}
 }
 
@@ -291,7 +491,7 @@ func TestDesiredPublishingSolarActuator_FailedPublishError(t *testing.T) {
 // publishes once (the retained doc is standing intent, not a tick stream).
 func TestDesiredPublishingSolarActuator_ContentDedupe(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil)
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil, nil, nil)
 	for i := 0; i < 3; i++ {
 		if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 2000}); err != nil {
 			t.Fatal(err)
@@ -306,7 +506,7 @@ func TestDesiredPublishingSolarActuator_ContentDedupe(t *testing.T) {
 // ConnectorID ride into the doc; the topic is the station's evse desired topic.
 func TestDesiredPublishingEVSEActuator_Mapping(t *testing.T) {
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, nil)
+	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, nil, nil, nil)
 
 	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16}); err != nil {
 		t.Fatal(err)
@@ -371,7 +571,7 @@ func TestDesiredPublishingBatteryActuator_JournalsDispatchPostDedupeOnly(t *test
 	defer jw.Close()
 
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, jw)
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, jw)
 	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
 
 	if err := a.ApplyBatteryCommand(cmd); err != nil {
@@ -400,8 +600,13 @@ func TestDesiredPublishingBatteryActuator_JournalsDispatchPostDedupeOnly(t *test
 }
 
 // TestDesiredPublishingBatteryActuator_FailedPublishDoesNotJournal verifies a
-// publish that returns an error (the retained-doc publish IS the command,
-// TASK-032) never journals a dispatch — only a publish that actually took.
+// publish that the opportunistic post-fire check (harvestPending, called
+// from ApplyBatteryCommand right after firing — see its doc) immediately
+// finds failed never journals a dispatch — only a publish that, as far as
+// this actuator can tell by the time it returns, actually took. TASK-046:
+// the failure no longer surfaces as this call's return error (there is no
+// synchronous broker round trip left to report it through), so this asserts
+// nil error and zero journal entries instead of a non-nil error.
 func TestDesiredPublishingBatteryActuator_FailedPublishDoesNotJournal(t *testing.T) {
 	dir := t.TempDir()
 	jw, err := journal.Open(journal.Config{Dir: dir})
@@ -411,9 +616,9 @@ func TestDesiredPublishingBatteryActuator_FailedPublishDoesNotJournal(t *testing
 	defer jw.Close()
 
 	mc := &fakeHubMQTTClient{failNext: true}
-	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, jw)
-	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}); err == nil {
-		t.Fatal("expected the actuator to surface the failed publish as an error")
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, jw)
+	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}); err != nil {
+		t.Fatalf("an async publish failure must never surface as a return error: %v", err)
 	}
 	if err := jw.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
@@ -437,7 +642,7 @@ func TestDesiredPublishingSolarActuator_JournalsDispatch(t *testing.T) {
 	defer jw.Close()
 
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, jw)
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil, nil, jw)
 	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 3000}); err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +675,7 @@ func TestDesiredPublishingEVSEActuator_JournalsDispatch(t *testing.T) {
 	defer jw.Close()
 
 	mc := &fakeHubMQTTClient{}
-	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, jw)
+	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, nil, nil, jw)
 	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16}); err != nil {
 		t.Fatal(err)
 	}
