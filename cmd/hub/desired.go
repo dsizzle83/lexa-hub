@@ -13,14 +13,13 @@ import (
 	"lexa-hub/internal/orchestrator"
 )
 
-// desiredPublishingBatteryActuator wraps a BatteryActuator (TASK-027) so every
-// battery command ALSO republishes the standing intent as a retained
-// bus.DesiredState document on lexa/desired/battery/{device} (AD-013), for the
-// lexa-modbus shadow reconciler to consume. This is purely additive: the
-// legacy actuator is invoked FIRST, unchanged, and its return value is what
-// this type returns — the desired-doc publish can fail without altering the
-// legacy behavior or the caller-visible error, exactly as ledger L1–L4
-// require while the reconciler is still shadow-only (03 Phase 2).
+// desiredPublishingBatteryActuator is the battery actuator: every battery
+// command publishes the standing intent as a retained bus.DesiredState document
+// on lexa/desired/battery/{device} (AD-013), which the lexa-modbus reconciler
+// consumes as the authoritative desired state. TASK-032 deleted the legacy
+// lexa/control/battery command path; this desired-doc publisher is now the ONLY
+// battery actuator implementation (it no longer wraps a legacy publisher), and a
+// failed publish surfaces as the actuator's error so the engine logs it.
 //
 // Source/MRID: BatteryCommand carries neither today (internal/orchestrator's
 // SystemState is where the active CSIP control's mRID lives — optimizer.go's
@@ -31,7 +30,6 @@ import (
 // TASK-031 (CannotComply attribution end-to-end) is the follow-up that wires
 // the real mRID through.
 type desiredPublishingBatteryActuator struct {
-	inner  orchestrator.BatteryActuator
 	mc     mqtt.Client
 	device string
 
@@ -57,19 +55,17 @@ type desiredPublishingBatteryActuator struct {
 	publishes *metrics.Counter
 }
 
-// newDesiredPublishingBatteryActuator builds the wrapper around inner (the
-// legacy MQTTBatteryActuator) for device.
-func newDesiredPublishingBatteryActuator(inner orchestrator.BatteryActuator, mc mqtt.Client, device string, publishes *metrics.Counter) *desiredPublishingBatteryActuator {
-	return &desiredPublishingBatteryActuator{inner: inner, mc: mc, device: device, publishes: publishes}
+// newDesiredPublishingBatteryActuator builds the battery actuator for device.
+func newDesiredPublishingBatteryActuator(mc mqtt.Client, device string, publishes *metrics.Counter) *desiredPublishingBatteryActuator {
+	return &desiredPublishingBatteryActuator{mc: mc, device: device, publishes: publishes}
 }
 
-// ApplyBatteryCommand delegates to the legacy actuator first (unchanged path,
-// unchanged return value), then — only when the resulting standing intent's
-// content differs from the last published doc — publishes a retained
-// bus.DesiredState.
+// ApplyBatteryCommand folds the command into the standing intent, then — only
+// when that intent's content differs from the last published doc — publishes a
+// retained bus.DesiredState. A failed publish is returned as the actuator error
+// (the publish IS the command now) and leaves the dedupe baseline untouched so
+// the identical content is retried on the next tick.
 func (a *desiredPublishingBatteryActuator) ApplyBatteryCommand(cmd orchestrator.BatteryCommand) error {
-	err := a.inner.ApplyBatteryCommand(cmd)
-
 	if !math.IsNaN(cmd.SetpointW) {
 		a.setpointW = cmd.SetpointW
 		a.haveSetpoint = true
@@ -95,7 +91,7 @@ func (a *desiredPublishingBatteryActuator) ApplyBatteryCommand(cmd orchestrator.
 	}
 
 	if desiredContentEqual(a.lastPublished, doc) {
-		return err
+		return nil
 	}
 
 	now := time.Now()
@@ -105,15 +101,14 @@ func (a *desiredPublishingBatteryActuator) ApplyBatteryCommand(cmd orchestrator.
 	if pubErr := mqttutil.PublishJSONRetained(a.mc, bus.DesiredTopic(bus.DesiredClassBattery, a.device), doc); pubErr != nil {
 		log.Printf("lexa-hub: publish desired battery %s: %v", a.device, pubErr)
 		// Not delivered: leave lastPublished/seq alone so the identical
-		// content is retried on the next tick, mirroring cmdDeduper's own
-		// "not delivered; retry next tick" convention in actuators.go.
-		return err
+		// content is retried on the next tick.
+		return pubErr
 	}
 	stored := doc
 	a.lastPublished = &stored
 	a.seq++
 	a.publishes.Inc()
-	return err
+	return nil
 }
 
 // desiredContentEqual reports whether cand's opinion content matches last's —
@@ -135,13 +130,13 @@ func desiredContentEqual(last *bus.DesiredState, cand bus.DesiredState) bool {
 		boolPtrEqual(last.Connect, cand.Connect)
 }
 
-// desiredPublishingSolarActuator wraps a SolarActuator (TASK-029) so every
-// solar command ALSO republishes the standing curtailment intent as a retained
-// bus.DesiredState document on lexa/desired/solar/{device} (AD-013), for the
-// lexa-modbus solar reconciler to consume. Purely additive, exactly like the
-// battery wrapper: the legacy actuator is invoked FIRST, unchanged, and its
-// return value is what this type returns — the desired-doc publish can fail
-// without altering the legacy behavior.
+// desiredPublishingSolarActuator is the solar actuator: every solar command
+// publishes the standing curtailment intent as a retained bus.DesiredState
+// document on lexa/desired/solar/{device} (AD-013), which the lexa-modbus solar
+// reconciler consumes as the authoritative desired state. TASK-032 deleted the
+// legacy lexa/control/solar command path; this desired-doc publisher is now the
+// ONLY solar actuator implementation, and a failed publish surfaces as the
+// actuator's error.
 //
 // The critical solar-specific mapping (ledger L1/L7): restore is a WRITE, not an
 // absence. orchestrator.SolarCommand encodes restore as CurtailToW == NaN; this
@@ -154,7 +149,6 @@ func desiredContentEqual(last *bus.DesiredState, cand bus.DesiredState) bool {
 // the inverter was dark, reproducing the solarCapActive dark-inverter gate
 // without a publisher equivalent).
 type desiredPublishingSolarActuator struct {
-	inner  orchestrator.SolarActuator
 	mc     mqtt.Client
 	device string
 
@@ -163,20 +157,16 @@ type desiredPublishingSolarActuator struct {
 	publishes     *metrics.Counter
 }
 
-func newDesiredPublishingSolarActuator(inner orchestrator.SolarActuator, mc mqtt.Client, device string, publishes *metrics.Counter) *desiredPublishingSolarActuator {
-	return &desiredPublishingSolarActuator{inner: inner, mc: mc, device: device, publishes: publishes}
+func newDesiredPublishingSolarActuator(mc mqtt.Client, device string, publishes *metrics.Counter) *desiredPublishingSolarActuator {
+	return &desiredPublishingSolarActuator{mc: mc, device: device, publishes: publishes}
 }
 
-// ApplySolarCommand delegates to the legacy actuator first (unchanged path,
-// unchanged return value), then — only when the derived ceiling differs from
-// the last published doc — publishes a retained bus.DesiredState carrying an
-// explicit CeilingW. Unlike the battery wrapper there is no "carry the last
-// value forward" bookkeeping: a SolarCommand always expresses a full ceiling
-// opinion (NaN CurtailToW is restore, a real value is the cap), so every call
-// yields a complete CeilingW.
+// ApplySolarCommand publishes — only when the derived ceiling differs from the
+// last published doc — a retained bus.DesiredState carrying an explicit
+// CeilingW. A SolarCommand always expresses a full ceiling opinion (NaN
+// CurtailToW is restore, a real value is the cap), so every call yields a
+// complete CeilingW. A failed publish surfaces as the actuator error.
 func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.SolarCommand) error {
-	err := a.inner.ApplySolarCommand(cmd)
-
 	ceiling := bus.RestoreCeilingW // NaN CurtailToW ⇒ restore is an explicit large ceiling
 	if !math.IsNaN(cmd.CurtailToW) {
 		ceiling = math.Max(0, cmd.CurtailToW)
@@ -191,7 +181,7 @@ func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.Sola
 	}
 
 	if desiredContentEqual(a.lastPublished, doc) {
-		return err
+		return nil
 	}
 
 	now := time.Now()
@@ -200,19 +190,21 @@ func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.Sola
 
 	if pubErr := mqttutil.PublishJSONRetained(a.mc, bus.DesiredTopic(bus.DesiredClassSolar, a.device), doc); pubErr != nil {
 		log.Printf("lexa-hub: publish desired solar %s: %v", a.device, pubErr)
-		return err
+		return pubErr
 	}
 	stored := doc
 	a.lastPublished = &stored
 	a.seq++
 	a.publishes.Inc()
-	return err
+	return nil
 }
 
-// desiredPublishingEVSEActuator wraps an EVSEActuator (TASK-030) so every EVSE
-// command ALSO republishes the standing current-limit intent as a retained
-// bus.DesiredState document on lexa/desired/evse/{station} (AD-013), for the
-// lexa-ocpp reconciler to consume. Additive, same pattern.
+// desiredPublishingEVSEActuator is the EVSE actuator: every EVSE command
+// publishes the standing current-limit intent as a retained bus.DesiredState
+// document on lexa/desired/evse/{station} (AD-013), which the lexa-ocpp
+// reconciler consumes as the authoritative desired state. TASK-032 deleted the
+// legacy lexa/evse/{station}/command path; this is now the ONLY EVSE actuator
+// implementation, and a failed publish surfaces as the actuator's error.
 //
 // orchestrator.EVSECommand.MaxCurrentA == 0 is an explicit suspend (not "no
 // opinion"), so it is published as MaxCurrentA == &0 — the reconciler maps that
@@ -221,7 +213,6 @@ func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.Sola
 // reserved for future disconnect semantics and always published true (TASK-030
 // blast-radius note: connect=false is a follow-up, not this task).
 type desiredPublishingEVSEActuator struct {
-	inner     orchestrator.EVSEActuator
 	mc        mqtt.Client
 	stationID string
 
@@ -230,15 +221,13 @@ type desiredPublishingEVSEActuator struct {
 	publishes     *metrics.Counter
 }
 
-func newDesiredPublishingEVSEActuator(inner orchestrator.EVSEActuator, mc mqtt.Client, stationID string, publishes *metrics.Counter) *desiredPublishingEVSEActuator {
-	return &desiredPublishingEVSEActuator{inner: inner, mc: mc, stationID: stationID, publishes: publishes}
+func newDesiredPublishingEVSEActuator(mc mqtt.Client, stationID string, publishes *metrics.Counter) *desiredPublishingEVSEActuator {
+	return &desiredPublishingEVSEActuator{mc: mc, stationID: stationID, publishes: publishes}
 }
 
-// ApplyEVSECommand delegates to the legacy actuator first, then publishes a
-// retained desired doc when the current-limit intent's content changes.
+// ApplyEVSECommand publishes a retained desired doc when the current-limit
+// intent's content changes. A failed publish surfaces as the actuator error.
 func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECommand) error {
-	err := a.inner.ApplyEVSECommand(cmd)
-
 	maxA := cmd.MaxCurrentA
 	connect := true
 	doc := bus.DesiredState{
@@ -252,7 +241,7 @@ func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECo
 	}
 
 	if desiredContentEqual(a.lastPublished, doc) {
-		return err
+		return nil
 	}
 
 	now := time.Now()
@@ -261,13 +250,13 @@ func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECo
 
 	if pubErr := mqttutil.PublishJSONRetained(a.mc, bus.DesiredTopic(bus.DesiredClassEVSE, a.stationID), doc); pubErr != nil {
 		log.Printf("lexa-hub: publish desired evse %s: %v", a.stationID, pubErr)
-		return err
+		return pubErr
 	}
 	stored := doc
 	a.lastPublished = &stored
 	a.seq++
 	a.publishes.Inc()
-	return err
+	return nil
 }
 
 func floatPtrEqual(a, b *float64) bool {

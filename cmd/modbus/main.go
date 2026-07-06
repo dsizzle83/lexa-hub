@@ -3,8 +3,10 @@
 // Northbound (MQTT):
 //   - Publishes lexa/measurements/{device} on every poll.
 //   - Publishes lexa/battery/{device}/metrics for battery-role devices.
-//   - Subscribes lexa/control/battery/{device} and applies battery setpoints.
-//   - Subscribes lexa/control/solar/{device} and applies solar curtailment.
+//   - Subscribes lexa/desired/{battery,solar}/{device}: the device reconciler
+//     executes the retained desired-state doc (AD-013). TASK-032 deleted the
+//     legacy lexa/control/* command subscriptions; the reconciler is now the
+//     sole write path (config must set reconciler battery/solar = "active").
 //
 // Southbound (Modbus):
 //   - Supports roles: "inverter" (SunSpec model 103), "battery" (model 802),
@@ -240,9 +242,6 @@ func main() {
 		}
 	}
 
-	// Subscribe to control topics before starting the poll loop.
-	subscribeControls(mc, cfg, reg, interlock, battShells, solarShells, batteryActive, solarActive)
-
 	// Subscribe to the registry and fan out to MQTT.
 	updates, unsub := reg.Subscribe()
 	defer unsub()
@@ -370,99 +369,6 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 				log.Printf("lexa-modbus: publish battery metrics %s: %v", upd.Name, err)
 			}
 		}
-	}
-}
-
-// subscribeControls sets up MQTT subscriptions for battery and solar commands.
-// batteryActive gates the legacy battery write path: when the battery
-// reconciler is active it OWNS hardware writes, so legacy battery commands keep
-// flowing (belt and braces for instant rollback) but are ignored on hardware —
-// no interlock.noteControl (intent is fed from the desired doc the reconciler
-// executes), no apply. The solar path is unaffected by battery mode.
-func subscribeControls(mc mqtt.Client, cfg *Config, reg *registry.Registry, interlock *batterySafetyInterlock, battShells map[string]*batteryShell, solarShells map[string]*solarShell, batteryActive, solarActive bool) {
-	// Build a map from device name → role for quick lookup.
-	roleOf := map[string]string{}
-	for _, dc := range cfg.Devices {
-		roleOf[dc.Name] = dc.Role
-	}
-
-	// last-ignored command signature per device, so an ignored legacy command is
-	// logged once per CHANGE (not once per redelivery) — guarded because the
-	// MQTT callback may fire for different devices concurrently.
-	var ignoreMu sync.Mutex
-	lastIgnored := map[string]string{}
-
-	if err := mqttutil.Subscribe(mc, bus.SubCtrlBattery, func(topic string, cmd bus.BattCommand) {
-		dev := bus.DeviceFromCtrlBatteryTopic(topic)
-		if roleOf[dev] != "battery" {
-			return
-		}
-		if batteryActive {
-			// Reconciler owns battery writes: ignore the legacy command on
-			// hardware but record that the belt-and-braces stream still arrives
-			// (log once per change).
-			sig := describeControl(battCommandToControl(cmd))
-			ignoreMu.Lock()
-			changed := lastIgnored[dev] != sig
-			if changed {
-				lastIgnored[dev] = sig
-			}
-			ignoreMu.Unlock()
-			if changed {
-				log.Printf("lexa-modbus: legacy battery command ignored (reconciler active) %s: %s", dev, sig)
-			}
-			return
-		}
-		// Record the hub's intent for the Tier-0 interlock before applying.
-		interlock.noteControl(dev, cmd)
-		ctrl := battCommandToControl(cmd)
-		if err := reg.ApplyControlTo(dev, ctrl); err != nil {
-			log.Printf("lexa-modbus: apply battery control %s: %v", dev, err)
-		} else {
-			log.Printf("lexa-modbus: battery %s control applied", dev)
-			// TASK-027: tell the shadow what the LEGACY path actually wrote,
-			// so its verdict line can compare against it. Recorder only.
-			if s, ok := battShells[dev]; ok {
-				s.observeLegacyWrite(ctrl)
-			}
-		}
-	}); err != nil {
-		log.Printf("lexa-modbus: subscribe battery control: %v", err)
-	}
-
-	if err := mqttutil.Subscribe(mc, bus.SubCtrlSolar, func(topic string, cmd bus.SolarCommand) {
-		dev := bus.DeviceFromCtrlSolarTopic(topic)
-		if roleOf[dev] != "inverter" {
-			return
-		}
-		ctrl := solarCommandToControl(cmd)
-		if solarActive {
-			// TASK-029: the solar reconciler owns inverter writes. Keep the
-			// legacy stream flowing (belt and braces for instant rollback) but
-			// ignore it on hardware; log once per change.
-			sig := describeControl(ctrl)
-			ignoreMu.Lock()
-			changed := lastIgnored[dev] != sig
-			if changed {
-				lastIgnored[dev] = sig
-			}
-			ignoreMu.Unlock()
-			if changed {
-				log.Printf("lexa-modbus: legacy solar command ignored (reconciler active) %s: %s", dev, sig)
-			}
-			return
-		}
-		if err := reg.ApplyControlTo(dev, ctrl); err != nil {
-			log.Printf("lexa-modbus: apply solar control %s: %v", dev, err)
-		} else {
-			log.Printf("lexa-modbus: solar %s control applied", dev)
-			// TASK-029: tell the shadow what the legacy path actually wrote.
-			if s, ok := solarShells[dev]; ok {
-				s.observeLegacyWrite(ctrl)
-			}
-		}
-	}); err != nil {
-		log.Printf("lexa-modbus: subscribe solar control: %v", err)
 	}
 }
 

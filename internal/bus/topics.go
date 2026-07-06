@@ -12,9 +12,7 @@
 //	lexa/csip/flowreservation/request         hub          → northbound (QoS 1)
 //	lexa/northbound/schedule                  northbound   → hub (retained)
 //	lexa/evse/{station}/state                 ocpp         → hub
-//	lexa/control/battery/{device}             hub          → modbus
-//	lexa/control/solar/{device}               hub          → modbus
-//	lexa/evse/{station}/command               hub          → ocpp
+//	lexa/desired/{class}/{device}             hub          → modbus/ocpp (retained, AD-013)
 //	lexa/hub/plan                             hub          → api (retained)
 //	lexa/reconcile/{class}/{device}/report    modbus/ocpp  → hub (retained, TASK-031)
 //
@@ -180,14 +178,26 @@ func EVSEStateTopic(stationID string) string {
 	return fmt.Sprintf("lexa/evse/%s/state", stationID)
 }
 
+// Deprecated: TASK-032 deleted the legacy command path — no producer or
+// consumer remains for lexa/evse/{station}/command; the EVSE reconciler
+// executes the retained lexa/desired/evse/{station} doc instead. Kept one
+// release for external tooling; slated for removal (backlog).
 func EVSECommandTopic(stationID string) string {
 	return fmt.Sprintf("lexa/evse/%s/command", stationID)
 }
 
+// Deprecated: TASK-032 deleted the legacy command path — no producer or
+// consumer remains for lexa/control/battery/{device}; the battery reconciler
+// executes the retained lexa/desired/battery/{device} doc instead. Kept one
+// release for external tooling; slated for removal (backlog).
 func CtrlBatteryTopic(device string) string {
 	return fmt.Sprintf("lexa/control/battery/%s", device)
 }
 
+// Deprecated: TASK-032 deleted the legacy command path — no producer or
+// consumer remains for lexa/control/solar/{device}; the solar reconciler
+// executes the retained lexa/desired/solar/{device} doc instead. Kept one
+// release for external tooling; slated for removal (backlog).
 func CtrlSolarTopic(device string) string {
 	return fmt.Sprintf("lexa/control/solar/%s", device)
 }
@@ -217,9 +227,12 @@ const (
 	SubMeasurements = "lexa/measurements/+"
 	SubBattMetrics  = "lexa/battery/+/metrics"
 	SubEVSEState    = "lexa/evse/+/state"
-	SubEVSECommand  = "lexa/evse/+/command"
-	SubCtrlBattery  = "lexa/control/battery/+"
-	SubCtrlSolar    = "lexa/control/solar/+"
+	// Deprecated (TASK-032): the legacy command subscriptions were deleted from
+	// lexa-modbus/lexa-ocpp; nothing subscribes these anymore. Kept one release
+	// for external tooling; slated for removal (backlog).
+	SubEVSECommand = "lexa/evse/+/command"
+	SubCtrlBattery = "lexa/control/battery/+"
+	SubCtrlSolar   = "lexa/control/solar/+"
 	// SubDesired matches every retained desired-state document across all
 	// device classes (AD-013). The reconciler (TASK-026) subscribes this.
 	SubDesired = "lexa/desired/+/+"

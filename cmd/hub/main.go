@@ -17,9 +17,13 @@
 //	                      DailyPlanner.Plan (24h DP, every 15 min)
 //	                      + Optimizer.Optimize (reactive rules, every 15 s)
 //	                                      ↓
-//	lexa/control/battery/+    ← MQTTBatteryActuator
-//	lexa/control/solar/+      ← MQTTSolarActuator
-//	lexa/evse/+/command       ← MQTTEVSEActuator
+//	lexa/desired/battery/+    ← desiredPublishingBatteryActuator (reconciler)
+//	lexa/desired/solar/+      ← desiredPublishingSolarActuator (reconciler)
+//	lexa/desired/evse/+       ← desiredPublishingEVSEActuator (reconciler)
+//
+// The retained desired-state documents (AD-013) are the authoritative command
+// path; the legacy lexa/control/* and lexa/evse/+/command topics were deleted in
+// TASK-032 once every device class ran on its reconciler.
 //
 // Usage:
 //
@@ -84,7 +88,11 @@ func main() {
 	tickDurationGauge := reg.Gauge("lexa_hub_tick_duration_seconds")
 	breachActiveGauge := reg.Gauge("lexa_hub_breach_active")
 	breachesTotalCtr := reg.Counter("lexa_hub_breaches_total")
-	dispatchesTotalCtr := reg.Counter("lexa_hub_dispatches_total")
+	// lexa_hub_dispatches_total counted the legacy lexa/control/* command
+	// publishes, which TASK-032 deleted. Kept registered-but-zero (like
+	// lexa_hub_tick_overruns_total) so the scrape surface is stable;
+	// lexa_hub_desired_publishes_total is now the live command-dispatch counter.
+	reg.Counter("lexa_hub_dispatches_total")
 	// desiredPublishesTotalCtr (TASK-027): retained lexa/desired/battery/{device}
 	// publishes actually sent by desiredPublishingBatteryActuator (content-change
 	// gated, not per-tick — see its doc).
@@ -304,40 +312,23 @@ func main() {
 		log.Printf("lexa-hub: subscribe reconcile reports: %v", err)
 	}
 
-	// Wire MQTT actuators for each device.
+	// Wire actuators for each device. TASK-032: the retained desired-doc
+	// publisher is the ONLY actuator implementation — the legacy lexa/control/*
+	// command path (and its cmdDeduper) was deleted once every class ran on its
+	// reconciler. Each command publishes a retained bus.DesiredState the
+	// lexa-modbus/lexa-ocpp reconcilers execute.
 	for _, dc := range cfg.Devices {
 		switch dc.Role {
 		case "battery":
-			a := &MQTTBatteryActuator{mc: mc, device: dc.Name, dispatches: dispatchesTotalCtr}
-			dedupeResets = append(dedupeResets, a.dedupe.reset)
-			// TASK-027: wrap (don't replace) the legacy actuator so every
-			// battery command additionally republishes the standing intent
-			// as a retained desired doc for the lexa-modbus shadow
-			// reconciler. dedupeResets stays wired to the LEGACY actuator's
-			// deduper above — unchanged breach-reset behavior (ledger L3).
-			wrapped := newDesiredPublishingBatteryActuator(a, mc, dc.Name, desiredPublishesTotalCtr)
-			eng.RegisterBatteryActuator(dc.Name, wrapped)
+			eng.RegisterBatteryActuator(dc.Name, newDesiredPublishingBatteryActuator(mc, dc.Name, desiredPublishesTotalCtr))
 		case "inverter":
-			a := &MQTTSolarActuator{mc: mc, device: dc.Name, dispatches: dispatchesTotalCtr}
-			dedupeResets = append(dedupeResets, a.dedupe.reset)
-			// TASK-029: wrap (don't replace) the legacy solar actuator so every
-			// curtailment/restore ALSO republishes an explicit-ceiling retained
-			// desired doc for the lexa-modbus solar reconciler. dedupeResets
-			// stays wired to the LEGACY actuator's deduper — unchanged
-			// breach-reset behavior (ledger L3).
-			wrapped := newDesiredPublishingSolarActuator(a, mc, dc.Name, desiredPublishesTotalCtr)
-			eng.RegisterSolarActuator(dc.Name, wrapped)
+			eng.RegisterSolarActuator(dc.Name, newDesiredPublishingSolarActuator(mc, dc.Name, desiredPublishesTotalCtr))
 		}
 	}
 
-	// Wire MQTT actuators for known EVSE stations.
+	// Wire actuators for known EVSE stations (desired-doc publisher only).
 	for _, sc := range cfg.Stations {
-		a := &MQTTEVSEActuator{mc: mc, stationID: sc.ID, dispatches: dispatchesTotalCtr}
-		dedupeResets = append(dedupeResets, a.dedupe.reset)
-		// TASK-030: wrap the legacy EVSE actuator so every current-limit command
-		// ALSO republishes a retained desired doc for the lexa-ocpp reconciler.
-		wrapped := newDesiredPublishingEVSEActuator(a, mc, sc.ID, desiredPublishesTotalCtr)
-		eng.RegisterEVSEActuator(sc.ID, wrapped)
+		eng.RegisterEVSEActuator(sc.ID, newDesiredPublishingEVSEActuator(mc, sc.ID, desiredPublishesTotalCtr))
 	}
 
 	// TASK-044: start serving /metrics before eng.Start() so a scrape during

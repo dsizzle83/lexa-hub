@@ -7,7 +7,10 @@
 //
 // MQTT southbound (subscribes):
 //
-//	lexa/evse/{station}/command — EVSECommand to set charging current limit
+//	lexa/desired/evse/{station} — retained AD-013 desired-state doc the EVSE
+//	    reconciler executes (SetChargingProfile). TASK-032 deleted the legacy
+//	    lexa/evse/{station}/command subscription; config must set reconciler
+//	    = "active".
 //
 // Usage:
 //
@@ -149,35 +152,9 @@ func main() {
 		log.Printf("lexa-ocpp: EVSE reconciler %s mode for %d station(s)", evseMode, len(shells))
 	}
 
-	// Subscribe to EVSE command topic from the hub (orchestrator). When the
-	// reconciler is active it OWNS SetChargingProfile: keep the legacy stream
-	// flowing but ignore it on OCPP (log once per change); in shadow mode record
-	// what legacy applied for the reconciler's verdict line.
-	var ignoreMu sync.Mutex
-	lastIgnored := map[string]string{}
-	if err := mqttutil.Subscribe(mc, bus.SubEVSECommand, func(topic string, cmd bus.EVSECommand) {
-		if evseActive {
-			sig := fmt.Sprintf("%d|%g", cmd.ConnectorID, cmd.MaxCurrentA)
-			ignoreMu.Lock()
-			changed := lastIgnored[cmd.StationID] != sig
-			if changed {
-				lastIgnored[cmd.StationID] = sig
-			}
-			ignoreMu.Unlock()
-			if changed {
-				log.Printf("lexa-ocpp: legacy EVSE command ignored (reconciler active) %s: MaxCurrentA=%g", cmd.StationID, cmd.MaxCurrentA)
-			}
-			return
-		}
-		if sh, ok := bridge.shells[cmd.StationID]; ok {
-			sh.observeLegacyCommand(cmd.MaxCurrentA)
-		}
-		if err := bridge.applyCommand(cmd); err != nil {
-			log.Printf("lexa-ocpp: apply command %s: %v", cmd.StationID, err)
-		}
-	}); err != nil {
-		log.Printf("lexa-ocpp: subscribe evse command: %v", err)
-	}
+	// TASK-032: the legacy lexa/evse/{station}/command subscription was deleted.
+	// The EVSE reconciler (above) owns SetChargingProfile via the retained
+	// lexa/desired/evse/{station} doc, so config must set reconciler = "active".
 
 	metrics.Serve(cfg.MetricsAddr, reg)
 
@@ -433,13 +410,6 @@ func (b *mqttBridge) observeShell(stationID string, currentA, maxA float64, conn
 		return
 	}
 	sh.observe(currentA, !implausibleCurrent(currentA, maxA), connected, time.Now())
-}
-
-// applyCommand is the LEGACY EVSE command path: it delegates to the shared
-// profile driver so both the legacy subscription and the TASK-030 reconciler
-// send byte-identical SetChargingProfile calls (including L11 rejected-as-error).
-func (b *mqttBridge) applyCommand(cmd bus.EVSECommand) error {
-	return b.Apply(cmd.StationID, cmd.ConnectorID, cmd.MaxCurrentA)
 }
 
 // Apply implements profileDriver (TASK-030): send a TxDefaultProfile capping the
