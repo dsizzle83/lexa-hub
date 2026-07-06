@@ -129,9 +129,9 @@ func main() {
 	// hardware writes — see reconcile_shell.go's grep-proof no-write-path claim
 	// for shadow mode). ACTIVE gives the reconciler write authority through the
 	// SAME registry path legacy used, with Tier-0 interlock seniority, and makes
-	// the reconciler the single reasserter-on-reconnect (retryDevice's lastCtrl
-	// reassert suppressed for the device). Legacy battery commands keep flowing
-	// either way (belt and braces for instant rollback).
+	// the reconciler the single reasserter-on-reconnect (via retryDevice's
+	// onReconnect hook; the transport-side lastCtrl reassert was deleted in
+	// TASK-032).
 	var battShells map[string]*batteryShell
 	battMode := cfg.ReconcilerMode("battery")
 	batteryActive := battMode == ReconcilerActive
@@ -162,12 +162,11 @@ func main() {
 				shell.pub = newReconcileReportPublisher(mc)
 			}
 			battShells[dc.Name] = shell
-			// Active: route reconnects to the reconciler (the SINGLE reasserter)
-			// and suppress retryDevice's own lastCtrl reassert for this device —
-			// avoiding the double-write race the task warns of (ledger L4).
+			// Active: route reconnects to the reconciler — the SINGLE
+			// reasserter-on-reconnect (ledger L4; the transport-side lastCtrl
+			// reassert was deleted in TASK-032).
 			if mode == modeActive {
 				if rd := retryDevices[dc.Name]; rd != nil {
-					rd.reconciledActive = true
 					rd.onReconnect = shell.markReconnected
 				}
 			}
@@ -179,11 +178,10 @@ func main() {
 	// TASK-029: one solarShell per inverter-role device when the solar
 	// reconciler is shadow or active. Shadow is a recorder; active gives the
 	// reconciler write authority through the SAME registry path legacy solar
-	// used, makes it the single reasserter-on-reconnect (retryDevice's
-	// reassertLocked inverter branch suppressed via reconciledActive), and seeds
-	// each inverter's initial standing desired to the restore ceiling
-	// (Background case 3 — never both the seed and reassertLocked). Legacy solar
-	// commands keep flowing either way (belt and braces).
+	// used, makes it the single reasserter-on-reconnect (via retryDevice's
+	// onReconnect hook), and seeds each inverter's initial standing desired to
+	// the restore ceiling — the never-commanded stale-ceiling clear the deleted
+	// reassertLocked used to do (TASK-032).
 	var solarShells map[string]*solarShell
 	solarMode := cfg.ReconcilerMode("solar")
 	solarActive := solarMode == ReconcilerActive
@@ -208,12 +206,10 @@ func main() {
 			}
 			solarShells[dc.Name] = shell
 			if mode == modeActive {
-				// Single reasserter: the shell's Reconnected() replaces
-				// reassertLocked's inverter branch, and the seed replaces its
-				// never-commanded stale-ceiling clear. Suppress reassertLocked
-				// for this device and route reconnects to the shell.
+				// Single reasserter: the shell's Reconnected() (via onReconnect)
+				// replaces the deleted reassertLocked inverter branch, and the
+				// seed replaces its never-commanded stale-ceiling clear.
 				if rd := retryDevices[dc.Name]; rd != nil {
-					rd.reconciledActive = true
 					rd.onReconnect = shell.markReconnected
 				}
 				shell.seedRestoreCeiling(now)
@@ -473,29 +469,13 @@ type retryDevice struct {
 	mu   sync.Mutex
 	live device.Device
 
-	// lastCtrl is the most recent control the orchestrator commanded for this
-	// device — recorded even while disconnected (the DESIRED state, not the
-	// delivered one). On reconnect it is re-asserted so a device that was dark
-	// through a control transition converges to what the hub currently wants
-	// instead of keeping whatever it latched before the drop (Phase 4; QA
-	// 2026-07-02: release-while-rebooting — a cap released while the inverter
-	// was rebooting left it clamped at the stale ceiling indefinitely).
-	//
-	// TASK-028: for an active-reconciled device, lastCtrl is NOT recorded and
-	// its reconnect reassert is NOT fired — the reconciler is the single
-	// reasserter (double-write races otherwise), signalled via onReconnect. The
-	// never-commanded-inverter branch of reassertLocked stays intact for solar.
-	lastCtrl *model.DERControlBase
-
-	// reconciledActive marks a device whose writes are owned by the active
-	// battery reconciler: suppresses lastCtrl recording/reassert (above) and
-	// enables the onReconnect signal below.
-	reconciledActive bool
-	// onReconnect, when set (active-reconciled devices only), is invoked after a
-	// successful reopen so the reconciler reasserts the standing desired (ledger
-	// L4). It MUST NOT take any lock the apply path holds — it runs under r.mu,
-	// and the reconciler's apply path is mu → registry → r.mu; the shell's
-	// markReconnected only does an atomic store, satisfying that.
+	// onReconnect, when set (active-reconciled battery/solar devices only), is
+	// invoked after a successful reopen so the reconciler reasserts the standing
+	// desired (ledger L4) — the SINGLE reasserter-on-reconnect (TASK-032 deleted
+	// the transport-side lastCtrl replay). It MUST NOT take any lock the apply
+	// path holds — it runs under r.mu, and the reconciler's apply path is
+	// mu → registry → r.mu; the shell's markReconnected only does an atomic
+	// store, satisfying that. Meters leave it nil (no reassert).
 	onReconnect func()
 
 	// TASK-044 metrics (all nil-safe; every registry_test.go/control_test.go
@@ -538,29 +518,15 @@ func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
 		r.live = dev
 		r.reconnects.Inc()
 		slog.Info("lexa-modbus: reconnected device", "device", r.cfg.Name) // TASK-045
-		if r.reconciledActive {
-			// TASK-028: the active reconciler owns reassert-on-reconnect (ledger
-			// L4). Signal it instead of replaying lastCtrl, so there is exactly
-			// ONE reasserter and no double-write race. The callback only sets an
-			// atomic flag (no lock), so calling it under r.mu is deadlock-safe;
-			// the shell reasserts on this poll's Observe.
-			if r.onReconnect != nil {
-				r.onReconnect()
-			}
-		} else if ctrl, why, ok := r.reassertLocked(); ok {
-			// Reconcile-on-reconnect (Phase 4): the device may have missed every
-			// control transition while dark — including a release, which for an
-			// inverter is a WRITE (the restore ceiling), not an absence of writes.
-			// Bring its registers back to the hub's current desired state before
-			// the first measurement is trusted.
-			if err := r.live.ApplyControl(ctrl); err != nil {
-				r.writeFailures.Inc()
-				slog.Warn("lexa-modbus: device reconnect reconcile failed",
-					"device", r.cfg.Name, "why", why, "err", err)
-				r.dropLocked() // suspect session; retry whole sequence next poll
-				return device.Measurements{W: math.NaN(), V: math.NaN(), Hz: math.NaN()}, err
-			}
-			slog.Info("lexa-modbus: device reconnected", "device", r.cfg.Name, "why", why)
+		// TASK-032: reassert-on-reconnect is owned entirely by the reconciler
+		// (ledger L4). Signal it (active-reconciled battery/solar devices only;
+		// meters have no onReconnect); the callback only sets an atomic flag (no
+		// lock), so calling it under r.mu is deadlock-safe, and the shell
+		// reasserts the standing desired on this poll's Observe before the
+		// post-reconnect reading is trusted. The former retryDevice-side lastCtrl
+		// replay / reassertLocked was deleted.
+		if r.onReconnect != nil {
+			r.onReconnect()
 		}
 	}
 	m, err := r.live.ReadMeasurements()
@@ -570,48 +536,15 @@ func (r *retryDevice) ReadMeasurements() (device.Measurements, error) {
 	return m, err
 }
 
-// reassertLocked picks the control to reconcile a just-reconnected device to.
-// Caller must hold r.mu.
-//
-//   - A control was commanded at some point (connected or not): re-assert it —
-//     it is the hub's current desired state, and the device may hold something
-//     older (or have reboot-reset to defaults; the orchestrator's periodic
-//     re-command covers that case too, but only while a control is ACTIVE).
-//   - Never commanded AND the device is an inverter: clear a possible stale
-//     ceiling by asserting the restore ceiling. An idle inverter receives no
-//     periodic commands, so a ceiling latched before this process started (or
-//     released while the device was dark) would otherwise persist forever.
-//   - Never commanded, battery: nothing — the orchestrator re-commands packs
-//     every engine tick, and an unsolicited write could fight it.
-//   - Meter: never — read-only device.
-func (r *retryDevice) reassertLocked() (model.DERControlBase, string, bool) {
-	if r.lastCtrl != nil {
-		return *r.lastCtrl, "re-asserted the hub's current control", true
-	}
-	if r.cfg.Role == "inverter" {
-		ap := activePowerFromWatts(restoreCeilingW)
-		return model.DERControlBase{OpModMaxLimW: &ap}, "cleared possible stale ceiling (restore to full output)", true
-	}
-	return model.DERControlBase{}, "", false
-}
-
 func (r *retryDevice) ApplyControl(ctrl model.DERControlBase) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// Record the DESIRED state even while disconnected — reconnect reconciles
-	// to the newest command, so a release/re-command that happened while the
-	// device was dark is not lost (Phase 4: release-while-rebooting).
-	//
-	// TASK-028: an active-reconciled device does NOT record lastCtrl — the
-	// reconciler is the single reasserter (its own Reconnected write covers the
-	// reboot case), and a lastCtrl replay here would be a competing second
-	// reasserter (the double-write race the task forbids).
-	if !r.reconciledActive {
-		stored := ctrl
-		r.lastCtrl = &stored
-	}
+	// TASK-032: reassert-on-reconnect is the reconciler's job (its own
+	// Reconnected write covers the reboot/dark-through-transition case), so the
+	// transport wrapper no longer records a lastCtrl to replay — that would be a
+	// competing second reasserter (double-write race).
 	if r.live == nil {
-		return nil // disconnected; the next ReadMeasurements poll reconnects and re-asserts
+		return nil // disconnected; the next ReadMeasurements poll reconnects and the reconciler reasserts
 	}
 	err := r.live.ApplyControl(ctrl)
 	if err != nil {

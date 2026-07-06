@@ -5,9 +5,8 @@ import (
 	"math"
 	"testing"
 
-	"lexa-hub/internal/bus"
-	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/southbound/device"
+	model "lexa-proto/csipmodel"
 )
 
 // fakeDevice is a controllable device.Device for retryDevice tests.
@@ -123,89 +122,15 @@ func TestRetryDevice_DisconnectedIsSafe(t *testing.T) {
 	}
 }
 
-// === Reconnect reconcile (Phase 4) ========================================
+// === Reconnect hook (TASK-032: reassert is the reconciler's job) ============
 
-// ctrlCeilingW decodes the OpModMaxLimW of a control, or NaN when absent.
-func ctrlCeilingW(ctrl model.DERControlBase) float64 {
-	if ctrl.OpModMaxLimW == nil {
-		return math.NaN()
-	}
-	return float64(ctrl.OpModMaxLimW.Value) * math.Pow(10, float64(ctrl.OpModMaxLimW.Multiplier))
-}
-
-// A control transition that happens while the device is dark must be delivered
-// on reconnect: cap active → device drops → cap released (restore commanded
-// into the void) → device returns → the RESTORE must land before the first
-// trusted read, or the inverter stays latched at the stale ceiling forever
-// (QA 2026-07-02: release-while-rebooting).
-func TestRetryDevice_ReassertsDesiredStateOnReconnect(t *testing.T) {
-	first := &fakeDevice{w: 1000}
-	second := &fakeDevice{w: 1000}
-	opens := 0
-	rd := &retryDevice{
-		cfg: DeviceConfig{Name: "solar", Role: "inverter"},
-		open: func() (device.Device, error) {
-			opens++
-			if opens == 1 {
-				return first, nil
-			}
-			return second, nil
-		},
-	}
-
-	// Cap active: curtail to 1000 W.
-	curtail := model.DERControlBase{OpModMaxLimW: &model.ActivePower{Value: 1000}}
-	if _, err := rd.ReadMeasurements(); err != nil {
-		t.Fatalf("first read: %v", err)
-	}
-	if err := rd.ApplyControl(curtail); err != nil {
-		t.Fatalf("curtail: %v", err)
-	}
-
-	// Device drops; the cap is RELEASED while it is dark.
-	first.readErr = errors.New("write: broken pipe")
-	if _, err := rd.ReadMeasurements(); err == nil {
-		t.Fatal("expected the dead session to error")
-	}
-	restore := solarCommandToControl(bus.SolarCommand{}) // nil CurtailToW = uncurtail
-	if err := rd.ApplyControl(restore); err != nil {
-		t.Fatalf("restore into the void must not error: %v", err)
-	}
-
-	// Device returns: the restore must be re-asserted before the first read.
-	if _, err := rd.ReadMeasurements(); err != nil {
-		t.Fatalf("reconnect read: %v", err)
-	}
-	if len(second.applied) != 1 {
-		t.Fatalf("reconnected device received %d controls, want 1 (the re-asserted restore)", len(second.applied))
-	}
-	if ceil := ctrlCeilingW(second.applied[0]); ceil < 1e6 {
-		t.Errorf("re-asserted ceiling = %.0f W — the stale 1000 W curtailment, not the restore", ceil)
-	}
-}
-
-// A never-commanded inverter may still hold a stale ceiling (latched before
-// this process started): reconnect clears it with the restore ceiling.
-func TestRetryDevice_ClearsStaleCeilingOnFirstConnect(t *testing.T) {
-	dev := &fakeDevice{w: 1000}
-	rd := &retryDevice{
-		cfg:  DeviceConfig{Name: "solar", Role: "inverter"},
-		open: func() (device.Device, error) { return dev, nil },
-	}
-	if _, err := rd.ReadMeasurements(); err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if len(dev.applied) != 1 {
-		t.Fatalf("inverter received %d controls on first connect, want 1 (stale-ceiling clear)", len(dev.applied))
-	}
-	if ceil := ctrlCeilingW(dev.applied[0]); ceil < 1e6 {
-		t.Errorf("first-connect clear ceiling = %.0f W, want the restore ceiling", ceil)
-	}
-}
-
-// Read-only and orchestrator-refreshed devices get no unsolicited write.
-func TestRetryDevice_NoUnsolicitedWriteForMeterOrBattery(t *testing.T) {
-	for _, role := range []string{"meter", "battery"} {
+// The bare transport wrapper issues NO unsolicited write on (re)connect for ANY
+// role — reassert-on-reconnect is owned entirely by the reconciler via the
+// onReconnect hook (ledger L4). This pins that the deleted lastCtrl replay /
+// reassertLocked stale-ceiling clear leaves no write behind on the transport
+// path itself.
+func TestRetryDevice_NoUnsolicitedWriteOnConnect(t *testing.T) {
+	for _, role := range []string{"meter", "battery", "inverter"} {
 		dev := &fakeDevice{w: 100}
 		rd := &retryDevice{
 			cfg:  DeviceConfig{Name: role, Role: role},
@@ -215,62 +140,27 @@ func TestRetryDevice_NoUnsolicitedWriteForMeterOrBattery(t *testing.T) {
 			t.Fatalf("%s read: %v", role, err)
 		}
 		if len(dev.applied) != 0 {
-			t.Errorf("%s received %d unsolicited controls on connect, want 0", role, len(dev.applied))
+			t.Errorf("%s received %d unsolicited controls on connect, want 0 (reassert is the reconciler's job)", role, len(dev.applied))
 		}
 	}
 }
 
-// A failed reconcile write means the session is suspect: drop it and retry the
-// whole open+reconcile+read sequence next poll — never read past a device in
-// an unknown control state.
-func TestRetryDevice_ReconcileFailureDropsSession(t *testing.T) {
-	bad := &fakeDevice{w: 1000, ctrlErr: errors.New("write refused")}
-	good := &fakeDevice{w: 1000}
-	opens := 0
-	rd := &retryDevice{
-		cfg: DeviceConfig{Name: "solar", Role: "inverter"},
-		open: func() (device.Device, error) {
-			opens++
-			if opens == 1 {
-				return bad, nil
-			}
-			return good, nil
-		},
-	}
-	if _, err := rd.ReadMeasurements(); err == nil {
-		t.Fatal("expected the failed reconcile to surface as an error")
-	}
-	if !bad.closed {
-		t.Error("the un-reconciled session must be dropped")
-	}
-	if _, err := rd.ReadMeasurements(); err != nil {
-		t.Fatalf("next poll should reconnect and reconcile cleanly: %v", err)
-	}
-	if len(good.applied) != 1 {
-		t.Errorf("recovered device received %d controls, want 1", len(good.applied))
-	}
-}
-
-// TestRetryDevice_ActiveReconciledSuppressesLastCtrl (TASK-028): a device owned
-// by the active battery reconciler must NOT record lastCtrl (so no competing
-// reassert) and must invoke onReconnect (not replay lastCtrl) on every reopen —
-// the reconciler is the single reasserter.
-func TestRetryDevice_ActiveReconciledSuppressesLastCtrl(t *testing.T) {
+// TestRetryDevice_OnReconnectFiresPerReopen (TASK-032): an active-reconciled
+// device fires its onReconnect hook on every successful reopen (initial open and
+// each reconnect), and the transport itself never writes on reconnect — the
+// reconciler shell is the single reasserter, driven off this signal. An explicit
+// ApplyControl still reaches hardware but is never replayed on the next reopen
+// (no lastCtrl exists anymore).
+func TestRetryDevice_OnReconnectFiresPerReopen(t *testing.T) {
 	dev := &fakeDevice{w: -500}
-	opens := 0
 	reconnects := 0
 	rd := &retryDevice{
-		cfg:              DeviceConfig{Name: "battery-0", Role: "battery"},
-		reconciledActive: true,
-		onReconnect:      func() { reconnects++ },
-		open: func() (device.Device, error) {
-			opens++
-			return dev, nil
-		},
+		cfg:         DeviceConfig{Name: "battery-0", Role: "battery"},
+		onReconnect: func() { reconnects++ },
+		open:        func() (device.Device, error) { return dev, nil },
 	}
 
-	// First connect: onReconnect fires, and NO reassert write is made (a battery
-	// with no lastCtrl would already skip reassert; this pins the active path).
+	// Initial open: onReconnect fires; no unsolicited write.
 	if _, err := rd.ReadMeasurements(); err != nil {
 		t.Fatalf("first read: %v", err)
 	}
@@ -278,21 +168,19 @@ func TestRetryDevice_ActiveReconciledSuppressesLastCtrl(t *testing.T) {
 		t.Fatalf("onReconnect calls = %d, want 1", reconnects)
 	}
 	if len(dev.applied) != 0 {
-		t.Fatalf("active-reconciled device must get no reassert write on connect, got %d", len(dev.applied))
+		t.Fatalf("no unsolicited write on connect, got %d", len(dev.applied))
 	}
 
-	// A control write goes to hardware but is NOT recorded as lastCtrl.
+	// An explicit control reaches hardware.
 	if err := rd.ApplyControl(model.DERControlBase{OpModConnect: bptr(true)}); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if rd.lastCtrl != nil {
-		t.Error("active-reconciled device must not record lastCtrl")
-	}
 	if len(dev.applied) != 1 {
-		t.Errorf("the control write should still reach hardware, applied=%d", len(dev.applied))
+		t.Errorf("the control write should reach hardware, applied=%d", len(dev.applied))
 	}
 
-	// Drop and reconnect: onReconnect fires again, still no lastCtrl replay.
+	// Drop and reconnect: onReconnect fires again, and the earlier control is
+	// NOT replayed by the transport (applied stays at the one explicit write).
 	dev.readErr = errors.New("write: broken pipe")
 	if _, err := rd.ReadMeasurements(); err == nil {
 		t.Fatal("expected the dropped session to error")
@@ -304,45 +192,7 @@ func TestRetryDevice_ActiveReconciledSuppressesLastCtrl(t *testing.T) {
 	if reconnects != 2 {
 		t.Errorf("onReconnect calls = %d, want 2 after reconnect", reconnects)
 	}
-	// applied is still just the one explicit control — no reassert replays.
 	if len(dev.applied) != 1 {
-		t.Errorf("no reassert replay expected; applied=%d, want 1", len(dev.applied))
-	}
-}
-
-// TestRetryDevice_LegacyReassertIntactForSolar guards that the reconnect-reassert
-// change is battery-active-scoped: a solar (inverter) device with reconciledActive
-// false keeps its lastCtrl reassert-on-reconnect (bit-identical to before).
-func TestRetryDevice_LegacyReassertIntactForSolar(t *testing.T) {
-	first := &fakeDevice{w: 1000}
-	second := &fakeDevice{w: 1000}
-	opens := 0
-	rd := &retryDevice{
-		cfg: DeviceConfig{Name: "solar", Role: "inverter"},
-		open: func() (device.Device, error) {
-			opens++
-			if opens == 1 {
-				return first, nil
-			}
-			return second, nil
-		},
-	}
-	if _, err := rd.ReadMeasurements(); err != nil {
-		t.Fatalf("first read: %v", err)
-	}
-	curtail := model.DERControlBase{OpModMaxLimW: &model.ActivePower{Value: 1000}}
-	if err := rd.ApplyControl(curtail); err != nil {
-		t.Fatalf("curtail: %v", err)
-	}
-	if rd.lastCtrl == nil {
-		t.Fatal("solar must still record lastCtrl (reconciledActive is false)")
-	}
-	first.readErr = errors.New("write: broken pipe")
-	rd.ReadMeasurements() // drop
-	if _, err := rd.ReadMeasurements(); err != nil {
-		t.Fatalf("reconnect: %v", err)
-	}
-	if len(second.applied) != 1 {
-		t.Fatalf("solar reconnect must reassert lastCtrl, applied=%d", len(second.applied))
+		t.Errorf("transport must not replay a control on reconnect; applied=%d, want 1", len(dev.applied))
 	}
 }
