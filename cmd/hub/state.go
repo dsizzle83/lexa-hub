@@ -192,7 +192,45 @@ type MQTTSystemReader struct {
 	// fire-and-forget (Append's own edge-triggered log covers failures;
 	// this reader never lets a journal write affect control flow).
 	jw *journal.Writer
+
+	// retainedAdoptionMaxAge bounds staleness at ADOPTION time (message
+	// arrival) only — see onCSIPControl's doc for why this must never be
+	// re-evaluated periodically against the already-held control (the
+	// wan-outage-hold regression, TASK-042 "things that must not change").
+	// Zero (the constructor's default, before SetRetainedAdoptionMaxAge is
+	// called) disables the check entirely, so every existing test/call site
+	// that never wires it keeps today's behavior.
+	retainedAdoptionMaxAge time.Duration
+	// lastCSIPStaleSuspect records whether the CURRENTLY-adopted retained
+	// control was flagged stale-suspect at its own adoption (TASK-042,
+	// GAP-01). Exposed for tests and a later metrics task (TASK-044
+	// follow-up); it reflects onCSIPControl's arrival-time classification
+	// only, never a later tick's re-derivation.
+	lastCSIPStaleSuspect bool
+
+	// onRewalkNeeded is invoked with reason "stale" or "decode" when the hub
+	// wants lexa-northbound to republish + immediately re-walk (TASK-042,
+	// bus.TopicCSIPRewalk). nil (the constructor's default) makes
+	// requestRewalkLocked/RequestRewalk a no-op — this package must not
+	// import internal/mqttutil or know about MQTT at all; cmd/hub/main.go
+	// wires a closure that calls mqttutil.PublishJSONQoS, the same
+	// decoupled-hook shape as mqttutil.Instrumentation.
+	onRewalkNeeded func(reason string)
+	// lastRewalkPublish rate-limits onRewalkNeeded to at most once per
+	// rewalkRateLimit, shared by BOTH trigger paths (onCSIPControl's
+	// stale-adoption check and the control topic's decode-error handler in
+	// main.go, via RequestRewalk) — see requestRewalkLocked's doc.
+	lastRewalkPublish time.Time
 }
+
+// rewalkRateLimit bounds how often the hub may publish bus.TopicCSIPRewalk
+// (TASK-042): the retained lexa/csip/control payload — corrupted or stale —
+// is redelivered on every broker reconnect (subRegistry.replay,
+// internal/mqttutil), so without a limit a flapping connection would hammer
+// lexa-northbound with rewalk requests (05 §12 "walk-rate courtesy": the
+// northbound side also rate-limits independently, cmd/northbound's
+// rewalkGate, but the hub must not rely solely on that).
+const rewalkRateLimit = 10 * time.Second
 
 type measSnapshot struct {
 	W          float64 // NaN if not received
@@ -248,6 +286,55 @@ func newMQTTSystemReader(devices []DeviceConfig, engineInterval time.Duration, j
 	return r
 }
 
+// SetRetainedAdoptionMaxAge configures onCSIPControl's stale-adoption bound
+// (TASK-042, GAP-01). An additive setter rather than a constructor parameter
+// so every existing newMQTTSystemReader call site (production and tests)
+// keeps compiling unchanged; zero/never-called means the check stays
+// disabled, matching r.retainedAdoptionMaxAge's zero value.
+func (r *MQTTSystemReader) SetRetainedAdoptionMaxAge(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.retainedAdoptionMaxAge = d
+}
+
+// SetRewalkHandler wires the callback onCSIPControl's stale-adoption path and
+// RequestRewalk (used by the control topic's decode-error handler,
+// cmd/hub/main.go) invoke to publish bus.TopicCSIPRewalk (TASK-042). nil (the
+// constructor's default) makes both paths a silent no-op — the same
+// additive-hook shape as mqttutil.Instrumentation; this package stays
+// decoupled from MQTT.
+func (r *MQTTSystemReader) SetRewalkHandler(fn func(reason string)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onRewalkNeeded = fn
+}
+
+// RequestRewalk asks lexa-northbound to republish + immediately re-walk
+// (TASK-042) for reason "decode" — the control topic's decode-error handler
+// (cmd/hub/main.go, wired via mqttutil.SubscribeDecodeErr) calls this from
+// its own goroutine, distinct from onCSIPControl's. Shares
+// requestRewalkLocked's rate limit with the stale-adoption path so the two
+// triggers can never together exceed rewalkRateLimit.
+func (r *MQTTSystemReader) RequestRewalk(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.requestRewalkLocked(reason)
+}
+
+// requestRewalkLocked invokes r.onRewalkNeeded(reason), rate-limited to at
+// most once per rewalkRateLimit regardless of reason. Caller holds r.mu.
+func (r *MQTTSystemReader) requestRewalkLocked(reason string) {
+	if r.onRewalkNeeded == nil {
+		return
+	}
+	now := time.Now()
+	if !r.lastRewalkPublish.IsZero() && now.Sub(r.lastRewalkPublish) < rewalkRateLimit {
+		return
+	}
+	r.lastRewalkPublish = now
+	r.onRewalkNeeded(reason)
+}
+
 func (r *MQTTSystemReader) onMeasurement(_ string, msg bus.Measurement) {
 	r.mu.Lock()
 	snap := r.lastMeas[msg.Device]
@@ -295,6 +382,44 @@ func (r *MQTTSystemReader) onCSIPControl(_ string, msg bus.ActiveControl) {
 		r.lastCSIPChangedAt = time.Now()
 	}
 	r.journalControlChange(prev, &msg)
+
+	// TASK-042/GAP-01: staleness bound at ADOPTION time only (this message's
+	// arrival) — enforce-but-verify, NEVER reject/drop (rejecting a stale-
+	// but-decodable cap can only increase export/import, converting an
+	// under-enforcement risk into a no-enforcement certainty; the enforcement
+	// path below and in ReadSystemState is completely unchanged). A retained
+	// lexa/csip/control resurrected by an unclean broker restart (mosquitto
+	// autosave_interval 60, §8.3) can arrive with a Ts up to ~60 s old.
+	//
+	// This runs ONLY here, on message arrival — never as a periodic re-check
+	// against the held control (r.lastCSIP) on every ReadSystemState tick:
+	// during a WAN outage lexa-northbound publishes nothing (main.go's
+	// fail-closed discipline), so a genuinely-still-valid retained control's
+	// Ts ages right along with a resurrected one, and a periodic re-check
+	// would misclassify normal outage holdover as staleness on every tick —
+	// drowning wan-outage-hold/-expiry in alarms (this task's "things that
+	// must not change"). Source=="none" is excluded: an aged "no active
+	// control" sentinel carries no compliance risk to flag.
+	//
+	// age is computed via utilitytime.ServerNowAt using THIS message's own
+	// ClockOffset, not r.utclk (which was just re-anchored to this exact
+	// message a few lines up and would trivially read back age==0 against
+	// itself). ServerNowAt(now, offset) = now.Unix()+offset, so this reduces
+	// to local-now minus msg.Ts — the offset term cancels — i.e. "how long
+	// ago, in wall-clock seconds, did lexa-northbound stamp this message",
+	// valid under the same shared-host-clock assumption the Anchor call above
+	// already relies on.
+	r.lastCSIPStaleSuspect = false
+	if controlIsReal(&msg) && r.retainedAdoptionMaxAge > 0 {
+		boundS := int64(r.retainedAdoptionMaxAge.Seconds())
+		age := utilitytime.ServerNowAt(time.Now(), msg.ClockOffset) - (msg.Ts + msg.ClockOffset)
+		if age > boundS {
+			r.lastCSIPStaleSuspect = true
+			slog.Warn("[hub] retained CSIP control is stale at adoption — enforcing (fail-closed) and requesting re-publish",
+				"mrid", msg.MRID, "source", msg.Source, "age_s", age, "bound_s", boundS)
+			r.requestRewalkLocked("stale")
+		}
+	}
 	r.mu.Unlock()
 }
 

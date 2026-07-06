@@ -104,6 +104,22 @@ type Config struct {
 	// start: a write-only soak before an ops-only config flip turns restore
 	// on (no code change accompanies that flip).
 	Snapshot *SnapshotConfig `json:"snapshot,omitempty"`
+
+	// RetainedAdoptionMaxAgeS bounds (in seconds) how old a retained
+	// lexa/csip/control message's Ts may be at ADOPTION time before the hub
+	// treats it as a stale-suspect resurrection (TASK-042, §8.3/GAP-01):
+	// mosquitto's `autosave_interval 60` (systemd/mosquitto-lexa.conf) can
+	// resurrect a control up to ~60 s stale after an unclean broker death,
+	// and the hub adopts whatever it (re)subscribes to. A stale-suspect
+	// control is still ENFORCED unchanged (enforce-but-verify, never
+	// fail-open — rejecting a stale-but-decodable cap can only increase
+	// export/import) — this only raises an edge-triggered alarm and asks
+	// lexa-northbound (via lexa/csip/rewalk) to republish current truth
+	// within seconds. 0/absent defaults to 300 in loadConfig: a handful of
+	// discovery-walk periods even at the slowest realistic (STOCK) cadence,
+	// comfortably above normal republish jitter and comfortably below "this
+	// might be a resurrected corpse."
+	RetainedAdoptionMaxAgeS int `json:"retained_adoption_max_age_s"`
 }
 
 // JournalConfig is the on-disk "journal" block. It intentionally has its
@@ -169,6 +185,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
+	}
+	if cfg.RetainedAdoptionMaxAgeS <= 0 {
+		cfg.RetainedAdoptionMaxAgeS = 300
 	}
 	if err := decodePlantBlocks(&cfg); err != nil {
 		return nil, err
@@ -262,4 +281,10 @@ func (c *Config) EngineInterval() time.Duration {
 
 func (c *Config) SafetyInterval() time.Duration {
 	return time.Duration(c.SafetyIntervalS) * time.Second
+}
+
+// RetainedAdoptionMaxAge is RetainedAdoptionMaxAgeS as a time.Duration, for
+// MQTTSystemReader.SetRetainedAdoptionMaxAge (TASK-042).
+func (c *Config) RetainedAdoptionMaxAge() time.Duration {
+	return time.Duration(c.RetainedAdoptionMaxAgeS) * time.Second
 }

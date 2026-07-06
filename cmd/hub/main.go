@@ -143,6 +143,22 @@ func main() {
 		r.Gauge("lexa_hub_control_adoption_age_seconds").Set(reader.ControlAdoptionAge(time.Now()).Seconds())
 	})
 
+	// TASK-042 (GAP-01/02): bound retained-control staleness at adoption and
+	// wire the re-request path. The rewalk handler publishes non-retained,
+	// QoS 1 (bus.PubQoS's default for anything outside the measurement
+	// plane) — lexa-northbound is the sole subscriber (bus.TopicCSIPRewalk).
+	reader.SetRetainedAdoptionMaxAge(cfg.RetainedAdoptionMaxAge())
+	reader.SetRewalkHandler(func(reason string) {
+		req := bus.RewalkRequest{
+			Envelope: bus.Envelope{V: bus.RewalkRequestV},
+			Reason:   reason,
+			Ts:       time.Now().Unix(),
+		}
+		if err := mqttutil.PublishJSONQoS(mc, bus.TopicCSIPRewalk, bus.PubQoS(bus.TopicCSIPRewalk), req); err != nil {
+			log.Printf("lexa-hub: publish rewalk request (%s): %v", reason, err)
+		}
+	})
+
 	// Build the optimizer and engine (before the subscriptions, which need to
 	// poke the engine on urgent controls).
 	opt := orchestrator.NewDefaultOptimizer()
@@ -341,13 +357,24 @@ func main() {
 	if err := mqttutil.Subscribe(mc, bus.SubBattMetrics, reader.onBattMetrics); err != nil {
 		log.Fatalf("lexa-hub: subscribe batt metrics: %v", err)
 	}
-	if err := mqttutil.Subscribe(mc, bus.TopicCSIPControl, func(topic string, msg bus.ActiveControl) {
+	// TASK-042 (GAP-02): SubscribeDecodeErr instead of Subscribe on this one
+	// topic so a corrupted retained payload — previously a silent
+	// log-and-drop with no recovery until the next successful northbound
+	// walk republished (potentially never, during a WAN outage) — alarms and
+	// asks lexa-northbound to republish immediately via
+	// reader.RequestRewalk("decode") (rate-limited jointly with the
+	// stale-adoption path in state.go). The handler (successful-decode) path
+	// is byte-identical to before.
+	if err := mqttutil.SubscribeDecodeErr(mc, bus.TopicCSIPControl, func(topic string, msg bus.ActiveControl) {
 		reader.onCSIPControl(topic, msg)
 		// A disconnect order must not wait out the ticker interval: force an
 		// immediate tick so cease-to-energize is applied within MQTT latency.
 		if msg.Connect != nil && !*msg.Connect {
 			eng.Wake()
 		}
+	}, func(_ string, _ []byte, err error) {
+		log.Printf("[hub] retained CSIP control payload undecodable: %v — requesting re-publish", err)
+		reader.RequestRewalk("decode")
 	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe csip control: %v", err)
 	}

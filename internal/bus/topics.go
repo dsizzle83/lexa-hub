@@ -10,6 +10,7 @@
 //	lexa/csip/billing                         northbound   → hub (retained)
 //	lexa/csip/flowreservation/status          northbound   → hub (retained)
 //	lexa/csip/flowreservation/request         hub          → northbound (QoS 1)
+//	lexa/csip/rewalk                          hub          → northbound (QoS 1, TASK-042)
 //	lexa/northbound/schedule                  northbound   → hub (retained)
 //	lexa/evse/{station}/state                 ocpp         → hub
 //	lexa/desired/{class}/{device}             hub          → modbus/ocpp (retained, AD-013)
@@ -116,6 +117,8 @@ func SupportedV(topic string) int {
 		return BillingUpdateV
 	case topic == TopicCSIPFRRequest:
 		return FlowReservationRequestV
+	case topic == TopicCSIPRewalk:
+		return RewalkRequestV
 	case topic == TopicCSIPFRStatus:
 		return FlowReservationStatusV
 	case topic == TopicNorthboundSchedule:
@@ -158,6 +161,24 @@ const (
 	TopicCSIPFRStatus  = "lexa/csip/flowreservation/status"
 	TopicCSIPFRRequest = "lexa/csip/flowreservation/request"
 )
+
+// TopicCSIPRewalk is published by lexa-hub, non-retained at QoS 1, to ask
+// lexa-northbound to refresh the retained lexa/csip/control message
+// immediately rather than waiting for the next discovery cycle (TASK-042,
+// AD-006 extension covering §8.3/GAP-01/GAP-02). The hub publishes a
+// RewalkRequest here when it either (a) adopts a retained control whose Ts
+// is older than retained_adoption_max_age_s — a possible mosquitto-autosave
+// resurrection of a superseded cap — or (b) fails to decode the retained
+// payload at all (corrupted retained control, previously a silent drop with
+// no recovery path). lexa-northbound subscribes this and, on receipt,
+// immediately republishes its last-published ActiveControl (fresh Ts) if it
+// has one — repairing the retained value even while the WAN is dark — and
+// triggers an out-of-cadence discovery walk to refresh ground truth. Not
+// retained: this is a one-shot nudge, not state that should replay on
+// reconnect (the hub re-issues it on its own next adoption/decode-error,
+// rate-limited independently on both ends — see cmd/hub/state.go's
+// rewalkRateLimit and cmd/northbound/main.go's rewalkGate).
+const TopicCSIPRewalk = "lexa/csip/rewalk"
 
 // TopicNorthboundSchedule is published by lexa-northbound after each discovery
 // walk. It carries the resolved 24-hour DER control schedule (retained, QoS 1).
