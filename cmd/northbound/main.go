@@ -181,6 +181,9 @@ func main() {
 		for _, n := range bus.VersionRejects() {
 			total += n
 		}
+		for _, n := range bus.DecodeFailures() {
+			total += n
+		}
 		r.Counter("lexa_bus_decode_failures_total").Set(total)
 	})
 	walkDurationGauge := reg.Gauge("lexa_nb_walk_duration_seconds")

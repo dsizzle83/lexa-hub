@@ -87,6 +87,9 @@ func main() {
 		for _, n := range bus.VersionRejects() {
 			total += n
 		}
+		for _, n := range bus.DecodeFailures() {
+			total += n
+		}
 		r.Counter("lexa_bus_decode_failures_total").Set(total)
 	})
 	mupPostsTotalCtr := reg.Counter("lexa_telemetry_mup_posts_total")

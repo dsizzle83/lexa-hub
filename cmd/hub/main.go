@@ -71,6 +71,9 @@ func main() {
 		for _, n := range bus.VersionRejects() {
 			total += n
 		}
+		for _, n := range bus.DecodeFailures() {
+			total += n
+		}
 		r.Counter("lexa_bus_decode_failures_total").Set(total)
 	})
 	// lexa_hub_tick_overruns_total: registered now with its real source
