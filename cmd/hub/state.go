@@ -82,6 +82,48 @@ func confirmTicksFor(engineInterval time.Duration) int {
 	return n
 }
 
+// localStepLogAction is localStepEdge's verdict for the current tick: log
+// nothing, log a forward step, log a backward step, or log that a
+// previously-logged step condition has cleared.
+type localStepLogAction int
+
+const (
+	localStepLogNone localStepLogAction = iota
+	localStepLogForward
+	localStepLogBackward
+	localStepLogCleared
+)
+
+// localStepEdge is TASK-037's local-clock-step logging policy as a pure
+// decision function, deliberately factored out of ReadSystemState so it is
+// unit-testable in isolation: given whether the reader was already in a
+// "stepped" state as of the previous tick, this tick's utilitytime.Clock
+// LocalStep() result (stepped, drift), it returns the new stepped state to
+// remember plus what (if anything) to log this tick.
+//
+// Policy (AD-004 extension, 02_ARCHITECTURE_DECISIONS.md in csip-tls-test):
+// forward steps re-anchor silently from the enforcement side (r.utclk already
+// re-anchors on every onCSIPControl arrival, independent of this function) and
+// get a plain transition log; backward steps get the identical anchored
+// correctness plus a louder alarm log, since a backward RTC/NTP correction is
+// the more operationally surprising direction (log wall-clock times can
+// appear to regress). Either way the log fires exactly once per transition —
+// edge-triggered like noteStaleness — not once per tick for the duration of
+// the step.
+func localStepEdge(prevStepped, stepped bool, drift int64) (newStepped bool, action localStepLogAction) {
+	switch {
+	case stepped && !prevStepped:
+		if drift >= 0 {
+			return true, localStepLogForward
+		}
+		return true, localStepLogBackward
+	case !stepped && prevStepped:
+		return false, localStepLogCleared
+	default:
+		return prevStepped, localStepLogNone
+	}
+}
+
 // MQTTSystemReader implements orchestrator.SystemReader by maintaining a
 // snapshot of all device state populated via MQTT subscriptions.
 type MQTTSystemReader struct {
@@ -99,6 +141,23 @@ type MQTTSystemReader struct {
 	// Last resolved CSIP active control from lexa-csip
 	lastCSIP    *bus.ActiveControl
 	clockOffset int64
+
+	// utclk anchors utility (server) time to a monotonic instant every time a
+	// fresh bus.ActiveControl arrives (onCSIPControl), so ServerNow() between
+	// arrivals is immune to a LOCAL wall-clock step (NTP correction at
+	// commissioning, RTC drift fix-up) — TASK-037/GAP-04. This is a distinct
+	// concern from clockOffset above: clockOffset is the raw *server-vs-local*
+	// offset (unaffected by this change, still fed to the optimizer via a
+	// derived value below); utclk instead protects against the *local* clock
+	// itself moving between messages. See internal/utilitytime's package doc
+	// for the full design writeup and AD-004 (csip-tls-test docs/refactor) for
+	// the decision record.
+	utclk *utilitytime.Clock
+	// clockStepped edge-triggers the local-step transition log (like
+	// noteStaleness): true once a LocalStep() call has classified the local
+	// clock as currently stepped, so the log fires once per transition, not
+	// once per tick for the duration of the step.
+	clockStepped bool
 
 	// lastCSIPMRID/lastCSIPChangedAt back lexa_hub_control_adoption_age_seconds
 	// (TASK-044): the topic is retained and lexa-northbound republishes it on
@@ -170,6 +229,7 @@ func newMQTTSystemReader(devices []DeviceConfig, engineInterval time.Duration) *
 		devByName:   make(map[string]*DeviceConfig),
 		stale:       make(map[string]bool),
 		expiry:      utilitytime.DebouncedExpiry{Confirm: confirmTicksFor(engineInterval)},
+		utclk:       utilitytime.New(utilitytime.Config{}),
 	}
 	for i := range devices {
 		d := &devices[i]
@@ -211,6 +271,15 @@ func (r *MQTTSystemReader) onCSIPControl(_ string, msg bus.ActiveControl) {
 	r.mu.Lock()
 	r.lastCSIP = &msg
 	r.clockOffset = msg.ClockOffset
+	// Anchor utility time at this message's arrival (TASK-037). msg.Ts is
+	// stamped by lexa-northbound with time.Now().Unix() at publish
+	// (cmd/northbound/main.go's toActiveControl); msg.Ts+msg.ClockOffset is
+	// therefore server time AT PUBLISH. This is only valid because
+	// lexa-northbound and lexa-hub share the same host clock (the hub Pi/SOM
+	// — see CLAUDE.md's bench topology) and MQTT localhost latency is
+	// negligible (≪ 1 s) — a split-host deployment would have to re-derive
+	// this anchor from its own local receipt time instead.
+	r.utclk.Anchor(msg.Ts + msg.ClockOffset)
 	if msg.MRID != r.lastCSIPMRID {
 		r.lastCSIPMRID = msg.MRID
 		r.lastCSIPChangedAt = time.Now()
@@ -437,13 +506,16 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 	// and keep enforcing the control in the meantime (a cap is conservative, so
 	// holding it across a transient clock jump is the safe choice).
 	//
-	// serverNow/expired delegate to utilitytime (ServerNowAt, Expired) for the
-	// exact same arithmetic the scheduler uses (validUntil != 0 && serverNow >=
-	// validUntil); r.expiry.Observe carries the debounce state that used to be
-	// the bare csipExpiredTicks counter. A false Observe (no control, or a
-	// ValidUntil=0 control that never expires) resets the counter, matching the
-	// old "else { r.csipExpiredTicks = 0 }" branch exactly.
-	serverNow := utilitytime.ServerNowAt(now, r.clockOffset)
+	// serverNow now reads from r.utclk (TASK-037/AD-004 extension): monotonic-
+	// anchored at every onCSIPControl arrival, so a LOCAL wall-clock step
+	// (distinct from the server-side excursion this debounce already handles)
+	// cannot move it between arrivals either. Before any control has ever
+	// arrived, r.utclk is unanchored and ServerNow() degrades to the local
+	// clock (offset 0) — identical to the pre-TASK-037 zero-value behavior.
+	// Expired/r.expiry.Observe are unchanged: a false Observe (no control, or
+	// a ValidUntil=0 control that never expires) resets the counter, matching
+	// the old "else { r.csipExpiredTicks = 0 }" branch exactly.
+	serverNow := r.utclk.ServerNow()
 	expired := r.lastCSIP != nil && utilitytime.Expired(r.lastCSIP.ValidUntil, serverNow)
 	if r.expiry.Observe(expired) {
 		// TASK-045: migrated to slog (control expiry edge).
@@ -456,7 +528,45 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 	if r.lastCSIP != nil {
 		state.CSIPControl = busToCSIPControl(r.lastCSIP)
 	}
-	state.ClockOffset = r.clockOffset
+
+	// TASK-037: edge-triggered local (wall-clock) step detection/logging, like
+	// noteStaleness above. This is purely observability — utility-time
+	// evaluation above is already monotonic-anchored and freshness windows
+	// (measStaleAfter/evseStaleAfter/meterFrozenAfter, all time.Now()+Sub)
+	// were already immune before this task; nothing here changes behavior.
+	// The decision of WHETHER/WHAT to log is factored into localStepEdge (a
+	// pure function) so the "log fires exactly once per step" edge-trigger
+	// claim is unit-testable without needing to fake a genuine OS-level
+	// wall/monotonic desync through r.utclk itself (see internal/utilitytime's
+	// package doc for why that can't be done through the public time.Time API).
+	drift, stepped := r.utclk.LocalStep()
+	var action localStepLogAction
+	r.clockStepped, action = localStepEdge(r.clockStepped, stepped, drift)
+	switch action {
+	case localStepLogForward:
+		slog.Info("[hub] local clock step detected — utility-time evaluation is monotonic-anchored; freshness unaffected",
+			"drift_s", drift, "direction", "forward")
+	case localStepLogBackward:
+		// Backward local steps get the same anchored correctness, plus an
+		// alarm: a backward RTC/NTP correction is the more operationally
+		// surprising direction (log wall-times can appear to regress), worth
+		// a louder signal even though enforcement stays correct.
+		slog.Warn("[hub] local clock step detected — utility-time evaluation is monotonic-anchored; freshness unaffected",
+			"drift_s", drift, "direction", "backward")
+	case localStepLogCleared:
+		slog.Info("[hub] local clock step condition cleared", "drift_s", drift)
+	}
+	// state.ClockOffset carries a DERIVED offset (r.utclk.ServerNow() minus
+	// this tick's local now), not the raw r.clockOffset — so the optimizer's
+	// existing utilitytime.ServerNowAt(state.Timestamp, state.ClockOffset)
+	// call (internal/orchestrator/optimizer.go, TOU/IsPeakHour) reconstructs
+	// the SAME anchored serverNow without the orchestrator touching a Clock
+	// or reading a wall clock of its own (AD-004: orchestrator stays I/O-free).
+	// Under a stable local clock this is bit-identical to r.clockOffset (both
+	// equal server-minus-local); it only diverges from the raw offset during
+	// the monotonic holdover between control arrivals under a local step —
+	// which is exactly the case this task closes.
+	state.ClockOffset = serverNow - now.Unix()
 
 	for _, snap := range r.lastEVSE {
 		es := busToEVSEState(snap.EVSEState)

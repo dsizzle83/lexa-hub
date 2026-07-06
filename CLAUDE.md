@@ -363,6 +363,9 @@ binary-only deploy + hand-set Pi config (05 §6 discipline).
   Pi's total journal at `SystemMaxUse=200M`. Rate/size math, per-service estimates, and
   the wear budget live in `docs/FLASH_BUDGET.md` — read it before changing per-tick
   logging or raising any cap.
+- **Local wall-clock steps** (TASK-037, GAP-04, AD-004 extension): must not move
+  utility-time evaluation (`internal/utilitytime`'s monotonic anchoring — `Clock.Anchor`/
+  `ServerNow`) nor freshness windows (already monotonic ages, `time.Now()`+`Sub`).
 
 ## Defensive fault-handling (do not strip — each backs a mayhem-QA finding)
 

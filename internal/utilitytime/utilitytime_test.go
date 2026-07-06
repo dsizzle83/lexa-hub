@@ -236,6 +236,215 @@ func TestExpired(t *testing.T) {
 	}
 }
 
+// --- TASK-037: monotonic anchoring + local clock-step detection ---
+//
+// Testability note (see the Config.Now doc comment): Go's time.Time only
+// carries a real monotonic reading when it originates from time.Now(), and
+// Time.Add shifts the wall and monotonic components by the exact same
+// duration — there is no public API to desynchronize them. That is
+// deliberate: in production, cfg.Now is real time.Now, whose monotonic
+// component is a hardware guarantee (CLOCK_MONOTONIC) that is immune to
+// wall-clock steps (NTP corrections, settimeofday) by construction — nothing
+// in this package needs to reproduce that guarantee, only to correctly rely
+// on it (i.e. never read the wall clock again after Anchor except via
+// cfg.Now().Sub(anchorMono)). The tests below therefore prove two separate
+// things instead of trying to fake an OS-level clock step:
+//  1. Anchored ServerNow is purely elapsed-time-based (tracks a base+Add()
+//     fake clock exactly, and — unlike the pre-anchor formula — completely
+//     ignores SetOffset/wall-Unix reads once anchored).
+//  2. LocalStep's drift arithmetic is correct given wall-vs-monotonic
+//     elapsed inputs, exercised directly against the (wallElapsed,
+//     monoElapsed) formula using deliberately constructed field values,
+//     since real desync can only originate from an actual OS clock step.
+
+func TestClock_Anchor_ServerNowTracksElapsed(t *testing.T) {
+	base := time.Now() // must be time.Now()-derived to carry a monotonic reading
+	now := base
+	c := New(Config{Now: func() time.Time { return now }})
+
+	c.Anchor(5_000)
+	if !c.Anchored() {
+		t.Fatal("Anchored() = false immediately after Anchor")
+	}
+	if got := c.ServerNow(); got != 5_000 {
+		t.Fatalf("ServerNow() immediately after Anchor(5000) = %d, want 5000", got)
+	}
+
+	tests := []struct {
+		name    string
+		advance time.Duration
+	}{
+		{"advance 1s", 1 * time.Second},
+		{"advance 1 more minute", time.Minute},
+		{"advance 2 more hours", 2 * time.Hour},
+	}
+	elapsed := time.Duration(0)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			elapsed += tt.advance
+			now = base.Add(elapsed)
+			want := int64(5_000) + int64(elapsed.Seconds())
+			if got := c.ServerNow(); got != want {
+				t.Errorf("ServerNow() after %v elapsed = %d, want %d", elapsed, got, want)
+			}
+		})
+	}
+}
+
+func TestClock_Anchor_IgnoresSetOffsetOnceAnchored(t *testing.T) {
+	// Once anchored, ServerNow must never fall back to the raw offset path —
+	// this is the property that makes it immune to whatever drove a wall
+	// step (an NTP correction would, pre-TASK-037, have to be chased via a
+	// new SetOffset/offset read; post-anchoring it is irrelevant).
+	base := time.Now()
+	now := base
+	c := New(Config{Now: func() time.Time { return now }})
+
+	c.SetOffset(30) // some pre-existing offset from server-time sync
+	c.Anchor(1_000_000)
+	now = base.Add(10 * time.Second)
+
+	if got, want := c.ServerNow(), int64(1_000_010); got != want {
+		t.Fatalf("ServerNow() = %d, want %d (anchored)", got, want)
+	}
+
+	// A dramatic SetOffset after anchoring (as if a fresh but wildly
+	// different server sync arrived) must not move ServerNow — only a fresh
+	// Anchor call re-anchors.
+	c.SetOffset(999_999)
+	if got, want := c.ServerNow(), int64(1_000_010); got != want {
+		t.Errorf("ServerNow() after post-anchor SetOffset = %d, want %d (unaffected)", got, want)
+	}
+}
+
+func TestClock_Anchor_ForwardLocalStepDoesNotMoveServerNow(t *testing.T) {
+	// Simulates GAP-04's forward NTP-step scenario: the anchored Clock is fed
+	// the TRUE elapsed time (5s — what really happened), while a parallel
+	// "legacy" computation using ServerNowAt against a wall-stepped `now`
+	// (simulating what the wall clock would read after a +1h forward step)
+	// shows what the pre-TASK-037 code would have produced. The anchored
+	// value must match ground truth; the legacy one is off by the step.
+	base := time.Now()
+	now := base
+	c := New(Config{Now: func() time.Time { return now }})
+	const offset = int64(20) // some server offset in effect at anchor time
+	c.SetOffset(offset)
+	c.Anchor(ServerNowAt(now, offset)) // anchor at server-time truth
+
+	trueElapsed := 5 * time.Second
+	now = base.Add(trueElapsed)
+	anchoredServerNow := c.ServerNow()
+	wantTruth := ServerNowAt(base, offset) + int64(trueElapsed.Seconds())
+	if anchoredServerNow != wantTruth {
+		t.Fatalf("anchored ServerNow() = %d, want %d (ground truth)", anchoredServerNow, wantTruth)
+	}
+
+	// What the OLD (unanchored) formula would have computed had the wall
+	// clock stepped forward 1h during that same 5s of real elapsed time.
+	stepped := base.Add(trueElapsed + time.Hour)
+	legacyServerNow := ServerNowAt(stepped, offset)
+	if legacyServerNow == anchoredServerNow {
+		t.Fatal("expected the legacy formula to diverge from the anchored one under a simulated forward step")
+	}
+	if diff := legacyServerNow - anchoredServerNow; diff != 3600 {
+		t.Errorf("legacy-vs-anchored divergence = %ds, want 3600s (the simulated step size)", diff)
+	}
+}
+
+func TestClock_Anchor_BackwardLocalStepDoesNotMoveServerNow(t *testing.T) {
+	// Mirror of the forward case for a −1h backward step.
+	base := time.Now()
+	now := base
+	c := New(Config{Now: func() time.Time { return now }})
+	const offset = int64(-10)
+	c.SetOffset(offset)
+	c.Anchor(ServerNowAt(now, offset))
+
+	trueElapsed := 5 * time.Second
+	now = base.Add(trueElapsed)
+	anchoredServerNow := c.ServerNow()
+	wantTruth := ServerNowAt(base, offset) + int64(trueElapsed.Seconds())
+	if anchoredServerNow != wantTruth {
+		t.Fatalf("anchored ServerNow() = %d, want %d (ground truth)", anchoredServerNow, wantTruth)
+	}
+
+	stepped := base.Add(trueElapsed - time.Hour)
+	legacyServerNow := ServerNowAt(stepped, offset)
+	if diff := anchoredServerNow - legacyServerNow; diff != 3600 {
+		t.Errorf("anchored-vs-legacy divergence = %ds, want 3600s (the simulated backward step size)", diff)
+	}
+}
+
+func TestClock_Anchor_ReanchorClearsDrift(t *testing.T) {
+	base := time.Now()
+	now := base
+	c := New(Config{Now: func() time.Time { return now }})
+
+	c.Anchor(100)
+	now = base.Add(time.Hour) // a lot of elapsed / drift accrues
+	if drift, stepped := c.LocalStep(); drift != 0 || stepped {
+		t.Fatalf("LocalStep() after 1h of pure elapsed time = (%d, %v), want (0, false) — elapsed time alone is not a step", drift, stepped)
+	}
+
+	// Re-anchoring resets the reference point; LocalStep against the SAME
+	// instant it just re-anchored at reports zero drift.
+	c.Anchor(ServerNowAt(now, 0))
+	if drift, stepped := c.LocalStep(); drift != 0 || stepped {
+		t.Errorf("LocalStep() immediately after re-anchor = (%d, %v), want (0, false)", drift, stepped)
+	}
+}
+
+func TestClock_LocalStep_NeverAnchored(t *testing.T) {
+	c := New(Config{})
+	if drift, stepped := c.LocalStep(); drift != 0 || stepped {
+		t.Errorf("LocalStep() before any Anchor = (%d, %v), want (0, false)", drift, stepped)
+	}
+}
+
+// TestClock_LocalStep_DriftClassification white-box tests the drift formula
+// directly (wallElapsed − monoElapsed, classified against StepThresholdS).
+// Real divergence between wall-elapsed and monotonic-elapsed can only arise
+// from an actual OS-level clock step straddling two real time.Now() calls —
+// not reproducible through the public API (see the package note above) — so
+// this constructs the anchor fields directly (legal: same-package test) to
+// exercise the classification arithmetic Anchor/LocalStep implement.
+func TestClock_LocalStep_DriftClassification(t *testing.T) {
+	anchorInstant := time.Now()
+	tests := []struct {
+		name       string
+		anchorWall int64 // deliberately offset from anchorInstant.Unix() to simulate wall/mono divergence
+		nowOffset  time.Duration
+		threshold  int64
+		wantDrift  int64
+		wantStep   bool
+	}{
+		{"no drift", anchorInstant.Unix(), 5 * time.Second, 30, 0, false},
+		{"forward drift under threshold", anchorInstant.Unix() - 20, 5 * time.Second, 30, 20, false},
+		{"forward drift at threshold (inclusive)", anchorInstant.Unix() - 30, 5 * time.Second, 30, 30, true},
+		{"forward drift over threshold", anchorInstant.Unix() - 3600, 5 * time.Second, 30, 3600, true},
+		{"backward drift under threshold", anchorInstant.Unix() + 20, 5 * time.Second, 30, -20, false},
+		{"backward drift at threshold (inclusive)", anchorInstant.Unix() + 30, 5 * time.Second, 30, -30, true},
+		{"backward drift over threshold", anchorInstant.Unix() + 3600, 5 * time.Second, 30, -3600, true},
+		{"default threshold applied when unset", anchorInstant.Unix() - 3600, 5 * time.Second, 0, 3600, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := anchorInstant.Add(tt.nowOffset)
+			c := &Clock{
+				cfg:          Config{Now: func() time.Time { return now }, StepThresholdS: tt.threshold},
+				anchored:     true,
+				anchorServer: 42,
+				anchorMono:   anchorInstant,
+				anchorWall:   tt.anchorWall,
+			}
+			drift, stepped := c.LocalStep()
+			if drift != tt.wantDrift || stepped != tt.wantStep {
+				t.Errorf("LocalStep() = (%d, %v), want (%d, %v)", drift, stepped, tt.wantDrift, tt.wantStep)
+			}
+		})
+	}
+}
+
 func TestInWindow(t *testing.T) {
 	const start, end = 1000, 1100
 	tests := []struct {
