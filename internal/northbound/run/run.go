@@ -67,6 +67,16 @@ type Discovery struct {
 	// and operator triage (was a package var, discoveryFailures, before
 	// TASK-068). Touched only from the single discovery goroutine (Loop).
 	failures int
+
+	// pollCfg/lastTree: TASK-071 (§12) walk-cadence pacing. pollCfg is fixed
+	// at construction (New); lastTree is the most recently SUCCESSFUL walk's
+	// tree (nil until the first success, and left untouched by a failed
+	// walk — see RunOnce), read by Loop after every RunOnce call to decide
+	// how long to wait before the next one. Both touched only from the
+	// single discovery goroutine (Loop/RunOnce), same discipline as
+	// failures above.
+	pollCfg  PollRateConfig
+	lastTree *discovery.ResourceTree
 }
 
 // New constructs a Discovery. mc is the MQTT client to publish on; fetcher is
@@ -75,7 +85,12 @@ type Discovery struct {
 // this replaced in cmd/northbound/main.go); sched/clk/tracker/frm are the
 // shared scheduler, single-owner Clock (AD-004), response tracker, and flow-
 // reservation manager this walk drives.
-func New(mc mqtt.Client, fetcher *tlsclient.WolfSSLFetcher, lfdi string, sched *scheduler.Scheduler, clk *utilitytime.Clock, tracker *responses.Tracker, frm *flowres.Manager, m Metrics) *Discovery {
+// pollCfg is TASK-071's walk-cadence pacing configuration (honor vs
+// override server-advertised pollRate — see PollRateConfig/PollRateMode's
+// docs in pollrate.go). Passing PollRateConfig{} (Go zero value, Mode "")
+// reproduces pre-TASK-071 behavior exactly: effectiveInterval treats any
+// Mode other than PollRateHonor as PollRateOverride.
+func New(mc mqtt.Client, fetcher *tlsclient.WolfSSLFetcher, lfdi string, sched *scheduler.Scheduler, clk *utilitytime.Clock, tracker *responses.Tracker, frm *flowres.Manager, m Metrics, pollCfg PollRateConfig) *Discovery {
 	return &Discovery{
 		mc:         mc,
 		fetcher:    fetcher,
@@ -88,6 +103,7 @@ func New(mc mqtt.Client, fetcher *tlsclient.WolfSSLFetcher, lfdi string, sched *
 		lastPub:    &lastPublishedStore{},
 		rewalkChan: make(chan struct{}, 1),
 		rewalkGate: &rewalkGate{},
+		pollCfg:    pollCfg,
 	}
 }
 
@@ -99,8 +115,9 @@ func (d *Discovery) HandleRewalk(req bus.RewalkRequest) {
 }
 
 // Loop runs the first discovery walk immediately, then loops on interval
-// (the ticker) and on TASK-042 rewalk pokes, until ctx is cancelled. Callers
-// run this in its own goroutine (it blocks until ctx.Done()).
+// (via a resettable timer — see below) and on TASK-042 rewalk pokes, until
+// ctx is cancelled. Callers run this in its own goroutine (it blocks until
+// ctx.Done()).
 //
 // ctx also threads all the way down into the walk itself (TASK-070, R5):
 // RunOnce passes it to discovery.Walker.Discover, which checks it between
@@ -109,6 +126,14 @@ func (d *Discovery) HandleRewalk(req bus.RewalkRequest) {
 // it also unwinds an in-progress walk between resource fetches, bounding
 // shutdown latency to one fetch's ReadTimeout instead of the whole
 // resource-tree walk.
+//
+// interval is the operator-configured base cadence (cmd/northbound's
+// discovery_interval_s). Pre-TASK-071 this drove a fixed time.Ticker; now it
+// is only the FLOOR/override value fed to effectiveInterval each cycle (see
+// pollrate.go) — a plain time.Timer replaces the ticker so the wait can
+// change cycle to cycle. In PollRateOverride (the bench default) or with a
+// zero-value PollRateConfig, effectiveInterval always returns interval
+// unchanged, so the wait is byte-identical to the old ticker's cadence.
 func (d *Discovery) Loop(ctx context.Context, interval time.Duration) {
 	d.RunOnce(ctx)
 	// TASK-008: kick once the initial walk returns, success or fail-closed —
@@ -117,33 +142,54 @@ func (d *Discovery) Loop(ctx context.Context, interval time.Duration) {
 	// stops responding must NOT starve this kick, only a wedged
 	// walker/registry should).
 	watchdog.Kick()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(d.nextInterval(interval))
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			// TASK-008: kick at the top of the loop body — every tick the
 			// loop wakes up at all is itself the liveness signal;
 			// RunOnce's internal errors are handled by its own fail-closed
 			// logging and never prevent reaching this line.
 			watchdog.Kick()
 			d.RunOnce(ctx)
+			timer.Reset(d.nextInterval(interval))
 		case <-d.rewalkChan:
 			// TASK-042: an immediate out-of-cadence walk requested via
 			// lexa/csip/rewalk (HandleRewalk already republished the cached
 			// control before poking this channel). Runs the IDENTICAL
-			// RunOnce call the ticker uses — same code path, same mutexes,
-			// nothing to drift out of sync — so single-flight is free: this
-			// goroutine is the only caller of RunOnce, and it can only be
-			// sitting in this select (not mid-walk) when it picks this case
-			// up.
+			// RunOnce call the regular cadence uses — same code path, same
+			// mutexes, nothing to drift out of sync — so single-flight is
+			// free: this goroutine is the only caller of RunOnce, and it
+			// can only be sitting in this select (not mid-walk) when it
+			// picks this case up. The pending regular-cadence timer is
+			// stopped/drained and restarted from now (TASK-071: an
+			// out-of-cadence walk still refreshes the pollRate-derived
+			// wait, same as a normal tick would).
 			slog.Info("lexa-northbound: immediate walk triggered by rewalk request")
 			watchdog.Kick()
 			d.RunOnce(ctx)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(d.nextInterval(interval))
 		}
 	}
+}
+
+// nextInterval wraps effectiveInterval (pollrate.go, TASK-071) with this
+// Discovery's own pollCfg and the most recent successful walk's tree —
+// nil until the first success, and left stale (not reset to nil) by a
+// failed walk, so a transient error doesn't bounce the cadence back to the
+// aggressive base interval and doesn't lose the last-known-good pollRate
+// either.
+func (d *Discovery) nextInterval(base time.Duration) time.Duration {
+	return effectiveInterval(d.lastTree, base, d.pollCfg)
 }
 
 // RunOnce performs one discovery walk cycle: walk, clock resync, scheduler
@@ -198,6 +244,11 @@ func (d *Discovery) RunOnce(ctx context.Context) {
 		return
 	}
 	d.failures = 0
+	// TASK-071: cache the successful walk's tree so Loop's NEXT interval
+	// computation (nextInterval, run after this RunOnce returns) can read
+	// whatever pollRate this server just advertised. Left untouched on a
+	// walk error/cancel above — see lastTree's field doc.
+	d.lastTree = tree
 	d.metrics.ClockOffset.Set(float64(tree.ClockOffset))
 
 	// Feed the walk's raw offset to the single-owner Clock (AD-004, TASK-035).

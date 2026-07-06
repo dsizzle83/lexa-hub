@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/journal"
+	"lexa-hub/internal/northbound/run"
 )
 
 // Config is the JSON configuration for lexa-northbound.
@@ -28,6 +29,20 @@ type Config struct {
 
 	DiscoveryIntervalS int    `json:"discovery_interval_s"` // default 60
 	ResponseSetPath    string `json:"response_set_path"`    // default "/rsps/0/r"
+
+	// PollRateModeStr selects TASK-071 (§12) walk-cadence pacing:
+	// "honor" throttles the walk interval to the server-advertised pollRate
+	// (DeviceCapability/Time/DERControlList — see run.effectiveInterval);
+	// "override" walks at the fixed discovery_interval_s cadence every
+	// cycle, ignoring pollRate (pre-TASK-071 behavior). Empty/absent
+	// defaults to "honor" here (loadConfig) — the spec-polite PRODUCT
+	// default. The BENCH config (configs/northbound.json) ships "override"
+	// explicitly: Mayhem's adoption-latency-sensitive scenarios need
+	// control adoption in seconds, far faster than gridsim's 60s
+	// DERControlList pollRate allows in honor mode, and deploy-hub-pi.sh
+	// reinstalls that file whole on every deploy so a redeploy always
+	// reinstates the explicit override, never relying on this default.
+	PollRateModeStr string `json:"poll_rate_mode,omitempty"`
 
 	// MetricsAddr is the Prometheus /metrics listen address (TASK-044).
 	// Empty ⇒ default "127.0.0.1:9102" (product default: loopback-only); the
@@ -117,11 +132,23 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
+	if cfg.PollRateModeStr == "" {
+		cfg.PollRateModeStr = string(run.PollRateHonor)
+	}
 	return &cfg, nil
 }
 
 func (c *Config) DiscoveryInterval() time.Duration {
 	return time.Duration(c.DiscoveryIntervalS) * time.Second
+}
+
+// PollRateMode returns the configured run.PollRateMode (TASK-071). Any
+// value other than the literal "honor" string is treated as
+// run.PollRateOverride by run.effectiveInterval — see that function's doc —
+// so an unrecognized poll_rate_mode string fails toward today's-unchanged
+// behavior rather than silently honoring pollRate.
+func (c *Config) PollRateMode() run.PollRateMode {
+	return run.PollRateMode(c.PollRateModeStr)
 }
 
 // CertRotatePollInterval returns the configured sentinel poll interval, or
