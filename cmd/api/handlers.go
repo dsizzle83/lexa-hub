@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"lexa-hub/internal/utilitytime"
 )
 
 // statusResp mirrors the JSON shape served by the legacy csip-tls-test hub on
@@ -99,7 +101,8 @@ type evseJSON struct {
 // csipReportGraceS is how many seconds past a control's ValidUntil (in server
 // time) /status keeps reporting it. Covers the orchestrator's own
 // expiry-confirm debounce plus a clock-jitter margin, so the API never reports
-// a control as active meaningfully after the hub stopped enforcing it.
+// a control as active meaningfully after the hub stopped enforcing it. Applied
+// via utilitytime.ReportGrace (AD-004, TASK-036) — see buildStatus below.
 const csipReportGraceS = 15
 
 // buildStatus reduces the aggregated snapshot into the dashboard-facing
@@ -142,8 +145,13 @@ func buildStatus(snap snapshot, hb heartbeatStatus) statusResp {
 	// 2026-07-02: wan-outage-expiry INV-EXPIRED was this artifact). The hub
 	// debounces with expiryConfirmTicks before RELEASING; for pure reporting a
 	// small fixed grace is enough and needs no tick cadence.
-	expired := snap.csipControl != nil && snap.csipControl.ValidUntil > 0 &&
-		snap.now.Unix()+snap.clockOffsetS >= snap.csipControl.ValidUntil+csipReportGraceS
+	//
+	// Delegates to utilitytime.ReportGrace (AD-004, TASK-036): identical
+	// semantics to the removed inline comparison (ValidUntil==0 never expires;
+	// otherwise reportable while serverNow < ValidUntil+GraceS).
+	grace := utilitytime.ReportGrace{GraceS: csipReportGraceS}
+	serverNow := utilitytime.ServerNowAt(snap.now, snap.clockOffsetS)
+	expired := snap.csipControl != nil && !grace.Reportable(snap.csipControl.ValidUntil, serverNow)
 	if snap.csipControl != nil && !expired {
 		c := snap.csipControl
 		info := &csipControlInfo{

@@ -8,6 +8,7 @@ import (
 
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/orchestrator"
+	"lexa-hub/internal/utilitytime"
 	model "lexa-proto/csipmodel"
 )
 
@@ -25,13 +26,6 @@ const (
 	// connected station, while a silent active session still expires.
 	evseStaleAfter = 90 * time.Second
 
-	// expiryConfirmTicks is how many consecutive ticks an active CSIP control
-	// must read as past its ValidUntil (in server time) before it is dropped.
-	// It rides out a non-monotonic clock step / lurch (a transient forward jump
-	// past ValidUntil) while still clearing a genuinely-expired control whose
-	// publisher has died within a few ticks.
-	expiryConfirmTicks = 3
-
 	// meterFrozenAfter is the window after which a meter that keeps publishing
 	// the same W value is treated as a frozen sensor and excluded from the
 	// optimizer's grid reading. The optimizer falls back to its computed power
@@ -47,6 +41,46 @@ const (
 	// is genuinely steady (meter stable because load is stable, not because it's stuck).
 	solarMovingWindow = 20 * time.Second
 )
+
+// expiryConfirmWindowS is the wall-clock window (seconds, server time) an
+// active CSIP control must read as past its ValidUntil before it is dropped
+// — riding out a non-monotonic clock step / lurch (a transient forward jump
+// past ValidUntil) while still clearing a genuinely-expired control whose
+// publisher has died within a few ticks. utilitytime.DebouncedExpiry
+// (AD-004, TASK-036) is the policy; this is denominated in seconds per 05 §5
+// ("thresholds in wall-clock seconds, scaled to ticks at the edge") rather
+// than the old tick-counted expiryConfirmTicks=3 constant.
+//
+// 9 s reproduces today's QA-validated FAST behavior bit-for-bit (3 ticks ×
+// the 3 s FAST engine interval — see confirmTicksFor). At the STOCK 15 s
+// interval this floors to 2 ticks = 30 s, not the legacy 3 ticks = 45 s: a
+// deliberate wall-clock-denomination correction (AD-004, TASK-036, 05 §5),
+// not a bug — tick-counting this threshold meant FAST and STOCK debounced
+// for different real-world durations. STOCK's control-expiry release
+// latency improves 45 s → 30 s; see
+// docs/refactor/02_ARCHITECTURE_DECISIONS.md AD-004 in csip-tls-test.
+const expiryConfirmWindowS = 9.0
+
+// confirmTicksFor scales expiryConfirmWindowS to the number of consecutive
+// engine ticks that represents at the given engine cadence, floored at 2 so
+// a single-tick clock excursion can never drop a still-valid control (the
+// floor the legacy constant also implicitly provided at every cadence <=
+// 4.5 s). Mirrors the optimizer's scaleTicks pattern
+// (internal/orchestrator/optimizer.go) on the economic-tick side.
+//
+// engineInterval <= 0 is defensive only (cmd/hub/config.go's loadConfig
+// always defaults EngineIntervalS to 15 before any reader is constructed);
+// it falls back to that same 15 s STOCK default rather than dividing by zero.
+func confirmTicksFor(engineInterval time.Duration) int {
+	if engineInterval <= 0 {
+		engineInterval = 15 * time.Second
+	}
+	n := int(math.Ceil(expiryConfirmWindowS / engineInterval.Seconds()))
+	if n < 2 {
+		n = 2
+	}
+	return n
+}
 
 // MQTTSystemReader implements orchestrator.SystemReader by maintaining a
 // snapshot of all device state populated via MQTT subscriptions.
@@ -76,10 +110,13 @@ type MQTTSystemReader struct {
 	// source flips to/from "none"/"default" with no MRID).
 	lastCSIPMRID      string
 	lastCSIPChangedAt time.Time
-	// csipExpiredTicks counts consecutive ticks lastCSIP has been past its
-	// validity window, so a transient (non-monotonic) clock excursion does not
-	// drop a still-valid control. Reset whenever it is back inside the window.
-	csipExpiredTicks int
+	// expiry debounces lastCSIP's expiry: a transient (non-monotonic) clock
+	// excursion past ValidUntil must not drop a still-valid control, but a
+	// SUSTAINED expiry (confirmed for expiry.Confirm consecutive ticks) must.
+	// utilitytime.DebouncedExpiry (AD-004, TASK-036) generalizes the old
+	// csipExpiredTicks/expiryConfirmTicks pair; see confirmTicksFor for how
+	// Confirm is derived from the engine cadence.
+	expiry utilitytime.DebouncedExpiry
 
 	// stale tracks which measurement sources are currently stale, so staleness
 	// is surfaced edge-triggered (one log on going stale, one on recovery)
@@ -120,7 +157,11 @@ func (s evseSnapshot) fresh(now time.Time) bool {
 	return now.Sub(s.at) <= evseStaleAfter
 }
 
-func newMQTTSystemReader(devices []DeviceConfig) *MQTTSystemReader {
+// newMQTTSystemReader constructs a reader for the given device set. engineInterval
+// is the engine's configured tick cadence (cfg.EngineInterval()) — it sizes the
+// CSIP expiry debounce (expiry.Confirm) so the debounce means the same
+// wall-clock seconds regardless of cadence (see confirmTicksFor, AD-004/TASK-036).
+func newMQTTSystemReader(devices []DeviceConfig, engineInterval time.Duration) *MQTTSystemReader {
 	r := &MQTTSystemReader{
 		lastMeas:    make(map[string]measSnapshot),
 		lastBattMet: make(map[string]bus.BattMetrics),
@@ -128,6 +169,7 @@ func newMQTTSystemReader(devices []DeviceConfig) *MQTTSystemReader {
 		devices:     devices,
 		devByName:   make(map[string]*DeviceConfig),
 		stale:       make(map[string]bool),
+		expiry:      utilitytime.DebouncedExpiry{Confirm: confirmTicksFor(engineInterval)},
 	}
 	for i := range devices {
 		d := &devices[i]
@@ -390,23 +432,26 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 	// ValidUntil. Dropping the control on that single excursion would stop
 	// enforcing a cap that is still valid once the clock settles — and the
 	// retained control would not come back on the clock's return. So require the
-	// expiry to PERSIST for expiryConfirmTicks consecutive ticks before dropping,
+	// expiry to PERSIST for the confirm window before dropping
+	// (utilitytime.DebouncedExpiry, AD-004/TASK-036 — see expiryConfirmWindowS),
 	// and keep enforcing the control in the meantime (a cap is conservative, so
 	// holding it across a transient clock jump is the safe choice).
-	if r.lastCSIP != nil && r.lastCSIP.ValidUntil > 0 &&
-		now.Unix()+r.clockOffset >= r.lastCSIP.ValidUntil {
-		r.csipExpiredTicks++
-		if r.csipExpiredTicks >= expiryConfirmTicks {
-			// TASK-045: migrated to slog (control expiry edge).
-			slog.Info("[hub] CSIP control expired; dropping",
-				"mrid", r.lastCSIP.MRID, "source", r.lastCSIP.Source,
-				"valid_until", r.lastCSIP.ValidUntil, "server_now", now.Unix()+r.clockOffset,
-				"confirm_ticks", r.csipExpiredTicks)
-			r.lastCSIP = nil
-			r.csipExpiredTicks = 0
-		}
-	} else {
-		r.csipExpiredTicks = 0
+	//
+	// serverNow/expired delegate to utilitytime (ServerNowAt, Expired) for the
+	// exact same arithmetic the scheduler uses (validUntil != 0 && serverNow >=
+	// validUntil); r.expiry.Observe carries the debounce state that used to be
+	// the bare csipExpiredTicks counter. A false Observe (no control, or a
+	// ValidUntil=0 control that never expires) resets the counter, matching the
+	// old "else { r.csipExpiredTicks = 0 }" branch exactly.
+	serverNow := utilitytime.ServerNowAt(now, r.clockOffset)
+	expired := r.lastCSIP != nil && utilitytime.Expired(r.lastCSIP.ValidUntil, serverNow)
+	if r.expiry.Observe(expired) {
+		// TASK-045: migrated to slog (control expiry edge).
+		slog.Info("[hub] CSIP control expired; dropping",
+			"mrid", r.lastCSIP.MRID, "source", r.lastCSIP.Source,
+			"valid_until", r.lastCSIP.ValidUntil, "server_now", serverNow,
+			"confirm_ticks", r.expiry.Confirm)
+		r.lastCSIP = nil
 	}
 	if r.lastCSIP != nil {
 		state.CSIPControl = busToCSIPControl(r.lastCSIP)

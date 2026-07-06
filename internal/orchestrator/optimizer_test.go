@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/orchestrator"
+	model "lexa-proto/csipmodel"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -437,6 +437,37 @@ func TestOptimizer_TOU_PeakHour_DischargeBattery(t *testing.T) {
 	}
 }
 
+// TestOptimizer_TOU_PeakHour_UsesServerTimeViaClockOffset is the AD-004/
+// TASK-036 regression for optimizer.go's Rule 5: peak detection must key off
+// SERVER time (state.Timestamp + state.ClockOffset, via utilitytime.ServerNowAt)
+// rather than the local Timestamp alone. state.Timestamp is set to 3 AM local
+// (well outside DefaultTOUCostModel's 16:00-21:00 peak window), but a +14h
+// ClockOffset — as a hub whose local clock is 14 hours behind the CSIP server
+// would report via bus.ActiveControl.ClockOffset — pushes server time to 5 PM,
+// squarely inside the peak window. If Rule 5 ever regressed to reading local
+// time only, this discharge would not fire.
+func TestOptimizer_TOU_PeakHour_UsesServerTimeViaClockOffset(t *testing.T) {
+	opt := orchestrator.NewDefaultOptimizer()
+	opt.CostModel = orchestrator.DefaultTOUCostModel()
+
+	s := state0()
+	s.Timestamp = time.Date(2025, 1, 15, 3, 0, 0, 0, time.Local) // 3 AM local: off-peak
+	s.ClockOffset = 14 * 3600                                    // server time = 3am+14h = 5pm: peak
+	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 80, 5000)}
+
+	plan := opt.Optimize(s)
+
+	found := false
+	for _, cmd := range plan.BatteryCommands {
+		if cmd.SetpointW > 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected battery discharge: server time (local+ClockOffset) is within the TOU peak window even though local time is not")
+	}
+}
+
 // ── Decision trace ────────────────────────────────────────────────────────────
 
 func TestOptimizer_DecisionsAreRecorded(t *testing.T) {
@@ -562,7 +593,7 @@ func TestOptimizer_ExportLimit_SwitchesBatteryFromDischargeToCharge(t *testing.T
 	s := state0()
 	s.Solar = []orchestrator.SolarState{solar("pv-0", 5000, 10000)}
 	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 3000, 50, 5000)} // discharging
-	s.Grid.NetW = -6000                                                           // 6kW export
+	s.Grid.NetW = -6000                                                         // 6kW export
 	s.CSIPControl = &orchestrator.CSIPControlState{
 		Base: model.DERControlBase{OpModExpLimW: ap(0)},
 	}
@@ -851,7 +882,9 @@ func TestScenario_S1_DiscoveryGap_NoImportFromUnconstrainedEV(t *testing.T) {
 // battery=-5kW and EV=6A, the Modbus meter settles to the new export within
 // ~1 s but OCPP MeterValues lag ~10 s, so evseW still reports the pre-event
 // current.  The old conservation identity
-//   unconstrainedExportW = signedNetExportW + measuredBatteryAbsorbW + evseW
+//
+//	unconstrainedExportW = signedNetExportW + measuredBatteryAbsorbW + evseW
+//
 // then over-estimated the surplus, the pre-flight branch boosted the EV by
 // 15-20 A, and the site flipped from a clean +620 W export into a 3.4 kW
 // import.  Verify the optimizer no longer over-tightens the EV when evseW is
@@ -881,10 +914,10 @@ func TestScenario_S1_ExportOvershoot_StaleEVMeasurement(t *testing.T) {
 	// Tick 2 — the meter has settled to the post-command export (~620 W) but
 	// OCPP MeterValues hasn't arrived yet, so evseW still reports the pre-event
 	// current.  Simulate this skew explicitly.
-	s.Batteries[0].PowerW = -5000   // battery actuator confirmed
-	s.EVSEs[0].CurrentA = 13.4      // stale OCPP reading from pre-event tick
-	s.EVSEs[0].PowerW = 13.4 * 230  // ≈ 3082 W stale
-	s.Grid.NetW = -620              // meter shows 620 W export (post-command reality)
+	s.Batteries[0].PowerW = -5000  // battery actuator confirmed
+	s.EVSEs[0].CurrentA = 13.4     // stale OCPP reading from pre-event tick
+	s.EVSEs[0].PowerW = 13.4 * 230 // ≈ 3082 W stale
+	s.Grid.NetW = -620             // meter shows 620 W export (post-command reality)
 
 	plan = opt.Optimize(s)
 
