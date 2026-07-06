@@ -482,10 +482,13 @@ survive; the guards below are deliberate, not redundant. Keep them when refactor
   a device can ACK a write and ignore it. `checkGenLimitConvergence` (cross-checked against an
   independent meter floor `gen ≥ export − batteryDischarge`), `checkImportConvergence`, and the
   export rule's battery-absorption guard all compare commanded vs MEASURED effect and, on a
-  sustained gap, curtail another lever or post a 2030.5 CannotComply. The export convergence
-  backstop (`checkExportLimitConvergence`/`expOverTicks`, session-scoped) is also ported to
-  `orchestrator/constraint/export.go` (TASK-060) running in SHADOW; the optimizer.go copy stays
-  authoritative until the `export: active` flip — do not strip either.
+  sustained gap, curtail another lever or post a 2030.5 CannotComply. The `checkGenLimitConvergence`
+  meter-independent floor is a HARD preserve (an inverter that echoes the cap while still generating
+  is caught only by it). The export/gen/import convergence backstops are ALL ported to the
+  constraint package running in SHADOW — `orchestrator/constraint/export.go` (TASK-060),
+  `constraint/genlimit.go` (meter floor, verbatim) + `constraint/importlimit.go` (NaN-hold
+  counter) (TASK-061); the optimizer.go copies stay authoritative until the per-axis `active`
+  flips — do not strip either side.
 - **Fail closed on bad CSIP**: the scheduler holds last-known-good on an empty/malformed
   resource (see `internal/northbound/CLAUDE.md` rule 6).
 - **Plausibility-gate ingested telemetry**: `cmd/modbus` withholds power over nameplate
