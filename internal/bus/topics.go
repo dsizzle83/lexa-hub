@@ -16,6 +16,7 @@
 //	lexa/control/solar/{device}               hub          → modbus
 //	lexa/evse/{station}/command               hub          → ocpp
 //	lexa/hub/plan                             hub          → api (retained)
+//	lexa/reconcile/{class}/{device}/report    modbus/ocpp  → hub (retained, TASK-031)
 //
 // Publish QoS is a per-topic policy owned here (PubQoS), not hardcoded by
 // callers: the measurement plane (lexa/measurements/*, lexa/battery/*/metrics,
@@ -128,6 +129,8 @@ func SupportedV(topic string) int {
 		// core landed unwired) to TASK-027, whose hub-side publisher is the
 		// first thing to ever put a message on this topic family.
 		return DesiredStateV
+	case strings.HasPrefix(topic, "lexa/reconcile/") && strings.HasSuffix(topic, "/report"):
+		return ReconcileReportV
 	default:
 		return 1
 	}
@@ -198,6 +201,17 @@ func DesiredTopic(class, device string) string {
 	return fmt.Sprintf("lexa/desired/%s/%s", class, device)
 }
 
+// ReconcileReportTopic returns the retained reconciler-report topic for a device
+// (TASK-031): lexa/reconcile/{class}/{device}/report, class ∈ battery|solar|evse.
+// The reconciler shells publish their device-level non-convergence state here
+// (NonConvergedBegin/End), RETAINED so the hub re-seeds current convergence
+// state after a restart. This is STATE (latest level wins), never an edge — the
+// CannotComply alert edge lives on TopicCSIPComplianceAlert and stays
+// non-retained (a retained edge would replay as a false edge after restarts).
+func ReconcileReportTopic(class, device string) string {
+	return fmt.Sprintf("lexa/reconcile/%s/%s/report", class, device)
+}
+
 // Wildcard subscription topics used by subscribers.
 const (
 	SubMeasurements = "lexa/measurements/+"
@@ -209,6 +223,10 @@ const (
 	// SubDesired matches every retained desired-state document across all
 	// device classes (AD-013). The reconciler (TASK-026) subscribes this.
 	SubDesired = "lexa/desired/+/+"
+	// SubReconcileReport matches every retained reconciler report across all
+	// device classes (TASK-031). The hub's breach-episode component subscribes
+	// this to merge device-level non-convergence into CannotComply episodes.
+	SubReconcileReport = "lexa/reconcile/+/+/report"
 )
 
 // DeviceFromMeasurementTopic extracts the device name from a topic like
@@ -256,6 +274,18 @@ func ClassFromDesiredTopic(topic string) string {
 // "lexa/desired/{class}/{device}" (the segment at index 3).
 func DeviceFromDesiredTopic(topic string) string {
 	return nthSegment(topic, 3)
+}
+
+// ClassFromReconcileReportTopic extracts the device class from
+// "lexa/reconcile/{class}/{device}/report" (the segment at index 1).
+func ClassFromReconcileReportTopic(topic string) string {
+	return nthSegment(topic, 1)
+}
+
+// DeviceFromReconcileReportTopic extracts the device (or EVSE stationID) from
+// "lexa/reconcile/{class}/{device}/report" (the segment at index 2).
+func DeviceFromReconcileReportTopic(topic string) string {
+	return nthSegment(topic, 2)
 }
 
 func lastSegment(topic string) string {

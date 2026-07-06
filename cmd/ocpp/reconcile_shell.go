@@ -45,8 +45,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/metrics"
+	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/reconcile"
 )
 
@@ -104,6 +107,10 @@ type evseShell struct {
 	wouldWrites   *metrics.Counter
 	writes        *metrics.Counter
 	writeFailures *metrics.Counter
+
+	// pub forwards convergence-state reports (NonConvergedBegin/End) to MQTT for
+	// the hub's breach-episode component (TASK-031); nil in shadow mode / tests.
+	pub func(reconcile.Report)
 }
 
 // newEVSEShell builds a shell in the given mode. In shadow mode driver MUST be
@@ -292,6 +299,37 @@ func (s *evseShell) logDecision(action reconcile.Action, reports []reconcile.Rep
 	for _, rep := range reports {
 		log.Printf("lexa-ocpp: reconciler[%s] %s(evse): report=%s episode=%d mrid=%q reject=%s",
 			tag, s.stationID, rep.Kind, rep.Episode, rep.MRID, rep.Reject)
+		if s.pub != nil {
+			s.pub(rep)
+		}
+	}
+}
+
+// newReconcileReportPublisher returns a shell.pub sink that forwards
+// convergence-state reports (NonConvergedBegin/End only) to the hub over MQTT
+// (TASK-031), RETAINED on lexa/reconcile/{class}/{device}/report so the hub
+// re-seeds current convergence STATE after a restart. Every other report kind
+// stays shell-log-only. Called from the shell's mu-held logDecision.
+func newReconcileReportPublisher(mc mqtt.Client) func(reconcile.Report) {
+	return func(r reconcile.Report) {
+		if r.Kind != reconcile.ReportNonConvergedBegin && r.Kind != reconcile.ReportNonConvergedEnd {
+			return
+		}
+		msg := bus.ReconcileReport{
+			Envelope:    bus.Envelope{V: bus.ReconcileReportV},
+			Kind:        r.Kind.String(),
+			DeviceClass: r.DeviceClass,
+			DeviceID:    r.DeviceID,
+			MRID:        r.MRID,
+			Seq:         r.Seq,
+			IssuedAt:    r.IssuedAt,
+			Episode:     r.Episode,
+			Ts:          r.At.Unix(),
+		}
+		topic := bus.ReconcileReportTopic(r.DeviceClass, r.DeviceID)
+		if err := mqttutil.PublishJSONRetained(mc, topic, msg); err != nil {
+			log.Printf("lexa-ocpp: publish reconcile report (%s %s): %v", r.DeviceClass, r.DeviceID, err)
+		}
 	}
 }
 

@@ -92,6 +92,10 @@ type solarShell struct {
 	wouldWrites   *metrics.Counter
 	writes        *metrics.Counter
 	writeFailures *metrics.Counter
+
+	// pub forwards convergence-state reports (NonConvergedBegin/End) to MQTT for
+	// the hub's breach-episode component (TASK-031); nil in shadow mode / tests.
+	pub func(reconcile.Report)
 }
 
 // newSolarShadow builds a SHADOW-mode inverter shell (recorder; no driver).
@@ -302,6 +306,9 @@ func (s *solarShell) logDecision(action reconcile.Action, reports []reconcile.Re
 	for _, rep := range reports {
 		log.Printf("lexa-modbus: reconciler[%s] %s(solar): report=%s episode=%d mrid=%q reject=%s",
 			tag, s.device, rep.Kind, rep.Episode, rep.MRID, rep.Reject)
+		if s.pub != nil {
+			s.pub(rep)
+		}
 	}
 }
 

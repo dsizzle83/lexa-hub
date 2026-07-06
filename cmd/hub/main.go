@@ -134,21 +134,48 @@ func main() {
 		opt.EVImportCooldownCycles = 4
 	}
 
-	// Compliance-breach alerter. The optimizer flags limits it cannot meet
-	// (e.g. an import cap with the battery at its SOC reserve) on plan.Breach.
-	// Publish one ComplianceAlert when a control's breach begins and one when it
-	// clears, so the northbound service POSTs one CannotComply Response per episode
-	// rather than spamming one per tick.
-	//
-	// Keyed on the breaching mRID, NOT a single active flag: when one control is
-	// already breaching and a DIFFERENT control then breaches without an
-	// intervening clear (a higher-primacy event supersedes an unmeetable one, or a
-	// held last-known-good control overlaps a fresh cap), an mRID-agnostic flag
-	// stays latched and the new control's breach is never reported. That was the
-	// reject-write/enable-gate-curtail flakiness: a prior episode's breach kept the
-	// alerter latched, so a fresh gen-cap breach published no alert and gridsim
-	// never saw the CannotComply.
-	activeBreachMRID := "" // "" = no breach currently active
+	// Compliance-breach reporting (TASK-031). The named breachEpisodes component
+	// is the single owner of CannotComply episode state: it merges the
+	// optimizer's meter-level breaches (plan.Breach, fed by the plan observer
+	// below) AND the reconcilers' device-level non-convergence (bus.ReconcileReport,
+	// fed by the retained lexa/reconcile/+/+/report subscription) into ONE episode
+	// stream, and emits one Active ComplianceAlert per episode onset (or new-mRID
+	// switch) and one !Active on full clear — so the northbound service POSTs
+	// exactly one CannotComply Response per real episode rather than one per source
+	// or one per tick. It replaces the former activeBreachMRID closure variable +
+	// standalone breachAlert func (05 §4: named, testable episode state).
+	episodes := newBreachEpisodes()
+	// emitAlerts publishes the component's edge alerts and updates the breach
+	// observability (lexa_hub_breaches_total per Active edge, lexa_hub_breach_active
+	// gauge). Shared by both feed paths (plan observer + report subscription), which
+	// run on different goroutines; the component itself is internally locked, and
+	// the mqtt client and metrics counters are goroutine-safe, so publishing here
+	// (outside the component lock) is race-free.
+	emitAlerts := func(alerts []bus.ComplianceAlert) {
+		for i := range alerts {
+			alert := alerts[i]
+			alert.Ts = time.Now().Unix()
+			if alert.Active {
+				breachesTotalCtr.Inc() // one per breach EDGE, not per tick
+				slog.Info("COMPLIANCE BREACH",
+					"limit_type", alert.LimitType, "limit_w", alert.LimitW,
+					"measured_w", alert.MeasuredW, "shortfall_w", alert.ShortfallW,
+					"reason", alert.Reason, "mrid", alert.MRID, "episode", alert.EpisodeID)
+			} else {
+				slog.Info("compliance breach cleared", "mrid", alert.MRID, "episode", alert.EpisodeID)
+			}
+			if err := mqttutil.PublishJSON(mc, bus.TopicCSIPComplianceAlert, alert); err != nil {
+				log.Printf("lexa-hub: publish compliance alert: %v", err)
+			}
+		}
+		// Reflect the current episode state on EVERY call so the gauge tracks the
+		// merged evidence, including ticks/reports that produced no edge.
+		if episodes.Active() {
+			breachActiveGauge.Set(1)
+		} else {
+			breachActiveGauge.Set(0)
+		}
+	}
 	// dedupeResets clears every actuator's command deduper; populated when the
 	// actuators are wired below (before the engine starts, so no race — the
 	// observer and executePlan both run on the engine's control goroutine).
@@ -206,37 +233,12 @@ func main() {
 			log.Printf("lexa-hub: publish plan log: %v", err)
 		}
 
-		alert, newMRID := breachAlert(activeBreachMRID, plan)
-		activeBreachMRID = newMRID
-		// lexa_hub_breach_active (TASK-044): reflects activeBreachMRID on
-		// EVERY tick (not just alert edges) so the gauge is always current,
-		// including ticks where breachAlert returns nil because nothing
-		// changed this pass.
-		if activeBreachMRID != "" {
-			breachActiveGauge.Set(1)
-		} else {
-			breachActiveGauge.Set(0)
-		}
-		if alert == nil {
-			return // no edge this tick
-		}
-		alert.Ts = time.Now().Unix()
-		if alert.Active {
-			breachesTotalCtr.Inc() // lexa_hub_breaches_total: one per breach EDGE, not per tick
-			// TASK-045: migrated to slog (breach begin edge). "COMPLIANCE BREACH"
-			// kept as the message text — grep-verified nothing in csip-tls-test
-			// quotes this phrase today, but it stays intact defensively (matches
-			// the QA harness's own vocabulary for this fault class).
-			slog.Info("COMPLIANCE BREACH",
-				"limit_type", alert.LimitType, "limit_w", alert.LimitW,
-				"measured_w", alert.MeasuredW, "shortfall_w", alert.ShortfallW,
-				"reason", alert.Reason, "mrid", alert.MRID)
-		} else {
-			slog.Info("compliance breach cleared")
-		}
-		if err := mqttutil.PublishJSON(mc, bus.TopicCSIPComplianceAlert, *alert); err != nil {
-			log.Printf("lexa-hub: publish compliance alert: %v", err)
-		}
+		// Feed this plan's meter-level breach evidence to the episode component
+		// and publish whatever edge it produces. The component owns the edge
+		// semantics (onset / new-mRID re-alert / clear) and the Safety-plan guard
+		// (a safety plan's nil Breach is "not assessed", never a clear edge).
+		// lexa_hub_breach_active is updated inside emitAlerts on every pass.
+		emitAlerts(episodes.OnPlan(plan, time.Now()))
 	}
 
 	eng := orchestrator.New(reader, opt, orchestrator.Config{
@@ -283,6 +285,20 @@ func main() {
 		}
 	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe csip pricing: %v", err)
+	}
+
+	// Subscribe to reconciler reports (TASK-031): device-level non-convergence
+	// evidence from the lexa-modbus / lexa-ocpp reconciler shells, RETAINED per
+	// device so this feeds the current convergence state after a hub restart.
+	// Fed to the same breach-episode component the plan observer feeds, so a
+	// device that won't converge under an active control opens/closes the SAME
+	// CannotComply episode the optimizer would — one episode per real fault, not
+	// one per source. Non-fatal on error: the optimizer's meter-level breach path
+	// still functions if this subscription fails to register.
+	if err := mqttutil.Subscribe(mc, bus.SubReconcileReport, func(_ string, rep bus.ReconcileReport) {
+		emitAlerts(episodes.OnReport(rep, time.Now()))
+	}); err != nil {
+		log.Printf("lexa-hub: subscribe reconcile reports: %v", err)
 	}
 
 	// Wire MQTT actuators for each device.
@@ -343,36 +359,6 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("lexa-hub: shutting down")
-}
-
-// breachAlert is the per-control compliance-alert edge logic, extracted from the
-// plan observer so it is unit-testable. Given the mRID whose breach is currently
-// being reported (prevMRID, "" if none) and the latest plan, it returns the alert
-// to publish — Active when a control's breach begins OR the breaching control
-// changes to a new mRID, !Active when the breach clears — or nil when nothing
-// changed (so the same episode is reported once, not per tick). The returned
-// string is the new active-breach mRID for the caller to carry forward. Ts is set
-// by the caller.
-func breachAlert(prevMRID string, plan orchestrator.Plan) (*bus.ComplianceAlert, string) {
-	switch {
-	// A fast-loop safety plan never evaluates CSIP limits: its nil Breach means
-	// "not assessed", not "compliant". Treating it as a clear edge would publish
-	// a spurious CannotComply-resolved between economic ticks mid-episode.
-	case plan.Safety:
-		return nil, prevMRID
-	case plan.Breach != nil && plan.Breach.MRID != prevMRID:
-		b := plan.Breach
-		return &bus.ComplianceAlert{
-			Envelope: bus.Envelope{V: bus.ComplianceAlertV},
-			MRID:     b.MRID, LimitType: b.LimitType, LimitW: b.LimitW,
-			MeasuredW: b.MeasuredW, ShortfallW: b.ShortfallW, Reason: b.Reason,
-			Active: true,
-		}, b.MRID
-	case plan.Breach == nil && prevMRID != "":
-		return &bus.ComplianceAlert{Envelope: bus.Envelope{V: bus.ComplianceAlertV}, Active: false}, ""
-	default:
-		return nil, prevMRID
-	}
 }
 
 // derConstraintsFromSchedule converts a DERScheduleMsg into per-step

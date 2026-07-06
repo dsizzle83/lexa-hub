@@ -254,9 +254,9 @@ func main() {
 	// guard so a future breach re-alerts.
 	if err := mqttutil.Subscribe(mc, bus.TopicCSIPComplianceAlert, func(_ string, alert bus.ComplianceAlert) {
 		if alert.Active {
-			log.Printf("lexa-northbound: compliance breach %s limit=%.0fW measured=%.0fW (%s) → CannotComply mrid=%s",
-				alert.LimitType, alert.LimitW, alert.MeasuredW, alert.Reason, alert.MRID)
-			respTracker.alertCannotComply(alert.MRID)
+			log.Printf("lexa-northbound: compliance breach %s limit=%.0fW measured=%.0fW (%s) → CannotComply mrid=%s episode=%s",
+				alert.LimitType, alert.LimitW, alert.MeasuredW, alert.Reason, alert.MRID, alert.EpisodeID)
+			respTracker.alertCannotComply(alert.MRID, alert.EpisodeID)
 		} else {
 			respTracker.clearAlerts()
 		}
@@ -819,16 +819,28 @@ func newResponseTracker(p responsePoster, lfdi, path string, clk *utilitytime.Cl
 	}
 }
 
-// alertCannotComply posts a single CannotComply Response for mrid per breach
-// episode. The hub already edge-triggers the alert, but the per-mRID guard
-// makes a redelivered MQTT message idempotent.
-func (rt *responseTracker) alertCannotComply(mrid string) {
+// alertCannotComply posts a single CannotComply Response per breach episode.
+// The hub edge-triggers the alert; this guard makes a redelivered MQTT message
+// idempotent.
+//
+// Dedupe key (TASK-031): the episode ID when present, falling back to the mRID
+// for pre-TASK-031 publishers. The mRID is ALSO recorded and checked
+// unconditionally as a safety net: a hub restart mid-episode re-derives a fresh
+// episode ID for the same still-breaching control, and keying on episode alone
+// would let that re-post — so a matching mRID (this tracker's alerted map
+// survives a hub restart because northbound does not restart with it) still
+// dedupes, exactly as the pre-TASK-031 mRID-keyed guard did. clearAlerts wipes
+// both keys, so a genuine new episode after a clear re-alerts.
+func (rt *responseTracker) alertCannotComply(mrid, episodeID string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	if rt.alerted[mrid] {
+	if rt.alerted[mrid] || (episodeID != "" && rt.alerted[episodeID]) {
 		return
 	}
 	rt.alerted[mrid] = true
+	if episodeID != "" {
+		rt.alerted[episodeID] = true
+	}
 	rt.postResponse(mrid, model.ResponseCannotComply)
 }
 

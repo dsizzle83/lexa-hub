@@ -150,6 +150,12 @@ func main() {
 				note = func(cmd bus.BattCommand) { interlock.noteControl(name, cmd) }
 			}
 			shell := newBatteryShell(dc.Name, reconcile.Config{}, mreg, mode, drv, ilg, note)
+			// TASK-031: forward device-level non-convergence to the hub's
+			// breach-episode component (active mode only — shadow shells never
+			// drive CannotComply).
+			if mode == modeActive {
+				shell.pub = newReconcileReportPublisher(mc)
+			}
 			battShells[dc.Name] = shell
 			// Active: route reconnects to the reconciler (the SINGLE reasserter)
 			// and suppress retryDevice's own lastCtrl reassert for this device —
@@ -192,6 +198,9 @@ func main() {
 				drv = registryDriver{reg: reg, dev: dc.Name}
 			}
 			shell := newSolarShell(dc.Name, reconcile.Config{}, mreg, mode, drv)
+			if mode == modeActive {
+				shell.pub = newReconcileReportPublisher(mc) // TASK-031
+			}
 			solarShells[dc.Name] = shell
 			if mode == modeActive {
 				// Single reasserter: the shell's Reconnected() replaces

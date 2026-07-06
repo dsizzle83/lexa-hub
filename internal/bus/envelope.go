@@ -49,6 +49,7 @@ const (
 	DERScheduleV            = 1 // lexa/northbound/schedule                 (DERScheduleMsg)
 	PlanLogV                = 1 // lexa/hub/plan                            (PlanLog)
 	DesiredStateV           = 1 // lexa/desired/{class}/{device}            (DesiredState, AD-013)
+	ReconcileReportV        = 1 // lexa/reconcile/{class}/{device}/report   (ReconcileReport, TASK-031)
 )
 
 // LegacyV0Accepted is the transition switch for AD-006's compatibility

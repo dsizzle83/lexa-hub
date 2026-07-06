@@ -125,3 +125,53 @@ func TestResponse_Superseded(t *testing.T) {
 	eq(t, fp.statusesFor("E4"),
 		model.ResponseEventReceived, model.ResponseEventStarted, model.ResponseEventSuperseded)
 }
+
+// TASK-031: exactly one CannotComply POST per episode. A redelivered alert with
+// the SAME episode ID must not double-post; clearAlerts re-arms so the NEXT
+// episode does post.
+func TestResponse_CannotComplyOncePerEpisode(t *testing.T) {
+	fp := &fakePoster{}
+	rt := newResponseTracker(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil)
+
+	rt.alertCannotComply("E5", "E5@100#1") // onset → post
+	rt.alertCannotComply("E5", "E5@100#1") // redelivered same episode → no re-post
+	if got := fp.statusesFor("E5"); len(got) != 1 || got[0] != model.ResponseCannotComply {
+		t.Fatalf("one CannotComply expected for the episode, got %v", got)
+	}
+
+	rt.clearAlerts()                       // episode ends, re-arm
+	rt.alertCannotComply("E5", "E5@200#2") // a genuinely new episode for the same mRID → posts again
+	if got := fp.statusesFor("E5"); len(got) != 2 {
+		t.Fatalf("a new episode after clear must re-post, got %v", got)
+	}
+}
+
+// TASK-031 hub-restart invariant: a hub restart mid-episode re-derives a FRESH
+// episode ID for the same still-breaching control (northbound keeps its alerted
+// map because it did not restart). Keying on episode ID alone would re-post; the
+// mRID safety net must suppress it — preserving the pre-TASK-031 behavior
+// (hub-restart-mid-cap posts exactly once).
+func TestResponse_CannotComplyRestartNoDoublePost(t *testing.T) {
+	fp := &fakePoster{}
+	rt := newResponseTracker(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil)
+
+	rt.alertCannotComply("E6", "E6@100#1") // pre-restart onset → post
+	// Hub restarts, re-opens the SAME control's episode with a new counter/time.
+	rt.alertCannotComply("E6", "E6@500#1") // different episode ID, same mRID → must NOT re-post
+	if got := fp.statusesFor("E6"); len(got) != 1 {
+		t.Fatalf("hub-restart re-alert for the same mRID must post once, got %v", got)
+	}
+}
+
+// TASK-031 mixed-version tolerance: an alert with no episode ID (a pre-TASK-031
+// hub) dedupes by mRID exactly as before.
+func TestResponse_CannotComplyLegacyNoEpisodeID(t *testing.T) {
+	fp := &fakePoster{}
+	rt := newResponseTracker(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil)
+
+	rt.alertCannotComply("E7", "") // legacy publisher, mRID-only
+	rt.alertCannotComply("E7", "") // redelivered → no re-post
+	if got := fp.statusesFor("E7"); len(got) != 1 {
+		t.Fatalf("legacy mRID-only dedupe must post once, got %v", got)
+	}
+}
