@@ -25,6 +25,14 @@ dependency order. Client certs are staged from `../csip-tls-test/certs/client-st
 token (`scripts/update-sim-pis.sh`, `scripts/bench-up.sh` relay it) — full staged
 rollout in `csip-tls-test/docs/BENCH.md`.
 
+**OCPP Security Profile 2 (TASK-074, AD-008, 09 Security hard gate):** pass
+`--enable-ocpp-sp2` to stage the CSMS TLS cert (`csip-tls-test/scripts/gen-ev-cert.sh
+<hub-ip>` first) and generate the Basic Auth secret. **Same-session lockstep**: also
+run `csip-tls-test/scripts/update-sim-pis.sh <hub-ip> <ssh-user> --enable-ocpp-sp2` in
+this session, or evsim's `ws://` dial gets rejected the instant lexa-ocpp restarts
+with TLS required — every EV Mayhem scenario goes BLIND until both sides flip
+together. Full runbook: `csip-tls-test/docs/BENCH.md`.
+
 **Lockstep warning**: if this deploy includes a SunSpec register-map change
 (`internal/southbound/sunspec`), the sims in csip-tls-test must be redeployed in the same
 session (audit MTR-4) — otherwise hub and metersim read garbage from each other.

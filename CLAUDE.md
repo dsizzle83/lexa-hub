@@ -356,7 +356,7 @@ All configs live in `/etc/lexa/`. Edit the copies created by `make install-confi
 | `/etc/lexa/ocpp.json` | lexa-ocpp |
 | `/etc/lexa/telemetry.json` | lexa-telemetry |
 | `/etc/lexa/api.json` | lexa-api |
-| `/etc/lexa/certs/` | ca.pem, client.pem, ocpp.crt etc. |
+| `/etc/lexa/certs/` | ca.pem, client.pem, client-key.pem (CSIP mTLS identity); ocpp-cert.pem, ocpp-key.pem (OCPP CSMS Security Profile 2 — TASK-074, staged by `deploy-hub-pi.sh --enable-ocpp-sp2`, separate leaf cert from a shared bench CA) |
 
 `hub.json`'s `devices[]`/`stations[]` entries accept an optional per-entry
 `"plant"` block (TASK-057, AD-007): the device's physical-response parameters —
@@ -456,6 +456,18 @@ binary-only deploy + hand-set Pi config (05 §6 discipline).
   `main()` of lexa-northbound and lexa-telemetry only. The other three services are
   pure Go and never touch wolfSSL.
 - **Cipher**: `ECDHE-ECDSA-AES128-CCM-8 TLSv1.2` only (CSIP §5.2.1.1).
+- **OCPP Security Profile 2 is the product default** (TASK-074, AD-008, 09
+  Security hard gate): `cert_path`/`key_path`/`basic_auth_user`/
+  `basic_auth_pass` in `ocpp.json` all set, so the CSMS on :8887 requires TLS
+  + HTTP Basic Auth. Plain `ws://` (all four fields empty) is a **bench-only**
+  fallback for dev/demo convenience on the air-gapped 69.0.0.x LAN — never
+  ship a product config with it. Enable via
+  `scripts/deploy-hub-pi.sh --enable-ocpp-sp2` (stages the CSMS cert from
+  csip-tls-test's `gen-ev-cert.sh`, generates the Basic Auth secret
+  idempotently); evsim must flip to `wss://` in the SAME session
+  (`csip-tls-test/scripts/update-sim-pis.sh --enable-ocpp-sp2`) or every EV
+  Mayhem scenario goes BLIND. Backlog: Security Profile 3 (mTLS) — AD-008
+  scopes this task to "≥2", see 10_BACKLOG.md.
 - **Bus messages**: `math.NaN()` never appears in JSON — use `*float64` (nil = absent),
   and the DECODE layer rejects non-finite numeric input (NaN/Inf, quoted or bare) with
   an alarm; a NaN limit never reaches the optimizer (GAP-09, TASK-055: stdlib already

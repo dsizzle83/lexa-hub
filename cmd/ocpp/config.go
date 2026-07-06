@@ -23,11 +23,20 @@ type Config struct {
 	MQTTUser     string `json:"mqtt_user"`
 	MQTTPassFile string `json:"mqtt_pass_file"`
 
-	// OCPP 2.0.1 CSMS WebSocket server (Security Profile 2)
+	// OCPP 2.0.1 CSMS WebSocket server (Security Profile 2: TLS + HTTP Basic
+	// Auth — TASK-074, AD-008, 09 Security hard gate). PRODUCT DEFAULT is
+	// profile 2 enabled: CertPath/KeyPath/BasicAuthUser/BasicAuthPass all set.
+	// `ws://` (both fields empty) is a BENCH-ONLY fallback for dev/demo
+	// convenience on the air-gapped 69.0.0.x LAN — never ship a product
+	// config with these empty. See scripts/deploy-hub-pi.sh
+	// --enable-ocpp-sp2 (csip-tls-test docs/BENCH.md has the bench runbook).
 	Port     int    `json:"port"`      // default 8887
-	CertPath string `json:"cert_path"` // TLS cert; plain WS when empty
+	CertPath string `json:"cert_path"` // TLS cert; plain WS when empty (bench-only)
 	KeyPath  string `json:"key_path"`
 
+	// BasicAuthUser/BasicAuthPass: HTTP Basic Auth for the charging station
+	// link. Ignored (no auth enforced) when BasicAuthUser is empty — that
+	// state is bench-only, same as an empty CertPath/KeyPath above.
 	BasicAuthUser string `json:"basic_auth_user"`
 	BasicAuthPass string `json:"basic_auth_pass"`
 
