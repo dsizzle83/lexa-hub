@@ -46,6 +46,7 @@ import (
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/northbound/discovery"
+	"lexa-hub/internal/northbound/flowres"
 	"lexa-hub/internal/northbound/identity"
 	"lexa-hub/internal/northbound/schedule"
 	"lexa-hub/internal/northbound/scheduler"
@@ -55,84 +56,6 @@ import (
 	"lexa-hub/internal/wolfssl"
 	model "lexa-proto/csipmodel"
 )
-
-// ── Flow reservation manager ──────────────────────────────────────────────────
-
-// flowReservationManager handles the client side of the Flow Reservation
-// function set (IEEE 2030.5 §10.9). It receives FlowReservationRequest
-// messages from the hub via MQTT and POSTs them to the utility server, tracking
-// the path to use for each end device.
-type flowReservationManager struct {
-	mu          sync.RWMutex
-	fetcher     *tlsclient.WolfSSLFetcher
-	lfdi        string
-	requestPath string // EndDevice FlowReservationRequestListLink.Href; guarded by mu
-}
-
-func newFlowReservationManager(f *tlsclient.WolfSSLFetcher, lfdi string) *flowReservationManager {
-	return &flowReservationManager{fetcher: f, lfdi: lfdi}
-}
-
-// setRequestPath updates the server path to POST new requests to. Called after
-// each discovery walk with the path from the EndDevice resource.
-func (m *flowReservationManager) setRequestPath(path string) {
-	m.mu.Lock()
-	m.requestPath = path
-	m.mu.Unlock()
-}
-
-// handleRequest is the MQTT message handler for TopicCSIPFRRequest. It
-// decodes the hub's FlowReservationRequestMsg and POSTs a corresponding
-// FlowReservationRequest to the utility server.
-func (m *flowReservationManager) handleRequest(payload []byte) {
-	var msg bus.FlowReservationRequestMsg
-	if err := json.Unmarshal(payload, &msg); err != nil {
-		log.Printf("lexa-northbound: flowreservation decode: %v", err)
-		return
-	}
-	m.mu.RLock()
-	requestPath := m.requestPath
-	m.mu.RUnlock()
-	if requestPath == "" {
-		log.Printf("lexa-northbound: flowreservation: no request path yet — server may not support FR")
-		return
-	}
-
-	req := model.FlowReservationRequest{
-		MRID:              msg.MRID,
-		Description:       msg.Description,
-		CreationTime:      msg.Ts,
-		DurationRequested: msg.DurationRequested,
-		EnergyRequested: &model.UnitValue{
-			Multiplier: 0,
-			Value:      int64(derefF64(msg.EnergyRequestedWh)),
-		},
-		IntervalRequested: model.DateTimeInterval{
-			Start:    msg.IntervalStart,
-			Duration: msg.IntervalDuration,
-		},
-		PowerRequested: &model.UnitValue{
-			Multiplier: 0,
-			Value:      int64(derefF64(msg.PowerRequestedW)),
-		},
-		RequestStatus: model.RequestStatus{
-			DateTime:      msg.Ts,
-			RequestStatus: model.FlowReqStatusRequested,
-		},
-	}
-
-	body, err := xml.Marshal(&req)
-	if err != nil {
-		log.Printf("lexa-northbound: flowreservation marshal: %v", err)
-		return
-	}
-	_, location, err := m.fetcher.Post(requestPath, body, "application/sep+xml")
-	if err != nil {
-		log.Printf("lexa-northbound: flowreservation POST %s: %v", requestPath, err)
-		return
-	}
-	log.Printf("lexa-northbound: flowreservation POSTed mrid=%s location=%s", msg.MRID, location)
-}
 
 func main() {
 	cfgPath := flag.String("config", "/etc/lexa/northbound.json", "path to JSON config")
@@ -246,7 +169,7 @@ func main() {
 	}
 	defer fetcherFR.Free()
 
-	frManager := newFlowReservationManager(fetcherFR, lfdi)
+	frManager := flowres.New(fetcherFR, lfdi)
 
 	// Subscribe to FlowReservationRequest messages from the hub.
 	// These arrive when the hub wants to schedule a charging/discharging window
@@ -265,7 +188,7 @@ func main() {
 			}
 			return
 		}
-		frManager.handleRequest(msg.Payload())
+		frManager.HandleRequest(msg.Payload())
 	}); token.Wait() && token.Error() != nil {
 		log.Printf("lexa-northbound: subscribe flowreservation/request: %v", token.Error())
 	}
@@ -492,7 +415,7 @@ func runDiscovery(
 	sched *scheduler.Scheduler,
 	clk *utilitytime.Clock,
 	rt *responseTracker,
-	frm *flowReservationManager,
+	frm *flowres.Manager,
 	cfg *Config,
 	nbm nbMetrics,
 	lp *lastPublishedStore,
@@ -605,7 +528,7 @@ func runDiscovery(
 
 	// Flow Reservation (§10.9): update the manager's request path and publish
 	// current reservation statuses.
-	frm.setRequestPath(tree.FlowReservationRequestPath)
+	frm.SetRequestPath(tree.FlowReservationRequestPath)
 	publishFlowReservations(mc, tree)
 }
 
@@ -893,13 +816,6 @@ func unitValueToFloat(uv *model.UnitValue) float64 {
 		return 0
 	}
 	return float64(uv.Value) * math.Pow10(int(uv.Multiplier))
-}
-
-func derefF64(p *float64) float64 {
-	if p == nil {
-		return 0
-	}
-	return *p
 }
 
 // toActiveControl converts a scheduler.ActiveControl to the MQTT bus message.
