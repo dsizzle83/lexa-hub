@@ -402,6 +402,12 @@ type PlanLog struct {
 	Envelope
 	Ts        int64          `json:"ts"` // Unix seconds of the plan's evaluation
 	Decisions []PlanDecision `json:"decisions,omitempty"`
+	// ShadowDivergences is the running count of constraint-shadow divergent
+	// ticks (TASK-059), included so the dashboard/QA can watch the shadow diff
+	// rate without a metrics scrape. Additive, omitempty ⇒ absent (and the wire
+	// version unchanged, PlanLogV) whenever the shadow harness is off or has
+	// seen zero divergences; a legacy decoder ignores the unknown key.
+	ShadowDivergences uint64 `json:"shadow_divergences,omitempty"`
 }
 
 // PlanDecision mirrors orchestrator.Decision for the bus.

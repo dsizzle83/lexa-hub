@@ -6,6 +6,7 @@
   "metrics_addr": "",
   "engine_interval_s": 15,
   "debug": false,
+  "constraint_shadow": false,
   "devices": [
     {
       "name": "inverter-0", "role": "inverter", "max_w": 10000,

@@ -225,9 +225,12 @@ internal/
   southbound/ Modbus/SunSpec: device interface, inverter, battery, meter, registry
   orchestrator/ Rule-based optimizer engine (no I/O — reads SystemState, returns Plan)
   orchestrator/constraint/ Priority-ordered constraint controller (safety > compliance
-              > economics; AD-007). Skeleton — UNWIRED (TASK-058): Constraint/Demand/
-              Arbiter/Session/Stack; Stack implements orchestrator.Optimizer. Wiring is
-              TASK-059+ (cmd/hub only); the cascade in optimizer.go stays the live path.
+              > economics; AD-007). Constraint/Demand/Arbiter/Session/Stack; Stack
+              implements orchestrator.Optimizer. Also the shadow harness (TASK-059,
+              shadow.go): Wrap(legacy, candidate) runs both per tick, diffs FINAL
+              per-device outputs under tolerance bands, counts+logs divergences,
+              returns the LEGACY plan unmodified. The cascade in optimizer.go stays
+              the live path; the Stack is observe-only until TASK-060 flips export.
 
 systemd/     Unit files + mosquitto config fragment
 configs/     Example JSON configs for each service
@@ -293,6 +296,17 @@ bench calibration. **The block is optional and currently UNWIRED** — nothing r
 it until TASK-064 swaps the bench-calibrated optimizer globals for these
 parameters; a missing block ⇒ bench defaults (`withDefaults`), an unknown key
 warns but never fails load, so pre-TASK-057 hub.json files parse unchanged.
+
+`hub.json`'s top-level `"constraint_shadow"` bool (TASK-059, default false) turns
+on the constraint-stack **shadow harness**: every economic tick ALSO runs the
+candidate constraint `Stack` observe-only, diffs its final per-device outputs
+against the live `DefaultOptimizer` under tolerance bands, and logs one
+rate-limited JSON line (`constraint-shadow divergence`) per divergent tick plus a
+`lexa_constraint_shadow_divergence_total` metric / `shadow_divergences` field on
+`lexa/hub/plan`. **The legacy cascade stays the sole author of actuated plans** —
+the candidate's plan is discarded, never actuated. Flag off ⇒ the wrapper is not
+even constructed (zero behaviour change). This is the ≥1-week bench-shadow gate
+for every P5 flip (03 §P5); TASK-060 adds the first real constraint.
 
 `modbus.json`'s `"reconciler"` key (TASK-027/028, AD-002/AD-013) maps device
 class → `"off"|"shadow"|"active"`, e.g. `{"battery":"shadow"}`. `"shadow"` runs

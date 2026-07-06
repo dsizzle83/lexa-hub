@@ -77,6 +77,14 @@ type Config struct {
 	SafetyIntervalS int  `json:"safety_interval_s"` // fast protection loop; default 1, 0 disables
 	Debug           bool `json:"debug"`
 
+	// ConstraintShadow enables the observe-only constraint-stack shadow harness
+	// (TASK-059): every economic tick runs the candidate constraint Stack
+	// ALONGSIDE the authoritative DefaultOptimizer, diffs their final per-device
+	// outputs, and logs/count divergences. The legacy cascade remains the SOLE
+	// author of actuated plans — the candidate's plan is discarded. Default
+	// false ⇒ zero behaviour change (the wrapper is not even constructed).
+	ConstraintShadow bool `json:"constraint_shadow"`
+
 	// LogLevel selects the slog level ("debug"|"info"|"warn"|"error");
 	// default "info" (TASK-045). See internal/logutil.ParseLevel.
 	LogLevel string `json:"log_level"`
