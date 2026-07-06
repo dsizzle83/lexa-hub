@@ -284,7 +284,11 @@ internal/
               = CORE-022/GEN.044 responseTracker (renamed responses.Tracker);
               flowres = §10.9 flow-reservation manager. cmd/northbound/main.go
               is wiring only.
-  tlsclient/  wolfSSL mTLS client (keep-alive fetcher)
+  tlsclient/  wolfSSL mTLS client (keep-alive fetcher). HTTP/1.1 response
+              parsing lives in the CGo-free httpwire/ leaf (fuzzed; 64 KiB
+              header + 10 MiB body caps). Chunked Transfer-Encoding is DECODED
+              (AD-009 option (b), TASK-069); net.Conn-shim-under-http.Transport
+              was deferred as a P6-with-time backlog item.
   wolfssl/    CGo wrapper for wolfSSL_Init (call exactly once per process)
   southbound/ Modbus/SunSpec: device interface, inverter, battery, meter, registry
   orchestrator/ Rule-based optimizer engine (no I/O — reads SystemState, returns Plan)

@@ -82,16 +82,22 @@ func FuzzReadHTTPResponse(f *testing.F) {
 	}
 	// Structural cases the task calls out explicitly, in case the corpus
 	// dir above is ever unavailable, plus a few of the trickiest edges.
-	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"))                            // minimal valid 200
-	f.Add([]byte("HTTP/1.1 200 OK\r\n\r\nno-content-length-read-until-close"))                    // missing CL
-	f.Add([]byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")) // chunked header
-	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: -5\r\n\r\nbody"))                            // negative CL
-	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: 999999999999\r\n\r\nbody"))                  // huge CL
-	f.Add(bytes.Repeat([]byte("X-Junk: filler-header-line\r\n"), 3000))                           // header-only flood, no terminator
-	f.Add([]byte(""))                                                                             // empty input
-	f.Add([]byte("\r\n\r\n"))                                                                     // terminator only, no status line
-	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))                                 // zero-length body
-	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 999\r\n\r\nhello"))     // duplicate CL
+	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"))                                                        // minimal valid 200
+	f.Add([]byte("HTTP/1.1 200 OK\r\n\r\nno-content-length-read-until-close"))                                                // missing CL
+	f.Add([]byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"))                             // chunked, one chunk
+	f.Add([]byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n<DCAP\r\n2\r\n/>\r\n0\r\n\r\n"))                  // chunked, multi-chunk
+	f.Add([]byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1a;ext=x\r\nabcdefghijklmnopqrstuvwxyz\r\n0\r\n\r\n")) // chunk extension
+	f.Add([]byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Trailer: v\r\n\r\n"))               // chunked, trailer
+	f.Add([]byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"))                                           // chunked, empty body
+	f.Add([]byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\ngarbage\r\n"))                                   // chunked, bad hex size
+	f.Add([]byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n64\r\nabcd"))                                          // chunked, truncated mid-chunk
+	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: -5\r\n\r\nbody"))                                                        // negative CL
+	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: 999999999999\r\n\r\nbody"))                                              // huge CL
+	f.Add(bytes.Repeat([]byte("X-Junk: filler-header-line\r\n"), 3000))                                                       // header-only flood, no terminator
+	f.Add([]byte(""))                                                                                                         // empty input
+	f.Add([]byte("\r\n\r\n"))                                                                                                 // terminator only, no status line
+	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))                                                             // zero-length body
+	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 999\r\n\r\nhello"))                                 // duplicate CL
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		resp, err := ReadHTTPResponse(varyingChunkReader(data), prodMaxHeader, prodMaxBody)

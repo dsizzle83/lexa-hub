@@ -15,10 +15,19 @@
 // server sends, this is unobservable: gridsim's headers run well under
 // 1 KiB, verified against the fuzz corpus in testdata/fuzz/.
 //
-// The parser rejects (does not decode) chunked Transfer-Encoding — see
-// isChunkedEncoding. Implementing chunked decoding is a separate decision
-// (AD-009, deferred to TASK-069); adding it here would only grow the
-// attack surface this task exists to cap.
+// The parser decodes chunked Transfer-Encoding (readChunkedBody): AD-009
+// (TASK-069) resolved the shim-vs-harden question in favor of keeping this
+// hardened, fuzz-clean parser and closing the one remaining functional gap —
+// a conformant IEEE 2030.5 / HTTP/1.1 utility head-end MAY chunk dynamically
+// generated resources, and the previous outright rejection failed the walk
+// closed against such a server. The chunked decoder is size-capped exactly
+// like the Content-Length path (maxBody bounds the decoded body,
+// maxChunkLineLen bounds a single size line) and, being here in the CGo-free
+// leaf, is covered by the same go-native fuzzing as the rest of the parser.
+// The net.Conn-shim-under-http.Transport alternative (option (a)) was
+// deferred as a P6-with-time item — it reworks the utility-facing transport
+// and needs a conformance dual-run, disproportionate risk under the V1.0
+// deadline now that the parser is fuzz-clean and capped.
 package httpwire
 
 import (
@@ -27,6 +36,13 @@ import (
 	"strconv"
 	"strings"
 )
+
+// maxChunkLineLen bounds a single chunk-size line (hex length plus any
+// chunk extensions and, in the trailer section, a trailer header line) so a
+// hostile server cannot stream unbounded bytes without ever sending the CRLF
+// the chunked framing requires. Real CSIP chunk-size lines are a handful of
+// hex digits; 4 KiB is generous headroom while staying bounded.
+const maxChunkLineLen = 4096
 
 // headerTerminator marks the end of the HTTP header block.
 var headerTerminator = []byte("\r\n\r\n")
@@ -46,19 +62,24 @@ var headerTerminator = []byte("\r\n\r\n")
 // trailing body bytes attached in the same read is not penalized: the cap
 // check only fires when no terminator has been found yet.
 //
-// Phase 2 rejects chunked Transfer-Encoding (detection only, see
-// isChunkedEncoding) and otherwise reads exactly Content-Length body bytes,
-// or — when Content-Length is absent, negative, or unparsable — reads until
-// read reports an error or n == 0 (connection close), capped at maxBody
-// bytes total. A parsed Content-Length greater than maxBody is rejected
-// without attempting the read.
+// Phase 2 handles the body. If the headers declare chunked
+// Transfer-Encoding (see isChunkedEncoding) the chunk framing is decoded
+// (readChunkedBody) and the returned blob is the header block followed by
+// the DECODED body — no Content-Length header is synthesized, so downstream
+// re-parsing sees content-length -1 and simply uses the body bytes.
+// Otherwise Phase 2 reads exactly Content-Length body bytes, or — when
+// Content-Length is absent, negative, or unparsable — reads until read
+// reports an error or n == 0 (connection close), capped at maxBody bytes
+// total. A parsed Content-Length greater than maxBody is rejected without
+// attempting the read.
 //
-// On success the returned slice is the exact response bytes consumed:
-// header block through the Content-Length body (trailing bytes beyond
-// headerEnd+contentLength are trimmed), or the full buffer in the
-// read-until-close case. Callers (tlsclient/fetcher.go, response.go) parse
-// this blob directly, so the successful-path bytes must stay identical to
-// the pre-extraction implementation.
+// On success the returned slice is: for the Content-Length path, the exact
+// response bytes consumed (header block through the Content-Length body,
+// trailing bytes beyond headerEnd+contentLength trimmed); for the
+// read-until-close path, the full buffer; for the chunked path, the header
+// block plus the reassembled (de-chunked) body. Callers (tlsclient/
+// fetcher.go, response.go) parse this blob directly, so the non-chunked
+// successful-path bytes stay identical to the pre-extraction implementation.
 func ReadHTTPResponse(read func([]byte) (int, error), maxHeader, maxBody int) ([]byte, error) {
 	scratch := make([]byte, 4096)
 	var buf []byte
@@ -86,7 +107,14 @@ func ReadHTTPResponse(read func([]byte) (int, error), maxHeader, maxBody int) ([
 	// Phase 2: read exactly Content-Length body bytes.
 	headers := buf[:headerEnd]
 	if isChunkedEncoding(headers) {
-		return nil, fmt.Errorf("Transfer-Encoding: chunked is not supported")
+		body, err := readChunkedBody(buf[headerEnd:], read, maxBody)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]byte, 0, headerEnd+len(body))
+		out = append(out, buf[:headerEnd]...)
+		out = append(out, body...)
+		return out, nil
 	}
 	cl := responseContentLength(headers)
 	if cl < 0 {
@@ -127,10 +155,112 @@ func ReadHTTPResponse(read func([]byte) (int, error), maxHeader, maxBody int) ([
 	return buf[:need], nil
 }
 
-// isChunkedEncoding reports whether the raw HTTP header block contains
-// Transfer-Encoding: chunked (case-insensitive). This parser does not
-// implement chunked decoding, so callers must reject such responses
-// (AD-009 defers the shim-vs-harden decision to TASK-069).
+// readChunkedBody decodes an HTTP/1.1 chunked message body (RFC 7230 §4.1).
+// initial is the bytes already buffered past the header terminator; read
+// pulls more from the still-open connection with the same contract as
+// io.Reader.Read. It returns the reassembled body (all chunk-data
+// concatenated, framing removed), consuming the stream exactly through the
+// terminating zero-size chunk and the blank line that ends any trailer
+// section, so the connection is left positioned for the next response.
+//
+// It fails closed on malformed framing (bad hex size, missing CRLF after a
+// chunk, a premature connection close) and is bounded on every axis a
+// hostile server controls: the decoded body may not exceed maxBody, and no
+// single chunk-size/trailer line may exceed maxChunkLineLen without its
+// CRLF. Chunk extensions (";name=value" after the size) and trailer header
+// lines are parsed past but discarded — this client talks to one pinned
+// CSIP server and has no use for either.
+func readChunkedBody(initial []byte, read func([]byte) (int, error), maxBody int) ([]byte, error) {
+	buf := append([]byte(nil), initial...)
+	scratch := make([]byte, 4096)
+	pos := 0
+	var out []byte
+
+	// fill appends one more read into buf; returns false when the stream
+	// ends (error or n == 0), matching ReadHTTPResponse's read contract.
+	fill := func() bool {
+		n, err := read(scratch)
+		if n > 0 {
+			buf = append(buf, scratch[:n]...)
+		}
+		return err == nil && n > 0
+	}
+
+	// nextLine returns the index of the '\r' of the next CRLF at or after
+	// pos, reading more bytes as needed. It errors if the unconsumed span
+	// grows past maxChunkLineLen without a CRLF, or the stream ends first.
+	nextLine := func() (int, error) {
+		for {
+			if idx := bytes.Index(buf[pos:], []byte("\r\n")); idx >= 0 {
+				return pos + idx, nil
+			}
+			if len(buf)-pos > maxChunkLineLen {
+				return 0, fmt.Errorf("chunked: line exceeds %d bytes without CRLF", maxChunkLineLen)
+			}
+			if !fill() {
+				return 0, fmt.Errorf("chunked: connection closed mid-line")
+			}
+		}
+	}
+
+	for {
+		crlf, err := nextLine()
+		if err != nil {
+			return nil, err
+		}
+		sizeField := buf[pos:crlf]
+		if semi := bytes.IndexByte(sizeField, ';'); semi >= 0 { // strip chunk extensions
+			sizeField = sizeField[:semi]
+		}
+		sizeField = bytes.TrimSpace(sizeField)
+		size, perr := strconv.ParseInt(string(sizeField), 16, 64)
+		if perr != nil || size < 0 {
+			return nil, fmt.Errorf("chunked: invalid chunk size %q", buf[pos:crlf])
+		}
+		pos = crlf + 2 // consume the size line's CRLF
+
+		if size == 0 {
+			// Last chunk: consume optional trailer header lines up to and
+			// including the blank line that terminates the message.
+			for {
+				tEnd, err := nextLine()
+				if err != nil {
+					return nil, err
+				}
+				lineLen := tEnd - pos
+				pos = tEnd + 2
+				if lineLen == 0 {
+					return out, nil
+				}
+			}
+		}
+
+		if size > int64(maxBody) || len(out)+int(size) > maxBody {
+			return nil, fmt.Errorf("chunked: body too large: exceeded %d bytes", maxBody)
+		}
+
+		// Need size data bytes plus the trailing CRLF.
+		for int64(len(buf)-pos) < size+2 {
+			if !fill() {
+				return nil, fmt.Errorf("chunked: connection closed mid-chunk")
+			}
+		}
+		out = append(out, buf[pos:pos+int(size)]...)
+		pos += int(size)
+		if buf[pos] != '\r' || buf[pos+1] != '\n' {
+			return nil, fmt.Errorf("chunked: missing CRLF after chunk data")
+		}
+		pos += 2
+	}
+}
+
+// isChunkedEncoding reports whether the raw HTTP header block declares
+// Transfer-Encoding: chunked (case-insensitive, bare "chunked" value).
+// ReadHTTPResponse decodes such responses via readChunkedBody (AD-009,
+// TASK-069). Detection stays deliberately narrow — a bare "chunked" value —
+// because this client talks to one pinned CSIP server; a stacked coding like
+// "gzip, chunked" is neither sent by that server nor something this client
+// decompresses, so it correctly falls through to the length/close path.
 func isChunkedEncoding(headers []byte) bool {
 	lower := bytes.ToLower(headers)
 	for _, line := range bytes.Split(lower, []byte("\r\n")) {

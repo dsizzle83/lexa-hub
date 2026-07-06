@@ -279,18 +279,176 @@ func TestReadHTTPResponse_DuplicateContentLengthFirstWins(t *testing.T) {
 	}
 }
 
-// === Chunked encoding: rejected, not decoded (AD-009 / TASK-069) ===========
+// === Chunked encoding: decoded (AD-009 → option (b), TASK-069) =============
+//
+// The returned blob is the header block followed by the DE-CHUNKED body (no
+// synthetic Content-Length), so response.go's parseHTTPResponse takes
+// body = raw[headerEnd+4:] and gets the reassembled payload directly. These
+// tests assert exactly that blob shape.
 
-func TestReadHTTPResponse_ChunkedRejected(t *testing.T) {
-	raw := []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
-	_, err := ReadHTTPResponse(bytesReader(raw), prodMaxHeader, prodMaxBody)
-	mustContain(t, err, "chunked is not supported")
+// wantDechunked builds the expected ReadHTTPResponse output for a chunked
+// response: the header block (through \r\n\r\n) plus the concatenated decoded
+// body. headers must include the trailing \r\n\r\n.
+func wantDechunked(headers, body string) []byte {
+	return []byte(headers + body)
 }
 
-func TestReadHTTPResponse_ChunkedRejectedCaseInsensitive(t *testing.T) {
-	raw := []byte("HTTP/1.1 200 OK\r\ntransfer-encoding: CHUNKED\r\n\r\nwhatever")
-	_, err := ReadHTTPResponse(bytesReader(raw), prodMaxHeader, prodMaxBody)
-	mustContain(t, err, "chunked is not supported")
+func TestReadHTTPResponse_ChunkedSingleChunk(t *testing.T) {
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	raw := headers + "5\r\nhello\r\n0\r\n\r\n"
+	got, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, prodMaxBody)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := wantDechunked(headers, "hello"); !bytes.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestReadHTTPResponse_ChunkedMultipleChunks(t *testing.T) {
+	headers := "HTTP/1.1 200 OK\r\nContent-Type: application/sep+xml\r\nTransfer-Encoding: chunked\r\n\r\n"
+	// "<DCAP" + "/>" + "!!!" split across three chunks, hex sizes.
+	raw := headers + "5\r\n<DCAP\r\n2\r\n/>\r\n3\r\n!!!\r\n0\r\n\r\n"
+	got, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, prodMaxBody)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := wantDechunked(headers, "<DCAP/>!!!"); !bytes.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestReadHTTPResponse_ChunkedCaseInsensitiveHeader(t *testing.T) {
+	headers := "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"
+	raw := headers + "4\r\nbody\r\n0\r\n\r\n"
+	got, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, prodMaxBody)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := wantDechunked(headers, "body"); !bytes.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestReadHTTPResponse_ChunkedHexSizeAndExtensions(t *testing.T) {
+	// A chunk size in multi-digit hex (0x1a = 26) plus a chunk extension the
+	// decoder must parse past and discard.
+	body := strings.Repeat("z", 26)
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	raw := headers + "1a;ext=ignored\r\n" + body + "\r\n0\r\n\r\n"
+	got, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, prodMaxBody)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := wantDechunked(headers, body); !bytes.Equal(got, want) {
+		t.Errorf("got len %d, want len %d", len(got), len(want))
+	}
+}
+
+func TestReadHTTPResponse_ChunkedWithTrailers(t *testing.T) {
+	// A trailer header line after the zero chunk must be consumed (and
+	// discarded) up to the terminating blank line.
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	raw := headers + "3\r\nabc\r\n0\r\nX-Checksum: deadbeef\r\n\r\n"
+	got, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, prodMaxBody)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := wantDechunked(headers, "abc"); !bytes.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestReadHTTPResponse_ChunkedSplitAcrossReads(t *testing.T) {
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	raw := headers + "b\r\nhello world\r\n5\r\n!!!!!\r\n0\r\n\r\n"
+	for _, chunk := range []int{1, 2, 3, 7, 4096} {
+		t.Run(string(rune('0'+chunk%10)), func(t *testing.T) {
+			got, err := ReadHTTPResponse(chunkedReader([]byte(raw), chunk), prodMaxHeader, prodMaxBody)
+			if err != nil {
+				t.Fatalf("chunk size %d: unexpected error: %v", chunk, err)
+			}
+			if want := wantDechunked(headers, "hello world!!!!!"); !bytes.Equal(got, want) {
+				t.Errorf("chunk size %d: got %q, want %q", chunk, got, want)
+			}
+		})
+	}
+}
+
+func TestReadHTTPResponse_ChunkedEmptyBody(t *testing.T) {
+	// Immediate zero chunk = empty body, valid.
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	raw := headers + "0\r\n\r\n"
+	got, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, prodMaxBody)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := wantDechunked(headers, ""); !bytes.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestReadHTTPResponse_ChunkedBadHexSizeRejected(t *testing.T) {
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	raw := headers + "zz\r\ngarbage\r\n0\r\n\r\n"
+	_, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, prodMaxBody)
+	mustContain(t, err, "invalid chunk size")
+}
+
+func TestReadHTTPResponse_ChunkedMissingCRLFAfterDataRejected(t *testing.T) {
+	// Chunk claims 5 bytes but the trailing CRLF is corrupted.
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	raw := headers + "5\r\nhelloXX0\r\n\r\n"
+	_, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, prodMaxBody)
+	mustContain(t, err, "missing CRLF after chunk data")
+}
+
+func TestReadHTTPResponse_ChunkedTruncatedMidChunkRejected(t *testing.T) {
+	// Declares 100 bytes but the connection closes after 4.
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	raw := headers + "64\r\nabcd"
+	_, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, prodMaxBody)
+	mustContain(t, err, "closed mid-chunk")
+}
+
+func TestReadHTTPResponse_ChunkedTruncatedMidLineRejected(t *testing.T) {
+	// Size line never terminated by CRLF before the connection closes.
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	raw := headers + "5"
+	_, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, prodMaxBody)
+	mustContain(t, err, "closed mid-line")
+}
+
+func TestReadHTTPResponse_ChunkedBodyOverCapRejected(t *testing.T) {
+	maxBody := 1024
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	// One chunk larger than maxBody: rejected before reading the data.
+	raw := headers + "800\r\n" + strings.Repeat("x", 0x800) + "\r\n0\r\n\r\n"
+	_, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, maxBody)
+	mustContain(t, err, "too large")
+}
+
+func TestReadHTTPResponse_ChunkedManySmallChunksOverCapRejected(t *testing.T) {
+	// Accumulated small chunks must also trip the cap (not just a single
+	// oversized chunk) — the slow-drip-past-budget guard.
+	maxBody := 64
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	var b strings.Builder
+	b.WriteString(headers)
+	for i := 0; i < 100; i++ {
+		b.WriteString("1\r\nx\r\n") // 100 one-byte chunks = 100 > 64
+	}
+	b.WriteString("0\r\n\r\n")
+	_, err := ReadHTTPResponse(bytesReader([]byte(b.String())), prodMaxHeader, maxBody)
+	mustContain(t, err, "too large")
+}
+
+func TestReadHTTPResponse_ChunkedSizeLineFloodRejected(t *testing.T) {
+	// A size "line" that never terminates: bounded by maxChunkLineLen.
+	headers := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	raw := headers + strings.Repeat("a", maxChunkLineLen+10)
+	_, err := ReadHTTPResponse(bytesReader([]byte(raw)), prodMaxHeader, prodMaxBody)
+	mustContain(t, err, "without CRLF")
 }
 
 // === No terminator at all ====================================================
