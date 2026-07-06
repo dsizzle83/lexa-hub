@@ -196,11 +196,14 @@ func main() {
 	var shadowDivergences func() uint64
 	if cfg.ConstraintShadow {
 		// The Stack carries the per-device plant models from hub.json (TASK-057)
-		// but has NO concrete constraints yet — TASK-060 adds the export
-		// constraint. An empty Stack expresses no per-axis opinion, so the diff
-		// is inert (~0 divergences) until then, which is the intended shadow
-		// baseline this task validates on the bench.
-		stack := constraint.NewStack(buildConstraintPlant(cfg), cfg.EngineInterval())
+		// and, as of TASK-060, the ExportConstraint (TierCompliance). In shadow
+		// the candidate now authors the solar-ceiling / battery-setpoint / export-
+		// breach axes; the diff becomes meaningful on exactly those axes while the
+		// legacy cascade stays authoritative (the wrapper still returns opt's plan).
+		// This is the first non-empty candidate — the RSK-03 shadow gate the export
+		// flip is validated against.
+		stack := constraint.NewStack(buildConstraintPlant(cfg), cfg.EngineInterval(),
+			constraint.NewExportConstraint())
 		reg.Counter("lexa_constraint_shadow_divergence_total")
 		wrapper := constraint.Wrap(opt, stack, constraint.Options{
 			Now: time.Now,
@@ -531,18 +534,24 @@ func buildConstraintPlant(cfg *Config) constraint.Plant {
 		Batteries: map[string]orchestrator.BatteryPlant{},
 		EVSEs:     map[string]orchestrator.EVSEPlant{},
 	}
+	// Apply bench defaults at consume time (TASK-060): a partial/absent plant
+	// block fills with the calibration that reproduces optimizer.go's constants,
+	// so the ExportConstraint's adaptive detection window (control latency + meter
+	// lag) lands on today's exportBreachTicks=3 instead of collapsing to the floor
+	// of 2 on a zero-value plant.
+	p.Meter = orchestrator.MeterPlant{}.WithDefaults()
 	for _, d := range cfg.Devices {
 		switch d.Role {
 		case "inverter":
-			p.Inverters[d.Name] = d.InverterPlant
+			p.Inverters[d.Name] = d.InverterPlant.WithDefaults()
 		case "battery":
-			p.Batteries[d.Name] = d.BatteryPlant
+			p.Batteries[d.Name] = d.BatteryPlant.WithDefaults()
 		case "meter":
-			p.Meter = d.MeterPlant
+			p.Meter = d.MeterPlant.WithDefaults()
 		}
 	}
 	for _, s := range cfg.Stations {
-		p.EVSEs[s.ID] = s.EVSEPlant
+		p.EVSEs[s.ID] = s.EVSEPlant.WithDefaults()
 	}
 	return p
 }
