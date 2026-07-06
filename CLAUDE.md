@@ -223,6 +223,10 @@ internal/
   wolfssl/    CGo wrapper for wolfSSL_Init (call exactly once per process)
   southbound/ Modbus/SunSpec: device interface, inverter, battery, meter, registry
   orchestrator/ Rule-based optimizer engine (no I/O — reads SystemState, returns Plan)
+  orchestrator/constraint/ Priority-ordered constraint controller (safety > compliance
+              > economics; AD-007). Skeleton — UNWIRED (TASK-058): Constraint/Demand/
+              Arbiter/Session/Stack; Stack implements orchestrator.Optimizer. Wiring is
+              TASK-059+ (cmd/hub only); the cascade in optimizer.go stays the live path.
 
 systemd/     Unit files + mosquitto config fragment
 configs/     Example JSON configs for each service
