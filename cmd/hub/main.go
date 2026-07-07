@@ -207,17 +207,33 @@ func main() {
 	var shadowDivergences func() uint64
 	if cfg.ConstraintShadow {
 		// The Stack carries the per-device plant models from hub.json (TASK-057)
-		// and the compliance constraints: Export (TASK-060) + Gen + Import
-		// (TASK-061), all TierCompliance. In shadow
-		// the candidate now authors the solar-ceiling / battery-setpoint / export-
-		// breach axes; the diff becomes meaningful on exactly those axes while the
-		// legacy cascade stays authoritative (the wrapper still returns opt's plan).
-		// This is the first non-empty candidate — the RSK-03 shadow gate the export
-		// flip is validated against.
+		// and, as of TASK-063, the WHOLE controller across all three tiers:
+		//   SAFETY     — BatterySafety (TASK-062), a post-arbitration force-disconnect
+		//                that reads this tick's resolved setpoint (closing the ≤1-tick
+		//                wrong-direction lag) and dominates every tier.
+		//   COMPLIANCE — Export (TASK-060) + Gen + Import (TASK-061): the CSIP caps.
+		//   ECONOMICS  — Economics (TASK-063): plan-following, self-consumption, TOU
+		//                peak, EV allocation, emitted as PointDemands the arbiter
+		//                clamps UNDER the caps (economics can never violate a limit).
+		// The candidate now authors every axis, so the shadow diff covers the FULL
+		// controller vs the legacy cascade — the R4 proof — while the wrapper still
+		// returns opt's plan (legacy authoritative until the soak-gated flip). The
+		// economics constraint takes the same config cmd/hub gives the legacy
+		// optimizer (opt.* above), so the two layers are the same controller modulo
+		// the tier seam.
 		stack := constraint.NewStack(buildConstraintPlant(cfg), cfg.EngineInterval(),
+			constraint.NewBatterySafetyConstraint(opt.SOCReserve),
 			constraint.NewExportConstraint(),
 			constraint.NewGenLimitConstraint(),
-			constraint.NewImportLimitConstraint())
+			constraint.NewImportLimitConstraint(),
+			constraint.NewEconomicsConstraint(
+				opt.CostModel,
+				opt.SOCReserve,
+				opt.SOCFullThreshold,
+				opt.ExcessSolarThreshold,
+				opt.ExportMarginFrac,
+				opt.EVImportCooldownCycles,
+			))
 		reg.Counter("lexa_constraint_shadow_divergence_total")
 		wrapper := constraint.Wrap(opt, stack, constraint.Options{
 			Now: time.Now,
