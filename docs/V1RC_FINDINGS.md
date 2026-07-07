@@ -20,6 +20,21 @@ tooling. All fixes are separate reviewed changes — none authored at the gate.
   'StartLimitIntervalSec' in section [Service], ignoring"*) — so it falls back
   to the default 10 s/5 window and gives up under the storm. The same keys are
   worth auditing on the other five units.
+- **RESOLVED 2026-07-06 (two commits, bench-traced):**
+  1. `StartLimit*` moved `[Service]`→`[Unit]` in all 6 units (commit ~`29f0ddb`).
+  2. **The real mechanism** (found in bench validation): the power-cut scenario
+     cleanly *stops* mosquitto, and every lexa unit had `Requires=mosquitto`,
+     which stop-propagates a clean stop (exit 0 — so `Restart=on-failure`
+     never fires) to all 6 lexa units; the scenario's recovery restarts only
+     `lexa-hub` (+ its `Wants=`), leaving `lexa-api`/`lexa-telemetry`
+     permanently dead. Fixed by `Requires=mosquitto`→`Wants=mosquitto` in all
+     6 units (commit `c571419`) — a broker stop/restart no longer stops the
+     lexa services; they survive via paho auto-reconnect (the crash-only
+     design; `mqtt-broker-restart` already proved this). **RE-CONFIRM at next
+     bench deploy:** redeploy + re-run `power-cut-retained-rollback`, assert
+     `lexa-api` stays active throughout. The ~40 s rollback export-breach
+     window is a separate 042-tuning item (SAFETY held) → tighten the
+     staleness-bound/rewalk latency; tracked in `09_RELEASE_CHECKLIST.md`.
 - **Fix:** move `StartLimitIntervalSec`/`StartLimitBurst` to the **`[Unit]`**
   section (all six units); size the retained-rollback re-adopt window so the
   post-power-cut breach stays inside the oracle.
