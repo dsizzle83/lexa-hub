@@ -587,8 +587,15 @@ survive; the guards below are deliberate, not redundant. Keep them when refactor
   resource (see `internal/northbound/CLAUDE.md` rule 6).
 - **Plausibility-gate ingested telemetry**: `cmd/modbus` withholds power over nameplate
   (suspect scale factor); `cmd/ocpp` rejects MeterValues current over the station rating.
-- **Battery reserve safety**: `checkBatterySafety` force-disconnects a pack measured
-  discharging at/below its SOC reserve (a device inverting its setpoint).
+- **Battery reserve safety**: `checkBatterySafety` (economic tick, debounced) + `EvaluateSafety`
+  (Tier-1 fast tick, `criticalBatteryInversion` only, ADR-0001) force-disconnect a pack measured
+  discharging at/below its SOC reserve or against a commanded charge (a device inverting its
+  setpoint). The fast path is deliberately arbiter-free and allocation-light — a 1 s protective
+  reflex, never slowed behind the economic tick. Both counters + `lastBattCmd` are ALSO ported to
+  the constraint package in SHADOW — `orchestrator/constraint/batterysafety.go` (`BatterySafetySession`
+  at `TierSafety`; `Evaluate`=economic, `EvaluateFast`=fast/arbiter-bypassing) (TASK-062); the
+  optimizer.go copies stay AUTHORITATIVE until the P5 flip — do not strip either side, and the
+  Tier-0 `cmd/modbus` interlock is independent of both.
 - **Converge the device to the desired state** (the Device Reconciler,
   `internal/reconcile` + the modbus/ocpp shells): this is now the SINGLE owner of
   "make the device match what the hub wants." Verify-by-readback + write-on-diff
