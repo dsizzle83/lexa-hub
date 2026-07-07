@@ -5,8 +5,49 @@ and how to recover the network configuration after a reboot or reflash.
 
 - **Device:** Digi International ConnectCore 93 DVK (i.MX 93, ARM64)
 - **Hostname:** `ccimx93-dvk`
-- **OS:** Digi Embedded Yocto 5.0-r3 (scarthgap), glibc 2.39
-- **Login:** `ssh root@69.0.0.2` (no password configured for root over the demo LAN)
+- **OS:** Digi Embedded Yocto 5.0-r3 (scarthgap), glibc 2.39, kernel 6.6.52-dey
+- **Login:** `ssh root@69.0.0.2` (no password configured for root over the demo LAN);
+  also on WiFi via DHCP (resolves as `ccimx93-dvk.local`)
+
+## 2026-07-07: dev kit is the live hub again (fresh image)
+
+The board came back with a **fresh Yocto image** (nothing from the previous
+install survived) and the hub was migrated onto it from hub-pi 69.0.0.1, whose
+lexa services are now stopped+disabled (standby). Differences from the old
+install, all live now:
+
+- **`/usr/bin/sudo` is a shim** (there is no sudo on Yocto): it strips sudo's
+  flags and execs the command as root. This is what lets unmodified bench
+  scripts and the Mayhem engine (`sudo -n true` probes, `sudo bash -s`,
+  `sudo date -s`, `sudo systemctl restart …`) work against `root@69.0.0.2`.
+  The dashboard is started with `LEXA_SSH_USER=root` (csip-tls-test
+  `bench-up.sh`).
+- **mosquitto 2.0.20** cross-built no-TLS (`WITH_TLS=no WITH_CJSON=no
+  WITH_LIB_CPP=no`, aarch64-linux-gnu-gcc) at `/usr/local/sbin/mosquitto`,
+  running with `allow_anonymous true` and **no passwd/ACL** (no
+  mosquitto_passwd on Yocto; services still send credentials, broker accepts
+  them). `log_dest stderr` → journal, persistence in `/var/lib/mosquitto/`.
+  **`user root` is REQUIRED in mosquitto.conf**: without it the broker tries
+  to drop privileges to the nonexistent `mosquitto` user, falls back to
+  `nobody`, and every persistence save fails with Permission denied — no
+  `mosquitto.db` is ever written and the Mayhem `power-cut-retained-rollback`
+  broker-snapshot scenario goes INCONCLUSIVE (found+fixed 2026-07-07).
+  **`mosquitto_sub`/`mosquitto_pub` must be installed at `/usr/bin`** (same
+  cross-build, `make -C client` with `WITH_SHARED_LIBRARIES=no
+  WITH_STATIC_LIBRARIES=yes`): the same Mayhem scenario verifies the retained
+  control by running `mosquitto_sub` ON the hub over SSH — the Pi got these
+  from the distro mosquitto-clients package, Yocto has nothing.
+- **mqttproxy** (QA fault proxy) installed and enabled: localhost:1882 →
+  broker :1883, control API on `69.0.0.2:11882`; all `/etc/lexa/*.json` point
+  `mqtt_broker` at `tcp://localhost:1882` (copied from the Pi's live configs,
+  `metrics_addr` rewritten to 69.0.0.2).
+- **netem gap:** the DEY kernel has `CONFIG_NET_SCH_NETEM` unset and ships no
+  `tc` — the three `netem-*` Mayhem scenarios are INCONCLUSIVE against this
+  hub until the kernel is rebuilt with netem + iproute2-tc is added.
+- Binaries deployed are the exact `bin/arm64/` set the Pi was running
+  (byte-identical, 2026-07-06 build). Units are the repo ones with
+  `User=lexa`/`Group=lexa` stripped (services run as root — see gotcha below).
+- Serial console **input works on this board** (see updated section below).
 
 ---
 
@@ -245,7 +286,16 @@ is affected, but to bring the upstream side back:
 
 ---
 
-## Serial console: input is dead (host→board), output works
+## Serial console
+
+**Update 2026-07-07:** on the current (reflashed/replaced) board, serial input
+**works** — commands typed/written to `/dev/ttyACM0` at 115200 reach a root
+shell and execute (verified with a marker command from the desktop). The
+diagnosis below is kept as history for the earlier board/bridge and for the
+fastboot-without-console procedure, which remains useful. ModemManager on the
+host is still a nuisance — keep it disabled when using the console.
+
+### Historical fault (earlier board): input dead (host→board), output works
 
 **Symptom:** over the USB serial console (`/dev/ttyACM0`, picocom `-b 115200`) you
 see all boot output and the Linux login prompt, but **nothing you type reaches the
