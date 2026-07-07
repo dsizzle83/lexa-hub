@@ -103,14 +103,95 @@ func sortDemands(group []Demand) {
 	})
 }
 
-// resolveInterval intersects an axis group top tier first. A demand that cannot
-// intersect the accumulated interval is a same-tier conflict resolved to the
-// tightest ceiling.
+// resolveInterval intersects an axis group with STRICT tier priority (AD-007,
+// TASK-063). It is a two-level fold:
+//
+//   - WITHIN a tier: demands intersect; an empty intersection is a same-tier
+//     conflict resolved to the most-restrictive (lowest) ceiling — the legacy
+//     "keep the tighter of two caps" reconciliation. This is unchanged from the
+//     058 skeleton, so same-tier arbitration (two compliance caps on one axis)
+//     is byte-identical.
+//
+//   - ACROSS tiers: tiers fold SAFETY→COMPLIANCE→ECONOMICS. A lower tier may only
+//     NARROW the interval a higher tier has already fixed. When a lower tier's
+//     admissible interval does NOT intersect the accumulated higher-tier interval,
+//     the HIGHER tier wins outright (its interval is kept) and a cross-tier
+//     conflict is recorded — the lower tier is fully clamped, never allowed to
+//     move a bound.
+//
+// The cross-tier rule is what makes "economics can never violate a compliance or
+// safety bound" STRUCTURAL rather than conventional (058's narrowing property):
+// an economics PointDemand outside a compliance bound is clamped to the bound,
+// not resolved by a global min that could let a lower-tier point (e.g. a charge
+// setpoint more negative than a compliance discharge point) silently override the
+// higher tier. See TestResolve_EconomicsPointClampedByCompliance*.
 func resolveInterval(device string, axis Axis, group []Demand) (Interval, []Conflict) {
-	sortDemands(group)
+	sortDemands(group) // SAFETY first, then by Source — deterministic tier order
 
+	var conflicts []Conflict
+	accLo, accHi := math.Inf(-1), math.Inf(1)
+	accSet := false // whether any higher tier has fixed the interval yet
+
+	for _, tg := range groupByTier(group) {
+		tierLo, tierHi, tierConflicts := intersectSameTier(device, axis, tg.demands)
+		conflicts = append(conflicts, tierConflicts...)
+
+		if !accSet {
+			accLo, accHi, accSet = tierLo, tierHi, true
+			continue
+		}
+
+		newLo := math.Max(accLo, tierLo)
+		newHi := math.Min(accHi, tierHi)
+		if newLo <= newHi {
+			accLo, accHi = newLo, newHi
+			continue
+		}
+
+		// Lower tier is infeasible inside the higher-tier interval: the higher
+		// tier wins outright, the lower tier is clamped. Record the seam.
+		conflicts = append(conflicts, Conflict{
+			Device:  device,
+			Axis:    axis,
+			Tier:    tg.tier,
+			Sources: [2]string{tg.demands[0].Source, tg.demands[len(tg.demands)-1].Source},
+			Reason: fmt.Sprintf("%s: %s demand [%s] outside the admissible bound set by a higher tier [%s]; clamped to the higher bound",
+				axis, tg.tier, fmtInterval(tierLo, tierHi), fmtInterval(accLo, accHi)),
+		})
+	}
+
+	return Interval{Min: infToNaN(accLo), Max: infToNaN(accHi)}, conflicts
+}
+
+// tierGroup is one tier's slice of an axis group, in the sorted (ascending-tier)
+// order sortDemands produced.
+type tierGroup struct {
+	tier    Tier
+	demands []Demand
+}
+
+// groupByTier splits a demand group (already tier-sorted) into contiguous
+// per-tier runs, preserving order so the fold visits SAFETY before COMPLIANCE
+// before ECONOMICS.
+func groupByTier(group []Demand) []tierGroup {
+	var out []tierGroup
+	for _, d := range group {
+		if n := len(out); n > 0 && out[n-1].tier == d.Tier {
+			out[n-1].demands = append(out[n-1].demands, d)
+			continue
+		}
+		out = append(out, tierGroup{tier: d.Tier, demands: []Demand{d}})
+	}
+	return out
+}
+
+// intersectSameTier intersects demands that share one tier. An empty intersection
+// collapses to the most-restrictive (lowest) ceiling and records a same-tier
+// conflict — the 058 skeleton's within-tier semantics, kept bit-identical so
+// same-tier arbitration does not shift under TASK-063.
+func intersectSameTier(device string, axis Axis, group []Demand) (float64, float64, []Conflict) {
 	lo, hi := math.Inf(-1), math.Inf(1)
-	tighteningSource := "" // source that last set hi, for conflict reporting
+	tighteningSource := ""
 	var conflicts []Conflict
 
 	for _, d := range group {
@@ -134,8 +215,6 @@ func resolveInterval(device string, axis Axis, group []Demand) (Interval, []Conf
 			continue
 		}
 
-		// Empty intersection: keep the most-restrictive (lowest) ceiling and
-		// collapse the interval to it so we never exceed either bound.
 		prev := tighteningSource
 		hi = math.Min(hi, dmax)
 		lo = math.Min(lo, hi)
@@ -149,8 +228,19 @@ func resolveInterval(device string, axis Axis, group []Demand) (Interval, []Conf
 				axis, d.Tier, hi),
 		})
 	}
+	return lo, hi, conflicts
+}
 
-	return Interval{Min: infToNaN(lo), Max: infToNaN(hi)}, conflicts
+// fmtInterval renders an interval for a conflict reason, mapping ±Inf to "∞".
+func fmtInterval(lo, hi float64) string {
+	l, h := "-∞", "∞"
+	if !math.IsInf(lo, 0) {
+		l = fmt.Sprintf("%.0f", lo)
+	}
+	if !math.IsInf(hi, 0) {
+		h = fmt.Sprintf("%.0f", hi)
+	}
+	return l + "," + h
 }
 
 // resolveConnect resolves the connect axis: false wins; a tier holding both a

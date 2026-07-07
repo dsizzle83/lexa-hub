@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"lexa-hub/internal/orchestrator"
@@ -25,8 +27,33 @@ type Stack struct {
 	tickInterval time.Duration
 }
 
-// compile-time proof the Stack is a drop-in Optimizer.
-var _ orchestrator.Optimizer = (*Stack)(nil)
+// compile-time proof the Stack is a drop-in Optimizer AND, once a fast-safety
+// constraint is wired, a SafetyEvaluator for the engine's protection loop.
+var (
+	_ orchestrator.Optimizer       = (*Stack)(nil)
+	_ orchestrator.SafetyEvaluator = (*Stack)(nil)
+)
+
+// postArbiter is an optional constraint capability: a pass that runs AFTER the
+// arbiter has resolved every tier, so it sees THIS tick's resolved commands.
+// Battery safety uses it (TASK-063) to read this tick's arbitrated battery
+// setpoint for commanded-charge intent — closing the ≤1-tick wrong-direction lag
+// TASK-062 left — and to override a tripped pack with a force-disconnect that
+// dominates every tier, mirroring legacy checkBatterySafety running LAST on the
+// built plan. A postArbiter's Evaluate is NOT called by the Stack: it authors its
+// effect entirely in PostArbitrate.
+type postArbiter interface {
+	Constraint
+	PostArbitrate(in Input, s *Session, plan *orchestrator.Plan)
+}
+
+// fastSafetyEvaluator is an optional constraint capability: the Tier-1 fast
+// protection reflex (ADR-0001), evaluated on the short safety cadence, BYPASSING
+// the arbiter. The Stack aggregates every wired fast-safety constraint into its
+// EvaluateSafety plan.
+type fastSafetyEvaluator interface {
+	EvaluateFast(state orchestrator.SystemState) []Demand
+}
 
 // NewStack builds a Stack from a plant model, the engine cadence (0 = tuned),
 // and an ordered list of constraints. Each constraint gets one Session keyed by
@@ -66,7 +93,20 @@ func (s *Stack) tickSeconds() float64 {
 	return s.tickInterval.Seconds()
 }
 
-// Optimize implements orchestrator.Optimizer: evaluate → arbitrate → emit.
+// session returns the constraint's persistent Session, creating it defensively
+// if a constraint was added after construction.
+func (s *Stack) session(c Constraint) *Session {
+	sess := s.sessions[c.Name()]
+	if sess == nil {
+		sess = NewSession(c.Name(), s.tickInterval)
+		s.sessions[c.Name()] = sess
+	}
+	return sess
+}
+
+// Optimize implements orchestrator.Optimizer: evaluate → arbitrate → emit, then
+// a post-arbitration pass for constraints that must see this tick's resolved
+// commands (battery safety, TASK-063).
 func (s *Stack) Optimize(state orchestrator.SystemState) orchestrator.Plan {
 	now := state.Timestamp
 	if now.IsZero() {
@@ -77,13 +117,16 @@ func (s *Stack) Optimize(state orchestrator.SystemState) orchestrator.Plan {
 	in := Input{State: state, Plant: s.plant, TickSeconds: s.tickSeconds()}
 
 	var demands []Demand
+	var post []postArbiter
 	for _, c := range s.constraints {
-		sess := s.sessions[c.Name()]
-		if sess == nil { // defensive: a constraint added after construction
-			sess = NewSession(c.Name(), s.tickInterval)
-			s.sessions[c.Name()] = sess
+		// A post-arbiter authors its whole effect after the arbiter; its Evaluate
+		// is intentionally NOT run in the demand pass (it would double-count its
+		// debounce counters and pre-date its command read by a tick).
+		if pa, ok := c.(postArbiter); ok {
+			post = append(post, pa)
+			continue
 		}
-		ds, breach := c.Evaluate(in, sess)
+		ds, breach := c.Evaluate(in, s.session(c))
 		demands = append(demands, ds...)
 		if breach != nil {
 			recordBreach(&plan, breach)
@@ -92,6 +135,37 @@ func (s *Stack) Optimize(state orchestrator.SystemState) orchestrator.Plan {
 
 	desired := Resolve(demands)
 	emitCommands(&plan, desired)
+
+	// Post-arbitration tier (SAFETY, after economics+compliance are resolved):
+	// battery safety reads this tick's arbitrated battery setpoints, may override
+	// a tripped pack with a force-disconnect, and records the FINAL commands for
+	// the fast protection loop.
+	for _, pa := range post {
+		pa.PostArbitrate(in, s.session(pa), &plan)
+	}
+	return plan
+}
+
+// EvaluateSafety implements orchestrator.SafetyEvaluator: the Tier-1 fast
+// protection pass. It aggregates every wired fast-safety constraint's immediate
+// protective disconnects, resolves them (disconnect always wins), and emits a
+// Safety-marked plan. With no fast-safety constraint wired it returns an inert
+// Safety plan, so the engine's fast loop is a no-op — matching the legacy
+// EvaluateSafety contract (Breach==nil on a Safety plan means "not assessed").
+func (s *Stack) EvaluateSafety(state orchestrator.SystemState) orchestrator.Plan {
+	now := state.Timestamp
+	if now.IsZero() {
+		now = time.Now()
+	}
+	plan := orchestrator.Plan{Timestamp: now, Safety: true}
+
+	var demands []Demand
+	for _, c := range s.constraints {
+		if fs, ok := c.(fastSafetyEvaluator); ok {
+			demands = append(demands, fs.EvaluateFast(state)...)
+		}
+	}
+	emitCommands(&plan, Resolve(demands))
 	return plan
 }
 
@@ -133,9 +207,13 @@ func emitCommands(plan *orchestrator.Plan, desired map[string]Desired) {
 		}
 
 		if iv, ok := d.Bound(AxisEVSECurrentA); ok && !math.IsNaN(iv.Max) {
+			// EVSE demands carry the OCPP connector in the device key
+			// ("station#connector", see evseKey/economics.go). A bare device name
+			// (the 058 skeleton and any whole-EVSE demand) maps to connector 0.
+			station, connector := parseEVSEDevice(dev)
 			plan.EVSECommands = append(plan.EVSECommands, orchestrator.EVSECommand{
-				StationID:   dev,
-				ConnectorID: 0, // whole-EVSE; a concrete constraint pins the connector
+				StationID:   station,
+				ConnectorID: connector,
 				MaxCurrentA: math.Max(0, iv.Max),
 			})
 		}
@@ -148,6 +226,35 @@ func emitCommands(plan *orchestrator.Plan, desired map[string]Desired) {
 			)
 		}
 	}
+}
+
+// parseEVSEDevice splits an EVSE device key "station#connector" into its parts.
+// A key with no "#" (or an unparseable connector) is treated as a whole-EVSE
+// demand on connector 0 — preserving the 058 skeleton's behaviour and the
+// fakeConstraint tests that emit a bare station name. It is the inverse of
+// evseKey (shadow.go).
+func parseEVSEDevice(dev string) (station string, connector int) {
+	i := strings.LastIndexByte(dev, '#')
+	if i < 0 {
+		return dev, 0
+	}
+	n, err := strconv.Atoi(dev[i+1:])
+	if err != nil {
+		return dev, 0
+	}
+	return dev[:i], n
+}
+
+// batteryCommandIndex returns the index of the command for name, or −1 if absent.
+// Mirrors the unexported optimizer helper (optimizer.go:2259) for the
+// post-arbitration safety override.
+func batteryCommandIndex(cmds []orchestrator.BatteryCommand, name string) int {
+	for i := range cmds {
+		if cmds[i].Name == name {
+			return i
+		}
+	}
+	return -1
 }
 
 // projectSetpoint chooses a battery setpoint from a resolved interval.

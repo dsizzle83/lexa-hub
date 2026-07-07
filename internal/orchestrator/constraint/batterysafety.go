@@ -74,8 +74,14 @@ type BatterySafetyConstraint struct {
 	socReserve float64
 }
 
-// compile-time proof BatterySafetyConstraint satisfies the Constraint interface.
-var _ Constraint = (*BatterySafetyConstraint)(nil)
+// compile-time proof BatterySafetyConstraint satisfies the Constraint interface
+// AND the two optional Stack capabilities it uses: the post-arbitration safety
+// pass (TASK-063 ordering) and the Tier-1 fast protection reflex (ADR-0001).
+var (
+	_ Constraint          = (*BatterySafetyConstraint)(nil)
+	_ postArbiter         = (*BatterySafetyConstraint)(nil)
+	_ fastSafetyEvaluator = (*BatterySafetyConstraint)(nil)
+)
 
 // NewBatterySafetyConstraint builds the constraint with an empty session and the
 // given SOC reserve (percent). Pass DefaultOptimizer.SOCReserve to match legacy.
@@ -117,16 +123,39 @@ func (c *BatterySafetyConstraint) RecordCommands(cmds []orchestrator.BatteryComm
 
 // Evaluate ports checkBatterySafety (optimizer.go:1520-1596): the two debounced
 // fault detectors plus the critical fast trip, emitting a force-disconnect demand
-// per pack that trips. It is the economic-tick, arbiter-mediated entry point.
+// per pack that trips. It is the ARBITER-MEDIATED, pre-arbitration entry point —
+// its commanded-charge intent comes from lastCmdW (the LAST committed command),
+// so on the wrong-direction path it lags the legacy economic-tick check by up to
+// one tick (see the type doc's TASK-063 handoff note).
+//
+// TASK-063 DECISION: the Stack does NOT use this entry point. It runs battery
+// safety through PostArbitrate (post-arbitration), which reads THIS tick's
+// resolved battery setpoint and so closes that lag. Evaluate is retained as the
+// documented pre-arbitration form and for the 062 unit suite that pins its
+// lastCmdW semantics directly. Both share evaluateTrips, so they can never drift.
 //
 // The tick threshold is scaled through the shared Session helper (058) so the
 // wall-clock debounce is constant across FAST/STOCK cadences, exactly as
 // DefaultOptimizer.scaleTicks(batteryReserveDrainTicks) does (optimizer.go:1563).
 func (c *BatterySafetyConstraint) Evaluate(in Input, s *Session) ([]Demand, *orchestrator.ComplianceBreach) {
-	sess := &c.sess
 	threshold := s.ScaleTicks(batteryReserveDrainTicks)
-
 	var demands []Demand
+	for _, name := range c.evaluateTrips(in, threshold, c.sess.chargeCommanded) {
+		demands = append(demands, c.disconnectDemands(name)...)
+	}
+	return demands, nil
+}
+
+// evaluateTrips is the shared per-tick fault-detection core (optimizer.go:1527-1569):
+// it prunes offline packs, advances the two debounce counters, and returns the
+// names of packs that must force-disconnect this tick. The ONLY thing that varies
+// between the pre-arbitration (Evaluate/EvaluateFast) and post-arbitration
+// (PostArbitrate) entry points is where commanded-charge intent comes from, so it
+// is injected as chargeCommanded — keeping the counter cadence and trip predicate
+// identical across all three.
+func (c *BatterySafetyConstraint) evaluateTrips(in Input, threshold int, chargeCommanded func(name string) bool) []string {
+	sess := &c.sess
+	var tripped []string
 	for _, b := range in.State.Batteries {
 		// Prune + skip offline / unmeasurable packs (optimizer.go:1527-1532).
 		if !b.Connected || math.IsNaN(b.SOC) {
@@ -142,25 +171,66 @@ func (c *BatterySafetyConstraint) Evaluate(in Input, s *Session) ([]Demand, *orc
 		}
 
 		// Check 2: wrong direction — commanded charge but measuring discharge
-		// (optimizer.go:1542-1552). Commanded intent comes from lastCmdW (the last
-		// committed command); see the type doc's TASK-063 handoff note.
-		chargeCommanded := sess.chargeCommanded(b.Name)
-		if chargeCommanded && b.PowerW > exportComplianceBreachW {
+		// (optimizer.go:1542-1552).
+		cc := chargeCommanded(b.Name)
+		if cc && b.PowerW > exportComplianceBreachW {
 			sess.wrongDirTicks[b.Name]++
 		} else {
 			sess.wrongDirTicks[b.Name] = 0
 		}
 
 		// Trip conditions — optimizer.go:1563-1569.
-		criticalTrip := criticalBatteryInversion(b.PowerW, b.SOC, c.socReserve, chargeCommanded)
+		criticalTrip := criticalBatteryInversion(b.PowerW, b.SOC, c.socReserve, cc)
 		drainTrip := sess.drainTicks[b.Name] >= threshold
 		wrongDirTrip := sess.wrongDirTicks[b.Name] >= threshold
-		if !criticalTrip && !drainTrip && !wrongDirTrip {
-			continue
+		if criticalTrip || drainTrip || wrongDirTrip {
+			tripped = append(tripped, b.Name)
 		}
-		demands = append(demands, c.disconnectDemands(b.Name)...)
 	}
-	return demands, nil
+	return tripped
+}
+
+// PostArbitrate is the Stack's chosen economic-tick battery-safety ordering
+// (TASK-063): it runs AFTER the arbiter has resolved the compliance and economics
+// tiers, so its commanded-charge intent reads THIS tick's resolved battery
+// setpoint first — exactly like legacy checkBatterySafety's chargeCommandedFor(plan)
+// (optimizer.go:1477-1487) — falling back to the last committed command only when
+// this tick left the pack uncommanded. This CLOSES the ≤1-tick wrong-direction lag
+// TASK-062 documented as an open ordering question.
+//
+// A tripped pack's command is overridden to a force-disconnect (setpoint 0,
+// Connect=false), overriding whatever economics/compliance resolved — the same
+// override checkBatterySafety applies at optimizer.go:1571-1582, and because it
+// runs last it dominates every tier without needing the arbiter. Finally it
+// records the FINAL commands (post-override) so the Tier-1 fast loop can infer
+// commanded direction between economic ticks (optimizer.go:380-387).
+func (c *BatterySafetyConstraint) PostArbitrate(in Input, s *Session, plan *orchestrator.Plan) {
+	threshold := s.ScaleTicks(batteryReserveDrainTicks)
+	chargeCommanded := func(name string) bool {
+		if i := batteryCommandIndex(plan.BatteryCommands, name); i >= 0 {
+			sp := plan.BatteryCommands[i].SetpointW
+			return !math.IsNaN(sp) && sp < 0
+		}
+		return c.sess.chargeCommanded(name)
+	}
+	for _, name := range c.evaluateTrips(in, threshold, chargeCommanded) {
+		overrideDisconnect(plan, name)
+	}
+	c.RecordCommands(plan.BatteryCommands)
+}
+
+// overrideDisconnect forces a pack to {SetpointW:0, Connect:false} in the resolved
+// plan, replacing any prior command or appending one — ports optimizer.go:1571-1582.
+func overrideDisconnect(plan *orchestrator.Plan, name string) {
+	f := false
+	if i := batteryCommandIndex(plan.BatteryCommands, name); i >= 0 {
+		plan.BatteryCommands[i].SetpointW = 0
+		plan.BatteryCommands[i].Connect = &f
+		return
+	}
+	plan.BatteryCommands = append(plan.BatteryCommands, orchestrator.BatteryCommand{
+		Name: name, SetpointW: 0, Connect: &f,
+	})
 }
 
 // EvaluateFast is the Tier-1 fast protection pass (ADR-0001). It issues ONLY the
