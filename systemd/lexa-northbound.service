@@ -8,7 +8,12 @@ StartLimitBurst=5
 Description=LEXA CSIP/IEEE 2030.5 Northbound Client
 Documentation=https://github.com/lexa/lexa-hub
 After=network.target mosquitto.service
-Requires=mosquitto.service
+# Wants= not Requires=: a clean mosquitto stop/restart must NOT stop-propagate
+# to the lexa services — they survive broker restarts via paho auto-reconnect
+# (the crash-only/reconnect design; mqtt-broker-restart scenario proves it).
+# Requires+stop-propagation left lexa-api/telemetry permanently dead when a
+# scenario cleanly stopped mosquitto. (V1RC FINDING A root fix, 2026-07-06.)
+Wants=mosquitto.service
 # wolfSSL mTLS requires the network to be fully up before connecting.
 After=network-online.target
 Wants=network-online.target

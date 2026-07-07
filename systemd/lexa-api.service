@@ -8,7 +8,12 @@ StartLimitBurst=5
 Description=LEXA HTTP API (dashboard-facing /status + /logs)
 Documentation=https://github.com/lexa/lexa-hub
 After=mosquitto.service lexa-modbus.service lexa-northbound.service lexa-ocpp.service lexa-hub.service
-Requires=mosquitto.service
+# Wants= not Requires=: a clean mosquitto stop/restart must NOT stop-propagate
+# to the lexa services — they survive broker restarts via paho auto-reconnect
+# (the crash-only/reconnect design; mqtt-broker-restart scenario proves it).
+# Requires+stop-propagation left lexa-api/telemetry permanently dead when a
+# scenario cleanly stopped mosquitto. (V1RC FINDING A root fix, 2026-07-06.)
+Wants=mosquitto.service
 Wants=lexa-modbus.service lexa-northbound.service lexa-ocpp.service lexa-hub.service
 
 [Service]
