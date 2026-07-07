@@ -19,10 +19,6 @@ import "math"
 //	               (optimizer.go:33).
 //	safeCount    — consecutive ticks importW ≤ hard limit; the battery ramp-down gate
 //	               (optimizer.go:34).
-//	evSafeCount  — consecutive ticks 0 ≤ importW ≤ hard limit; the EV resume gate
-//	               (optimizer.go:35). Tracked for fidelity; EV emission is DEFERRED
-//	               (see ImportLimitConstraint doc), so it does not affect emitted
-//	               demands, but it must track exactly so the flip inherits correct state.
 //	activeLimitW — limit value when the guard was reset; NaN = no active limit
 //	               (optimizer.go:36). Follows sub-threshold decode drift within a session.
 //	breachTicks  — consecutive ticks measured import stayed over the cap; the leaky
@@ -30,7 +26,6 @@ import "math"
 type ImportSession struct {
 	dischargeW   float64
 	safeCount    int
-	evSafeCount  int
 	activeLimitW float64
 	breachTicks  int
 }
@@ -49,8 +44,9 @@ func (s *ImportSession) clearForNoLimit() {
 }
 
 // resetForNewLimit starts a fresh guard session for a meaningfully changed cap
-// value — dischargeW, safeCount, evSafeCount, breachTicks all zero. Ports the
-// wholesale struct replacement at optimizer.go:1944.
+// value — dischargeW, safeCount, breachTicks all zero (the EV-resume cooldown is
+// now the shared EVImportCooldown, reset by the import controller's manageSession).
+// Ports the wholesale struct replacement at optimizer.go:1944.
 func (s *ImportSession) resetForNewLimit(limitW float64) {
 	*s = ImportSession{dischargeW: math.NaN(), activeLimitW: limitW}
 }

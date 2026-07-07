@@ -15,7 +15,7 @@ import (
 // counter can be inspected directly for the mutation checks.
 
 func newImportPair() (*ImportLimitConstraint, *Session) {
-	return NewImportLimitConstraint(), NewSession("import", 0)
+	return NewImportLimitConstraint(NewEVImportCooldown()), NewSession("import", 0)
 }
 
 func impLimControl(w int16) *orchestrator.CSIPControlState {

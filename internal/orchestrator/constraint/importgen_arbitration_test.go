@@ -20,7 +20,7 @@ func fullStack() *Stack {
 		EVSEs:     map[string]orchestrator.EVSEPlant{},
 		Meter:     orchestrator.MeterPlant{}.WithDefaults(),
 	}
-	return NewStack(p, 0, NewExportConstraint(), NewGenLimitConstraint(), NewImportLimitConstraint())
+	return NewStack(p, 0, NewExportConstraint(), NewGenLimitConstraint(), NewImportLimitConstraint(NewEVImportCooldown()))
 }
 
 func solarCeilingOf(p orchestrator.Plan, name string) float64 {

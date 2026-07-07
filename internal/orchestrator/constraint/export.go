@@ -174,11 +174,15 @@ func (c *ExportConstraint) applyExportControl(in Input, s *Session, exportLimitW
 	}
 	actualExportW := math.Max(0, signedNetExportW)
 
-	// Low-pass filter (optimizer.go:696-702).
+	// Low-pass filter (optimizer.go:696-702). The EMA coefficient is the site
+	// meter's plant FilterAlpha (TASK-064) — an explicit tuned override (bench 0.4)
+	// that reproduces the legacy constant exactly; the wiring layer defaults it, and
+	// WithDefaults here keeps a zero-value plant (unit tests) on the bench value.
+	filterAlpha := in.Plant.Meter.WithDefaults().FilterAlpha
 	if math.IsNaN(ctrl.filteredExportW) {
 		ctrl.filteredExportW = actualExportW
 	} else {
-		ctrl.filteredExportW = exportFilterAlpha*actualExportW + (1-exportFilterAlpha)*ctrl.filteredExportW
+		ctrl.filteredExportW = filterAlpha*actualExportW + (1-filterAlpha)*ctrl.filteredExportW
 	}
 	filteredExportW := ctrl.filteredExportW
 
@@ -246,17 +250,25 @@ func (c *ExportConstraint) applyExportControl(in Input, s *Session, exportLimitW
 		if b.MaxChargeW < 50 {
 			continue
 		}
+		// Per-pack plant (TASK-064): SOC taper start and the one-tick SOC pre-position
+		// step come from THIS battery's plant model instead of the bench constants.
+		// WithDefaults reproduces the legacy socTaperStart=80 / socStep=1.0 exactly for
+		// a zero-value or partial plant. socStep is a deliberate conservative
+		// overestimate kept as an explicit legacy-debt override (see BatteryPlant).
+		bp := in.Plant.Batteries[b.Name].WithDefaults()
+		socTaperStart := bp.SOCTaperStartPct
+		socStep := bp.SOCStepPctPerTickOverride
 		taperFactor := func(soc float64) float64 {
-			if math.IsNaN(soc) || soc <= exportSOCTaperStart {
+			if math.IsNaN(soc) || soc <= socTaperStart {
 				return 1.0
 			}
-			if soc >= exportSOCFull || exportSOCFull <= exportSOCTaperStart {
+			if soc >= exportSOCFull || exportSOCFull <= socTaperStart {
 				return 0.0
 			}
-			return math.Max(0, (exportSOCFull-soc)/(exportSOCFull-exportSOCTaperStart))
+			return math.Max(0, (exportSOCFull-soc)/(exportSOCFull-socTaperStart))
 		}
 		effectiveMaxNow := b.MaxChargeW * taperFactor(b.SOC)
-		nextSOC := b.SOC + exportSOCStepEstimate
+		nextSOC := b.SOC + socStep
 		effectiveMaxNext := b.MaxChargeW * taperFactor(nextSOC)
 
 		need := math.Max(0, unconstrainedExportW-conservativeW)
@@ -295,7 +307,11 @@ func (c *ExportConstraint) applyExportControl(in Input, s *Session, exportLimitW
 	// window below is). Ported via the Session's ScaleTicks, identical to
 	// DefaultOptimizer.scaleTicks.
 	battStallThreshold := s.ScaleTicks(exportBattBreachTicks)
-	if batteryAbsorbW > exportComplianceBreachW && measuredBatteryAbsorbW < batteryAbsorbW*exportBattConvergeFrac {
+	// Absorption convergence floor from the pack plant (TASK-064): a representative
+	// connected battery's ConvergeFrac (bench default 0.5). The stall check is on the
+	// aggregate commanded absorption; multi-pack per-battery fractions are TASK-065.
+	battConvergeFrac := representativeConvergeFrac(in)
+	if batteryAbsorbW > exportComplianceBreachW && measuredBatteryAbsorbW < batteryAbsorbW*battConvergeFrac {
 		if ctrl.battStallTicks < battStallThreshold {
 			ctrl.battStallTicks++
 		}
@@ -371,12 +387,17 @@ func (c *ExportConstraint) applyExportControl(in Input, s *Session, exportLimitW
 	}
 
 	// Slew-limit the feedback change (optimizer.go:1059-1070); skipped on the
-	// first tick of an episode (NaN prev).
+	// first tick of an episode (NaN prev). The per-tick slew now comes from the
+	// inverter plant's PHYSICAL ramp (W/s) scaled by the engine tick (TASK-064,
+	// AD-007): at the bench FAST tick (3 s) this reproduces maxDropW=1500 / maxRiseW=500
+	// exactly; on a slower STOCK tick the ceiling may physically move further, which
+	// is the intended cadence-correct behaviour (§13 STOCK spot-check).
+	maxDropW, maxRiseW := ceilingSlewW(in)
 	if !math.IsNaN(prevCeilingW) {
-		if desiredCeilingW < prevCeilingW-exportMaxDropW {
-			desiredCeilingW = prevCeilingW - exportMaxDropW
-		} else if desiredCeilingW > prevCeilingW+exportMaxRiseW {
-			desiredCeilingW = prevCeilingW + exportMaxRiseW
+		if desiredCeilingW < prevCeilingW-maxDropW {
+			desiredCeilingW = prevCeilingW - maxDropW
+		} else if desiredCeilingW > prevCeilingW+maxRiseW {
+			desiredCeilingW = prevCeilingW + maxRiseW
 		}
 		if desiredCeilingW < 0 {
 			desiredCeilingW = 0
@@ -467,6 +488,52 @@ func (c *ExportConstraint) checkConvergence(in Input, s *Session, exportLimitW f
 		}
 	}
 	return nil
+}
+
+// ceilingSlewW returns this tick's ceiling drop/rise limits (W) from the inverter
+// plant's physical ramp (W per wall-clock second) scaled by the engine tick
+// (TASK-064). The export ceiling is a single site-wide aggregate; like the legacy
+// single-ceiling assumption it uses ONE representative inverter — the first
+// CONNECTED one — pending the multi-inverter ramp aggregation TASK-065 owns. With
+// no connected inverter (no ceiling to slew) it falls back to the bench-defaulted
+// ramp. At the bench FAST tick this yields maxDropW=1500 / maxRiseW=500; the rise
+// carries a ~1e-13 W float-conversion residue (500/3×3) that is far inside the
+// shadow ceiling tolerance and only affects on-cap ticks.
+func ceilingSlewW(in Input) (dropW, riseW float64) {
+	var ip orchestrator.InverterPlant
+	found := false
+	for _, sol := range in.State.Solar {
+		if sol.Connected {
+			ip = in.Plant.Inverters[sol.Name]
+			found = true
+			break
+		}
+	}
+	if !found {
+		// No connected inverter: bench-defaulted ramp (harmless — the slew block only
+		// runs when there is nameplate to curtail).
+		ip = orchestrator.InverterPlant{}
+	}
+	ip = ip.WithDefaults()
+	tick := in.TickSeconds
+	if tick <= 0 {
+		tick = tunedTickInterval.Seconds()
+	}
+	return ip.MaxRampDownWPerS * tick, ip.MaxRampUpWPerS * tick
+}
+
+// representativeConvergeFrac returns the absorption-convergence floor for the
+// aggregate battery-stall check from a representative connected battery's plant
+// (TASK-064). The legacy check applied ONE battConvergeFrac to the summed
+// absorption; here the first connected battery's ConvergeFrac stands in (bench
+// default 0.5). Per-battery fractions in a multi-pack site are TASK-065.
+func representativeConvergeFrac(in Input) float64 {
+	for _, b := range in.State.Batteries {
+		if b.Connected {
+			return in.Plant.Batteries[b.Name].WithDefaults().ConvergeFrac
+		}
+	}
+	return orchestrator.BatteryPlant{}.WithDefaults().ConvergeFrac
 }
 
 // detectionWindowTicks derives the adaptive export-breach window from plant

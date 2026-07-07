@@ -54,11 +54,16 @@ import (
 // That divergence is EXPECTED and is the characterized finding for TASK-064
 // (constants→plant / shared-state owner) — it is not forced to bit-match here.
 // The one genuinely cross-tier piece the rules need, the EV import-cooldown
-// (evSafeCount, import-session-owned after TASK-061), is reproduced with an
-// economics-local counter so the battery-empty-import-cap suspension is preserved
-// (a HARD-preserve invariant); a single shared owner is a TASK-064 item.
+// (evSafeCount, import-session-owned after TASK-061), is now the SHARED
+// EVImportCooldown (TASK-064): the import constraint writes it, economics reads it,
+// so the battery-empty-import-cap suspension (a HARD-preserve invariant) is
+// preserved with ONE counter instead of a divergent economics-local copy.
 type EconomicsConstraint struct {
-	sess EconomicsSession
+	// cooldown is the SHARED EV-resume cooldown (TASK-064): written by the import
+	// constraint (compliance tier, runs first), READ here to gate EV resumption.
+	// nil ⇒ no import writer wired (standalone economics unit tests with no import
+	// cap) ⇒ never suppressed, matching legacy where no import rule ran.
+	cooldown *EVImportCooldown
 
 	// costModel drives Rule 5 TOU peak detection. nil ⇒ TOU never fires (matching
 	// DefaultOptimizer with a nil CostModel).
@@ -88,10 +93,12 @@ const (
 )
 
 // NewEconomicsConstraint builds the economics constraint with the bench-default
-// DefaultOptimizer config. cmd/hub passes the same values it assigns to opt.*.
-func NewEconomicsConstraint(costModel *orchestrator.TOUCostModel, socReserve, socFull, excessSolar, exportMargin float64, evCooldownCycles int) *EconomicsConstraint {
+// DefaultOptimizer config. cmd/hub passes the same values it assigns to opt.*. cd is
+// the shared EV-resume cooldown the import constraint writes and this constraint
+// reads (TASK-064); nil is tolerated for standalone unit tests with no import cap.
+func NewEconomicsConstraint(costModel *orchestrator.TOUCostModel, socReserve, socFull, excessSolar, exportMargin float64, evCooldownCycles int, cd *EVImportCooldown) *EconomicsConstraint {
 	return &EconomicsConstraint{
-		sess:                   newEconomicsSession(),
+		cooldown:               cd,
 		costModel:              costModel,
 		socReserve:             socReserve,
 		socFull:                socFull,
@@ -139,10 +146,11 @@ func (c *EconomicsConstraint) Evaluate(in Input, s *Session) ([]Demand, *orchest
 	exportLimitW := effectiveExportLimitW(st)
 	importLimitW := effectiveImportLimitW(st)
 
-	// EV import cooldown (economics-local copy; see the type doc). Advance BEFORE
-	// the EV rule reads it, matching the legacy order where applyImportLimitRule
-	// increments evSafeCount before applyEVChargingRule gates on it.
-	c.sess.updateEVCooldown(importLimitW, st.Grid.NetW, c.evImportCooldownCycles)
+	// EV import cooldown: the import constraint (compliance tier) already advanced the
+	// SHARED counter THIS tick before economics runs (Stack evaluates compliance
+	// before economics), matching the legacy order where applyImportLimitRule advances
+	// evSafeCount before applyEVChargingRule gates on it. Economics only READS it below
+	// (TASK-064 single owner) — no local advance here.
 
 	// Rule 2: CSIP fixed dispatch — discharge battery to meet an explicit export request.
 	batteries = c.applyFixedDispatch(st.CSIPControl, batteries, solarW, homeLoadW, e)
@@ -453,7 +461,7 @@ func (c *EconomicsConstraint) applyTOU(st orchestrator.SystemState, batteries []
 // grid supplement. evImportSuppressed is reproduced from the economics-local
 // cooldown counter (see the type doc).
 func (c *EconomicsConstraint) applyEVCharging(evses []orchestrator.EVSEState, exportLimitW, importLimitW, netW, solarW, surplusW float64, e *ecoPlan) {
-	evImportSuppressed := !math.IsNaN(importLimitW) && c.sess.evSafeCount < c.evImportCooldownCycles
+	evImportSuppressed := !math.IsNaN(importLimitW) && c.cooldown != nil && c.cooldown.Suppressed(c.evImportCooldownCycles)
 
 	for _, evse := range evses {
 		if !evse.Connected || !evse.SessionActive {

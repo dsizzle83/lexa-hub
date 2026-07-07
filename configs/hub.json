@@ -26,7 +26,8 @@
         "capacity_kwh": 10.0,
         "soc_taper_start_pct": 80.0,
         "converge_frac": 0.5,
-        "control_latency_s": 3.0
+        "control_latency_s": 3.0,
+        "soc_step_pct_per_tick_override": 1.0
       }
     },
     {
@@ -34,7 +35,8 @@
       "role": "meter",
       "max_w": 0,
       "plant": {
-        "meter_lag_s": 5.0
+        "meter_lag_s": 5.0,
+        "filter_alpha": 0.4
       }
     }
   ],

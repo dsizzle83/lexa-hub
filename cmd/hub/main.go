@@ -221,11 +221,14 @@ func main() {
 		// economics constraint takes the same config cmd/hub gives the legacy
 		// optimizer (opt.* above), so the two layers are the same controller modulo
 		// the tier seam.
+		// One shared EV-resume cooldown (TASK-064): the import constraint writes it,
+		// economics reads it — a single counter across the tier seam.
+		evCooldown := constraint.NewEVImportCooldown()
 		stack := constraint.NewStack(buildConstraintPlant(cfg), cfg.EngineInterval(),
 			constraint.NewBatterySafetyConstraint(opt.SOCReserve),
 			constraint.NewExportConstraint(),
 			constraint.NewGenLimitConstraint(),
-			constraint.NewImportLimitConstraint(),
+			constraint.NewImportLimitConstraint(evCooldown),
 			constraint.NewEconomicsConstraint(
 				opt.CostModel,
 				opt.SOCReserve,
@@ -233,6 +236,7 @@ func main() {
 				opt.ExcessSolarThreshold,
 				opt.ExportMarginFrac,
 				opt.EVImportCooldownCycles,
+				evCooldown,
 			))
 		reg.Counter("lexa_constraint_shadow_divergence_total")
 		wrapper := constraint.Wrap(opt, stack, constraint.Options{

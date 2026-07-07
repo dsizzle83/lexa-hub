@@ -27,12 +27,18 @@ package orchestrator
 //     it. The defaults reproduce today's constants EXACTLY (per-second defaults
 //     multiplied back by tunedTickInterval recover the legacy per-tick values).
 //
-// Note on socStepEstimate (optimizer.go:787, 1.0 %/tick): it is DERIVED, not a
-// parameter. It is the SOC a pack climbs per tick at full charge, i.e.
-// MaxChargeW (from live BatteryMetrics) × tickSeconds ÷ (CapacityKWh × 36 000).
-// TASK-064 computes it from BatteryPlant.CapacityKWh and the engine cadence; it
-// is deliberately absent from BatteryPlant so it can never drift from the pack
-// energy it must be consistent with.
+// Note on socStepEstimate (optimizer.go:787, 1.0 %/tick): physically it is
+// DERIVABLE — the SOC a pack climbs per tick at full charge, i.e. MaxChargeW
+// (from live BatteryMetrics) × tickSeconds ÷ (CapacityKWh × 36 000), which for the
+// bench pack (5 kW, 10 kWh, 3 s) yields ≈0.42 %/tick, NOT 1.0. The legacy 1.0 is a
+// DELIBERATE conservative overestimate ("Calibrated for the 20× demo"): it errs
+// HIGH so the SOC taper hands off EARLY, never late. TASK-064's mandate is
+// identical bench behaviour, so it does NOT switch to the derived value — that is a
+// behaviour change. Instead BatteryPlant carries an explicit
+// SOCStepPctPerTickOverride defaulting to the legacy 1.0 (preserve-first, marked
+// legacy debt per 05 §6); the derived-formula migration is backlogged (10_BACKLOG,
+// "derived socStep + discovery probe"). The override is a per-pack knob so a real
+// pack can be calibrated without editing product code.
 
 // Bench-calibration provenance constants. These name the legacy values so the
 // per-second/per-percent defaults below (and the equivalence test) have a
@@ -60,6 +66,19 @@ const (
 	// the physical meter refreshes ~every 5 s, OCPP MeterValues ~every 10 s.
 	benchMeterLagS     = 5.0
 	benchEVSEMeterLagS = 10.0
+
+	// benchFilterAlpha is optimizer.go's filterAlpha (:696, 0.4): the EMA low-pass
+	// coefficient on the measured site-export reading that rejects the meter/OCPP
+	// reporting jitter. Tuned for this bench's 5 s meter / 10 s OCPP cadence; the
+	// FilterAlphaFor mapping derives ≈0.375 from those lags, close but NOT identical,
+	// so the bench keeps this explicit tuned value (preserve-first, TASK-064).
+	benchFilterAlpha = 0.4
+
+	// benchSOCStepPctPerTick is optimizer.go's socStepEstimate (:787, 1.0 %/tick):
+	// the SOC the export controller ASSUMES the pack climbs per tick when it
+	// pre-positions the taper one tick ahead. A deliberate conservative overestimate
+	// (see the socStepEstimate note above). Bench-calibrated legacy debt.
+	benchSOCStepPctPerTick = 1.0
 )
 
 // benchControlLatencyS is the bench command→measured-effect lag. It equals one
@@ -138,6 +157,16 @@ type BatteryPlant struct {
 	// the inverter is curtailed. Replaces optimizer.go's battConvergeFrac
 	// (0.5). Bench-calibrated. Default 0.5.
 	ConvergeFrac float64 `json:"converge_frac"`
+	// SOCStepPctPerTickOverride is the SOC (%) the export controller ASSUMES the
+	// pack climbs in one engine tick when it pre-positions the SOC taper one tick
+	// ahead (optimizer.go:787, socStepEstimate). It is a DELIBERATE conservative
+	// overestimate — the derived value is MaxChargeW×tickS/(CapacityKWh×36000)
+	// (≈0.42 %/tick for the bench pack) but the legacy 1.0 errs HIGH so the taper
+	// hands off early, never late. TASK-064 keeps the 1.0 override to preserve bench
+	// behaviour EXACTLY; the derived formula is backlogged (10_BACKLOG). This is an
+	// explicit per-pack legacy-debt knob (05 §6): burn down after real-pack
+	// calibration replaces it with the derived value. Default 1.0.
+	SOCStepPctPerTickOverride float64 `json:"soc_step_pct_per_tick_override"`
 	// ControlLatencyS is the command→measured-effect lag (seconds) for a
 	// battery charge setpoint. Bench-calibrated to one tuned tick (3 s). Feeds
 	// the same adaptive detection window as InverterPlant.ControlLatencyS
@@ -159,6 +188,9 @@ func (p BatteryPlant) WithDefaults() BatteryPlant {
 	if p.ControlLatencyS == 0 {
 		p.ControlLatencyS = benchControlLatencyS()
 	}
+	if p.SOCStepPctPerTickOverride == 0 {
+		p.SOCStepPctPerTickOverride = benchSOCStepPctPerTick
+	}
 	// TaperCurve stays nil by default (empty = linear taper); never synthesized.
 	return p
 }
@@ -171,13 +203,45 @@ type MeterPlant struct {
 	// MeterLagS is the meter's export-reading refresh cadence (seconds).
 	// Bench-calibrated to the ~5 s bench meter (optimizer.go:693). Default 5.
 	MeterLagS float64 `json:"meter_lag_s"`
+	// FilterAlpha is the EMA low-pass coefficient the export controller applies to
+	// the measured site-export reading (optimizer.go:696, filterAlpha=0.4) to reject
+	// the meter/OCPP reporting jitter. It is DERIVABLE from MeterLagS and the tick
+	// (see FilterAlphaFor: a slower meter needs a heavier filter — smaller alpha),
+	// but TASK-064 keeps an explicit tuned override to preserve bench behaviour
+	// EXACTLY (the derived value ≈0.375 is close but not identical to the tuned 0.4).
+	// The override WINS when set; the derivation is the documented fallback for a
+	// vendor meter that ships only a datasheet refresh cadence. Bench-calibrated.
+	// Default 0.4.
+	FilterAlpha float64 `json:"filter_alpha"`
 }
 
 func (p MeterPlant) WithDefaults() MeterPlant {
 	if p.MeterLagS == 0 {
 		p.MeterLagS = benchMeterLagS
 	}
+	if p.FilterAlpha == 0 {
+		p.FilterAlpha = benchFilterAlpha
+	}
 	return p
+}
+
+// FilterAlphaFor derives an EMA low-pass coefficient from a meter's reporting lag
+// and the engine tick, for a vendor meter that ships only a datasheet refresh
+// cadence and no tuned alpha. It is the exponential-smoothing form
+// alpha = tickS / (meterLagS + tickS): a slower meter (larger lag) yields a smaller
+// alpha (heavier filter). At the bench (meterLag 5 s, tick 3 s) it yields 0.375 —
+// close to, but NOT identical to, the tuned 0.4 the bench keeps as an explicit
+// override (preserve-first, TASK-064; provenance benchFilterAlpha). Result is
+// clamped to (0,1]; a zero/negative lag or tick yields 1.0 (no filtering).
+func FilterAlphaFor(meterLagS, tickS float64) float64 {
+	if meterLagS <= 0 || tickS <= 0 {
+		return 1.0
+	}
+	a := tickS / (meterLagS + tickS)
+	if a > 1 {
+		a = 1
+	}
+	return a
 }
 
 // EVSEPlant is the EV-charger plant model. Its meter lag is the OCPP
