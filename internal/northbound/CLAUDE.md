@@ -46,6 +46,24 @@ fetchers, MQTT connect/subscribe, signal handling); it constructs one
    until its own `ValidUntil` expires; a malformed control is never adopted nor stored as
    last-known-good. Only an actually-expired (or never-set) last-known-good yields `nil`.
 
+## Walk-cadence pacing (TASK-071, §12, AD-014)
+`run/pollrate.go`'s `effectiveInterval` paces `Discovery.Loop`'s per-cycle
+wait: `poll_rate_mode: "honor"` (product default, `cmd/northbound/config.go`)
+throttles the walk to the MAX of every advertised class pollRate seen in the
+last successful tree (DeviceCapability/Time/each DERProgram's
+DERControlList) — floored at the operator's `discovery_interval_s`, capped
+at `min(MaxInterval, 15 min)` (the 15-min clock-resync max-staleness bound
+is unconditional in every mode). `poll_rate_mode: "override"` (BENCH
+default — `configs/northbound.json` ships it explicitly) ignores the tree
+entirely and reproduces the pre-TASK-071 fixed cadence byte-for-byte —
+required because gridsim's DERControlList pollRate (60s) would otherwise
+push Mayhem's adoption-latency-sensitive scenarios (`expired-control`,
+`conflicting-primacy`, `clock-jump-forward`) well past their expected
+few-second adoption window. The walk itself is still one atomic whole-tree
+`discovery.Walker.Discover` call every cycle (unchanged) — this paces WHEN
+that call happens, not what it fetches; per-class independent scheduling
+and conditional-GET (gridsim has none) are backlogged, see AD-014.
+
 ## MirrorUsagePoint telemetry flow
 1. `POST /mup` → 201 + Location header (e.g. `/mup/0`). Save location.
 2. `POST /mup/{n}` with `MirrorMeterReading` XML → 204. Post per measurement update.

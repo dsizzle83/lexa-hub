@@ -147,7 +147,7 @@ func main() {
 	clk := utilitytime.New(utilitytime.Config{})
 	respTracker := responses.New(fetcherResp, lfdi, cfg.ResponseSetPath, clk, responsesPostedCtr, jw)
 	frManager := flowres.New(fetcherFR, lfdi)
-	discovery := run.New(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, nbm)
+	discovery := run.New(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, nbm, run.PollRateConfig{Mode: cfg.PollRateMode()})
 
 	// FlowReservationRequest from the hub. Bypasses mqttutil.Subscribe (needs
 	// the raw payload for HandleRequest, not a JSON-decoded T) so it carries
