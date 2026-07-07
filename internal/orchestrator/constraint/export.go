@@ -56,27 +56,24 @@ func (c *ExportConstraint) Name() string { return "export" }
 // Tier places the export cap in the CSIP compliance band.
 func (c *ExportConstraint) Tier() Tier { return TierCompliance }
 
-// Ported constants. Kept identical to optimizer.go (parameterization is
-// TASK-064); the export prefix avoids colliding with the sibling constraints
-// that will port import/gen on this pattern.
+// Ported constants. The six bench-calibrated ones (filterAlpha, socTaperStart,
+// socStepEstimate, maxDropW, maxRiseW, battConvergeFrac) were BURNED DOWN in
+// TASK-064 Stage B — they are now read from the per-device plant model; see
+// plantmodel.go (the withDefaults() source that still names the legacy values).
+// What remains here is compliance-latency policy and controller gains that are
+// NOT plant physics and stay constants (05 §5 wall-clock rule handles cadence).
 const (
-	exportFilterAlpha       = 0.4    // optimizer.go:696
-	exportSOCTaperStart     = 80.0   // optimizer.go:778
-	exportSOCStepEstimate   = 1.0    // optimizer.go:787
-	exportCeilGain          = 0.5    // optimizer.go:1036
-	exportMaxDropW          = 1500.0 // optimizer.go:1060
-	exportMaxRiseW          = 500.0  // optimizer.go:1061
-	exportEVMinChargeA      = 6.0    // optimizer.go:903
-	exportEVDeadbandA       = 0.5    // optimizer.go:904
-	exportEVMaxTightenA     = 2.0    // optimizer.go:905
-	exportEVMaxRelaxA       = 1.0    // optimizer.go:906
-	exportComplianceBreachW = 100.0  // optimizer.go:2143 (complianceBreachW)
-	exportBattConvergeFrac  = 0.5    // optimizer.go:72
-	exportBattBreachTicks   = 3      // optimizer.go:73
-	exportBreachTicks       = 3      // optimizer.go:1168
-	exportMarginFrac        = 0.20   // NewDefaultOptimizer default (optimizer.go:226); bench does not override
-	exportRelaxCycles       = 5      // NewDefaultOptimizer default (optimizer.go:227)
-	exportSOCFull           = 95.0   // SOCFullThreshold default (optimizer.go:224); bench does not override
+	exportCeilGain          = 0.5   // optimizer.go:1036
+	exportEVMinChargeA      = 6.0   // optimizer.go:903
+	exportEVDeadbandA       = 0.5   // optimizer.go:904
+	exportEVMaxTightenA     = 2.0   // optimizer.go:905
+	exportEVMaxRelaxA       = 1.0   // optimizer.go:906
+	exportComplianceBreachW = 100.0 // optimizer.go:2143 (complianceBreachW)
+	exportBattBreachTicks   = 3     // optimizer.go:73 — compliance latency policy, not plant
+	exportBreachTicks       = 3     // optimizer.go:1168 — compliance latency policy, not plant
+	exportMarginFrac        = 0.20  // NewDefaultOptimizer default (optimizer.go:226); bench does not override
+	exportRelaxCycles       = 5     // NewDefaultOptimizer default (optimizer.go:227)
+	exportSOCFull           = 95.0  // SOCFullThreshold default (optimizer.go:224); bench does not override
 )
 
 // effectiveExportLimitW reproduces deriveGridConstraints' export leg
