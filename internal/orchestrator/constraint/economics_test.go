@@ -32,8 +32,12 @@ const (
 // newEconomicsPair returns a fresh economics constraint (bench config, default TOU
 // schedule) and its base session at the tuned tick.
 func newEconomicsPair() (*EconomicsConstraint, *Session) {
+	// nil cooldown: a standalone economics constraint with no import writer never
+	// suppresses (matching legacy, where no import rule ran without an import cap).
+	// Cooldown-suppression is proven with a shared cooldown in
+	// TestEconomics_EVSuppressedDuringImportCooldown.
 	c := NewEconomicsConstraint(orchestrator.DefaultTOUCostModel(),
-		benchSOCReserve, benchSOCFull, benchExcessSolar, benchExportMargin, benchEVCooldown)
+		benchSOCReserve, benchSOCFull, benchExcessSolar, benchExportMargin, benchEVCooldown, nil)
 	return c, NewSession("economics", 0)
 }
 
@@ -223,14 +227,25 @@ func TestEconomics_EVFullRateNoConstraint(t *testing.T) {
 // battery-empty-import-cap (HARD preserve): EV stays suspended during the import
 // cooldown after an import cap arrives while the site is NOT compliant.
 func TestEconomics_EVSuppressedDuringImportCooldown(t *testing.T) {
-	c, s := newEconomicsPair()
+	// One shared cooldown (TASK-064): the import constraint is the WRITER, economics
+	// the reader. Drive import first (as the Stack does) so economics reads the value
+	// import wrote this tick — proving the single-owner wiring, not an economics-local
+	// copy.
+	cd := NewEVImportCooldown()
+	imp := NewImportLimitConstraint(cd)
+	c := NewEconomicsConstraint(orchestrator.DefaultTOUCostModel(),
+		benchSOCReserve, benchSOCFull, benchExcessSolar, benchExportMargin, benchEVCooldown, cd)
+	is := NewSession("import", 0)
+	es := NewSession("economics", 0)
+
 	// Import cap arrives while over the limit (netW 3000 > 1000) → cooldown starts at 0.
 	st := orchestrator.SystemState{
 		Timestamp: offPeakTime(),
 		EVSEs:     []orchestrator.EVSEState{{StationID: "cs1", ConnectorID: 1, Connected: true, SessionActive: true, MaxCurrentA: 32, VoltageV: 230}},
 		Grid:      orchestrator.GridState{NetW: 3000, ImportLimitW: 1000, ExportLimitW: math.NaN(), MaxLimitW: math.NaN()},
 	}
-	demands, _ := c.Evaluate(benchInput(st), s)
+	imp.Evaluate(benchInput(st), is) // writer advances the shared cooldown
+	demands, _ := c.Evaluate(benchInput(st), es)
 	if got := evDemand(demands, "cs1", 1); math.Abs(got) > 0.01 {
 		t.Fatalf("EV during import cooldown = %.1f, want 0 (suspended)", got)
 	}
@@ -267,11 +282,13 @@ func benchLegacy() *orchestrator.DefaultOptimizer {
 // economics, in the order main.go wires them, at the tuned tick.
 func benchFullStack(st orchestrator.SystemState) *Stack {
 	in := benchInput(st)
+	// One shared cooldown across the import (writer) and economics (reader) tiers.
+	cd := NewEVImportCooldown()
 	return NewStack(in.Plant, 0,
 		NewBatterySafetyConstraint(benchSOCReserve),
-		NewExportConstraint(), NewGenLimitConstraint(), NewImportLimitConstraint(),
+		NewExportConstraint(), NewGenLimitConstraint(), NewImportLimitConstraint(cd),
 		NewEconomicsConstraint(orchestrator.DefaultTOUCostModel(),
-			benchSOCReserve, benchSOCFull, benchExcessSolar, benchExportMargin, benchEVCooldown))
+			benchSOCReserve, benchSOCFull, benchExcessSolar, benchExportMargin, benchEVCooldown, cd))
 }
 
 // TestEconomics_ShadowParityOffCap drives the full stack and the legacy optimizer

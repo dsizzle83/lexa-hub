@@ -44,14 +44,23 @@ import (
 //     migration.
 type ImportLimitConstraint struct {
 	sess ImportSession
+	// cooldown is the SHARED EV-resume cooldown (TASK-064): the import constraint is
+	// its sole WRITER (this is the legacy applyImportLimitRule's tier), the economics
+	// constraint reads it. One counter, no cross-copy divergence — see EVImportCooldown.
+	cooldown *EVImportCooldown
 }
 
 // compile-time proof ImportLimitConstraint satisfies the Constraint interface.
 var _ Constraint = (*ImportLimitConstraint)(nil)
 
 // NewImportLimitConstraint builds the import constraint in the no-active-limit state.
-func NewImportLimitConstraint() *ImportLimitConstraint {
-	return &ImportLimitConstraint{sess: newImportSession()}
+// cd is the shared EV-resume cooldown this constraint WRITES and the economics
+// constraint reads; the Stack builder mints one and passes it to both (TASK-064).
+func NewImportLimitConstraint(cd *EVImportCooldown) *ImportLimitConstraint {
+	if cd == nil {
+		cd = NewEVImportCooldown()
+	}
+	return &ImportLimitConstraint{sess: newImportSession(), cooldown: cd}
 }
 
 // Name is the stable identity; it keys the Session and appears as Demand.Source.
@@ -92,9 +101,11 @@ func (c *ImportLimitConstraint) Evaluate(in Input, s *Session) ([]Demand, *orche
 	importLimitW := effectiveImportLimitW(st)
 
 	// Cap cleared → whole session clears, no demands (optimizer.go:1930-1932 +
-	// checkImportConvergence :1402-1404).
+	// checkImportConvergence :1402-1404). The shared cooldown clears too — its
+	// compliance session is over (there is no import cap to recover under).
 	if math.IsNaN(importLimitW) {
 		sess.clearForNoLimit()
+		c.cooldown.clear()
 		return nil, nil
 	}
 
@@ -122,13 +133,16 @@ func (c *ImportLimitConstraint) Evaluate(in Input, s *Session) ([]Demand, *orche
 // compliant (the cooldown exists for post-violation recovery, not limit arrival).
 func (c *ImportLimitConstraint) manageSession(s *Session, importLimitW, netW float64) {
 	sess := &c.sess
+	compliant := !math.IsNaN(netW) && netW >= 0 && netW <= importLimitW
 	if math.IsNaN(sess.activeLimitW) || math.Abs(importLimitW-sess.activeLimitW) > exportComplianceBreachW {
 		sess.resetForNewLimit(importLimitW)
-		if !math.IsNaN(netW) && netW >= 0 && netW <= importLimitW {
-			sess.evSafeCount = c.evCooldown(s)
-		}
+		// Seed the shared EV-resume gate as satisfied when the cap ARRIVES while
+		// already compliant (the cooldown is for post-violation recovery, not limit
+		// arrival). advance() runs the same tick, landing at seed+1 exactly as legacy.
+		c.cooldown.arrival(importLimitW, compliant, c.evCooldown(s))
 	} else {
 		sess.activeLimitW = importLimitW // same session; track sub-threshold drift
+		c.cooldown.sameCap(importLimitW)
 	}
 }
 
@@ -183,14 +197,11 @@ func (c *ImportLimitConstraint) applyImportControl(st orchestrator.SystemState, 
 		sess.safeCount = 0
 	}
 
-	// evSafeCount gates EV resumption: only when actually importing (positive netW)
-	// and under the cap; negative netW (export from over-discharge) resets it
-	// (optimizer.go:2001-2009).
-	if !math.IsNaN(netW) && netW >= 0 && netW <= importLimitW {
-		sess.evSafeCount++
-	} else {
-		sess.evSafeCount = 0
-	}
+	// The shared EV-resume gate advances: increment only when actually importing
+	// (positive netW) and under the cap; negative netW (export from over-discharge)
+	// resets it so the EV cannot resume during the settling transient
+	// (optimizer.go:2001-2009). Sole writer of the cooldown (TASK-064).
+	c.cooldown.advance(!math.IsNaN(netW) && netW >= 0 && netW <= importLimitW)
 
 	// Target discharge brings unconstrained import down to the conservative limit
 	// (optimizer.go:2012).

@@ -17,7 +17,7 @@ func safetyStack() *Stack {
 	return NewStack(Plant{Meter: orchestrator.MeterPlant{}.WithDefaults()}, 0,
 		NewBatterySafetyConstraint(benchSOCReserve),
 		NewEconomicsConstraint(orchestrator.DefaultTOUCostModel(),
-			benchSOCReserve, benchSOCFull, benchExcessSolar, benchExportMargin, benchEVCooldown))
+			benchSOCReserve, benchSOCFull, benchExcessSolar, benchExportMargin, benchEVCooldown, nil))
 }
 
 // A pack commanded to CHARGE this tick (economics self-consumption resolves a
