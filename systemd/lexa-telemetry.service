@@ -1,4 +1,10 @@
 [Unit]
+# StartLimit* MUST live in [Unit] (systemd >=v230 ignores them in
+# [Service]); the default 5-in-10s otherwise applies and a crash
+# burst (e.g. the power-cut-retained scenario) permanently disables
+# the service. (V1RC FINDING A, 2026-07-06.)
+StartLimitIntervalSec=120
+StartLimitBurst=5
 Description=LEXA CSIP Telemetry (MUP POST) Service
 Documentation=https://github.com/lexa/lexa-hub
 After=network-online.target mosquitto.service lexa-modbus.service
@@ -28,8 +34,6 @@ ExecStart=/usr/local/sbin/lexa-telemetry -config /etc/lexa/telemetry.json
 Restart=on-failure
 RestartSec=10s
 
-StartLimitIntervalSec=120
-StartLimitBurst=5
 
 # journald rate cap (TASK-009, review §11 flash wear / RSK-14): one summary
 # line per device per post (bench MUPPostRate=60s) plus per-quantity POST

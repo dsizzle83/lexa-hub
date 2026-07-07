@@ -1,4 +1,10 @@
 [Unit]
+# StartLimit* MUST live in [Unit] (systemd >=v230 ignores them in
+# [Service]); the default 5-in-10s otherwise applies and a crash
+# burst (e.g. the power-cut-retained scenario) permanently disables
+# the service. (V1RC FINDING A, 2026-07-06.)
+StartLimitIntervalSec=60
+StartLimitBurst=5
 Description=LEXA OCPP 2.0.1 CSMS (EV Charger Server)
 Documentation=https://github.com/lexa/lexa-hub
 After=network.target mosquitto.service
@@ -26,8 +32,6 @@ ExecStart=/usr/local/sbin/lexa-ocpp -config /etc/lexa/ocpp.json
 Restart=on-failure
 RestartSec=5s
 
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # journald rate cap (TASK-009, review §11 flash wear / RSK-14): event-driven
 # logging (StatusNotification/MeterValues/TransactionEvent), one line per

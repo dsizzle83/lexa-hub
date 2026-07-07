@@ -1,4 +1,10 @@
 [Unit]
+# StartLimit* MUST live in [Unit] (systemd >=v230 ignores them in
+# [Service]); the default 5-in-10s otherwise applies and a crash
+# burst (e.g. the power-cut-retained scenario) permanently disables
+# the service. (V1RC FINDING A, 2026-07-06.)
+StartLimitIntervalSec=60
+StartLimitBurst=5
 Description=LEXA HTTP API (dashboard-facing /status + /logs)
 Documentation=https://github.com/lexa/lexa-hub
 After=mosquitto.service lexa-modbus.service lexa-northbound.service lexa-ocpp.service lexa-hub.service
@@ -27,8 +33,6 @@ ExecStart=/usr/local/sbin/lexa-api -config /etc/lexa/api.json
 Restart=on-failure
 RestartSec=5s
 
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # journald rate cap (TASK-009, review §11 flash wear / RSK-14): the /logs SSE
 # feed (lb.Emit) is an in-memory ring buffer, NOT journal output — the

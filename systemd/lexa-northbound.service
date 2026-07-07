@@ -1,4 +1,10 @@
 [Unit]
+# StartLimit* MUST live in [Unit] (systemd >=v230 ignores them in
+# [Service]); the default 5-in-10s otherwise applies and a crash
+# burst (e.g. the power-cut-retained scenario) permanently disables
+# the service. (V1RC FINDING A, 2026-07-06.)
+StartLimitIntervalSec=120
+StartLimitBurst=5
 Description=LEXA CSIP/IEEE 2030.5 Northbound Client
 Documentation=https://github.com/lexa/lexa-hub
 After=network.target mosquitto.service
@@ -8,6 +14,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# StateDirectory=lexa auto-creates /var/lib/lexa for the append-only
+# journal (TASK-039/040). (V1RC FINDING D, 2026-07-06.)
+StateDirectory=lexa
 # Type=notify + WatchdogSec (TASK-008, review §11 item 5 / RSK-08): northbound
 # is the utility-facing path and the service most plausibly wedged by a
 # wolfSSL hang (§8.6) — exactly who most needs this. lexa-northbound sends
@@ -35,8 +44,6 @@ Restart=on-failure
 RestartSec=10s
 
 # CSIP server may be temporarily unreachable; back off before retry.
-StartLimitIntervalSec=120
-StartLimitBurst=5
 
 # journald rate cap (TASK-009, review §11 flash wear / RSK-14): FAST 5s walk
 # cadence, ~2 lines/walk (one "discovery OK ..." summary plus an occasional

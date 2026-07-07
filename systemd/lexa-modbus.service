@@ -1,4 +1,10 @@
 [Unit]
+# StartLimit* MUST live in [Unit] (systemd >=v230 ignores them in
+# [Service]); the default 5-in-10s otherwise applies and a crash
+# burst (e.g. the power-cut-retained scenario) permanently disables
+# the service. (V1RC FINDING A, 2026-07-06.)
+StartLimitIntervalSec=60
+StartLimitBurst=5
 Description=LEXA Modbus/SunSpec Device Service
 Documentation=https://github.com/lexa/lexa-hub
 After=network.target mosquitto.service
@@ -31,8 +37,6 @@ Restart=on-failure
 RestartSec=5s
 
 # Give Modbus connections time to settle before the next restart.
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # journald rate cap (TASK-009, review §11 flash wear / RSK-14): normal
 # steady-state logging is sparse (per-poll updates don't log unless
