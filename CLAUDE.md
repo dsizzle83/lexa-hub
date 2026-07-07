@@ -472,6 +472,20 @@ binary-only deploy + hand-set Pi config (05 §6 discipline).
 
 ## Critical invariants
 
+- **Engine state is single-writer (TASK-067)**: `internal/orchestrator/engine.go`
+  + `engine_state.go` hold ALL Engine mutable state in one `engineState`
+  struct, each field owned by exactly one writer goroutine (control loop
+  `run()`, or the planner goroutine for `dailyPlan`), with lock-free atomic
+  snapshot reads for everyone else — no mutexes left in `engine.go`.
+  `SetDERConstraints`/`SetPrices` are **async**: they enqueue a command on a
+  bounded channel (`cmdCh`, cap 16, drop-and-count on overflow) that only the
+  control goroutine applies, so they take effect no later than the *next*
+  tick/safetyTick/forced-Wake tick — never synchronously. `RegisterBattery/
+  Solar/EVSEActuator` must be called **before** `Start()`; calling them after
+  panics (the actuator maps are immutable once running, so `executePlan`
+  reads them lock-free). `Wake()`/the fast safety loop (`EvaluateSafety`,
+  ADR-0001 Tier 1) are unchanged — the safety tick never touches `cmdCh` and
+  is never at the mercy of a mutator.
 - **wolfSSL_Init**: process-global C state. `wolfssl.Init()` is called once in
   `main()` of lexa-northbound and lexa-telemetry only. The other three services are
   pure Go and never touch wolfSSL.

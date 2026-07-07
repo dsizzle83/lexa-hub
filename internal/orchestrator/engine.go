@@ -6,11 +6,13 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // plannerInput holds the external inputs consumed by the daily planner.
-// Protected by Engine.planInMu.
+// Published via Engine.state.planIn (see engine_state.go) — set by
+// SetDERConstraints/SetPrices, read by replan().
 type plannerInput struct {
 	derConstraints []StepConstraint
 	importPrices   []float64 // per planSteps step; nil = use FallbackTOU
@@ -24,6 +26,18 @@ type plannerInput struct {
 //
 // The Engine is safe for concurrent use: SetDERConstraints and SetPrices may be
 // called from any goroutine while the engine is running.
+//
+// State model (05 §4, TASK-067): all mutable Engine state lives in one
+// engineState struct (engine_state.go) with a single designated writer per
+// field and lock-free atomic snapshot reads — see that file's doc comments
+// for the writer/reader map. Mutators that need to touch engineState from an
+// arbitrary caller goroutine (SetDERConstraints, SetPrices) enqueue a command
+// on cmdCh instead of locking; the control goroutine (run) is the only thing
+// that ever applies a command, which is what makes the read-modify-write in
+// engineState.setPlanIn race-free. A command takes effect no later than the
+// next tick (drainCmds runs immediately before every tick/safetyTick/forced
+// Wake tick) — the same "at most one tick" latency the old RLock-at-tick-time
+// scheme gave.
 type Engine struct {
 	reader    SystemReader
 	optimizer Optimizer
@@ -35,35 +49,28 @@ type Engine struct {
 	safetyReader   SafetyReader
 	safetyInterval time.Duration
 
-	// Actuators — keyed by device name.  Protected by actuMu so Register* can
-	// be called after Start (e.g. hot-plug EVSE).
-	actuMu         sync.RWMutex
-	battActuators  map[string]BatteryActuator
-	solarActuators map[string]SolarActuator
-	evseActuators  map[string]EVSEActuator
+	// state holds every mutable field the control/planner goroutines and
+	// external callers share. See engine_state.go.
+	state *engineState
+
+	// started guards the actuator registries: Register*Actuator panics once
+	// this is true (registration is a before-Start-only, init-time
+	// operation — 05 §3). Set once, in Start(), before either goroutine
+	// launches.
+	started atomic.Bool
+
+	// cmdCh carries mutations to be applied to state from the control
+	// goroutine (drainCmds). Buffered so SetDERConstraints/SetPrices never
+	// block their caller; a full channel drops the command and counts it
+	// (05 §4 bounded-channel policy) rather than stalling an MQTT callback.
+	cmdCh      chan engineCmd
+	cmdDropped atomic.Uint64
 
 	// Daily planner — produces 24-hour cost-optimal dispatch plans.
 	planner    *DailyPlanner
 	plannerCfg PlannerCfg
 
-	// lastSolarPeakKw is a running high-water estimate of the clear-sky PV peak,
-	// used to seed the diurnal solar forecast after dark. Touched only by the
-	// planner goroutine (buildPlannerParams), so it needs no lock.
-	lastSolarPeakKw float64
-
-	// planIn holds the planner inputs, updated via SetDERConstraints /
-	// SetPrices; guarded by planInMu.
-	planIn   plannerInput
-	planInMu sync.RWMutex
-
-	// dailyPlan is the most recent planner output; guarded by dailyPlanMu.
-	dailyPlan   *DailyPlan
-	dailyPlanMu sync.RWMutex
 	plannerWake chan struct{} // buffered(1): signals the planner goroutine
-
-	// Last plan — updated after every tick; readable from any goroutine.
-	planMu   sync.RWMutex
-	lastPlan Plan
 
 	// planObserver, when non-nil, is called with every Plan after it is computed.
 	planObserver func(Plan)
@@ -109,9 +116,8 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 		optimizer:      optimizer,
 		interval:       cfg.Interval,
 		safetyInterval: cfg.SafetyInterval,
-		battActuators:  make(map[string]BatteryActuator),
-		solarActuators: make(map[string]SolarActuator),
-		evseActuators:  make(map[string]EVSEActuator),
+		state:          newEngineState(),
+		cmdCh:          make(chan engineCmd, 16),
 		planner:        NewDailyPlanner(),
 		plannerCfg:     cfg.Planner,
 		plannerWake:    make(chan struct{}, 1),
@@ -137,9 +143,9 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 // northbound 24-hour schedule.  Triggers an immediate re-plan.
 // Safe for concurrent use.
 func (e *Engine) SetDERConstraints(constraints []StepConstraint) {
-	e.planInMu.Lock()
-	e.planIn.derConstraints = constraints
-	e.planInMu.Unlock()
+	e.enqueue(func(s *engineState) {
+		s.setPlanIn(func(in *plannerInput) { in.derConstraints = constraints })
+	})
 	e.signalReplan()
 }
 
@@ -147,10 +153,12 @@ func (e *Engine) SetDERConstraints(constraints []StepConstraint) {
 // Both slices must have len == planSteps.  Triggers an immediate re-plan.
 // Safe for concurrent use.
 func (e *Engine) SetPrices(importPrices, exportPrices []float64) {
-	e.planInMu.Lock()
-	e.planIn.importPrices = importPrices
-	e.planIn.exportPrices = exportPrices
-	e.planInMu.Unlock()
+	e.enqueue(func(s *engineState) {
+		s.setPlanIn(func(in *plannerInput) {
+			in.importPrices = importPrices
+			in.exportPrices = exportPrices
+		})
+	})
 	e.signalReplan()
 }
 
@@ -161,29 +169,9 @@ func (e *Engine) signalReplan() {
 	}
 }
 
-// RegisterBatteryActuator wires an actuator for the battery device called name.
-// Safe to call after Start.
-func (e *Engine) RegisterBatteryActuator(name string, a BatteryActuator) {
-	e.actuMu.Lock()
-	e.battActuators[name] = a
-	e.actuMu.Unlock()
-}
-
-// RegisterSolarActuator wires an actuator for the solar device called name.
-// Safe to call after Start.
-func (e *Engine) RegisterSolarActuator(name string, a SolarActuator) {
-	e.actuMu.Lock()
-	e.solarActuators[name] = a
-	e.actuMu.Unlock()
-}
-
-// RegisterEVSEActuator wires an actuator for the EVSE station called id.
-// Safe to call after Start.
-func (e *Engine) RegisterEVSEActuator(stationID string, a EVSEActuator) {
-	e.actuMu.Lock()
-	e.evseActuators[stationID] = a
-	e.actuMu.Unlock()
-}
+// enqueue, drainCmds, mustNotBeStarted, and Register*Actuator — the Engine
+// methods that mutate or gate engineState — live in engine_state.go
+// alongside the struct they operate on.
 
 // Wake forces an immediate optimization tick instead of waiting for the next
 // ticker interval.  Non-blocking and safe to call from any goroutine (e.g. an
@@ -199,6 +187,12 @@ func (e *Engine) Wake() {
 // Start launches the control loop goroutine and the daily planner goroutine.
 // Pair with Stop.
 func (e *Engine) Start() {
+	e.started.Store(true)
+	// Apply any commands enqueued before Start (e.g. a retained MQTT message
+	// resolving SetPrices/SetDERConstraints between subscribe and Start) here,
+	// on the calling goroutine, while nothing else can be draining cmdCh —
+	// once run() is running it's the only drainer, by construction.
+	e.drainCmds()
 	go e.run()
 	go e.plannerLoop()
 }
@@ -218,6 +212,11 @@ func (e *Engine) Stop() {
 // runs the fast safety pass, and every econEvery-th tick ALSO runs the full
 // economic pass. Both run on this one goroutine, so the optimizer needs no locking.
 // Otherwise it degenerates to the original single economic ticker.
+//
+// This goroutine is also engineState's single writer: every mutation —
+// registered actuators (fixed before Start), planner-input commands drained
+// from cmdCh, and lastPlan — is written from here or from the one other
+// long-lived goroutine (plannerLoop, for dailyPlan). See engine_state.go.
 func (e *Engine) run() {
 	defer close(e.done)
 
@@ -237,6 +236,7 @@ func (e *Engine) run() {
 	defer ticker.Stop()
 
 	// Evaluate immediately so devices get their first control without waiting.
+	e.drainCmds()
 	e.tick()
 
 	n := 0
@@ -245,10 +245,12 @@ func (e *Engine) run() {
 		case <-e.stop:
 			return
 		case <-e.urgentWake:
+			e.drainCmds()
 			e.tick()
 			ticker.Reset(base) // skip the tick that would fire after the forced one
 			n = 0
 		case <-ticker.C:
+			e.drainCmds()
 			n++
 			if !fastLoop || n >= econEvery {
 				n = 0
@@ -263,7 +265,9 @@ func (e *Engine) run() {
 // safetyTick is the fast protection pass: read the cheap safety snapshot, evaluate
 // the immediate protective reflexes, and actuate only their commands. It never
 // touches the economic plan, planner, or CSIP scheduler. Runs between economic
-// ticks on the same goroutine as tick().
+// ticks on the same goroutine as tick(). It never waits on cmdCh — the drain
+// happens in run() before this is called — so the fast loop's cadence is never
+// at the mercy of a mutator.
 func (e *Engine) safetyTick() {
 	state, err := e.safetyReader.ReadSafetyState()
 	if err != nil {
@@ -290,7 +294,8 @@ func (e *Engine) safetyTick() {
 
 // plannerLoop re-runs the daily planner whenever its inputs change or the
 // replan cadence fires.  It runs as a separate goroutine so the DP does not
-// block the 15-second control-loop tick.
+// block the 15-second control-loop tick. It is dailyPlan's single writer
+// (engine_state.go) and planIn's only reader.
 func (e *Engine) plannerLoop() {
 	defer close(e.plannerDone)
 	interval := time.Duration(e.plannerCfg.ReplanIntervalS) * time.Second
@@ -324,16 +329,12 @@ func (e *Engine) replan() {
 		return
 	}
 
-	e.planInMu.RLock()
-	inp := e.planIn
-	e.planInMu.RUnlock()
+	inp := e.state.planInSnapshot()
 
 	params := e.buildPlannerParams(state, inp)
 	plan := e.planner.Plan(params)
 
-	e.dailyPlanMu.Lock()
-	e.dailyPlan = plan
-	e.dailyPlanMu.Unlock()
+	e.state.dailyPlan.Store(plan)
 
 	log.Printf("[orchestrator] replan: window=%s–%s cost=%.3f slots=%d",
 		time.Unix(plan.WindowStart, 0).Format("15:04"),
@@ -372,12 +373,12 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 	// and keep a high-water mark so a replan after dark still forecasts tomorrow.
 	if curKw := state.TotalSolarW() / 1000; curKw > 0 {
 		if shape := clearSkyShape(localHourOf(now.Unix())); shape > 0.15 {
-			if est := curKw / shape; est > e.lastSolarPeakKw {
-				e.lastSolarPeakKw = est
+			if est := curKw / shape; est > e.state.lastSolarPeakKw {
+				e.state.lastSolarPeakKw = est
 			}
 		}
 	}
-	peakKw := e.lastSolarPeakKw
+	peakKw := e.state.lastSolarPeakKw
 	if cfg.SolarPeakKw > peakKw {
 		peakKw = cfg.SolarPeakKw
 	}
@@ -489,9 +490,7 @@ func (e *Engine) tick() {
 	// interval the planner built its window around (and the optimizer evaluates
 	// TOU at). Without this the planned dispatch never lines up with the live
 	// tick under a warped clock.
-	e.dailyPlanMu.RLock()
-	dp := e.dailyPlan
-	e.dailyPlanMu.RUnlock()
+	dp := e.state.dailyPlan.Load()
 	serverTime := state.Timestamp.Add(time.Duration(state.ClockOffset) * time.Second)
 	state.DailyPlanTarget = dp.CurrentTarget(serverTime)
 
@@ -506,9 +505,7 @@ func (e *Engine) tick() {
 	e.executePlan(plan)
 
 	// 5. Store plan for external inspection (e.g. /status endpoint).
-	e.planMu.Lock()
-	e.lastPlan = plan
-	e.planMu.Unlock()
+	e.state.lastPlan.Store(&plan)
 
 	// 6. Log decisions.
 	if e.Debug || len(plan.Decisions) > 0 {
@@ -519,31 +516,19 @@ func (e *Engine) tick() {
 // LastPlan returns a snapshot of the most recently computed Plan.
 // Safe for concurrent use from any goroutine.
 func (e *Engine) LastPlan() Plan {
-	e.planMu.RLock()
-	defer e.planMu.RUnlock()
-	return e.lastPlan
+	if p := e.state.lastPlan.Load(); p != nil {
+		return *p
+	}
+	return Plan{}
 }
 
-// executePlan fans out the plan's commands to the registered actuators.
+// executePlan fans out the plan's commands to the registered actuators. The
+// actuator maps are fixed before Start (RegisterXActuator panics afterwards —
+// see mustNotBeStarted), so they can be read directly here with no lock and
+// no snapshot-copy.
 func (e *Engine) executePlan(plan Plan) {
-	// Snapshot actuator maps under read lock so hardware calls run lock-free.
-	e.actuMu.RLock()
-	batt := make(map[string]BatteryActuator, len(e.battActuators))
-	for k, v := range e.battActuators {
-		batt[k] = v
-	}
-	sol := make(map[string]SolarActuator, len(e.solarActuators))
-	for k, v := range e.solarActuators {
-		sol[k] = v
-	}
-	evse := make(map[string]EVSEActuator, len(e.evseActuators))
-	for k, v := range e.evseActuators {
-		evse[k] = v
-	}
-	e.actuMu.RUnlock()
-
 	for _, cmd := range plan.BatteryCommands {
-		a, ok := batt[cmd.Name]
+		a, ok := e.state.battActuators[cmd.Name]
 		if !ok {
 			log.Printf("[orchestrator] no battery actuator for %q", cmd.Name)
 			continue
@@ -554,7 +539,7 @@ func (e *Engine) executePlan(plan Plan) {
 	}
 
 	for _, cmd := range plan.SolarCommands {
-		a, ok := sol[cmd.Name]
+		a, ok := e.state.solarActuators[cmd.Name]
 		if !ok {
 			log.Printf("[orchestrator] no solar actuator for %q", cmd.Name)
 			continue
@@ -565,9 +550,9 @@ func (e *Engine) executePlan(plan Plan) {
 	}
 
 	for _, cmd := range plan.EVSECommands {
-		a, ok := evse[cmd.StationID]
+		a, ok := e.state.evseActuators[cmd.StationID]
 		if !ok {
-			a, ok = evse["*"] // wildcard fallback for single-EVSE setups
+			a, ok = e.state.evseActuators["*"] // wildcard fallback for single-EVSE setups
 		}
 		if !ok {
 			log.Printf("[orchestrator] no EVSE actuator for %q", cmd.StationID)
