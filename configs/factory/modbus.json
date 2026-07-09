@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "mqtt_broker": "tcp://localhost:1883",
+  "mqtt_client_id": "lexa-modbus",
+  "mqtt_user": "",
+  "mqtt_pass_file": "",
+  "metrics_addr": "",
+  "poll_interval_s": 10,
+  "devices": []
+}

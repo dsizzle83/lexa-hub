@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "mqtt_broker": "tcp://localhost:1883",
+  "mqtt_client_id": "lexa-ocpp",
+  "mqtt_user": "",
+  "mqtt_pass_file": "",
+  "metrics_addr": "",
+  "port": 8887,
+  "cert_path": "",
+  "key_path": "",
+  "basic_auth_user": "",
+  "basic_auth_pass": "",
+  "bench": false,
+  "reconciler": "",
+  "stations": []
+}

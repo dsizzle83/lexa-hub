@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "endpoint": "",
+  "serial_file": "/etc/lexa/identity/serial",
+  "cloud_ca": "/etc/lexa/identity/cloud-ca.pem",
+  "cloud_cert": "/etc/lexa/identity/cloud-cert.pem",
+  "cloud_key": "/etc/lexa/identity/cloud-key.pem",
+  "cert_expiry_warn_days": 30,
+  "spool_dir": "/var/lib/lexa/spool",
+  "spool_max_bytes": 33554432,
+  "uplink": {
+    "measurements_batch_s": 60,
+    "evse_batch_s": 60,
+    "plan_interval_s": 300,
+    "health_interval_s": 900
+  },
+  "mqtt_broker": "tcp://localhost:1883",
+  "mqtt_client_id": "lexa-cloudlink",
+  "mqtt_user": "",
+  "mqtt_pass_file": "",
+  "metrics_addr": "",
+  "log_level": "info"
+}

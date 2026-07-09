@@ -1,0 +1,60 @@
+[Unit]
+# StartLimit* MUST live in [Unit] (systemd >=v230 ignores them in
+# [Service]); the default 5-in-10s otherwise applies. (V1RC FINDING A,
+# 2026-07-06.) This unit has no Restart= below (a schema-migration failure
+# is almost always deterministic — e.g. a refused down-migrate — so an
+# automatic restart would just fail again identically with no operator
+# visibility gained); StartLimit* is set anyway for consistency with every
+# other lexa-*.service and to bound any future Restart= this unit might
+# gain, or repeated `systemctl restart` calls from OTA tooling.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+Description=LEXA Config Schema Migration (runs once, before the lexa services)
+Documentation=https://github.com/lexa/lexa-hub
+After=local-fs.target
+# Ordering only — deliberately NOT Requires=/BindsTo=. Before= (mirrored by
+# systemd onto each listed unit's After=) guarantees this unit's start job
+# finishes before each lexa-*.service's start job begins, but a FAILED
+# migration must not itself block boot: a service whose config didn't
+# migrate is still normally usable, since every lexa-*.service config
+# loader tolerates unknown/extra keys (plain json.Unmarshal, no
+# DisallowUnknownFields) — see cmd/lexa-migrate/README.md's "the backups
+# are the recovery path" section for what a refused migration actually
+# means and how to recover it. Per Unit 1.6's brief, the six lexa-*.service
+# units are deliberately NOT edited to add the reverse
+# After=lexa-migrate.service (a bounded-edit constraint) — this Before=
+# line alone is sufficient for systemd's dependency solver to order them
+# correctly whenever both units are pulled into the same transaction (which
+# WantedBy=multi-user.target below ensures they are, alongside the six
+# services' own WantedBy=multi-user.target).
+Before=lexa-hub.service lexa-northbound.service lexa-modbus.service lexa-ocpp.service lexa-telemetry.service lexa-api.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# WS-1-style sandboxing (V1.0 punch list convention, applied here too for
+# consistency): unlike the six services (none of which write to
+# /etc/lexa — see e.g. lexa-modbus.service's "writes nothing to disk"
+# comment), this one's entire job is writing there, so ProtectSystem=strict
+# needs an explicit carve-out rather than "no ReadWritePaths= needed".
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+ReadWritePaths=/etc/lexa
+# Runs as root (no User=/Group=): it must be able to write configs
+# regardless of their current ownership (root-owned, from `make
+# install-configs`/deploy-hub-pi.sh, or otherwise), and every write it does
+# explicitly matches the ORIGINAL file's owner/group/mode before renaming
+# over it (cmd/lexa-migrate/migrate.go's writeFileLike) — it never widens
+# who can read a config, it only ever preserves what was already there.
+ExecStart=/usr/local/sbin/lexa-migrate -config-dir /etc/lexa
+Restart=no
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lexa-migrate
+
+[Install]
+WantedBy=multi-user.target

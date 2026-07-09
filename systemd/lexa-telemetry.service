@@ -7,7 +7,16 @@ StartLimitIntervalSec=120
 StartLimitBurst=5
 Description=LEXA CSIP Telemetry (MUP POST) Service
 Documentation=https://github.com/lexa/lexa-hub
-After=network-online.target mosquitto.service lexa-modbus.service
+# time-sync.target (Unit 1.6, DEVICE_ROADMAP.md §9): cert validation (this
+# service dials the same wolfSSL mTLS server as lexa-northbound, sharing its
+# cert files) needs a sane clock. Ordering ONLY — deliberately no
+# Wants=time-sync.target and no ConditionClockSynchronized=: a SOM whose
+# clock never syncs (no NTP reachable, no RTC) must still boot and run this
+# service, degrading to its existing fail-closed behavior (POST failures
+# retry/re-register on the normal schedule, same as any other unreachable-
+# server condition) rather than hanging boot or refusing to start.
+# RestartSec is unchanged for the same reason.
+After=network-online.target mosquitto.service lexa-modbus.service time-sync.target
 # Wants= not Requires=: a clean mosquitto stop/restart must NOT stop-propagate
 # to the lexa services — they survive broker restarts via paho auto-reconnect
 # (the crash-only/reconnect design; mqtt-broker-restart scenario proves it).

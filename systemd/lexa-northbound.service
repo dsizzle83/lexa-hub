@@ -7,7 +7,16 @@ StartLimitIntervalSec=120
 StartLimitBurst=5
 Description=LEXA CSIP/IEEE 2030.5 Northbound Client
 Documentation=https://github.com/lexa/lexa-hub
-After=network.target mosquitto.service
+# time-sync.target (Unit 1.6, DEVICE_ROADMAP.md §9): cert validation
+# (wolfSSL handshake NotBefore/NotAfter checks, the TASK-072 cert-expiry
+# monitor) needs a sane clock. Ordering ONLY — deliberately no
+# Wants=time-sync.target and no ConditionClockSynchronized=: a SOM whose
+# clock never syncs (no NTP reachable, no RTC) must still boot and run this
+# service, degrading to its existing fail-closed discovery-walk behavior
+# (same as any other wan-outage-shaped fault — the walk loop keeps
+# iterating, retrying) rather than hanging boot or refusing to start.
+# RestartSec is unchanged for the same reason.
+After=network.target mosquitto.service time-sync.target
 # Wants= not Requires=: a clean mosquitto stop/restart must NOT stop-propagate
 # to the lexa services — they survive broker restarts via paho auto-reconnect
 # (the crash-only/reconnect design; mqtt-broker-restart scenario proves it).

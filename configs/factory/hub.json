@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "mqtt_broker": "tcp://localhost:1883",
+  "mqtt_client_id": "lexa-hub",
+  "mqtt_user": "",
+  "mqtt_pass_file": "",
+  "metrics_addr": "",
+  "engine_interval_s": 15,
+  "debug": false,
+  "constraint_shadow": false,
+  "devices": [],
+  "stations": [],
+  "journal": {
+    "dir": "/var/lib/lexa/journal/hub",
+    "max_bytes": 1048576,
+    "max_files": 4
+  },
+  "snapshot": {
+    "enabled": false,
+    "path": "/var/lib/lexa/snapshot/hub.json",
+    "max_age_s": 300
+  },
+  "retained_adoption_max_age_s": 300,
+  "tariff_zone": ""
+}

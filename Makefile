@@ -13,11 +13,19 @@ BINS     := $(addprefix $(BINDIR)/lexa-, $(SERVICES))
 
 all: build
 
-build: $(BINS)
+build: $(BINS) $(BINDIR)/lexa-migrate
 
 $(BINDIR)/lexa-%: cmd/%/*.go internal/**/*.go go.mod
 	@mkdir -p $(BINDIR)
 	go build -o $@ ./cmd/$*
+
+# lexa-migrate's source dir (cmd/lexa-migrate) doesn't fit the lexa-% pattern
+# rule above (% would resolve to cmd/migrate), so it gets an explicit rule.
+# Oneshot config-schema migrator (unit 1.6) — pure Go, runs before the
+# services via systemd/lexa-migrate.service.
+$(BINDIR)/lexa-migrate: cmd/lexa-migrate/*.go go.mod
+	@mkdir -p $(BINDIR)
+	go build -o $@ ./cmd/lexa-migrate
 
 # Cross-compile for Digi ConnectCore 93 (ARM64 Linux).
 #
@@ -52,6 +60,7 @@ build-arm64:
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-ocpp       ./cmd/ocpp
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-api        ./cmd/api
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-healthcheck ./cmd/healthcheck
+	$(GOARM64)     -o $(BINDIR)/arm64/lexa-migrate     ./cmd/lexa-migrate
 	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-northbound ./cmd/northbound
 	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-telemetry  ./cmd/telemetry
 
@@ -82,6 +91,7 @@ install: build
 	for svc in $(SERVICES); do \
 		install -m 755 $(BINDIR)/lexa-$$svc $(SBINDIR)/lexa-$$svc; \
 	done
+	install -m 755 $(BINDIR)/lexa-migrate $(SBINDIR)/lexa-migrate
 
 # Install example configs (does not overwrite existing files)
 install-configs:
@@ -97,7 +107,7 @@ install-services:
 	install -m 644 systemd/lexa-*.service $(SVCDIR)/
 	install -m 644 systemd/mosquitto-lexa.conf /etc/mosquitto/conf.d/lexa.conf
 	systemctl daemon-reload
-	systemctl enable mosquitto lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-hub lexa-api
+	systemctl enable mosquitto lexa-migrate lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-hub lexa-api
 
 # Start all services (after install-services)
 start:
