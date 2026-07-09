@@ -54,6 +54,28 @@
 # LEXA_HUB_RO_TOKEN) -- TASK-004's old lockstep gate ran only in
 # csip-tls-test CI, which let an asymmetric bump go undetected on this side;
 # TASK-024 closes that by gating both repos.
+#
+# WS-7 (docs/refactor/HANDOFF.md §8): mirrors csip-tls-test's own WS-7 gates
+# (-race was already present here via `test-nocgo` / the `cgo` job's `go test
+# -race`, so nothing to add there).
+#   - `vet-build-test` gains a `gofmt -l` step (tracked, non-vendor .go files
+#     -- vendor/ is committed third-party source plus the AD-003(e)
+#     vendor/lexa-proto/ mirror, neither ours to reformat; reformatting
+#     vendor/lexa-proto here would fight the new proto-pin --verify-vendor
+#     check below, since it diffs against a fresh regeneration from
+#     lexa-proto's own, not-yet-reformatted, source).
+#   - `cgo` gains a golangci-lint step (basic/default preset, no
+#     .golangci.yml -- errcheck/govet/ineffassign/staticcheck/unused --
+#     pinned golangci-lint v2.1.6, reusing this job's wolfSSL sysroot so the
+#     cgo packages lint too). `only-new-issues: true`: a full-repo baseline
+#     today surfaces ~60 pre-existing issues (errcheck on defer'd
+#     Close()/test helpers, a few ineffassign/staticcheck/unused) out of
+#     scope for a CI-gates task to fix inline; gates only issues introduced
+#     by a PR/push diff. A follow-up WS can burn down the backlog.
+#   - `proto-pin` now passes `--verify-vendor` instead of `--no-proto-check`.
+#     No-op today (no lexa-proto sibling checkout on this runner -- it has no
+#     hosted remote yet, AD-003(f), open human item, HANDOFF §6) but wired
+#     for the day it is hosted and a checkout step is added.
 
 name: CI
 
@@ -88,6 +110,19 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      - name: gofmt -l (tracked, non-vendor .go files)
+        # vendor/ excluded deliberately -- see the WS-7 note above `on:`.
+        run: |
+          UNFMT="$(git ls-files '*.go' | grep -v '^vendor/' | xargs gofmt -l)"
+          if [[ -n "$UNFMT" ]]; then
+            echo "gofmt -l found unformatted file(s):" >&2
+            echo "$UNFMT" >&2
+            echo >&2
+            echo "Fix locally: gofmt -w \$(git ls-files '*.go' | grep -v '^vendor/')" >&2
+            exit 1
+          fi
+          echo "gofmt: all tracked non-vendor .go files are formatted."
 
       - name: go vet (pure-Go surface)
         run: |
@@ -163,6 +198,15 @@ jobs:
           # at link time with undefined pow/log.
           CGO_LDFLAGS: -L${{ env.WOLFSSL_SYSROOT }}/lib -lm
         run: go build ./cmd/northbound ./cmd/telemetry
+
+      - name: golangci-lint (basic preset, new issues only — WS-7, see note above `on:`)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.1.6
+          only-new-issues: true
+        env:
+          CGO_CFLAGS: -I${{ env.WOLFSSL_SYSROOT }}/include
+          CGO_LDFLAGS: -L${{ env.WOLFSSL_SYSROOT }}/lib -lm
 
       - name: "test -race (cgo: tlsclient, wolfssl, northbound)"
         env:
@@ -330,5 +374,7 @@ jobs:
           token: ${{ secrets.CSIP_TLS_TEST_RO_TOKEN }}
           path: csip-tls-test
 
-      - name: proto.pin version-pin check (fails on mismatch -- no allowlist)
-        run: bash csip-tls-test/scripts/check-proto-pin.sh --self . --product csip-tls-test --no-proto-check
+      - name: proto.pin version-pin check + vendor content verify (fails on mismatch -- no allowlist)
+        # --verify-vendor (WS-7) replaces --no-proto-check -- see the WS-7
+        # note above `on:` for why this still degrades to a no-op today.
+        run: bash csip-tls-test/scripts/check-proto-pin.sh --self . --product csip-tls-test --verify-vendor
