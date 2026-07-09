@@ -104,6 +104,12 @@ type Config struct {
 	// "/var/lib/lexa/api".
 	CertDir string `json:"cert_dir"`
 
+	// SiteCacheFile is the passthrough path GET /site reads for cloud-pushed
+	// site metadata (cmd/api/site.go, DEVICE_ROADMAP.md §4.3/§10). Default
+	// "/var/lib/lexa/site.json"; absent/unreadable/non-JSON ⇒ the "site_cache"
+	// field is simply omitted from /site's response, never fabricated.
+	SiteCacheFile string `json:"site_cache"`
+
 	Devices []DeviceConfig `json:"devices"`
 }
 
@@ -142,6 +148,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.CertDir == "" {
 		cfg.CertDir = "/var/lib/lexa/api"
+	}
+	if cfg.SiteCacheFile == "" {
+		cfg.SiteCacheFile = defaultSiteCacheFile
 	}
 	// WS-1 (V1.0 punch list, security fail-closed by default): a wildcard/LAN
 	// bind with no bearer-token auth is an unauthenticated control-adjacent

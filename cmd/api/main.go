@@ -161,6 +161,64 @@ func main() {
 		log.Fatalf("lexa-api: subscribe hub plan: %v", err)
 	}
 
+	// DEVICE_ROADMAP.md §3.5/§4.3: the hub's authoritative plan-author mode.
+	if err := mqttutil.Subscribe(mc, bus.TopicHubMode, func(topic string, m bus.ModeStatus) {
+		store.onModeStatus(topic, m)
+		lb.Emit(fmt.Sprintf("[mode] %s (actor=%s)", m.Mode, m.Actor))
+	}); err != nil {
+		log.Fatalf("lexa-api: subscribe hub mode: %v", err)
+	}
+
+	// DEVICE_ROADMAP.md §2/§4.3: lexa-cloudlink's retained status. No such
+	// service exists in this repo yet (TASK-085+) — this subscribe is inert
+	// (never delivers) until it lands, exactly like every other forward-
+	// looking subscribe in this file.
+	if err := mqttutil.Subscribe(mc, bus.TopicCloudlinkStatus, func(topic string, c bus.CloudlinkStatus) {
+		store.onCloudlinkStatus(topic, c)
+		lb.Emit(fmt.Sprintf("[cloudlink] connected=%v endpoint=%s", c.Connected, c.Endpoint))
+	}); err != nil {
+		log.Fatalf("lexa-api: subscribe cloudlink status: %v", err)
+	}
+
+	// DEVICE_ROADMAP.md §5/§4.3: commissioning-scan progress + result.
+	if err := mqttutil.Subscribe(mc, bus.TopicScanStatus, func(topic string, s bus.ScanStatus) {
+		store.onScanStatus(topic, s)
+		lb.Emit(fmt.Sprintf("[scan] %s phase=%s probed=%d found=%d", s.ID, s.Phase, s.Probed, s.Found))
+	}); err != nil {
+		log.Fatalf("lexa-api: subscribe scan status: %v", err)
+	}
+
+	if err := mqttutil.Subscribe(mc, bus.TopicScanResult, func(topic string, r bus.ScanResult) {
+		store.onScanResult(topic, r)
+		lb.Emit(fmt.Sprintf("[scan] result id=%s devices=%d", r.ID, len(r.Devices)))
+	}); err != nil {
+		log.Fatalf("lexa-api: subscribe scan result: %v", err)
+	}
+
+	// DEVICE_ROADMAP.md §6/§4.3: OCPP stations awaiting installer approval.
+	if err := mqttutil.Subscribe(mc, bus.TopicOCPPPending, func(topic string, p bus.PendingStations) {
+		store.onOCPPPending(topic, p)
+		lb.Emit(fmt.Sprintf("[ocpp] pending stations=%d", len(p.Stations)))
+	}); err != nil {
+		log.Fatalf("lexa-api: subscribe ocpp pending: %v", err)
+	}
+
+	// DEVICE_ROADMAP.md §4.3: resWaiter subscribes lexa/intent/result exactly
+	// once for the process lifetime — see resultwaiter.go's doc. (Named
+	// resWaiter, not resultWaiter, to avoid shadowing the resultWaiter TYPE
+	// in this same function's scope.)
+	resWaiter, err := newResultWaiter(mc)
+	if err != nil {
+		log.Fatalf("lexa-api: subscribe intent result: %v", err)
+	}
+
+	// resolveSerial mirrors the same serial-file/hostname resolution the TLS
+	// cert (below) and mDNS advertisement (further down) both use, so the
+	// cert's CN, the mDNS TXT "serial=" field, and /site's "serial" field
+	// always agree. Computed here (rather than only at the mDNS call site,
+	// as before DEVICE_ROADMAP.md §4.3) so siteHandler can also close over it.
+	serial := resolveSerial(cfg.SerialFile)
+
 	// DEVICE_ROADMAP.md §4.1: the HTTPS server cert. Generated once on
 	// first boot and persisted (cmd/api/tlscert.go); a load/generate
 	// failure is FATAL here — a misprovisioned unit must not silently fall
@@ -191,6 +249,18 @@ func main() {
 	mux.HandleFunc("/healthz", healthzHandler)
 	mux.HandleFunc("/status", requireBearer(apiToken, statusHandler(store, planHB, certFP)))
 	mux.HandleFunc("/logs", requireBearer(apiToken, logsHandler(lb)))
+	// DEVICE_ROADMAP.md §4.3: read routes (staged-rollout requireBearer, same
+	// semantics as /status and /logs above) plus the two write routes
+	// (requireBearerStrict — an empty/unconfigured token fails CLOSED here,
+	// never open; see auth.go's doc).
+	mux.HandleFunc("/site", requireBearer(apiToken, siteHandler(serial, cfg.SiteCacheFile)))
+	mux.HandleFunc("/devices", requireBearer(apiToken, devicesHandler(store)))
+	mux.HandleFunc("/telemetry/recent", requireBearer(apiToken, telemetryRecentHandler(store.telemetry)))
+	mux.HandleFunc("/mode", requireBearer(apiToken, modeHandler(store)))
+	mux.HandleFunc("/intent", requireBearerStrict(apiToken, intentHandler(mc, resWaiter)))
+	// /scan dispatches GET vs POST to their own auth wrapper internally
+	// (scan.go's scanHandler) since both methods share this one path.
+	mux.HandleFunc("/scan", scanHandler(mc, store, apiToken))
 	// /metrics is NEVER wrapped either (TASK-044): same reasoning as
 	// /healthz — a Prometheus scraper is infra, not a dashboard consumer of
 	// this API's data, and AD-008's bearer-token rollout is scoped to
@@ -266,13 +336,14 @@ func main() {
 		log.Printf("lexa-api: startup healthz probe failed (%s) — sending Ready anyway; watchdog kicks will gate on this same probe", healthzURL)
 	}
 
-	// DEVICE_ROADMAP.md §4.4: mDNS advertisement. resolveSerial mirrors the
-	// same serial-file/hostname resolution ensureServerCertFor used above
-	// for the cert's CN, so the mDNS TXT "serial=" field and the cert
-	// identity always agree. Non-fatal by construction (startMDNS logs and
-	// returns nil on any failure); refreshLoop and Shutdown are both
-	// nil-receiver-safe so no "if configured" guard is needed below.
-	serial := resolveSerial(cfg.SerialFile)
+	// DEVICE_ROADMAP.md §4.4: mDNS advertisement. serial was already resolved
+	// above (before the mux was built, so /site could close over it too) —
+	// resolveSerial is a cheap file read, and reusing the same value here
+	// (rather than re-deriving it) keeps the mDNS TXT "serial=" field, the
+	// cert identity, and /site's "serial" field all provably in agreement.
+	// Non-fatal by construction (startMDNS logs and returns nil on any
+	// failure); refreshLoop and Shutdown are both nil-receiver-safe so no
+	// "if configured" guard is needed below.
 	var mdnsAdv *mdnsAdvertiser
 	if cfg.MDNSEnabled() {
 		mdnsAdv = startMDNS(serial, cfg.ListenAddr, cfg.TLSEnabled())

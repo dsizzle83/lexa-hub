@@ -32,6 +32,13 @@ type evseSnap struct {
 	UpdatedAt time.Time
 }
 
+// scanStatusRingCap bounds stateStore.scanStatusRing (DEVICE_ROADMAP.md
+// §4.3): ScanStatus is a transient progress line, not state — a commissioning
+// sweep emits a handful of them (one per TCP/RTU phase transition plus
+// per-hit progress), so 50 is generous headroom for one scan's whole
+// lifetime without the ring growing unbounded across repeated scans.
+const scanStatusRingCap = 50
+
 // stateStore is the thread-safe aggregator that backs /status.
 //
 // It subscribes to MQTT and keeps the latest snapshot per topic, plus enough
@@ -71,6 +78,45 @@ type stateStore struct {
 	// that case rather than reporting a fabricated OK.
 	certStatus *bus.CertStatus
 
+	// modeStatus is the hub's latest authoritative plan-author mode
+	// (TopicHubMode, retained, DEVICE_ROADMAP.md §3.5/§4.3). nil until the
+	// first message arrives — GET /mode reports 503 {"error":"unknown"} in
+	// that case rather than guessing a default (the retained topic means
+	// this is normally present within one broker round trip of either
+	// side's startup).
+	modeStatus *bus.ModeStatus
+
+	// cloudLinkStatus is lexa-cloudlink's latest retained status
+	// (TopicCloudlinkStatus). nil until the first message arrives — no
+	// cloudlink service exists in this repo yet (TASK-085+), so today this
+	// stays nil forever on every deployment; folded into /status as
+	// "cloud_link" only once non-nil.
+	cloudLinkStatus *bus.CloudlinkStatus
+
+	// scanStatusRing holds the last scanStatusRingCap ScanStatus progress
+	// lines (TopicScanStatus, not retained — a transient one-shot command's
+	// progress, not state) across however many scans have run this process
+	// lifetime, oldest evicted first.
+	scanStatusRing []bus.ScanStatus
+
+	// scanResult is the latest completed commissioning scan
+	// (TopicScanResult, retained until commissioning supersedes it). nil
+	// until the first scan ever completes.
+	scanResult *bus.ScanResult
+
+	// ocppPending is the current set of OCPP stations that have dialed the
+	// CSMS but are not yet in ocpp.json (TopicOCPPPending, retained). nil
+	// until lexa-ocpp has ever published (including the "no pending
+	// stations" empty-slice case, which IS a message — nil here specifically
+	// means "never heard from lexa-ocpp's pending-station surface at all").
+	ocppPending *bus.PendingStations
+
+	// telemetry is the bounded in-memory ring of recent Measurement/
+	// BattMetrics/EVSEState samples backing GET /telemetry/recent
+	// (DEVICE_ROADMAP.md §4.3). See telemetry.go's telemetryRingCap doc for
+	// the RAM-bound rationale. Always non-nil once newStateStore returns.
+	telemetry *telemetryRing
+
 	staleAfter time.Duration
 }
 
@@ -80,6 +126,7 @@ func newStateStore(devices []DeviceConfig, staleAfter time.Duration) *stateStore
 		evses:      make(map[string]*evseSnap),
 		staleAfter: staleAfter,
 		utclk:      utilitytime.New(utilitytime.Config{}),
+		telemetry:  newTelemetryRing(telemetryRingCap),
 	}
 	for _, d := range devices {
 		s.devices[d.Name] = &deviceSnap{Name: d.Name, Role: d.Role, MaxW: d.MaxW}
@@ -99,13 +146,13 @@ func (s *stateStore) deviceLocked(name string) *deviceSnap {
 }
 
 func (s *stateStore) onMeasurement(_ string, m bus.Measurement) {
+	now := time.Now()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	d := s.deviceLocked(m.Device)
 	if m.W != nil {
 		v := *m.W
 		if d.W == nil || *d.W != v {
-			d.WChangedAt = time.Now()
+			d.WChangedAt = now
 		}
 		d.W = &v
 	}
@@ -117,12 +164,21 @@ func (s *stateStore) onMeasurement(_ string, m bus.Measurement) {
 		v := *m.Hz
 		d.Hz = &v
 	}
-	d.UpdatedAt = time.Now()
+	d.UpdatedAt = now
+	s.mu.Unlock()
+
+	// TASK-088 telemetry ring: ARRIVAL-stamped (not m.Ts — same clock-warp-safe
+	// discipline as planHeartbeat/WChangedAt), independent of stateStore's own
+	// mutex (telemetryRing has its own).
+	s.telemetry.add(telemetrySample{
+		Kind: telemetryKindMeasurement, Device: m.Device, ArrivedAt: now,
+		W: m.W, VoltageV: m.VoltageV, Hz: m.Hz,
+	})
 }
 
 func (s *stateStore) onBattMetrics(_ string, m bus.BattMetrics) {
+	now := time.Now()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	d := s.deviceLocked(m.Device)
 	if d.Role == "" {
 		d.Role = "battery"
@@ -131,7 +187,14 @@ func (s *stateStore) onBattMetrics(_ string, m bus.BattMetrics) {
 		v := *m.SOC
 		d.SOC = &v
 	}
-	d.UpdatedAt = time.Now()
+	d.UpdatedAt = now
+	s.mu.Unlock()
+
+	s.telemetry.add(telemetrySample{
+		Kind: telemetryKindBattMetrics, Device: m.Device, ArrivedAt: now,
+		SOC: m.SOC, SOH: m.SOH, CapacityWh: m.CapacityWh,
+		MaxChargeW: m.MaxChargeW, MaxDischargeW: m.MaxDischargeW,
+	})
 }
 
 func (s *stateStore) onPlanLog(_ string, p bus.PlanLog) {
@@ -165,10 +228,10 @@ func (s *stateStore) onCSIPControl(_ string, c bus.ActiveControl) {
 }
 
 func (s *stateStore) onEVSEState(_ string, e bus.EVSEState) {
+	now := time.Now()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	key := evseKey(e.StationID, e.ConnectorID)
-	s.evses[key] = &evseSnap{State: e, UpdatedAt: time.Now()}
+	s.evses[key] = &evseSnap{State: e, UpdatedAt: now}
 	// The ocpp service publishes a synthetic connector-0 entry while a station
 	// has no connectors yet (pre-StatusNotification). Once a real connector
 	// reports, drop the placeholder so /status doesn't carry a phantom idle
@@ -176,6 +239,13 @@ func (s *stateStore) onEVSEState(_ string, e bus.EVSEState) {
 	if e.ConnectorID > 0 {
 		delete(s.evses, evseKey(e.StationID, 0))
 	}
+	s.mu.Unlock()
+
+	s.telemetry.add(telemetrySample{
+		Kind: telemetryKindEVSE, Device: key, ArrivedAt: now,
+		CurrentA: e.CurrentA, MaxCurrentA: e.MaxCurrentA, VoltageV: e.VoltageV,
+		PowerW: e.PowerW, EnergyWh: e.EnergyWh, Status: e.Status,
+	})
 }
 
 func (s *stateStore) onSchedule(_ string, sched bus.DERScheduleMsg) {
@@ -193,6 +263,50 @@ func (s *stateStore) onSchedule(_ string, sched bus.DERScheduleMsg) {
 	}
 }
 
+// onModeStatus records the hub's latest authoritative plan-author mode
+// (TopicHubMode, retained, DEVICE_ROADMAP.md §3.5/§4.3).
+func (s *stateStore) onModeStatus(_ string, m bus.ModeStatus) {
+	s.mu.Lock()
+	s.modeStatus = &m
+	s.mu.Unlock()
+}
+
+// onCloudlinkStatus records lexa-cloudlink's latest retained status
+// (TopicCloudlinkStatus).
+func (s *stateStore) onCloudlinkStatus(_ string, c bus.CloudlinkStatus) {
+	s.mu.Lock()
+	s.cloudLinkStatus = &c
+	s.mu.Unlock()
+}
+
+// onScanStatus appends one commissioning-scan progress line
+// (TopicScanStatus, not retained) to the bounded ring, evicting the oldest
+// entry once scanStatusRingCap is reached.
+func (s *stateStore) onScanStatus(_ string, st bus.ScanStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scanStatusRing = append(s.scanStatusRing, st)
+	if len(s.scanStatusRing) > scanStatusRingCap {
+		s.scanStatusRing = s.scanStatusRing[len(s.scanStatusRing)-scanStatusRingCap:]
+	}
+}
+
+// onScanResult records the latest completed commissioning scan
+// (TopicScanResult, retained until commissioning supersedes it).
+func (s *stateStore) onScanResult(_ string, r bus.ScanResult) {
+	s.mu.Lock()
+	s.scanResult = &r
+	s.mu.Unlock()
+}
+
+// onOCPPPending records the current set of unapproved OCPP stations
+// (TopicOCPPPending, retained).
+func (s *stateStore) onOCPPPending(_ string, p bus.PendingStations) {
+	s.mu.Lock()
+	s.ocppPending = &p
+	s.mu.Unlock()
+}
+
 // snapshot returns a deep-copy view safe to render without holding the lock.
 type snapshot struct {
 	devices      map[string]deviceSnap
@@ -204,6 +318,14 @@ type snapshot struct {
 	certStatus   *bus.CertStatus
 	staleAfter   time.Duration
 	now          time.Time
+
+	// TASK-088 additions (DEVICE_ROADMAP.md §4.3): all nil/empty until the
+	// first corresponding message arrives, exactly like certStatus above.
+	modeStatus      *bus.ModeStatus
+	cloudLinkStatus *bus.CloudlinkStatus
+	scanStatusRing  []bus.ScanStatus
+	scanResult      *bus.ScanResult
+	ocppPending     *bus.PendingStations
 }
 
 func (s *stateStore) snapshot() snapshot {
@@ -241,6 +363,26 @@ func (s *stateStore) snapshot() snapshot {
 	if s.certStatus != nil {
 		cs := *s.certStatus
 		out.certStatus = &cs
+	}
+	if s.modeStatus != nil {
+		ms := *s.modeStatus
+		out.modeStatus = &ms
+	}
+	if s.cloudLinkStatus != nil {
+		cl := *s.cloudLinkStatus
+		out.cloudLinkStatus = &cl
+	}
+	if s.scanResult != nil {
+		sr := *s.scanResult
+		out.scanResult = &sr
+	}
+	if s.ocppPending != nil {
+		op := *s.ocppPending
+		out.ocppPending = &op
+	}
+	if len(s.scanStatusRing) > 0 {
+		out.scanStatusRing = make([]bus.ScanStatus, len(s.scanStatusRing))
+		copy(out.scanStatusRing, s.scanStatusRing)
 	}
 	// Stable order: sort by stationID, then connector.
 	keys := make([]string, 0, len(s.evses))

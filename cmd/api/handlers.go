@@ -42,6 +42,28 @@ type statusResp struct {
 	// logged at startup and advertised for TOFU comparison. Empty/omitted
 	// when TLS is disabled (Config.TLS false). Additive field.
 	APICertFP string `json:"api_cert_fp,omitempty"`
+	// Mode is the hub's current plan-author mode (bus.ModeStatus.Mode,
+	// TopicHubMode, DEVICE_ROADMAP.md §3.5/§4.3) — "optimizer" or "gateway".
+	// Additive: omitted until the first ModeStatus arrives (no mode manager
+	// exists in this repo yet, TASK-095+, so today this stays omitted on
+	// every deployment).
+	Mode string `json:"mode,omitempty"`
+	// CloudLink is lexa-cloudlink's latest retained status
+	// (bus.CloudlinkStatus, TopicCloudlinkStatus). Additive: nil/omitted
+	// until the first message arrives (no cloudlink service exists in this
+	// repo yet, TASK-085+, so today this stays omitted on every deployment).
+	CloudLink *cloudLinkJSON `json:"cloud_link,omitempty"`
+}
+
+// cloudLinkJSON is /status's stable, hand-rolled shape for bus.CloudlinkStatus
+// — decoupled from the wire envelope, same pattern certStatusJSON uses for
+// bus.CertStatus.
+type cloudLinkJSON struct {
+	Connected    bool   `json:"connected"`
+	Endpoint     string `json:"endpoint,omitempty"`
+	SpoolBytes   int64  `json:"spool_bytes"`
+	LastUplinkTs string `json:"last_uplink_ts,omitempty"` // RFC3339, omitted if never uplinked
+	CertDaysLeft int    `json:"cert_days_left,omitempty"`
 }
 
 // certStatusJSON is /status's stable, hand-rolled shape for bus.CertStatus —
@@ -164,6 +186,23 @@ func buildStatus(snap snapshot, hb heartbeatStatus) statusResp {
 			csj.CANotAfter = time.Unix(cs.CANotAfter, 0).UTC().Format(time.RFC3339)
 		}
 		resp.CertStatus = csj
+	}
+
+	if ms := snap.modeStatus; ms != nil {
+		resp.Mode = ms.Mode
+	}
+
+	if cl := snap.cloudLinkStatus; cl != nil {
+		clj := &cloudLinkJSON{
+			Connected:    cl.Connected,
+			Endpoint:     cl.Endpoint,
+			SpoolBytes:   cl.SpoolBytes,
+			CertDaysLeft: cl.CertDaysLeft,
+		}
+		if cl.LastUplinkTs != 0 {
+			clj.LastUplinkTs = time.Unix(cl.LastUplinkTs, 0).UTC().Format(time.RFC3339)
+		}
+		resp.CloudLink = clj
 	}
 
 	// Relay the hub's actual plan trace (TopicHubPlan). The timestamp is the
