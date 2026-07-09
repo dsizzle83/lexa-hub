@@ -1,6 +1,9 @@
 package main
 
-import "lexa-hub/internal/metrics"
+import (
+	"lexa-hub/internal/metrics"
+	"lexa-hub/internal/spool"
+)
 
 // cloudlinkMetrics is the flat-name metrics inventory for lexa-cloudlink
 // (docs/DEVICE_ROADMAP.md §2.9; internal/metrics has no label dimension, so
@@ -15,11 +18,15 @@ import "lexa-hub/internal/metrics"
 // from this unit's first deploy, well before 2.2-2.4 wire their real
 // sources.
 type cloudlinkMetrics struct {
-	connected  *metrics.Gauge // lexa_cloudlink_connected (0/1) — driven by THIS unit's statusPublisher
-	spoolBytes *metrics.Gauge // lexa_cloudlink_spool_bytes — 0 until 2.2 wires a real spool
+	connected  *metrics.Gauge   // lexa_cloudlink_connected (0/1) — driven by the cloud session + statusPublisher
+	spoolBytes *metrics.Gauge   // lexa_cloudlink_spool_bytes — driven by the spool (via spoolMetrics) when enabled
+	spoolDrops *metrics.Counter // lexa_cloudlink_spool_drops_total — driven by the spool's eviction/over-budget path (§2.9)
+	batchBytes *metrics.Gauge   // lexa_cloudlink_batch_bytes — last compressed uplink frame size, set by the batcher (2.2/§6)
 
-	uplinkFrames *metrics.Counter // lexa_cloudlink_uplink_frames_total — wired by 2.2's batcher
-	uplinkFail   *metrics.Counter // lexa_cloudlink_uplink_fail_total — wired by 2.2's batcher
+	uplinkFrames *metrics.Counter // lexa_cloudlink_uplink_frames_total — batcher increments on a PUBACK'd frame
+	uplinkFail   *metrics.Counter // lexa_cloudlink_uplink_fail_total — batcher increments on a failed/timed-out/over-budget frame
+
+	cloudReconn *metrics.Counter // lexa_cloudlink_cloud_reconnects_total — the CLOUD session's reconnects (distinct from the local mqttReconn)
 
 	intentsForwarded *metrics.Counter // lexa_cloudlink_intents_forwarded_total — wired by 2.4/2.6's downlink
 	intentsRejected  *metrics.Counter // lexa_cloudlink_intents_rejected_total — wired by 2.4/2.6's downlink
@@ -38,11 +45,31 @@ func newCloudlinkMetrics(reg *metrics.Registry) *cloudlinkMetrics {
 	return &cloudlinkMetrics{
 		connected:        reg.Gauge("lexa_cloudlink_connected"),
 		spoolBytes:       reg.Gauge("lexa_cloudlink_spool_bytes"),
+		spoolDrops:       reg.Counter("lexa_cloudlink_spool_drops_total"),
+		batchBytes:       reg.Gauge("lexa_cloudlink_batch_bytes"),
 		uplinkFrames:     reg.Counter("lexa_cloudlink_uplink_frames_total"),
 		uplinkFail:       reg.Counter("lexa_cloudlink_uplink_fail_total"),
+		cloudReconn:      reg.Counter("lexa_cloudlink_cloud_reconnects_total"),
 		intentsForwarded: reg.Counter("lexa_cloudlink_intents_forwarded_total"),
 		intentsRejected:  reg.Counter("lexa_cloudlink_intents_rejected_total"),
 		mqttPubFail:      reg.Counter("lexa_mqtt_publish_failures_total"),
 		mqttReconn:       reg.Counter("lexa_mqtt_reconnects_total"),
+	}
+}
+
+// spoolMetrics returns the spool.Metrics view backed by this service's
+// registered series, so the spool drives lexa_cloudlink_spool_bytes and
+// lexa_cloudlink_spool_drops_total directly on every mutation (Append/Commit/
+// eviction) — no scrape-time Collect hook needed, the gauge is always current.
+// The remaining spool.Metrics fields (Appends/Commits/DropBytes/Errors) are
+// left nil: spool.Metrics is fully nil-safe (each field's methods no-op on a
+// nil receiver), so an unwired field costs nothing and keeps the exported
+// metric surface to the §2.9 list. Constructed only on the enabled path (the
+// spool is not opened for a local-only box), so a disabled unit's spool series
+// stay a clean registered-but-zero.
+func (m *cloudlinkMetrics) spoolMetrics() *spool.Metrics {
+	return &spool.Metrics{
+		Bytes: m.spoolBytes,
+		Drops: m.spoolDrops,
 	}
 }

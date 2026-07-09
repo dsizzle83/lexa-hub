@@ -32,6 +32,7 @@ import (
 	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
+	"lexa-hub/internal/spool"
 	"lexa-hub/internal/watchdog"
 )
 
@@ -89,35 +90,64 @@ func main() {
 
 	metrics.Serve(cfg.MetricsAddr, reg)
 
-	if !cfg.Enabled {
-		// First-class local-only operation (spec item 3): everything above
-		// still runs (local MQTT session, metrics, watchdog, retained
-		// status) — only the cloud session stays a stub. This is an Info
-		// line, not a Warn/Error: it is the safe shipped default, not a
-		// fault.
-		log.Println("lexa-cloudlink: cloud link disabled by config — local-only operation")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Cloud session (unit 2.3). enabled:false ⇒ a stub that never dials the
+	// WAN; enabled:true with an unreadable serial or bad cert/key/CA is FATAL
+	// at startup (a misprovisioned unit fails loud, not silently offline).
+	cloud, err := newCloudSession(cfg, m)
+	if err != nil {
+		log.Fatalf("lexa-cloudlink: cloud session: %v", err)
 	}
 
-	// session/spool are both stubs in this unit — see status.go's doc
-	// comments on cloudSession/spoolStats for what 2.2/2.3 replace them
-	// with. Neither one ever dials the WAN or touches disk beyond the
-	// journal already opened above, regardless of cfg.Enabled.
-	session := stubCloudSession{}
-	spool := stubSpoolStats{}
+	// spStats is the status seam; sp is the live spool. PRINCIPAL DECISION
+	// (00_PROGRESS W3): when enabled:false the collectors do NOT run and the
+	// spool is NOT opened — a local-only box must never consume flash for a
+	// cloud that never comes. The spool + collectors + batcher exist only on
+	// the enabled path (unit 2.2).
+	var spStats spoolStats = stubSpoolStats{}
+	var sp *spool.Spool
+	lastUplink := func() int64 { return 0 }
 
-	ctx, cancel := context.WithCancel(context.Background())
+	if cfg.Enabled {
+		sp, err = spool.Open(cfg.SpoolDir, cfg.SpoolMaxBytes, m.spoolMetrics())
+		if err != nil {
+			log.Fatalf("lexa-cloudlink: spool: %v", err)
+		}
+		defer sp.Close()
+		spStats = sp
+
+		// notify wakes the batcher on a P0 append so events drain within the
+		// coalesce window rather than a whole telemetry interval.
+		notify := make(chan struct{}, 1)
+		up := newUplink(mc, sp, notify, m)
+		up.subscribeAll()
+
+		b, err := newBatcher(sp, cloud, cfg, m, notify)
+		if err != nil {
+			log.Fatalf("lexa-cloudlink: batcher: %v", err)
+		}
+		lastUplink = b.LastUplinkTs
+		go b.run(ctx)
+	} else {
+		// First-class local-only operation: everything else still runs (local
+		// MQTT session, metrics, watchdog, retained status). Info, not Warn —
+		// the safe shipped default, not a fault.
+		log.Println("lexa-cloudlink: cloud link disabled by config — local-only operation (no spool, no collectors)")
+	}
 
 	// Publishes the retained CloudlinkStatus once now and every
-	// cfg.HealthInterval() thereafter (spec item 4).
-	go statusPublisher(ctx, mc, cfg, session, spool, m)
+	// cfg.HealthInterval() thereafter (spec item 4). lastUplink is the batcher's
+	// atomic when enabled, else a constant 0.
+	go statusPublisher(ctx, mc, cfg, cloud, spStats, lastUplink, m)
 
 	watchdog.Ready()
 
-	// TASK-008 pattern: like lexa-telemetry/lexa-ocpp, this unit has no
-	// tight control loop to ride (no cloud session, no batcher yet), so a
-	// 10s kick ticker is the liveness proxy, gated on shouldKick's two
-	// inputs — see that function and healthy()'s doc comments for what
-	// each currently checks and what 2.2 adds.
+	// TASK-008 pattern: no tight control loop of its own (the batcher rides one,
+	// but on a slow cadence), so a 10s kick ticker is the liveness proxy — gated
+	// on local MQTT connectivity AND, when enabled, spool health (§2.4: a wedged
+	// or unwritable spool must not be reported healthy).
 	kick := time.NewTicker(10 * time.Second)
 	defer kick.Stop()
 
@@ -131,7 +161,11 @@ func main() {
 			cancel()
 			return
 		case <-kick.C:
-			if shouldKick(mc.IsConnected(), healthy()) {
+			spoolHealthy := true
+			if cfg.Enabled {
+				spoolHealthy = sp.Healthy()
+			}
+			if shouldKick(mc.IsConnected(), healthy() && spoolOK(cfg.Enabled, spoolHealthy)) {
 				watchdog.Kick()
 			}
 		}
@@ -159,4 +193,14 @@ func healthy() bool {
 // extraction rationale in status.go).
 func shouldKick(mqttConnected, healthyNow bool) bool {
 	return mqttConnected && healthyNow
+}
+
+// spoolOK folds the spool into the kick health gate (§2.4): a local-only box
+// (enabled=false, no spool) is always spool-OK; an enabled box is spool-OK only
+// while the spool reports Healthy() (dir writable + byte accounting consistent).
+// Pure function of its two inputs so it is table-testable without a real spool,
+// and kept SEPARATE from healthy() so the 2.1 healthy()==true baseline still
+// holds (the combined gate is healthy() && spoolOK(...) at the call site).
+func spoolOK(enabled, spoolHealthy bool) bool {
+	return !enabled || spoolHealthy
 }

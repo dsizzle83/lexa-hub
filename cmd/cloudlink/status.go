@@ -88,9 +88,17 @@ func buildStatus(cfg *Config, session cloudSession, sp spoolStats, now time.Time
 // negligible (CLAUDE.md's Metrics section makes the same point about the
 // plan heartbeat's 5s ticker, a much faster cadence), so no additional rate
 // limiting is needed beyond the ticker itself.
-func statusPublisher(ctx context.Context, mc mqtt.Client, cfg *Config, session cloudSession, sp spoolStats, m *cloudlinkMetrics) {
+//
+// lastUplink supplies CloudlinkStatus.LastUplinkTs — the batcher's atomic when
+// the cloud link is enabled, else a constant 0. It is overlaid AFTER buildStatus
+// so buildStatus's pure (cfg, session, sp, now) signature stays exactly as unit
+// 2.1 pinned it (status_test.go); the batcher, not buildStatus, owns that field.
+func statusPublisher(ctx context.Context, mc mqtt.Client, cfg *Config, session cloudSession, sp spoolStats, lastUplink func() int64, m *cloudlinkMetrics) {
 	publish := func() {
 		st := buildStatus(cfg, session, sp, time.Now())
+		if lastUplink != nil {
+			st.LastUplinkTs = lastUplink()
+		}
 		if err := mqttutil.PublishJSONRetained(mc, bus.TopicCloudlinkStatus, st); err != nil {
 			slog.Warn("lexa-cloudlink: publish status failed", "err", err)
 		}
