@@ -66,6 +66,16 @@ const (
 // never allowed to leak into output — shadow diffing needs reproducibility).
 var axisOrder = []Axis{AxisSolarCeilingW, AxisBatterySetpointW, AxisEVSECurrentA, AxisConnect}
 
+// axisKey builds the device+axis lookup key shared by three FIX-F consumers
+// that must all agree on the exact same format: Resolve's per-tick authorship
+// map (Desired.Authors, surfaced by Stack.AxisAuthors), the post-arbiter
+// override attribution (stack.go attributePostArbiterAuthorship), and the
+// Wrapper's divergence Author lookup (shadow.go), which builds the same key
+// from an already-formatted AxisDivergence.Device/Axis pair.
+func axisKey(device string, axis Axis) string {
+	return device + "/" + axis.String()
+}
+
 // String renders an Axis for traces.
 func (a Axis) String() string {
 	switch a {
