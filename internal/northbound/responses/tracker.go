@@ -51,6 +51,17 @@ type Tracker struct {
 	// in the current breach episode, so a redelivered MQTT alert does not
 	// double-post. Cleared when the hub signals the breach has cleared.
 	alerted map[string]bool
+	// confirmedAlerted mirrors the subset of alerted[] that has been
+	// durably persisted to store (WS-4.2, persist.go): AlertCannotComply
+	// marks alerted[key]=true immediately (in-memory dedup, unchanged from
+	// pre-persistence behavior) but only adds to confirmedAlerted — and
+	// only then calls store.AppendAlerted — once postResponse confirms the
+	// POST succeeded. maybeCompact's checkpoint reads from THIS map, never
+	// alerted directly: an in-flight/failed attempt is real in alerted
+	// (blocks a same-process retry, unchanged) but must never be written
+	// durably, or a genuine restart would lose its only chance to retry a
+	// CannotComply the utility never actually received.
+	confirmedAlerted map[string]bool
 	// mu guards the tracker: Update() runs on the discovery goroutine while
 	// AlertCannotComply()/ClearAlerts() run on the MQTT subscription goroutine.
 	mu sync.Mutex
@@ -62,22 +73,47 @@ type Tracker struct {
 	// jw is the optional TASK-040 event journal; nil disables the
 	// cannot_comply_posted emit in AlertCannotComply below.
 	jw *journal.Writer
+
+	// store is the optional WS-4.2 response-state persistence path (nil
+	// disables persistence entirely — RAM-only, pre-WS-4.2 behavior). See
+	// persist.go's package doc for the format and why it is not
+	// internal/journal.Writer reused as-is.
+	store *Store
 }
 
 // New constructs a Tracker that POSTs Responses via p, identifying as lfdi,
 // to responseSetPath, reading time from clk, counting successful POSTs on
-// responsesPosted (nil-safe), and optionally journaling CannotComply posts
-// via jw (nil disables journaling).
-func New(p Poster, lfdi, responseSetPath string, clk *utilitytime.Clock, responsesPosted *metrics.Counter, jw *journal.Writer) *Tracker {
+// responsesPosted (nil-safe), optionally journaling CannotComply posts via
+// jw (nil disables journaling), and optionally persisting posted/alerted
+// state via store (nil disables persistence — RAM-only, pre-WS-4.2
+// behavior). initial seeds the maps (e.g. from persist.LoadState after a
+// restart); a zero State starts empty exactly as before WS-4.2. Every key
+// present in initial.Alerted is treated as already confirmed-persisted
+// (LoadState only ever returns confirmed entries — see persist.go).
+func New(p Poster, lfdi, responseSetPath string, clk *utilitytime.Clock, responsesPosted *metrics.Counter, jw *journal.Writer, store *Store, initial State) *Tracker {
+	posted := initial.Posted
+	if posted == nil {
+		posted = make(map[string]uint8)
+	}
+	alerted := initial.Alerted
+	if alerted == nil {
+		alerted = make(map[string]bool)
+	}
+	confirmed := make(map[string]bool, len(alerted))
+	for k := range alerted {
+		confirmed[k] = true
+	}
 	return &Tracker{
-		poster:          p,
-		lfdi:            lfdi,
-		responseSetPath: responseSetPath,
-		clk:             clk,
-		posted:          make(map[string]uint8),
-		alerted:         make(map[string]bool),
-		responsesPosted: responsesPosted,
-		jw:              jw,
+		poster:           p,
+		lfdi:             lfdi,
+		responseSetPath:  responseSetPath,
+		clk:              clk,
+		posted:           posted,
+		alerted:          alerted,
+		confirmedAlerted: confirmed,
+		responsesPosted:  responsesPosted,
+		jw:               jw,
+		store:            store,
 	}
 }
 
@@ -105,6 +141,22 @@ func (rt *Tracker) AlertCannotComply(mrid, episodeID string) {
 	}
 	posted := rt.postResponse(mrid, model.ResponseCannotComply)
 
+	// WS-4.2: persist ONLY once the POST is confirmed — deliberately AFTER
+	// the in-memory mark above, not alongside it. A process crash between
+	// the mark and here leaves nothing durable for this key: a fresh
+	// Tracker's alerted map won't have it, so a redelivered alert genuinely
+	// retries instead of being silently swallowed by a "recorded but never
+	// actually sent" ghost dedupe entry — the exact restart-window loss
+	// WS-4.2 exists to close. See persist.go's Store.AppendAlerted doc.
+	if posted {
+		rt.confirmedAlerted[mrid] = true
+		if episodeID != "" {
+			rt.confirmedAlerted[episodeID] = true
+		}
+		rt.store.AppendAlerted(mrid, episodeID)
+		rt.maybeCompact()
+	}
+
 	// TASK-040: journal only the successful POST (the err == nil branch) —
 	// this dedupe guard already ensures at most one attempt per episode, so
 	// a failed POST here is not retried and must not leave a false
@@ -128,6 +180,25 @@ func (rt *Tracker) ClearAlerts() {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.alerted = make(map[string]bool)
+	rt.confirmedAlerted = make(map[string]bool)
+	rt.store.AppendClear()
+	rt.maybeCompact()
+}
+
+// maybeCompact triggers a Store compaction once the append log crosses its
+// size threshold. Always called with rt.mu held: Store's own mutex nests
+// safely under rt.mu (rt.mu -> store.mu, never the reverse — Store never
+// calls back into Tracker), matching how rt.jw.Append is already called
+// under rt.mu elsewhere in this file. A compaction failure is logged and
+// otherwise ignored — this store is dedupe-hint state, never worth failing
+// a live control-adjacent path over (AD-011).
+func (rt *Tracker) maybeCompact() {
+	if rt.store == nil || !rt.store.NeedsCompact() {
+		return
+	}
+	if err := rt.store.Compact(rt.posted, rt.confirmedAlerted); err != nil {
+		slog.Warn("lexa-northbound: response-state compaction failed", "path", rt.store.Path, "err", err)
+	}
 }
 
 // terminalResponse reports whether a response status ends an event's lifecycle:
@@ -225,6 +296,11 @@ func (rt *Tracker) completeActive() {
 func (rt *Tracker) set(mrid string, status uint8) {
 	rt.postResponse(mrid, status)
 	rt.posted[mrid] = status
+	// WS-4.2: persisted unconditionally, matching this method's own
+	// unconditional in-memory record above (see the doc comment: a failed
+	// POST here was already silently swallowed before this task).
+	rt.store.AppendPosted(mrid, status)
+	rt.maybeCompact()
 }
 
 // postResponse POSTs a Response for mrid/status and reports whether it
