@@ -9,6 +9,26 @@ and how to recover the network configuration after a reboot or reflash.
 - **Login:** `ssh root@69.0.0.2` (no password configured for root over the demo LAN);
   also on WiFi via DHCP (resolves as `ccimx93-dvk.local`)
 
+## Custom DEY image build (2026-07-07 — flash pending)
+
+A custom headless DEY 5.0 image + kernel for this board is built and verified
+on the desktop (BT provisioning-ready, netem enabled, no display/camera/audio,
+eth0 69.0.0.2 static baked in, mosquitto/tc/sudo/python3/bash/tzdata included
+— once flashed, the sudo shim, hand-built mosquitto, and NM profile below
+become unnecessary):
+
+- Yocto layer (git): `~/projects/meta-lexa` · project: `~/workspace/ccimx93-dvk`
+  · DEY install: `~/dey/dey-5.0` (scarthgap; pinned snapshot
+  `pinned-manifest-20260707.xml`)
+- Rebuild: `cd ~/workspace/ccimx93-dvk && source ./dey-setup-environment &&
+  bitbake dey-image-lexa` → `tmp/deploy/images/ccimx93-dvk/`
+- Host gotchas (Ubuntu 24.04): `kernel.apparmor_restrict_unprivileged_userns=0`
+  required (`/etc/sysctl.d/60-yocto-userns.conf`); `hg` removed from bitbake
+  HOSTTOOLS (setuptools-scm probe times out under load); Mali GPU + display-PHY
+  kernel symbols must stay disabled with DRM off (build breaks otherwise);
+  `ETH0_STATIC_GATEWAY` has a baked Digi default — meta-lexa ships a
+  gateway-free `nm.eth0.static` with never-default=true instead.
+
 ## 2026-07-07: dev kit is the live hub again (fresh image)
 
 The board came back with a **fresh Yocto image** (nothing from the previous
