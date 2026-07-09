@@ -4,6 +4,23 @@ After=network.target
 Before=lexa-modbus.service lexa-hub.service lexa-ocpp.service lexa-api.service
 
 [Service]
+# WS-9.1 (V1.0 punch list): Type=simple, no WatchdogSec — deliberately, not
+# an oversight. Upstream mosquitto has no sd_notify(3) integration, so unlike
+# the six lexa-* services (Type=notify + WatchdogSec, systemd/lexa-*.service)
+# it cannot be given a liveness kick of its own; only Restart=on-failure
+# below catches an outright crash/exit. A WEDGED-BUT-RUNNING mosquitto
+# (accepting TCP but not routing PUBLISH/SUBSCRIBE traffic) is NOT detected
+# or auto-restarted by systemd today — that is a known, documented gap, not
+# a fix. Do not add Type=notify/WatchdogSec here: mosquitto does not speak
+# the systemd notify protocol, and doing so would just break startup
+# (READY=1 would never arrive, so systemd would kill it on TimeoutStartSec).
+#
+# The only currently-deployed detection signal for this gap is indirect: the
+# lexa_mqtt_deaf_seconds gauge each lexa-* service now exports (WS-9.1,
+# internal/watchdog.DeafTracker) — every service going deaf AT THE SAME TIME
+# is the observable signature of a wedged broker (as opposed to one service's
+# own network path failing). There is no alert wired on that signature yet;
+# an operator/dashboard has to notice it.
 Type=simple
 ExecStart=/usr/local/sbin/mosquitto -c /etc/mosquitto/mosquitto.conf
 Restart=on-failure

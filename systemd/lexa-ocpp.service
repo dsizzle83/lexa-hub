@@ -33,10 +33,16 @@ RestrictAddressFamilies=AF_INET AF_UNIX
 # accept loop with MQTT still up would NOT trip this watchdog (backlog:
 # TASK-044 metrics probes listener health properly).
 #
-# WatchdogSec=60: a sustained MQTT broker outage (> 60s) means this kick
-# gate never fires and the watchdog restarts the service — accepted
-# crash-only behavior (AD-011), not a bug; see PR for the mqtt-broker-restart
-# / mqtt-broker-latency Mayhem reasoning.
+# WS-9.1: mc.IsConnected() alone is NOT enough — paho's AutoReconnect keeps
+# it true for the client's entire reconnect retry loop, not just while
+# actually connected, so a plain IsConnected() gate would never withhold a
+# kick during a sustained outage. The kick is additionally gated on
+# watchdog.DeafTracker (mqtt_deaf_restart_after_s in ocpp.json, default
+# 300s): once the broker has been continuously unreachable that long, kicks
+# stop, and WatchdogSec=60 restarts the service roughly
+# mqtt_deaf_restart_after_s + 60s into the outage — accepted crash-only
+# behavior (AD-011), not a bug; see PR for the mqtt-broker-restart /
+# mqtt-broker-latency Mayhem reasoning.
 Type=notify
 NotifyAccess=main
 WatchdogSec=60

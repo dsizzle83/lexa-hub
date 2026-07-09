@@ -109,14 +109,18 @@ func (t *tickTiming) takeReset() time.Duration {
 // an error return anyway so the interface (and engine.go's existing
 // log-on-error call site) needs no change.
 //
-// Source/MRID: BatteryCommand carries neither today (internal/orchestrator's
-// SystemState is where the active CSIP control's mRID lives — optimizer.go's
-// plan.Breach.MRID stamping shows the only place it currently escapes the
-// optimizer). Plumbing it through the actuator interface is a change to
-// internal/orchestrator, which this task does not touch (radioactive zone,
-// 05 §12). Every document below is stamped Source: "economic", MRID: "" —
-// TASK-031 (CannotComply attribution end-to-end) is the follow-up that wires
-// the real mRID through.
+// Source/MRID: WS-4.3 (V1.0 punch list, TASK-031 follow-up) plumbed the real
+// mRID through: optimizer.go's Optimize() stamps orchestrator.BatteryCommand.MRID
+// from state.CSIPControl.MRID — the same source plan.Breach.MRID uses — with
+// a blanket post-hoc pass alongside the existing Breach.MRID stamp, so no
+// individual rule function needed to change. This actuator just copies
+// cmd.MRID straight into the published doc's MRID field below. When no real
+// CSIP control is active (state.CSIPControl == nil), MRID stays "" — that is
+// correct, not a gap: an economic-only device axis has no CSIP event/default
+// to attribute a CannotComply episode to. Source stays the literal
+// "economic" below regardless — bus.DesiredState.Source's four-value
+// taxonomy ("csip-event" | "csip-default" | "economic" | "safety") predates
+// this fix and is not fully implemented; broadening it is out of scope here.
 type desiredPublishingBatteryActuator struct {
 	mc     mqtt.Client
 	device string
@@ -270,6 +274,7 @@ func (a *desiredPublishingBatteryActuator) ApplyBatteryCommand(cmd orchestrator.
 		DeviceClass: bus.DesiredClassBattery,
 		DeviceID:    a.device,
 		Source:      "economic",
+		MRID:        cmd.MRID,
 	}
 	if a.haveSetpoint {
 		w := a.setpointW
@@ -448,6 +453,7 @@ func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.Sola
 		DeviceID:    a.device,
 		CeilingW:    &ceiling,
 		Source:      "economic",
+		MRID:        cmd.MRID,
 	}
 
 	now := time.Now()
@@ -572,6 +578,7 @@ func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECo
 		ConnectorID: cmd.ConnectorID,
 		Connect:     &connect,
 		Source:      "economic",
+		MRID:        cmd.MRID,
 	}
 
 	now := time.Now()

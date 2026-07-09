@@ -262,6 +262,11 @@ type BatteryCommand struct {
 
 	// Connect: nil means "leave unchanged".
 	Connect *bool
+
+	// MRID is the active CSIP control this command derives from, empty when
+	// none is active — TASK-031/WS-4.3. Stamped in Optimize() from
+	// state.CSIPControl.MRID, the same source plan.Breach.MRID uses.
+	MRID string
 }
 
 // SolarCommand limits a solar inverter's output.
@@ -270,6 +275,11 @@ type SolarCommand struct {
 
 	// CurtailToW caps the inverter output. math.NaN() means "no curtailment".
 	CurtailToW float64
+
+	// MRID is the active CSIP control this command derives from, empty when
+	// none is active — TASK-031/WS-4.3. Stamped in Optimize() from
+	// state.CSIPControl.MRID, the same source plan.Breach.MRID uses.
+	MRID string
 }
 
 // EVSECommand sets a current limit on an EV charger.
@@ -278,6 +288,11 @@ type EVSECommand struct {
 	ConnectorID int
 	// MaxCurrentA: 0 = suspend session, >0 = set limit.
 	MaxCurrentA float64
+
+	// MRID is the active CSIP control this command derives from, empty when
+	// none is active — TASK-031/WS-4.3. Stamped in Optimize() from
+	// state.CSIPControl.MRID, the same source plan.Breach.MRID uses.
+	MRID string
 }
 
 // Decision records one reasoning step in the optimizer.

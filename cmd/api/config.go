@@ -74,6 +74,18 @@ type Config struct {
 	// the hub's actual interval, so this is its own config rather than derived.
 	PlanStallAfterS int `json:"plan_stall_after_s"`
 
+	// MQTTDeafRestartAfterS bounds how long lexa-api keeps kicking the
+	// systemd watchdog while mc.IsConnected() reports true but the broker
+	// connection has actually been down the whole time (WS-9.1):
+	// mqtt.Client.IsConnected() stays true for paho's entire AutoReconnect
+	// retry loop, not just while actually connected, so a naive kick gated
+	// on it alone never trips during a sustained outage. A watchdog.DeafTracker
+	// tracks continuous-disconnected time from mqttutil's OnConnectionLost/
+	// OnReconnect hooks; once that exceeds this many seconds, the kick gate
+	// stops firing (alongside the existing probeHealthz gate) and systemd's
+	// WatchdogSec restarts the service. Default 300 (5 min) when unset/zero.
+	MQTTDeafRestartAfterS int `json:"mqtt_deaf_restart_after_s"`
+
 	Devices []DeviceConfig `json:"devices"`
 }
 
@@ -106,6 +118,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.PlanStallAfterS == 0 {
 		cfg.PlanStallAfterS = 75
+	}
+	if cfg.MQTTDeafRestartAfterS == 0 {
+		cfg.MQTTDeafRestartAfterS = 300
 	}
 	// WS-1 (V1.0 punch list, security fail-closed by default): a wildcard/LAN
 	// bind with no bearer-token auth is an unauthenticated control-adjacent
@@ -150,6 +165,11 @@ func (c *Config) StaleAfter() time.Duration {
 // PlanStallAfter is PlanStallAfterS as a time.Duration (TASK-045).
 func (c *Config) PlanStallAfter() time.Duration {
 	return time.Duration(c.PlanStallAfterS) * time.Second
+}
+
+// MQTTDeafRestartAfter is MQTTDeafRestartAfterS as a time.Duration (WS-9.1).
+func (c *Config) MQTTDeafRestartAfter() time.Duration {
+	return time.Duration(c.MQTTDeafRestartAfterS) * time.Second
 }
 
 // LoadAPIToken reads the bearer token from APITokenFile. An unset

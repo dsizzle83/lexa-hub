@@ -375,6 +375,28 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 		plan.Breach.MRID = state.CSIPControl.MRID
 	}
 
+	// WS-4.3 (V1.0 punch list): stamp the same active control's mRID onto
+	// every per-device command this tick produced (including checkBatterySafety's
+	// forced disconnects above, since that runs inside Optimize() too) — a
+	// small, safe, post-hoc blanket stamp mirroring the Breach.MRID technique
+	// just above, rather than threading MRID through every individual rule
+	// function that builds a command. state.CSIPControl == nil is exactly
+	// "no real CSIP control active" (cmd/hub/state.go's busToCSIPControl),
+	// in which case MRID correctly stays "". The separate fast-protection-loop
+	// path (EvaluateSafety/EvaluateFast) does NOT go through Optimize() and is
+	// deliberately NOT stamped here — see EvaluateSafety's own doc.
+	if state.CSIPControl != nil {
+		for i := range plan.BatteryCommands {
+			plan.BatteryCommands[i].MRID = state.CSIPControl.MRID
+		}
+		for i := range plan.SolarCommands {
+			plan.SolarCommands[i].MRID = state.CSIPControl.MRID
+		}
+		for i := range plan.EVSECommands {
+			plan.EVSECommands[i].MRID = state.CSIPControl.MRID
+		}
+	}
+
 	// Record commanded battery setpoints so the fast protection loop's
 	// EvaluateSafety can infer charge-vs-discharge intent between economic ticks.
 	if o.lastBattCmd == nil {

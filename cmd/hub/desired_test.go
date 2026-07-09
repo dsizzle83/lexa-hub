@@ -537,6 +537,92 @@ func TestDesiredPublishingEVSEActuator_Mapping(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------
+// WS-4.3: real MRID plumbed from the command into the published doc
+// ---------------------------------------------------------------------
+
+// TestDesiredPublishingBatteryActuator_MRIDPassthrough verifies the
+// published bus.DesiredState.MRID matches orchestrator.BatteryCommand.MRID —
+// the actuator-side half of WS-4.3 (the optimizer-side half is covered by
+// TestOptimizer_CommandsStampedWithActiveControlMRID/
+// TestOptimizer_CommandsUnstampedWithNoActiveControl in
+// internal/orchestrator/optimizer_test.go). Both a populated and an empty
+// MRID are exercised so this doesn't just prove "some string passes
+// through" — an empty MRID (no active CSIP control) must publish as
+// omitted (bus.DesiredState.MRID has `omitempty`), not a literal "".
+func TestDesiredPublishingBatteryActuator_MRIDPassthrough(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, nil)
+
+	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, MRID: "mrid-batt-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("got %d publishes, want 1", len(mc.publishes))
+	}
+	var doc bus.DesiredState
+	if err := json.Unmarshal(mc.publishes[0].payload, &doc); err != nil {
+		t.Fatalf("unmarshal published doc: %v", err)
+	}
+	if doc.MRID != "mrid-batt-1" {
+		t.Fatalf("published MRID = %q, want mrid-batt-1", doc.MRID)
+	}
+
+	// A content-differing follow-up command with MRID == "" (control cleared)
+	// must publish MRID omitted from the wire doc, not a literal "mrid".
+	if err := a.ApplyBatteryCommand(orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -600, MRID: ""}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("got %d publishes after a content-changing follow-up, want 2", len(mc.publishes))
+	}
+	if strings.Contains(string(mc.publishes[1].payload), `"mrid"`) {
+		t.Errorf("published payload = %s, want mrid key omitted (empty MRID, omitempty)", mc.publishes[1].payload)
+	}
+}
+
+// TestDesiredPublishingSolarActuator_MRIDPassthrough is
+// TestDesiredPublishingBatteryActuator_MRIDPassthrough's solar counterpart.
+func TestDesiredPublishingSolarActuator_MRIDPassthrough(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingSolarActuator(mc, "pv-0", nil, nil, nil, nil)
+
+	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "pv-0", CurtailToW: 2000, MRID: "mrid-solar-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("got %d publishes, want 1", len(mc.publishes))
+	}
+	var doc bus.DesiredState
+	if err := json.Unmarshal(mc.publishes[0].payload, &doc); err != nil {
+		t.Fatalf("unmarshal published doc: %v", err)
+	}
+	if doc.MRID != "mrid-solar-1" {
+		t.Fatalf("published MRID = %q, want mrid-solar-1", doc.MRID)
+	}
+}
+
+// TestDesiredPublishingEVSEActuator_MRIDPassthrough is
+// TestDesiredPublishingBatteryActuator_MRIDPassthrough's EVSE counterpart.
+func TestDesiredPublishingEVSEActuator_MRIDPassthrough(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, nil, nil, nil)
+
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16, MRID: "mrid-evse-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("got %d publishes, want 1", len(mc.publishes))
+	}
+	var doc bus.DesiredState
+	if err := json.Unmarshal(mc.publishes[0].payload, &doc); err != nil {
+		t.Fatalf("unmarshal published doc: %v", err)
+	}
+	if doc.MRID != "mrid-evse-1" {
+		t.Fatalf("published MRID = %q, want mrid-evse-1", doc.MRID)
+	}
+}
+
+// ---------------------------------------------------------------------
 // WS-2 fix 1: heartbeat re-stamp (desiredHeartbeatInterval)
 // ---------------------------------------------------------------------
 

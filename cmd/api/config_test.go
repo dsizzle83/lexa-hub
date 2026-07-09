@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // WS-1 (V1.0 punch list, security fail-closed by default): loadConfig must
@@ -96,6 +97,36 @@ func TestLoadConfig_NonLoopback_NoToken_BenchTrue_Succeeds(t *testing.T) {
 	}
 	if !cfg.Bench {
 		t.Fatal("cfg.Bench = false, want true")
+	}
+}
+
+// WS-9.1: mqtt_deaf_restart_after_s defaults to 300s (5 min) when unset, and
+// carries through an explicit override.
+func TestLoadConfig_MQTTDeafRestartAfter_Default(t *testing.T) {
+	path := writeTempAPIConfig(t, `{"mqtt_broker": "tcp://localhost:1883"}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.MQTTDeafRestartAfterS != 300 {
+		t.Fatalf("MQTTDeafRestartAfterS default = %d, want 300", cfg.MQTTDeafRestartAfterS)
+	}
+	if got, want := cfg.MQTTDeafRestartAfter(), 300*time.Second; got != want {
+		t.Fatalf("MQTTDeafRestartAfter() = %s, want %s", got, want)
+	}
+}
+
+func TestLoadConfig_MQTTDeafRestartAfter_Override(t *testing.T) {
+	path := writeTempAPIConfig(t, `{
+		"mqtt_broker": "tcp://localhost:1883",
+		"mqtt_deaf_restart_after_s": 60
+	}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.MQTTDeafRestartAfterS != 60 {
+		t.Fatalf("MQTTDeafRestartAfterS = %d, want 60", cfg.MQTTDeafRestartAfterS)
 	}
 }
 

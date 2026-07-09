@@ -182,6 +182,24 @@ func (s *Stack) Optimize(state orchestrator.SystemState) orchestrator.Plan {
 		attributePostArbiterAuthorship(before, plan.BatteryCommands, pa.Name(), authors)
 	}
 	s.lastAuthors = authors
+
+	// WS-4.3 parity with the legacy cascade (optimizer.go's blanket stamp):
+	// every command carries the active control's MRID so device-level
+	// non-convergence evidence survives the flip — a composed plan that
+	// APPENDS a candidate-only command (no legacy twin to inherit from) and,
+	// after TASK-066 deletes the cascade, every command outright, would
+	// otherwise regress to MRID:"" and be dropped by breach.go by design.
+	if state.CSIPControl != nil {
+		for i := range plan.BatteryCommands {
+			plan.BatteryCommands[i].MRID = state.CSIPControl.MRID
+		}
+		for i := range plan.SolarCommands {
+			plan.SolarCommands[i].MRID = state.CSIPControl.MRID
+		}
+		for i := range plan.EVSECommands {
+			plan.EVSECommands[i].MRID = state.CSIPControl.MRID
+		}
+	}
 	return plan
 }
 

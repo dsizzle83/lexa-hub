@@ -38,6 +38,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
@@ -330,6 +331,111 @@ func newReconcileReportPublisher(mc mqtt.Client) func(reconcile.Report) {
 		if err := mqttutil.PublishJSONRetained(mc, topic, msg); err != nil {
 			log.Printf("lexa-ocpp: publish reconcile report (%s %s): %v", r.DeviceClass, r.DeviceID, err)
 		}
+	}
+}
+
+// healSubscribeWaitTimeout/healRetainedWaitTimeout bound
+// healStaleRetainedReport's one-shot startup probe (WS-4.5): how long to
+// wait for the SUBSCRIBE to ack, and how long to wait for a retained message
+// to arrive on it (nothing arriving within healRetainedWaitTimeout means
+// there was no retained message at all — nothing to heal). Kept as
+// variables, not inlined into healStaleRetainedReport, purely so
+// reconcile_shell_test.go can drive the "nothing retained" timeout path
+// without a real multi-second wait — production always calls
+// healStaleRetainedReport, never healStaleRetainedReportT directly.
+var (
+	healSubscribeWaitTimeout = 5 * time.Second
+	healRetainedWaitTimeout  = 3 * time.Second
+)
+
+// healStaleRetainedReport corrects a retained NonConvergedBegin report left
+// over from a PREVIOUS process instance of this shell (a crash/restart
+// between Begin and its matching End) — see WS-4.5 (docs/refactor/HANDOFF.md
+// §8, csip-tls-test repo). Call exactly ONCE, at shell startup (active mode
+// only), BEFORE this instance's own reconciler starts publishing — this
+// deliberately uses a plain one-shot mc.Subscribe, NOT mqttutil.Subscribe's
+// reconnect-replay registry: a broker reconnect during a still-running shell
+// (not a process restart) must not be confused with this case — the
+// in-memory reconciler may legitimately still be mid-episode then, and
+// healing would wrongly close a real episode. Only a genuine process
+// restart resets the reconciler's episode memory to "not tracking
+// anything", which is exactly when a leftover retained Begin becomes
+// untrustworthy and needs healing.
+func healStaleRetainedReport(mc mqtt.Client, class, deviceID string, now time.Time) {
+	healStaleRetainedReportT(mc, class, deviceID, now, healSubscribeWaitTimeout, healRetainedWaitTimeout)
+}
+
+// healStaleRetainedReportT is healStaleRetainedReport with injectable wait
+// bounds (see healSubscribeWaitTimeout/healRetainedWaitTimeout's doc).
+func healStaleRetainedReportT(mc mqtt.Client, class, deviceID string, now time.Time, subscribeWait, retainedWait time.Duration) {
+	topic := bus.ReconcileReportTopic(class, deviceID)
+	done := make(chan *bus.ReconcileReport, 1)
+	handler := func(_ mqtt.Client, m mqtt.Message) {
+		if !m.Retained() {
+			done <- nil // a live (non-retained) message arrived; nothing was retained
+			return
+		}
+		var rep bus.ReconcileReport
+		if err := json.Unmarshal(m.Payload(), &rep); err != nil {
+			log.Printf("lexa-ocpp: heal stale retained report %s: unmarshal: %v", topic, err)
+			done <- nil
+			return
+		}
+		done <- &rep
+	}
+
+	tok := mc.Subscribe(topic, 1, handler)
+	if !tok.WaitTimeout(subscribeWait) || tok.Error() != nil {
+		log.Printf("lexa-ocpp: heal stale retained report: subscribe %s failed", topic)
+		return
+	}
+	defer mc.Unsubscribe(topic)
+
+	var retained *bus.ReconcileReport
+	select {
+	case retained = <-done:
+	case <-time.After(retainedWait):
+		return // no retained message at all — nothing to heal
+	}
+
+	end := decideStaleHeal(retained, class, deviceID, now)
+	if end == nil {
+		return
+	}
+	if err := mqttutil.PublishJSONRetained(mc, topic, *end); err != nil {
+		log.Printf("lexa-ocpp: heal stale retained report %s: publish End: %v", topic, err)
+		return
+	}
+	log.Printf("lexa-ocpp: healed stale retained NonConvergedBegin for %s/%s (mrid=%s) on shell start",
+		class, deviceID, end.MRID)
+}
+
+// decideStaleHeal is healStaleRetainedReport's pure decision core, split out
+// for table-testing without a broker or fake mqtt.Client (this package has
+// no fake mqtt.Client today — mirroring newReconcileReportPublisher, which
+// also has no direct unit test; the Subscribe/Unsubscribe/Publish glue in
+// healStaleRetainedReportT above is exercised by reconcile_shell_test.go's
+// fake client, but a real-broker end-to-end proof is an accepted gap, same
+// honesty standard as the rest of this package's MQTT glue). retained is nil
+// when nothing was retained on the topic, or the retained payload failed to
+// decode — both treated as "nothing to heal". A retained report whose Kind
+// isn't NonConvergedBegin (e.g. it already ended cleanly) is also left
+// alone. Only a retained NonConvergedBegin produces a corrective End,
+// carrying the SAME MRID/Episode forward so a consumer can correlate it with
+// the stale Begin it corrects.
+func decideStaleHeal(retained *bus.ReconcileReport, class, deviceID string, now time.Time) *bus.ReconcileReport {
+	if retained == nil || retained.Kind != reconcile.ReportNonConvergedBegin.String() {
+		return nil
+	}
+	return &bus.ReconcileReport{
+		Envelope:    bus.Envelope{V: bus.ReconcileReportV},
+		Kind:        reconcile.ReportNonConvergedEnd.String(),
+		DeviceClass: class,
+		DeviceID:    deviceID,
+		MRID:        retained.MRID,
+		Episode:     retained.Episode,
+		IssuedAt:    now.Unix(),
+		Ts:          now.Unix(),
 	}
 }
 
