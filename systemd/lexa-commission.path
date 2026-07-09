@@ -1,0 +1,30 @@
+[Unit]
+Description=Watch for LEXA commissioning restart requests
+Documentation=https://github.com/lexa/lexa-hub
+
+[Path]
+# PathChanged (not PathExists alone): PathExists= fires once on the
+# absent->present transition but does NOT refire on a subsequent write to
+# an ALREADY-existing file — e.g. lexa-api appending a second service name
+# while an earlier request is still pending (the root oneshot below
+# hasn't gotten to it yet), or this same request file surviving a broker/
+# api restart. PathChanged= fires on every close-after-write (including
+# lexa-api's tmp+rename — systemd treats the rename's target-path change
+# as a path change) whether the file is new OR modified, which is what
+# unit 4.5's file protocol actually needs: every append must re-trigger
+# the oneshot below.
+#
+# PathExists= is kept too, belt-and-braces: it catches the case where this
+# .path unit itself starts (boot, or `systemctl daemon-reload` /
+# `systemctl start`) and the request file is ALREADY sitting there with no
+# fresh PathChanged edge to fire on (e.g. lexa-commission.path was
+# reloaded/restarted while a request was mid-flight). It is not the
+# primary trigger — PathChanged= above is — but costs nothing extra since
+# scripts/lexa-commission-apply's own missing-request-file check makes a
+# spurious extra run a clean no-op (exit 0).
+PathChanged=/var/lib/lexa/commission/restart.request
+PathExists=/var/lib/lexa/commission/restart.request
+Unit=lexa-commission.service
+
+[Install]
+WantedBy=multi-user.target

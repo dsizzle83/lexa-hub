@@ -1,0 +1,201 @@
+#!/bin/sh
+# scripts/lexa-commission-apply — root oneshot triggered by
+# systemd/lexa-commission.path whenever
+# /var/lib/lexa/commission/restart.request changes (Unit 4.5,
+# docs/extension/00_PROGRESS.md's 4.4 review finding). POSIX sh, no
+# bashisms: DEVKIT.md documents this repo's actual bring-up on a Yocto
+# (DEY) image with a sudo SHIM and no guarantee of bash/GNU coreutils —
+# see scripts/factory-reset.sh's header for the identical reasoning.
+#
+# WHY THIS EXISTS: lexa-api's hardened unit (NoNewPrivileges=yes,
+# systemd/lexa-api.service) can no longer `sudo -n systemctl restart ...`
+# by design — that path (systemd/sudoers.d-lexa-api) is DELETED. Instead
+# lexa-api only ever WRITES a request file (cmd/api/configwrite.go's
+# requestRestart); this script, running as root, is the only thing that
+# actually execs `systemctl restart`.
+#
+# PROTOCOL (kept in lockstep with cmd/api/configwrite.go — re-read both
+# together before changing either):
+#
+#   request file:  $LEXA_COMMISSION_REQUEST_FILE
+#                  (default /var/lib/lexa/commission/restart.request)
+#     One bare service name per line: hub|northbound|modbus|ocpp|
+#     telemetry|cloudlink|api. Written by lexa-api via tmp+rename
+#     (atomic) — StateDirectory=lexa on lexa-api.service makes
+#     /var/lib/lexa writable by it; lexa-api creates the "commission"
+#     subdirectory itself (requestRestart's os.MkdirAll).
+#
+#   result file:   $LEXA_COMMISSION_RESULT_FILE
+#                  (default /var/lib/lexa/commission/restart.result)
+#     JSON {"ts": <unix-seconds>, "results": {"<svc>": "ok"|"failed: <detail>"}},
+#     written by THIS SCRIPT via tmp+rename. cmd/api/configwrite.go's
+#     defaultRestartRunner polls this file for its own service's entry,
+#     ignoring (as stale) any entry whose ts predates its own request.
+#
+# DEFENSE IN DEPTH: this script refuses to do anything unless
+# $LEXA_COMMISSIONED_MARKER (default /etc/lexa/commissioned) is ABSENT —
+# mirroring cmd/api/configwrite.go's own gate (isCommissioned()) exactly.
+# lexa-api's HTTP handler already refuses every config write (and
+# therefore every restart request) on a commissioned unit, so a request
+# file should never exist here in that state — but the entire point of
+# moving this privilege OUT of lexa-api is to not have to trust lexa-api's
+# gate alone. A second, independent lock on the same door is the design,
+# not a redundant no-op.
+#
+# ALLOWLIST: closed, enumerated by hand in is_allowed() below — exactly
+# the six cmd/api/configwrite.go serviceUnit entries plus "api" itself.
+# An unrecognized name is NEVER executed; it is recorded as
+# "failed: not in allowlist" in the result file instead. Re-derive this
+# list from that map before changing it — same discipline the deleted
+# sudoers fragment's header asked for (systemd/sudoers.d-lexa-api, kept
+# only in git history now).
+#
+# ORDERING: "api" is always processed LAST, and the result file is
+# written (and the request file removed) covering every OTHER service
+# BEFORE lexa-api is ever touched. Restarting lexa-api briefly takes it
+# down; a wizard polling defaultRestartRunner's poll loop for the other
+# six services must not lose their already-durable results waiting on
+# that. lexa-api's own self-restart (cmd/api/configwrite.go's
+# handleAPISecretWrite) never polls its own result at all — see that
+# function's doc comment for why — but a wizard restarting several
+# services in one commissioning pass, api included, still needs the
+# non-api results written down first regardless.
+#
+# lexa-api IS a legal target here, unlike the deleted sudoers fragment
+# (which excluded it because lexa-api restarting itself INSIDE its own
+# HTTP handler would kill the very response reporting the restart). That
+# problem does not apply to this script: it is an entirely separate
+# process, so restarting lexa-api from here is safe — this is what closes
+# 4.4's "lexa-api can never restart itself" gap. A commissioning wizard
+# should poll for lexa-api coming back (e.g. GET /healthz) rather than
+# expect a synchronous result for it.
+#
+# KNOWN LIMITATION (accepted for this unit's S-sized scope): if this
+# script itself crashes mid-run (after the interim result write but
+# before finishing), the request file is left untouched and the request
+# is effectively stuck until this service is re-triggered (a fresh write
+# to the request file, or a manual `systemctl start lexa-commission`).
+# Re-running is always safe: restarting an already-restarted systemd unit
+# is idempotent, so no partial-run state is ever unsafe to redo.
+
+set -eu
+
+REQUEST_FILE="${LEXA_COMMISSION_REQUEST_FILE:-/var/lib/lexa/commission/restart.request}"
+RESULT_FILE="${LEXA_COMMISSION_RESULT_FILE:-/var/lib/lexa/commission/restart.result}"
+COMMISSIONED_MARKER="${LEXA_COMMISSIONED_MARKER:-/etc/lexa/commissioned}"
+
+log() {
+  # $1 = message. logger may not exist on every minimal image (see
+  # scripts/factory-reset.sh's identical guard); never let a missing or
+  # failing logger abort this script.
+  logger -t lexa-commission-apply -- "$1" 2>/dev/null || true
+  echo "lexa-commission-apply: $1"
+}
+
+# is_allowed: exit 0 iff $1 is exactly one of the seven bare service
+# names this codebase ships. Deliberately a fixed enumeration, never a
+# glob/wildcard — see this file's header.
+is_allowed() {
+  case "$1" in
+    hub|northbound|modbus|ocpp|telemetry|cloudlink|api) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# sanitize: $1 = raw text (may contain newlines/quotes/backslashes
+# captured from a subprocess's stderr) -> a single-line fragment safe to
+# embed inside a JSON string body. Only REMOVES characters a JSON string
+# can't contain raw; the caller supplies the surrounding quotes.
+sanitize() {
+  printf '%s' "$1" | tr '\n\r\t' '   ' | tr -d '"\\'
+}
+
+# write_result: $1 = the accumulated `"svc":"status"` comma-joined body
+# (may be empty). Atomic tmp+rename, same discipline as
+# cmd/api/configwrite.go's writeStagedThenRename.
+write_result() {
+  ts=$(date +%s)
+  tmp="${RESULT_FILE}.tmp.$$"
+  printf '{"ts":%s,"results":{%s}}\n' "$ts" "$1" > "$tmp"
+  mv -f -- "$tmp" "$RESULT_FILE"
+}
+
+# process_name: $1 = a bare name already known to be non-"api" OR "api"
+# itself (this function's restart logic is identical either way; only
+# the caller's ordering around it differs). Sets STATUS_JSON to a
+# `"name":"status"` fragment; never touches $REQUEST_FILE.
+process_name() {
+  name="$1"
+  if ! is_allowed "$name"; then
+    log "REJECTED $name: not in allowlist"
+    STATUS_JSON="\"$name\":\"failed: not in allowlist\""
+    return 0
+  fi
+  unit="lexa-$name"
+  if out=$(timeout 30 systemctl restart "$unit" 2>&1); then
+    log "restarted $unit"
+    STATUS_JSON="\"$name\":\"ok\""
+    return 0
+  fi
+  rc=$?
+  detail=$(sanitize "$out")
+  if [ "$rc" -eq 124 ]; then
+    log "TIMEOUT restarting $unit after 30s: $detail"
+    STATUS_JSON="\"$name\":\"failed: timed out after 30s: $detail\""
+  else
+    log "FAILED to restart $unit (exit $rc): $detail"
+    STATUS_JSON="\"$name\":\"failed: exit $rc: $detail\""
+  fi
+}
+
+if [ -e "$COMMISSIONED_MARKER" ]; then
+  log "refusing: unit is commissioned ($COMMISSIONED_MARKER present) -- restart triggers are commissioning-only, mirroring cmd/api/configwrite.go's own gate"
+  exit 0
+fi
+
+if [ ! -e "$REQUEST_FILE" ]; then
+  # Nothing to do -- a clean, expected exit (missing request = no-op per
+  # this unit's spec; also covers PathExists='s belt-and-braces firing
+  # with nothing pending, and a re-run after a prior run already
+  # consumed the file).
+  exit 0
+fi
+
+# Snapshot the request NOW: a fresh write racing in after this point is
+# picked up by the NEXT trigger (systemd re-evaluates PathChanged= once
+# this unit exits), never lost, never half-processed in this run.
+names=$(cat "$REQUEST_FILE")
+
+body=""
+sep=""
+seen=""
+api_requested=0
+
+for name in $names; do
+  case " $seen " in
+    *" $name "*) continue ;;
+  esac
+  seen="$seen $name"
+
+  if [ "$name" = "api" ]; then
+    api_requested=1
+    continue
+  fi
+
+  process_name "$name"
+  body="${body}${sep}${STATUS_JSON}"
+  sep=","
+done
+
+# Durable BEFORE lexa-api is ever touched -- see this file's header
+# ("ORDERING").
+write_result "$body"
+
+if [ "$api_requested" -eq 1 ]; then
+  process_name "api"
+  body="${body}${sep}${STATUS_JSON}"
+  write_result "$body"
+fi
+
+rm -f -- "$REQUEST_FILE"
+log "processed request; request file removed"

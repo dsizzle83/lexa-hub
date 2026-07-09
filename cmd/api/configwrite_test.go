@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -27,6 +28,33 @@ func useTempConfigWriteDir(t *testing.T) string {
 	configWriteDir = dir
 	t.Cleanup(func() { configWriteDir = orig })
 	return dir
+}
+
+// useTempCommissionDir points commissionDir (unit 4.5's restart-request/
+// result file directory) at a fresh temp directory for the duration of the
+// test — mirrors useTempConfigWriteDir's convention exactly.
+func useTempCommissionDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	orig := commissionDir
+	commissionDir = dir
+	t.Cleanup(func() { commissionDir = orig })
+	return dir
+}
+
+// writeCommissionResult writes commissionDir/restart.result directly (as
+// scripts/lexa-commission-apply would, in production) so a test can hand
+// defaultRestartRunner's poll loop a scripted result without a real script
+// or systemctl anywhere nearby.
+func writeCommissionResult(t *testing.T, ts int64, results map[string]string) {
+	t.Helper()
+	body, err := json.Marshal(commissionResult{TS: ts, Results: results})
+	if err != nil {
+		t.Fatalf("marshal commissionResult: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(commissionDir, commissionResultFile), body, 0o640); err != nil {
+		t.Fatalf("write restart.result: %v", err)
+	}
 }
 
 // useUncommissioned points commissionedMarkerPath at a path that does not
@@ -652,62 +680,174 @@ func TestConfigWriteHandler_RestartOutcomes(t *testing.T) {
 	}
 }
 
-// TestDefaultRestartRunner_ExecSeam exercises the REAL defaultRestartRunner
-// (not the restartRunner function-value seam) via its command/timeout vars,
-// pointed at harmless shell one-liners instead of a live sudo/systemctl —
-// pins the success, failure, and timeout paths of the actual subprocess
-// plumbing (context deadline, CombinedOutput, exit-status detection).
-func TestDefaultRestartRunner_ExecSeam(t *testing.T) {
-	origName, origArgs, origTimeout := restartCmdName, restartCmdArgs, restartTimeout
-	defer func() {
-		restartCmdName, restartCmdArgs, restartTimeout = origName, origArgs, origTimeout
-	}()
+// TestDefaultRestartRunner_FileProtocol exercises the REAL
+// defaultRestartRunner (not the restartRunner function-value seam) against
+// the unit 4.5 file protocol — commissionDir pointed at a temp directory,
+// restartTimeout/restartPollInterval shrunk so the test runs fast. This
+// replaces the old TestDefaultRestartRunner_ExecSeam (which exercised a
+// sudo/systemctl subprocess directly): defaultRestartRunner no longer execs
+// anything itself — it writes a request file and polls a result file that
+// scripts/lexa-commission-apply would write in production, so these tests
+// write that result file directly instead.
+func TestDefaultRestartRunner_FileProtocol(t *testing.T) {
+	origTimeout, origPoll := restartTimeout, restartPollInterval
+	defer func() { restartTimeout, restartPollInterval = origTimeout, origPoll }()
+	restartPollInterval = 10 * time.Millisecond
 
 	t.Run("success", func(t *testing.T) {
-		restartCmdName = "sh"
-		restartCmdArgs = []string{"-c", "exit 0"}
+		dir := useTempCommissionDir(t)
 		restartTimeout = 2 * time.Second
+
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			writeCommissionResult(t, time.Now().Unix()+1, map[string]string{"hub": "ok"})
+		}()
+
 		ok, detail := defaultRestartRunner("lexa-hub")
 		if !ok {
 			t.Fatalf("ok = false, want true: %s", detail)
 		}
+		if detail != "restarted lexa-hub" {
+			t.Errorf("detail = %q, want %q", detail, "restarted lexa-hub")
+		}
+
+		reqBody, err := os.ReadFile(filepath.Join(dir, commissionRequestFile))
+		if err != nil {
+			t.Fatalf("read request file: %v", err)
+		}
+		if strings.TrimSpace(string(reqBody)) != "hub" {
+			t.Errorf("request file = %q, want bare name %q", reqBody, "hub")
+		}
 	})
 
 	t.Run("failure", func(t *testing.T) {
-		restartCmdName = "sh"
-		restartCmdArgs = []string{"-c", "echo boom-detail >&2; exit 1"}
+		useTempCommissionDir(t)
 		restartTimeout = 2 * time.Second
+
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			writeCommissionResult(t, time.Now().Unix()+1, map[string]string{"hub": "failed: exit 1: unit not found"})
+		}()
+
 		ok, detail := defaultRestartRunner("lexa-hub")
 		if ok {
-			t.Fatal("ok = true, want false for a non-zero exit")
+			t.Fatal("ok = true, want false for a failed result")
 		}
-		if !strings.Contains(detail, "boom-detail") {
-			t.Errorf("detail = %q, want it to include the subprocess's stderr", detail)
+		if !strings.Contains(detail, "unit not found") {
+			t.Errorf("detail = %q, want it to include the script's failure detail", detail)
 		}
 	})
 
 	t.Run("timeout", func(t *testing.T) {
-		restartCmdName = "sh"
-		restartCmdArgs = []string{"-c", "sleep 5"}
-		restartTimeout = 50 * time.Millisecond
+		useTempCommissionDir(t)
+		restartTimeout = 60 * time.Millisecond
+		// No result ever written — the root oneshot never ran (or hasn't
+		// gotten to it yet); the poll must give up honestly.
 		ok, detail := defaultRestartRunner("lexa-hub")
 		if ok {
 			t.Fatal("ok = true, want false on timeout")
 		}
-		if !strings.Contains(detail, "timed out") {
-			t.Errorf("detail = %q, want it to mention a timeout", detail)
+		if detail != "restart requested; result pending — poll /status or retry" {
+			t.Errorf("detail = %q, want the pending-result message", detail)
 		}
 	})
+
+	// STALE RESULTS MUST NEVER BE READ AS FRESH: a result file left over
+	// from an EARLIER restart of the same service (ts before this call's
+	// own request) must be ignored — proven by observing the runner is
+	// STILL polling well after a stale entry already exists, and only
+	// returns once a result with a ts at/after the request is written.
+	t.Run("stale result from a prior cycle is ignored until a fresh one appears", func(t *testing.T) {
+		dir := useTempCommissionDir(t)
+		restartTimeout = 2 * time.Second
+		writeCommissionResult(t, time.Now().Add(-time.Hour).Unix(), map[string]string{"hub": "ok"})
+
+		type outcome struct {
+			ok     bool
+			detail string
+		}
+		resultCh := make(chan outcome, 1)
+		go func() {
+			ok, detail := defaultRestartRunner("lexa-hub")
+			resultCh <- outcome{ok, detail}
+		}()
+
+		select {
+		case r := <-resultCh:
+			t.Fatalf("returned early (%+v) based on a stale result — request file: %s", r, mustReadFile(t, filepath.Join(dir, commissionRequestFile)))
+		case <-time.After(80 * time.Millisecond):
+			// expected: still polling past the stale entry
+		}
+
+		writeCommissionResult(t, time.Now().Unix()+1, map[string]string{"hub": "ok"})
+
+		select {
+		case r := <-resultCh:
+			if !r.ok {
+				t.Fatalf("ok = false after a fresh result, want true: %s", r.detail)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("did not pick up the fresh result before restartTimeout")
+		}
+	})
+}
+
+func mustReadFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "<absent>"
+	}
+	return string(b)
+}
+
+// TestRequestRestart_ProtocolShape pins the request-file format itself:
+// bare names (no "lexa-" prefix), one per line, appended across calls, and
+// deduplicated for a name already pending.
+func TestRequestRestart_ProtocolShape(t *testing.T) {
+	dir := useTempCommissionDir(t)
+
+	if err := requestRestart("hub"); err != nil {
+		t.Fatalf("requestRestart(hub): %v", err)
+	}
+	got := mustReadFile(t, filepath.Join(dir, commissionRequestFile))
+	if strings.TrimSpace(got) != "hub" {
+		t.Fatalf("after one request, file = %q, want %q", got, "hub")
+	}
+
+	if err := requestRestart("northbound"); err != nil {
+		t.Fatalf("requestRestart(northbound): %v", err)
+	}
+	got = mustReadFile(t, filepath.Join(dir, commissionRequestFile))
+	fields := strings.Fields(got)
+	if len(fields) != 2 || fields[0] != "hub" || fields[1] != "northbound" {
+		t.Fatalf("after two requests, file = %q, want lines [hub northbound]", got)
+	}
+
+	// Re-requesting "hub" while it is still pending must not duplicate it.
+	if err := requestRestart("hub"); err != nil {
+		t.Fatalf("requestRestart(hub) again: %v", err)
+	}
+	got = mustReadFile(t, filepath.Join(dir, commissionRequestFile))
+	fields = strings.Fields(got)
+	if len(fields) != 2 {
+		t.Fatalf("after a duplicate request, file = %q, want still exactly [hub northbound]", got)
+	}
 }
 
 // --- api-secret rotation ----------------------------------------------------
 
 // TestAPISecretRotation_WritesFileWithRestrictiveModeAndNoRestart pins the
-// api-secret branch's whole shape: 0600 mode, no restart attempted ever
-// (even a runner that would fail the test if called), and the specific
-// "restart lexa-api manually" detail message.
+// api-secret branch's whole shape: 0600 mode, the injected restart runner
+// seam is NEVER called (api-secret doesn't use it — unchanged from before
+// unit 4.5), and the specific "connection will drop" detail message. Unit
+// 4.5 changed WHAT actually requests the restart (a commission-trigger
+// file write, asserted below) and the detail text, but not the {Written:
+// true, Restarted:false} shape or the "never call the injected runner"
+// invariant.
 func TestAPISecretRotation_WritesFileWithRestrictiveModeAndNoRestart(t *testing.T) {
 	useUncommissioned(t)
+	commissionDirTmp := useTempCommissionDir(t)
 	dir := t.TempDir()
 	secretPath := filepath.Join(dir, "api-secret")
 	if err := os.WriteFile(secretPath, []byte("old-secret\n"), 0o600); err != nil {
@@ -723,7 +863,7 @@ func TestAPISecretRotation_WritesFileWithRestrictiveModeAndNoRestart(t *testing.
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
 	if calledRestart {
-		t.Fatal("restart runner was called for api-secret — lexa-api must never try to restart itself")
+		t.Fatal("the injected restart runner was called for api-secret — that seam is only for the generic six-service path")
 	}
 	var resp configWriteResp
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
@@ -732,8 +872,8 @@ func TestAPISecretRotation_WritesFileWithRestrictiveModeAndNoRestart(t *testing.
 	if !resp.Written || resp.Restarted {
 		t.Fatalf("resp = %+v, want {Written:true Restarted:false}", resp)
 	}
-	if !strings.Contains(resp.Detail, "restart lexa-api manually") {
-		t.Errorf("Detail = %q, want it to instruct a manual restart", resp.Detail)
+	if resp.Detail != "restart requested via commissioning trigger; connection will drop" {
+		t.Errorf("Detail = %q, want the commissioning-trigger message", resp.Detail)
 	}
 
 	info, err := os.Stat(secretPath)
@@ -750,6 +890,15 @@ func TestAPISecretRotation_WritesFileWithRestrictiveModeAndNoRestart(t *testing.
 	if strings.TrimSpace(string(got)) != "new-secret-value" {
 		t.Errorf("secret file content = %q, want %q", strings.TrimSpace(string(got)), "new-secret-value")
 	}
+
+	// The self-restart DOES go through the same commissioning-trigger file
+	// the generic six-service path uses — this is the new part unit 4.5
+	// adds: "api" is a legal bare name in restart.request even though it's
+	// never a legal serviceUnit key.
+	reqBody := mustReadFile(t, filepath.Join(commissionDirTmp, commissionRequestFile))
+	if strings.TrimSpace(reqBody) != "api" {
+		t.Errorf("commission request file = %q, want bare name %q", reqBody, "api")
+	}
 }
 
 // TestAPISecretRotation_OldTokenStillWorksUntilRestart pins the DOCUMENTED
@@ -761,6 +910,7 @@ func TestAPISecretRotation_WritesFileWithRestrictiveModeAndNoRestart(t *testing.
 func TestAPISecretRotation_OldTokenStillWorksUntilRestart(t *testing.T) {
 	useUncommissioned(t)
 	useTempConfigWriteDir(t)
+	useTempCommissionDir(t) // the api-secret rotation below now also requests a self-restart (unit 4.5)
 	dir := t.TempDir()
 	secretPath := filepath.Join(dir, "api-secret")
 	oldToken := "old-token-from-startup"
@@ -853,6 +1003,7 @@ func TestAPISecretRotation_EmptyBodyRejected(t *testing.T) {
 // journals a config_write event (service="api-secret") with correct shas.
 func TestAPISecretRotation_Journaled(t *testing.T) {
 	useUncommissioned(t)
+	useTempCommissionDir(t) // the api-secret rotation now also requests a self-restart (unit 4.5)
 	dir := t.TempDir()
 	secretPath := filepath.Join(dir, "api-secret")
 	if err := os.WriteFile(secretPath, []byte("old\n"), 0o600); err != nil {
@@ -952,4 +1103,220 @@ func TestConfigSchemasLoadForEverySix(t *testing.T) {
 	if len(configSchemas) != len(serviceUnit) {
 		t.Errorf("configSchemas has %d entries, serviceUnit has %d", len(configSchemas), len(serviceUnit))
 	}
+}
+
+// --- scripts/lexa-commission-apply smoke test (unit 4.5) -------------------
+//
+// These tests shell the REAL script (not a Go reimplementation of its
+// logic) against a fake systemctl/logger on PATH and temp request/result/
+// commissioned-marker paths, via the script's own
+// LEXA_COMMISSION_REQUEST_FILE/LEXA_COMMISSION_RESULT_FILE/
+// LEXA_COMMISSIONED_MARKER env overrides — the closest this package can
+// get to proving the shell side of unit 4.5's protocol matches the Go
+// side (commissionRequestFile/commissionResultFile/commissionResult
+// above) without a live systemd or root.
+
+// commissionApplyScriptPath resolves scripts/lexa-commission-apply's real
+// path relative to this package's test working directory (cmd/api).
+func commissionApplyScriptPath(t *testing.T) string {
+	t.Helper()
+	path, err := filepath.Abs(filepath.Join("..", "..", "scripts", "lexa-commission-apply"))
+	if err != nil {
+		t.Fatalf("resolve script path: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("scripts/lexa-commission-apply not found at %s: %v", path, err)
+	}
+	return path
+}
+
+// TestLexaCommissionApplyScript_ShSyntaxOK is the "sh -n" syntax check the
+// task's VERIFY step calls for, pinned as a real go test so CI catches a
+// syntax regression here the same way it catches a Go compile error
+// anywhere else in this repo.
+func TestLexaCommissionApplyScript_ShSyntaxOK(t *testing.T) {
+	script := commissionApplyScriptPath(t)
+	out, err := exec.Command("sh", "-n", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("sh -n %s: %v: %s", script, err, out)
+	}
+}
+
+// writeFakeExecutable writes a POSIX sh script to dir/name with the given
+// body appended after a shebang, mode 0755.
+func writeFakeExecutable(t *testing.T, dir, name, body string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatalf("write fake %s: %v", name, err)
+	}
+}
+
+// fakeSystemctlScript is a scripted double for `systemctl restart <unit>`:
+// "lexa-northbound" fails (simulating a real systemctl error), every
+// other "restart <unit>" succeeds, and every invocation (successful or
+// not) is appended to $FAKE_SYSTEMCTL_LOG when set — so a test can assert
+// exactly which units were restarted, in what order, without a real
+// systemd anywhere nearby.
+const fakeSystemctlScript = `
+if [ -n "${FAKE_SYSTEMCTL_LOG:-}" ]; then
+  echo "$*" >> "$FAKE_SYSTEMCTL_LOG"
+fi
+case "$1 $2" in
+  "restart lexa-northbound")
+    echo "Unit lexa-northbound.service not found." >&2
+    exit 1
+    ;;
+  "restart "*)
+    exit 0
+    ;;
+  *)
+    echo "fake systemctl: unsupported invocation: $*" >&2
+    exit 2
+    ;;
+esac
+`
+
+// TestLexaCommissionApplyScript_EndToEnd exercises the full protocol: a
+// mixed request (a service that succeeds, one that fails, one not in the
+// allowlist, and "api" itself submitted FIRST in the file to prove the
+// script reorders it to run LAST), the commissioned-unit refusal gate,
+// and the missing-request-file no-op.
+func TestLexaCommissionApplyScript_EndToEnd(t *testing.T) {
+	script := commissionApplyScriptPath(t)
+
+	t.Run("mixed request: ok, failed, not-in-allowlist, api-last", func(t *testing.T) {
+		fakeBin := t.TempDir()
+		callsLog := filepath.Join(t.TempDir(), "systemctl-calls.log")
+		writeFakeExecutable(t, fakeBin, "logger", "exit 0\n")
+		writeFakeExecutable(t, fakeBin, "systemctl", fakeSystemctlScript)
+
+		commissionDir := t.TempDir()
+		reqPath := filepath.Join(commissionDir, commissionRequestFile)
+		resultPath := filepath.Join(commissionDir, commissionResultFile)
+		markerPath := filepath.Join(t.TempDir(), "commissioned") // absent -> uncommissioned
+
+		// "api" listed FIRST on purpose: the script must still process it
+		// LAST regardless of input order (see the script's header,
+		// "ORDERING").
+		if err := os.WriteFile(reqPath, []byte("api\nhub\nnorthbound\ntotally-bogus\n"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+
+		cmd := exec.Command("sh", script)
+		cmd.Env = append(os.Environ(),
+			"PATH="+fakeBin+":"+os.Getenv("PATH"),
+			"LEXA_COMMISSION_REQUEST_FILE="+reqPath,
+			"LEXA_COMMISSION_RESULT_FILE="+resultPath,
+			"LEXA_COMMISSIONED_MARKER="+markerPath,
+			"FAKE_SYSTEMCTL_LOG="+callsLog,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("script failed: %v: %s", err, out)
+		}
+
+		if _, err := os.Stat(reqPath); !os.IsNotExist(err) {
+			t.Errorf("request file still exists after processing: %v", err)
+		}
+
+		resultBody, err := os.ReadFile(resultPath)
+		if err != nil {
+			t.Fatalf("read result file: %v", err)
+		}
+		var res commissionResult
+		if err := json.Unmarshal(resultBody, &res); err != nil {
+			t.Fatalf("result file is not valid JSON: %v\n%s", err, resultBody)
+		}
+		if res.TS <= 0 {
+			t.Errorf("ts = %d, want a positive unix timestamp", res.TS)
+		}
+		want := map[string]string{
+			"hub":           "ok",
+			"api":           "ok",
+			"totally-bogus": "failed: not in allowlist",
+		}
+		for name, wantStatus := range want {
+			if got := res.Results[name]; got != wantStatus {
+				t.Errorf("results[%q] = %q, want %q", name, got, wantStatus)
+			}
+		}
+		if got := res.Results["northbound"]; !strings.Contains(got, "failed:") || !strings.Contains(got, "not found") {
+			t.Errorf("results[northbound] = %q, want a failed: ... detail mentioning the fake systemctl's stderr", got)
+		}
+
+		callsRaw, err := os.ReadFile(callsLog)
+		if err != nil {
+			t.Fatalf("read fake systemctl calls log: %v", err)
+		}
+		calls := strings.Split(strings.TrimSpace(string(callsRaw)), "\n")
+		if len(calls) != 3 {
+			t.Fatalf("systemctl called %d times %v, want exactly 3 (hub, northbound, api — never the not-allowlisted name)", len(calls), calls)
+		}
+		if calls[len(calls)-1] != "restart lexa-api" {
+			t.Errorf("last systemctl call = %q, want %q (api must be restarted LAST)", calls[len(calls)-1], "restart lexa-api")
+		}
+	})
+
+	t.Run("commissioned unit refuses and never touches systemctl", func(t *testing.T) {
+		fakeBin := t.TempDir()
+		callsLog := filepath.Join(t.TempDir(), "systemctl-calls.log")
+		writeFakeExecutable(t, fakeBin, "logger", "exit 0\n")
+		writeFakeExecutable(t, fakeBin, "systemctl", fakeSystemctlScript)
+
+		commissionDir := t.TempDir()
+		reqPath := filepath.Join(commissionDir, commissionRequestFile)
+		resultPath := filepath.Join(commissionDir, commissionResultFile)
+		markerPath := filepath.Join(t.TempDir(), "commissioned")
+		if err := os.WriteFile(markerPath, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(reqPath, []byte("hub\n"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+
+		cmd := exec.Command("sh", script)
+		cmd.Env = append(os.Environ(),
+			"PATH="+fakeBin+":"+os.Getenv("PATH"),
+			"LEXA_COMMISSION_REQUEST_FILE="+reqPath,
+			"LEXA_COMMISSION_RESULT_FILE="+resultPath,
+			"LEXA_COMMISSIONED_MARKER="+markerPath,
+			"FAKE_SYSTEMCTL_LOG="+callsLog,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("script failed: %v: %s", err, out)
+		}
+
+		if _, err := os.Stat(reqPath); err != nil {
+			t.Errorf("request file was removed/modified on a commissioned unit: %v", err)
+		}
+		if _, err := os.Stat(resultPath); !os.IsNotExist(err) {
+			t.Errorf("result file was written on a commissioned unit: %v", err)
+		}
+		if _, err := os.Stat(callsLog); !os.IsNotExist(err) {
+			t.Errorf("systemctl was invoked on a commissioned unit (calls log exists)")
+		}
+	})
+
+	t.Run("missing request file exits cleanly", func(t *testing.T) {
+		commissionDir := t.TempDir()
+		reqPath := filepath.Join(commissionDir, commissionRequestFile) // never created
+		resultPath := filepath.Join(commissionDir, commissionResultFile)
+		markerPath := filepath.Join(t.TempDir(), "commissioned")
+
+		cmd := exec.Command("sh", script)
+		cmd.Env = append(os.Environ(),
+			"LEXA_COMMISSION_REQUEST_FILE="+reqPath,
+			"LEXA_COMMISSION_RESULT_FILE="+resultPath,
+			"LEXA_COMMISSIONED_MARKER="+markerPath,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("script failed on a missing request file: %v: %s", err, out)
+		}
+		if _, err := os.Stat(resultPath); !os.IsNotExist(err) {
+			t.Errorf("result file was written despite no request ever existing: %v", err)
+		}
+	})
 }

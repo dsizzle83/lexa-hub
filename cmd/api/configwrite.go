@@ -17,16 +17,28 @@ package main
 //  5. write  — sha256(before) → staged file (0640, fsynced) → rename →
 //              sha256(after)
 //  6. journal — config_write{service, actor, before_sha256, after_sha256}
-//  7. restart — sudo -n systemctl restart lexa-<service> (skipped entirely
-//              for api-secret: lexa-api cannot safely restart itself
-//              mid-response)
+//  7. restart — request via the privilege-free commissioning trigger (unit
+//              4.5): append the bare service name to
+//              /var/lib/lexa/commission/restart.request (tmp+rename) and
+//              poll restart.result for this service's entry, up to
+//              restartTimeout. A root-owned systemd .path unit
+//              (systemd/lexa-commission.path -> lexa-commission.service ->
+//              scripts/lexa-commission-apply) does the actual `systemctl
+//              restart` from a closed allowlist — lexa-api itself never
+//              escalates privilege (NoNewPrivileges=yes,
+//              systemd/lexa-api.service; see that unit's comment block).
+//              This replaces a sudo-based restart (systemd/sudoers.d-
+//              lexa-api, DELETED) that NoNewPrivileges blocked by design.
+//              The api-secret case now ALSO requests a restart through the
+//              SAME file (of "api" itself, uniquely legal here since the
+//              actual restart runs in an external process) but never
+//              polls for the outcome — see handleAPISecretWrite.
 //
 // Callers wrap this handler in requireBearerStrict (main.go): the bearer
 // token is required on this route even while the unit is uncommissioned —
 // it is the per-unit label secret, not a "commissioning implies trusted"
 // bypass.
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -36,10 +48,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"lexa-hub/configs/schema"
@@ -135,44 +147,153 @@ type configWriteResp struct {
 }
 
 // restartRunner executes the restart step and reports its outcome. A
-// function value (not exec.Command called inline in the handler) so tests
-// can substitute a scripted double (success/failure/timeout) without
-// spawning a real sudo/systemctl subprocess — see configwrite_test.go's
-// fakeRestartRunner.
+// function value (not the file-write-and-poll sequence called inline in
+// the handler) so tests can substitute a scripted double
+// (success/failure/timeout) without ever touching the real
+// /var/lib/lexa/commission files or a live lexa-commission-apply — see
+// configwrite_test.go's recordingRestartRunner.
 type restartRunner func(unit string) (ok bool, detail string)
 
-// restartCmdName/restartCmdArgs/restartTimeout name the subprocess
-// defaultRestartRunner execs and how long it waits — vars, not inlined
-// literals, purely so a test can point them at a harmless local command
-// (e.g. "sh -c") and a short timeout to exercise the REAL
-// timeout/error-capture/success plumbing below without ever installing a
-// live sudoers fragment or systemd unit. Production always runs with the
-// defaults set here.
+// commissionDir locates the commissioning restart trigger's request/result
+// files (unit 4.5) — a var (not const), matching configWriteDir's
+// convention, so tests can point it at a temp directory instead of the
+// real /var/lib/lexa/commission. restartTimeout/restartPollInterval bound
+// how long defaultRestartRunner polls restart.result before reporting a
+// timeout — also vars, so a test can shrink both instead of waiting out a
+// real 15s bound. Production always runs with the defaults set here.
 var (
-	restartCmdName = "sudo"
-	restartCmdArgs = []string{"-n", "/bin/systemctl", "restart"}
-	restartTimeout = 15 * time.Second
+	commissionDir       = "/var/lib/lexa/commission"
+	restartTimeout      = 15 * time.Second
+	restartPollInterval = 500 * time.Millisecond
 )
 
-// defaultRestartRunner runs `sudo -n /bin/systemctl restart <unit>` (§4.5
-// point 5), authorized by the shipped systemd/sudoers.d-lexa-api fragment
-// (installed as /etc/sudoers.d/lexa-api). A restart failure is reported
-// honestly in the response but is NEVER a write failure — the config is
-// already committed to disk by the time this runs (see configWriteHandler:
-// write, then journal, then restart, in that order).
-func defaultRestartRunner(unit string) (bool, string) {
-	ctx, cancel := context.WithTimeout(context.Background(), restartTimeout)
-	defer cancel()
-	args := append(append([]string{}, restartCmdArgs...), unit)
-	cmd := exec.CommandContext(ctx, restartCmdName, args...)
-	out, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return false, fmt.Sprintf("restart of %s timed out after %s", unit, restartTimeout)
+// commissionRequestFile/commissionResultFile are the two file BASE NAMES
+// (joined onto commissionDir) the protocol uses — see
+// scripts/lexa-commission-apply's header for the full protocol writeup
+// shared between that script and this file.
+const (
+	commissionRequestFile = "restart.request"
+	commissionResultFile  = "restart.result"
+)
+
+// commissionWriteMu serializes read-modify-write access to the request
+// file across concurrent HTTP handler goroutines within this ONE lexa-api
+// process (net/http runs each request in its own goroutine, and two
+// commissioning config writes landing back-to-back would otherwise race
+// on the read-append-rename below). It says nothing about the root
+// oneshot on the other end of the file, which only ever reads-then-removes
+// it — no lock needed there since PathChanged= events serialize its runs.
+var commissionWriteMu sync.Mutex
+
+// commissionResult is restart.result's JSON shape, written by
+// scripts/lexa-commission-apply and read here: {"ts": <unix-seconds>,
+// "results": {"<svc>": "ok"|"failed: <detail>"}}. Results is keyed by the
+// SAME bare service name (hub|northbound|modbus|ocpp|telemetry|cloudlink|
+// api) the request file uses.
+type commissionResult struct {
+	TS      int64             `json:"ts"`
+	Results map[string]string `json:"results"`
+}
+
+// requestRestart appends bare (a bare service name, e.g. "hub" — NOT
+// "lexa-hub") to commissionDir/restart.request via tmp+rename, creating
+// the directory first if needed (§4.5 point 1: StateDirectory=lexa makes
+// /var/lib/lexa writable by this process; the "commission" subdirectory
+// itself is this function's job to create, not systemd's — the root
+// lexa-commission.service that later reads it never needs to create
+// anything, since it only ever runs once this directory already holds a
+// request). A name already pending is left alone rather than duplicated —
+// harmless either way since scripts/lexa-commission-apply's allowlist step
+// processes each line independently, but a duplicate line is wasted work
+// for no benefit.
+func requestRestart(bare string) error {
+	commissionWriteMu.Lock()
+	defer commissionWriteMu.Unlock()
+
+	if err := os.MkdirAll(commissionDir, 0o750); err != nil {
+		return fmt.Errorf("create %s: %w", commissionDir, err)
 	}
+	reqPath := filepath.Join(commissionDir, commissionRequestFile)
+	existing, err := os.ReadFile(reqPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read %s: %w", reqPath, err)
+	}
+	lines := strings.Fields(string(existing))
+	for _, name := range lines {
+		if name == bare {
+			return nil // already pending
+		}
+	}
+	lines = append(lines, bare)
+	data := []byte(strings.Join(lines, "\n") + "\n")
+	return writeStagedThenRename(reqPath, data, 0o640)
+}
+
+// readRestartResult looks up bare's entry in commissionDir/restart.result.
+// ok is false when the file is absent, unparsable, or has no entry for
+// bare yet — all three mean "nothing to report yet, keep polling" to
+// defaultRestartRunner's caller, not an error: the root oneshot may not
+// have run at all yet, may still be mid-run, or may be processing a
+// DIFFERENT service's line first (unit 4.5's api-last ordering,
+// scripts/lexa-commission-apply).
+func readRestartResult(bare string) (status string, ts int64, ok bool) {
+	data, err := os.ReadFile(filepath.Join(commissionDir, commissionResultFile))
 	if err != nil {
-		return false, fmt.Sprintf("restart of %s failed: %v: %s", unit, err, strings.TrimSpace(string(out)))
+		return "", 0, false
 	}
-	return true, fmt.Sprintf("restarted %s", unit)
+	var res commissionResult
+	if err := json.Unmarshal(data, &res); err != nil {
+		return "", 0, false
+	}
+	status, present := res.Results[bare]
+	return status, res.TS, present
+}
+
+// defaultRestartRunner requests a restart via the privilege-free
+// commissioning trigger (unit 4.5): lexa-api runs unprivileged
+// (NoNewPrivileges=yes, systemd/lexa-api.service) and can no longer sudo
+// into systemctl — that path is deleted (systemd/sudoers.d-lexa-api, see
+// its header for why it existed and this comment for why it's gone).
+// Instead this appends unit's bare name to restart.request and polls
+// restart.result for that name's entry, up to restartTimeout
+// (restartPollInterval between reads), returning the SAME (ok, detail)
+// shape the old sudo-exec implementation did — every caller
+// (configWriteHandler's `run(unit)`) is unchanged. A restart failure or
+// timeout is reported honestly in the response but is NEVER a write
+// failure — the config is already committed to disk by the time this
+// runs (see configWriteHandler: write, then journal, then restart, in
+// that order).
+//
+// reqAt (captured BEFORE the request is written, not after) guards
+// against reading a STALE result left over from an earlier restart of the
+// same service: scripts/lexa-commission-apply always removes the request
+// file after writing a fresh result, but this process has no way to tell
+// "the file I see now is fresh" from "the file I see now is yesterday's"
+// except by timestamp — a result whose ts predates this call's own
+// request can only be leftover from a PRIOR cycle, so it is treated as
+// not-yet-answered and polling continues rather than returning a false
+// positive.
+func defaultRestartRunner(unit string) (bool, string) {
+	bare := strings.TrimPrefix(unit, "lexa-")
+	reqAt := time.Now().Unix()
+
+	if err := requestRestart(bare); err != nil {
+		return false, fmt.Sprintf("could not request restart of %s: %v", unit, err)
+	}
+
+	deadline := time.Now().Add(restartTimeout)
+	for {
+		if status, ts, ok := readRestartResult(bare); ok && ts >= reqAt {
+			if status == "ok" {
+				return true, fmt.Sprintf("restarted %s", unit)
+			}
+			return false, fmt.Sprintf("restart of %s %s", unit, status)
+		}
+		if time.Now().After(deadline) {
+			return false, "restart requested; result pending — poll /status or retry"
+		}
+		time.Sleep(restartPollInterval)
+	}
 }
 
 // configWriteHandler serves POST /config/{service} (DEVICE_ROADMAP.md §4.5).
@@ -333,9 +454,25 @@ func configWriteHandler(apiSecretPath string, jw *journal.Writer, run restartRun
 // handleAPISecretWrite implements the "api-secret" case (§4.5 point 1): the
 // body is NOT a JSON config — it IS the new bearer token, plain text, ≤128
 // bytes — written straight to apiSecretPath (lexa-api's own
-// Config.APITokenFile). No restart is ever attempted (§4.5 point 5): lexa-api
-// restarting itself mid-request would kill the very HTTP connection carrying
-// this response.
+// Config.APITokenFile).
+//
+// Unlike every other service, "api" IS a legal restart-trigger target
+// under unit 4.5 — scripts/lexa-commission-apply runs it LAST and
+// documents why: restarting lexa-api happens in an entirely SEPARATE root
+// process, not inside this handler's own goroutine, so — unlike the old
+// sudo-exec design this replaced — it no longer kills the very HTTP
+// response reporting the restart. This handler still never POLLS for that
+// restart's outcome the way configWriteHandler's defaultRestartRunner does
+// for the other six services, though: polling here would mean blocking
+// this goroutine until either a result appears or lexa-api itself is
+// killed by the restart it is waiting on — the second outcome is the
+// LIKELY one, and it would simply drop the connection mid-poll with no
+// response ever written, which is strictly worse than an honest,
+// immediate {restarted:false, "connection will drop"}. So the request is
+// fired (best-effort — see the error log below) and this handler returns
+// immediately; a commissioning wizard is expected to poll for lexa-api
+// coming back on its own (e.g. GET /healthz) rather than wait on this
+// response for it.
 //
 // Live-reload vs restart-required, documented (TESTS spec explicitly allows
 // either — this ships restart-required): main.go loads the bearer token
@@ -344,12 +481,14 @@ func configWriteHandler(apiSecretPath string, jw *journal.Writer, run restartRun
 // process's life. This write commits the NEW secret to disk immediately
 // (0600, matching the file's manufacturing-provisioned permissions) but does
 // NOT take effect for authentication until lexa-api itself restarts — which
-// is exactly the action this handler's own response asks the operator (or
-// the next commissioning step) to take. A live in-process reload would need
-// either a background re-read of the token file on every request (defeating
-// much of the point of comparing a fixed constant-time secret) or a
-// SIGHUP-style signal wired through main()'s wrapper closures — a materially
-// bigger change than this unit's bounded scope over cmd/api/main.go.
+// is exactly the restart this handler now requests via the SAME
+// commissioning-trigger file the generic config-write path uses (unit 4.5),
+// instead of asking the operator to do it by hand. A live in-process reload
+// would need either a background re-read of the token file on every request
+// (defeating much of the point of comparing a fixed constant-time secret) or
+// a SIGHUP-style signal wired through main()'s wrapper closures — a
+// materially bigger change than this unit's bounded scope over
+// cmd/api/main.go.
 // configwrite_test.go's TestAPISecretRotation_OldTokenStillWorksUntilRestart
 // pins this contract explicitly so it can't silently drift into looking like
 // a bug.
@@ -400,12 +539,21 @@ func handleAPISecretWrite(w http.ResponseWriter, r *http.Request, apiSecretPath 
 	}
 	writesCtr.Inc()
 
+	// Fire the self-restart request (best-effort: a failure here means the
+	// new secret is already safely on disk, just not yet requested to take
+	// effect — logged loudly rather than failing this already-succeeded
+	// write). See this function's doc comment for why this never polls for
+	// the outcome the way the generic configWriteHandler path does.
+	if err := requestRestart("api"); err != nil {
+		slog.Error("lexa-api: could not request self-restart via commissioning trigger", "route", "/config", "service", "api-secret", "err", err)
+	}
+
 	slog.Info("lexa-api: config write", "route", "/config", "service", "api-secret", "actor", actor,
 		"before_sha256", beforeSHA, "after_sha256", afterSHA, "restarted", false)
 	writeJSON(w, http.StatusOK, configWriteResp{
 		Written:   true,
 		Restarted: false,
-		Detail:    "restart lexa-api manually or via next commissioning step",
+		Detail:    "restart requested via commissioning trigger; connection will drop",
 	})
 }
 

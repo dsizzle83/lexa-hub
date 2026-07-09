@@ -33,12 +33,25 @@ ProtectSystem=strict
 # ReadWritePaths=/etc/lexa: the commissioning config-write path (unit 4.4,
 # POST /config/{service}) stages+renames /etc/lexa/<svc>.json and rotates
 # /etc/lexa/api-secret on UNCOMMISSIONED units. ProtectSystem=strict would
-# otherwise EROFS those writes. NOTE (unit 4.5, tracked): the sudo-based
-# service-restart step is still blocked by NoNewPrivileges above — kept
-# deliberately (this is the LAN-exposed service; we will NOT weaken it).
-# Until 4.5 lands a privilege-free restart mechanism (systemd path-unit
-# trigger), config writes report {restarted:false} honestly and the wizard
-# restarts services via its next step.
+# otherwise EROFS those writes.
+#
+# NoNewPrivileges=yes (unit 4.5, landed): a sudo-based restart step
+# (`sudo -n systemctl restart lexa-<service>`) used to run from inside
+# this same handler, authorized by systemd/sudoers.d-lexa-api — but that
+# fragment is now DELETED, because NoNewPrivileges above blocks sudo's
+# setuid escalation by design, and this IS the LAN-exposed service: we
+# will NOT weaken it to let that sudo call through. lexa-api now never
+# escalates privilege at all. Instead, cmd/api/configwrite.go's
+# defaultRestartRunner only WRITES a request file under
+# /var/lib/lexa/commission (covered by StateDirectory=lexa above, no
+# further sandbox carve-out needed) and polls for a result; a separate
+# root-owned systemd .path unit (systemd/lexa-commission.path ->
+# lexa-commission.service) watches that file and runs the actual
+# `systemctl restart` from a closed allowlist in
+# scripts/lexa-commission-apply. See that script's header for the full
+# protocol and why it is safe for lexa-api to request ITS OWN restart
+# through the same mechanism (unlike the deleted sudo path, which
+# excluded self-restart because it ran inside this process).
 ReadWritePaths=/etc/lexa
 ProtectHome=yes
 PrivateTmp=yes

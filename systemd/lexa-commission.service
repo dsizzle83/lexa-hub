@@ -1,0 +1,54 @@
+[Unit]
+# StartLimit* MUST live in [Unit] (systemd >=v230 ignores them in
+# [Service]); the default 5-in-10s (every other lexa-*.service's baseline,
+# V1RC FINDING A, 2026-07-06) would trip on a SINGLE commissioning
+# session — a wizard restarts several services in sequence (hub,
+# northbound, modbus, ocpp, telemetry, cloudlink, and finally api), each
+# landing its own line + PathChanged= trigger in cmd/api/configwrite.go's
+# requestRestart, in quick succession. Widened on both axes for that
+# burst, not because failures here are expected to be routine.
+StartLimitIntervalSec=60
+StartLimitBurst=20
+Description=LEXA commissioning restart trigger (root oneshot, unit 4.5)
+Documentation=https://github.com/lexa/lexa-hub
+
+[Service]
+Type=oneshot
+# Runs as root — no User=/Group= line. This is now the ONLY root-privileged
+# code path this codebase's commissioning restart flow executes, replacing
+# the sudo-based mechanism (systemd/sudoers.d-lexa-api, DELETED by this
+# same unit) that lexa-api.service's NoNewPrivileges=yes blocks by design.
+# Reviewed with the same discipline that sudoers fragment's header asked
+# for: the closed allowlist enumerating exactly which units this may
+# restart lives in scripts/lexa-commission-apply, NOT here — re-derive it
+# from cmd/api/configwrite.go's serviceUnit map (plus "api" itself) before
+# changing it.
+ExecStart=/usr/local/sbin/lexa-commission-apply
+
+# Hardened where this job's actual work allows it to be. It needs two
+# things beyond a bare sandbox: (a) `systemctl restart` — a connection to
+# systemd's private control socket (/run/systemd/private), which is a
+# Unix-domain socket CONNECT, not a filesystem write, so it is unaffected
+# by ProtectSystem=strict/ProtectHome/PrivateTmp below; and (b) read/write
+# access to /var/lib/lexa/commission specifically, carved out via
+# ReadWritePaths (mirrors lexa-migrate.service's identical
+# ProtectSystem=strict + ReadWritePaths=/etc/lexa pattern for its own
+# write-access carve-out). The leading "-" tolerates the directory not
+# existing yet on a run triggered by PathExists='s belt-and-braces case
+# before lexa-api has ever created it — see systemd.exec(5)'s
+# ReadWritePaths= "prefixed with '-'" behavior.
+ProtectSystem=strict
+ReadWritePaths=-/var/lib/lexa/commission
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# AF_UNIX covers both the systemctl control-socket connection above and
+# `logger`'s /dev/log write (scripts/lexa-commission-apply's log()
+# helper, same journal channel every other lexa-* operational script
+# uses, e.g. scripts/factory-reset.sh). No network access of any kind is
+# needed, unlike the six lexa-*.service units.
+RestrictAddressFamilies=AF_UNIX
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lexa-commission

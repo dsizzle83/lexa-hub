@@ -114,9 +114,11 @@ install-configs:
 # Install and enable systemd services
 install-services:
 	install -m 644 systemd/lexa-*.service $(SVCDIR)/
+	install -m 644 systemd/lexa-commission.path $(SVCDIR)/
+	install -m 755 scripts/lexa-commission-apply $(SBINDIR)/lexa-commission-apply
 	install -m 644 systemd/mosquitto-lexa.conf /etc/mosquitto/conf.d/lexa.conf
 	systemctl daemon-reload
-	systemctl enable mosquitto lexa-migrate lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-hub lexa-api lexa-cloudlink
+	systemctl enable mosquitto lexa-migrate lexa-commission.path lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-hub lexa-api lexa-cloudlink
 
 # Start all services (after install-services)
 start:
