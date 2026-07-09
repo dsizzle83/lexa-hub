@@ -69,9 +69,25 @@ type solarShell struct {
 
 	// desiredCeilingW is the standing ceiling the shell compares readbacks
 	// against, one-sided. Updated only when the core ACCEPTS a doc (or by the
-	// initial-desired seed) so a rejected/stale doc never moves it.
+	// initial-desired seed) so a rejected/stale doc never moves it — EXCEPT
+	// the one WS-2 fail-closed case standingIsSeed/reseedFromStaleDoc below
+	// documents.
 	desiredCeilingW    float64
 	haveDesiredCeiling bool
+
+	// standingIsSeed is true from seedRestoreCeiling until the reconciler
+	// core genuinely ACCEPTS a doc from the hub (setDesired's !rejected
+	// branch) — i.e. desiredCeilingW/haveDesiredCeiling reflect ONLY a
+	// synthetic startup seed, never a real hub opinion. WS-2 fail-closed
+	// fix: while this is true, a doc REJECTED FOR STALENESS is still the
+	// only information this process has ever seen about the hub's real
+	// intent (a stale cap is safer than an open restore seed), so setDesired
+	// re-seeds from it instead of leaving the restore-ceiling seed standing.
+	// Once any real doc is accepted, this is false for the rest of the
+	// process's life — a later stale/replay doc must not move a genuinely
+	// adopted standing intent, which is exactly what the pre-WS-2 "rejected
+	// docs never move desiredCeilingW" rule protects.
+	standingIsSeed bool
 
 	// reconnectPending: set by retryDevice's onReconnect callback (active only)
 	// without taking mu; consumed by observe. Same lock-order discipline as
@@ -146,7 +162,62 @@ func (s *solarShell) seedRestoreCeiling(now time.Time) {
 	_, _ = s.r.SetDesired(doc, now)
 	s.desiredCeilingW = ceiling
 	s.haveDesiredCeiling = true
+	s.standingIsSeed = true
 	log.Printf("lexa-modbus: reconciler[%s] %s: seeded initial desired CeilingW=restore (no hub doc yet)", s.tag(), s.device)
+}
+
+// reseedFromStaleDoc is seedRestoreCeiling's WS-2 fail-closed twin, called
+// from setDesired when the FIRST real doc this process ever sees for this
+// device is too old to adopt (the hub was down, or wedged, across this
+// lexa-modbus restart — reconcile.Reconciler.SetDesired's AD-013 staleness
+// gate, reconcile.go:203, rejects it regardless of seq). Re-seeds the core
+// AND the shell's tracked ceiling from the STALE doc's own CeilingW instead
+// of leaving the blind restore-ceiling seed standing: a stale cap is
+// strictly safer standing intent than an open restore (fail-closed = hold
+// the cap). Like seedRestoreCeiling, the resulting new-desired write is
+// deliberately dropped — this corrects what the reconciler will REASSERT on
+// the next reconnect/observe, it does not itself command hardware. Seq is
+// hardcoded to 1: this is only ever reached while standingIsSeed is true,
+// which means the core's one and only prior accepted doc is
+// seedRestoreCeiling's own Seq 0 (nothing else can have been accepted in
+// between — a retained MQTT topic delivers at most once per subscribe, and
+// setDesired is the only caller that feeds this reconciler instance real
+// docs), so Seq 1 is always genuine forward progress. A later real doc from
+// the hub (any seq/issuedAt newer than this) still supersedes it, exactly as
+// seedRestoreCeiling's own doc comment promises for the restore case. Must
+// be called with mu held, with doc.CeilingW known non-nil.
+func (s *solarShell) reseedFromStaleDoc(doc bus.DesiredState, now time.Time) {
+	reseed := bus.DesiredState{
+		Envelope:    bus.Envelope{V: bus.DesiredStateV},
+		DeviceClass: bus.DesiredClassSolar,
+		DeviceID:    s.device,
+		CeilingW:    doc.CeilingW,
+		Source:      "safety",
+		IssuedAt:    now.Unix(),
+		Seq:         1,
+	}
+	_, _ = s.r.SetDesired(reseed, now)
+	s.desiredCeilingW = *doc.CeilingW
+	s.haveDesiredCeiling = true
+	// standingIsSeed stays true: this is still not a genuine hub-adopted
+	// doc, just a better-informed seed. Cleared the moment a real doc is
+	// accepted (setDesired's !rejected branch).
+	log.Printf("lexa-modbus: reconciler[%s] %s: WS-2 fail-closed re-seed — first hub doc seen this restart was stale (issued_at=%d, age exceeds StaleAfter), holding its CeilingW=%.0f over the startup restore seed",
+		s.tag(), s.device, doc.IssuedAt, *doc.CeilingW)
+}
+
+// staleRejected reports whether reports contains a RejectedDoc specifically
+// for staleness (reconcile.RejectStale) — the one rejection reason
+// reseedFromStaleDoc treats as real (if old) information about the hub's
+// intent, as opposed to RejectNaN/RejectSeqRegression, which carry no such
+// signal.
+func staleRejected(reports []reconcile.Report) bool {
+	for _, rep := range reports {
+		if rep.Kind == reconcile.ReportRejectedDoc && rep.Reject == reconcile.RejectStale {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *solarShell) tag() string {
@@ -162,9 +233,16 @@ func (s *solarShell) setDesired(doc bus.DesiredState, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	action, reports := s.r.SetDesired(doc, now)
-	if !rejected(reports) && doc.CeilingW != nil {
+	switch {
+	case !rejected(reports) && doc.CeilingW != nil:
 		s.desiredCeilingW = *doc.CeilingW
 		s.haveDesiredCeiling = true
+		s.standingIsSeed = false
+	case s.standingIsSeed && staleRejected(reports) && doc.CeilingW != nil:
+		// WS-2 fail-closed fix: nothing but the startup restore seed has
+		// ever stood for this device, and the first real doc we see is too
+		// stale to adopt normally — see reseedFromStaleDoc's doc.
+		s.reseedFromStaleDoc(doc, now)
 	}
 	if s.active() && action.Kind == reconcile.ActionWrite {
 		s.applyActionLocked(action)
