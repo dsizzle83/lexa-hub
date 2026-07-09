@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,14 +28,23 @@ func writeTempConfig(t *testing.T, body string) string {
 	return path
 }
 
+// Unit 6.1 amendment (2026-07-09): the SP2-blank refusal only applies when a
+// config would actually SERVE chargers. This fixture's whole point is that
+// dangerous case, so it now explicitly configures a station (the omission
+// was incidental — the station-awareness carve-out didn't exist yet when
+// this test was written) rather than relying on the pre-amendment behavior
+// of refusing regardless of station count. See
+// TestLoadConfig_UncommissionedIdleTruthTable for the full 8-combination
+// pin, including this one.
 func TestLoadConfig_ProductProfile_BlankSP2Fails(t *testing.T) {
 	path := writeTempConfig(t, `{
 		"mqtt_broker": "tcp://localhost:1883",
-		"reconciler": "active"
+		"reconciler": "active",
+		"stations": [{"id": "cs-001"}]
 	}`)
 	_, err := loadConfig(path)
 	if err == nil {
-		t.Fatal("loadConfig succeeded with blank SP2 fields and no bench profile; want a fail-closed error")
+		t.Fatal("loadConfig succeeded with blank SP2 fields, a configured station, and no bench profile; want a fail-closed error")
 	}
 	for _, want := range []string{"cert_path", "key_path", "basic_auth_user", "basic_auth_pass", "bench"} {
 		if !strings.Contains(err.Error(), want) {
@@ -44,12 +54,15 @@ func TestLoadConfig_ProductProfile_BlankSP2Fails(t *testing.T) {
 }
 
 func TestLoadConfig_ProductProfile_PartiallyBlankSP2Fails(t *testing.T) {
-	// A realistic near-miss: cert/key set but Basic Auth still blank.
+	// A realistic near-miss: cert/key set but Basic Auth still blank. A
+	// station is configured (Unit 6.1 amendment: the refusal only applies
+	// when this config would actually serve chargers).
 	path := writeTempConfig(t, `{
 		"mqtt_broker": "tcp://localhost:1883",
 		"reconciler": "active",
 		"cert_path": "/etc/lexa/certs/ocpp-cert.pem",
-		"key_path": "/etc/lexa/certs/ocpp-key.pem"
+		"key_path": "/etc/lexa/certs/ocpp-key.pem",
+		"stations": [{"id": "cs-001"}]
 	}`)
 	_, err := loadConfig(path)
 	if err == nil {
@@ -91,12 +104,16 @@ func TestLoadConfig_OCPPProfileEnv_BlankSP2Succeeds(t *testing.T) {
 
 func TestLoadConfig_OCPPProfileEnv_WrongValueStillFails(t *testing.T) {
 	t.Setenv("OCPP_PROFILE", "production") // anything other than exactly "bench"
+	// A station is configured (Unit 6.1 amendment: the refusal only applies
+	// when this config would actually serve chargers) — otherwise this would
+	// now be the uncommissioned-idle case instead of a refusal.
 	path := writeTempConfig(t, `{
 		"mqtt_broker": "tcp://localhost:1883",
-		"reconciler": "active"
+		"reconciler": "active",
+		"stations": [{"id": "cs-001"}]
 	}`)
 	if _, err := loadConfig(path); err == nil {
-		t.Fatal("loadConfig succeeded with OCPP_PROFILE=production and blank SP2 fields; want a fail-closed error")
+		t.Fatal("loadConfig succeeded with OCPP_PROFILE=production, a configured station, and blank SP2 fields; want a fail-closed error")
 	}
 }
 
@@ -118,11 +135,102 @@ func TestLoadConfig_ProductProfile_FullSP2Succeeds(t *testing.T) {
 	}
 }
 
-// No stations configured ⇒ the pre-existing reconciler-empty-ok path; SP2
-// fail-closed still applies independent of whether any station is present.
-func TestLoadConfig_ProductProfile_NoStations_BlankSP2StillFails(t *testing.T) {
+// Unit 6.1 amendment (2026-07-09) SUPERSEDES this test's original premise:
+// before the amendment, SP2 fail-closed applied "independent of whether any
+// station is present," so this exact fixture (no stations, no bench, blank
+// SP2) used to be refused. That is now precisely the wrong outcome: zero
+// stations + not bench is the uncommissioned-idle state
+// (docs/DEVICE_ROADMAP.md §6/§9) that must load successfully so
+// configs/factory/ocpp.json is loadable — main() simply never binds the
+// CSMS listener in this state, so there is no open ws:// surface to protect
+// by refusing here. See TestLoadConfig_UncommissionedIdleTruthTable for the
+// full 8-combination pin, including the two refusal cases that are
+// UNCHANGED (stations configured, blank SP2, not bench).
+func TestLoadConfig_NoStations_NotBench_BlankSP2_IsUncommissionedIdle(t *testing.T) {
 	path := writeTempConfig(t, `{"mqtt_broker": "tcp://localhost:1883"}`)
-	if _, err := loadConfig(path); err == nil {
-		t.Fatal("loadConfig succeeded with no stations, no bench profile, blank SP2; want a fail-closed error")
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig failed with no stations, no bench profile, blank SP2 (uncommissioned idle): %v", err)
+	}
+	if !uncommissionedIdle(cfg) {
+		t.Error("uncommissionedIdle(cfg) = false, want true for zero stations + not bench")
+	}
+}
+
+// TestLoadConfig_UncommissionedIdleTruthTable enumerates all eight
+// (stations empty/configured) × (SP2 blank/full) × (bench false/true)
+// combinations (Unit 6.1 amendment). The two "stations configured, SP2
+// blank, bench false" combinations are the pre-existing WS-1 refusal cases
+// and must remain UNCHANGED refusals; every other combination must load,
+// and uncommissionedIdle must read true exactly when stations are empty and
+// bench is not set (independent of SP2 field state).
+func TestLoadConfig_UncommissionedIdleTruthTable(t *testing.T) {
+	blankSP2 := ``
+	fullSP2 := `,
+		"cert_path": "/etc/lexa/certs/ocpp-cert.pem",
+		"key_path": "/etc/lexa/certs/ocpp-key.pem",
+		"basic_auth_user": "evse-bench",
+		"basic_auth_pass": "s3cret"`
+	withStation := `,
+		"reconciler": "active",
+		"stations": [{"id": "cs-001"}]`
+	noStations := ``
+
+	cases := []struct {
+		name     string
+		stations string
+		sp2      string
+		bench    bool
+		wantErr  bool
+		wantIdle bool // only checked when wantErr is false
+	}{
+		{"noStations_blankSP2_notBench", noStations, blankSP2, false, false, true},
+		{"noStations_blankSP2_bench", noStations, blankSP2, true, false, false},
+		{"noStations_fullSP2_notBench", noStations, fullSP2, false, false, true},
+		{"noStations_fullSP2_bench", noStations, fullSP2, true, false, false},
+		{"stations_blankSP2_notBench", withStation, blankSP2, false, true, false},
+		{"stations_blankSP2_bench", withStation, blankSP2, true, false, false},
+		{"stations_fullSP2_notBench", withStation, fullSP2, false, false, false},
+		{"stations_fullSP2_bench", withStation, fullSP2, true, false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{
+				"mqtt_broker": "tcp://localhost:1883",
+				"bench": %t%s%s
+			}`, tc.bench, tc.sp2, tc.stations)
+			path := writeTempConfig(t, body)
+			cfg, err := loadConfig(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("loadConfig succeeded, want a fail-closed error (fixture: %s)", body)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig failed, want success: %v (fixture: %s)", err, body)
+			}
+			if got := uncommissionedIdle(cfg); got != tc.wantIdle {
+				t.Errorf("uncommissionedIdle(cfg) = %v, want %v (fixture: %s)", got, tc.wantIdle, body)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_FactoryProfileLoadsAndIsIdle is the acceptance test for the
+// Unit 1.6 dependency (docs/extension/00_PROGRESS.md, configs/factory/
+// README.md "Known gaps" #2): the factory ocpp.json profile (stations: [],
+// every SP2 field blank, bench: false) was deliberately shipped in
+// TARGET (not yet loadable) state until this unit's uncommissioned-idle
+// gate landed. It must now load without error and be recognized as
+// uncommissioned-idle.
+func TestLoadConfig_FactoryProfileLoadsAndIsIdle(t *testing.T) {
+	cfg, err := loadConfig("../../configs/factory/ocpp.json")
+	if err != nil {
+		t.Fatalf("loadConfig(configs/factory/ocpp.json) failed: %v", err)
+	}
+	if !uncommissionedIdle(cfg) {
+		t.Error("uncommissionedIdle(cfg) = false for the factory profile, want true")
 	}
 }

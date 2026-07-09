@@ -106,6 +106,27 @@ func benchProfile(cfg *Config) bool {
 	return cfg.Bench || os.Getenv("OCPP_PROFILE") == "bench"
 }
 
+// uncommissionedIdle reports whether cfg describes a valid UNCOMMISSIONED
+// IDLE lexa-ocpp instance (Unit 6.1 amendment, 2026-07-09,
+// docs/extension/00_PROGRESS.md "Scope amendments" / docs/DEVICE_ROADMAP.md
+// §6/§9): no stations configured, and not an explicit bench profile.
+//
+// This is deliberately independent of the SP2 fields (CertPath/KeyPath/
+// BasicAuthUser/BasicAuthPass): a config with zero stations but full SP2
+// fields set is STILL idle — cert/auth paths alone don't imply any charger
+// will ever dial in, so there is nothing to protect by refusing to start.
+// main() checks this after loadConfig succeeds and, when true, never builds
+// or starts the CSMS WS listener at all (no socket bound) — see main.go's
+// top-level branch. loadConfig's own SP2 fail-closed gate below only
+// refuses a config that would actually SERVE chargers (stations configured
+// and not bench); it does not call this helper directly, but the two are
+// consistent by construction: stations==0 && !bench never reaches the
+// refusal branch (guarded by len(cfg.Stations) > 0), so it always loads,
+// and main() then idles it.
+func uncommissionedIdle(cfg *Config) bool {
+	return len(cfg.Stations) == 0 && !benchProfile(cfg)
+}
+
 func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -157,7 +178,17 @@ func loadConfig(path string) (*Config, error) {
 	// here; SP2's blank fields silently fell back to plaintext ws:// with no
 	// auth — the exact bench-only state CLAUDE.md already claimed was never
 	// the product default. See the Bench field / benchProfile doc above.
-	if !benchProfile(&cfg) {
+	//
+	// Unit 6.1 amendment (2026-07-09): this refusal only applies when the
+	// config would actually SERVE chargers, i.e. one or more stations are
+	// configured (the bench escape hatch is already handled by the outer
+	// !benchProfile check). Zero stations + not bench is the uncommissioned-
+	// idle state (uncommissionedIdle above) — main() never binds the CSMS
+	// listener in that state, so there is no open ws:// surface to refuse
+	// here; refusing anyway would make the fail-closed factory profile
+	// (configs/factory/ocpp.json: SP2 blank, bench:false, stations: [])
+	// unloadable, which defeats commissioning rather than protecting it.
+	if !benchProfile(&cfg) && len(cfg.Stations) > 0 {
 		var missing []string
 		if cfg.CertPath == "" {
 			missing = append(missing, "cert_path")

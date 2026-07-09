@@ -125,7 +125,9 @@ TLS context at all. Recommend whoever picks up TASK-098
 explicitly — the healthcheck's own spec (§8.1 item 4, "config has no
 server ⇒ cleanly idle") already assumes the fix is in place.
 
-**2. `lexa-ocpp`'s factory profile is written in TARGET state, not
+**2. RESOLVED (unit 6.1, 2026-07-09)** — lexa-ocpp now treats `stations: []` + `bench:false` as uncommissioned-idle (config loads, CSMS listener never binds; `cmd/ocpp/config.go`'s `uncommissionedIdle` + narrowed WS-1 gate). This profile is loadable as written. Original note kept below:
+
+**(superseded) 2. `lexa-ocpp`'s factory profile is written in TARGET state, not
 LOADABLE state, on purpose.** `cmd/ocpp/config.go`'s WS-1 gate refuses to
 start with `cert_path`/`key_path`/`basic_auth_user`/`basic_auth_pass` all
 blank unless `bench: true`. This profile ships `bench: false` (correctly —

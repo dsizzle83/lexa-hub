@@ -33,6 +33,7 @@ import (
 	ocpp2 "github.com/lorenzodonini/ocpp-go/ocpp2.0.1"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/availability"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/meter"
+	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/provisioning"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/remotecontrol"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/smartcharging"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/transactions"
@@ -76,6 +77,15 @@ func main() {
 	})
 	transactionsTotalCtr := reg.Counter("lexa_ocpp_transactions_total")
 
+	// Unit 6.1 (amended, docs/extension/00_PROGRESS.md "Scope amendments"):
+	// both gauges are registered here — BEFORE the uncommissioned-idle
+	// branch below decides whether the CSMS even starts — so both metric
+	// names are always present in /metrics regardless of mode (the
+	// "registered-but-zero counter is normal" convention, CLAUDE.md's
+	// Metrics section), rather than appearing/disappearing with it.
+	pendingGauge := reg.Gauge("lexa_ocpp_pending_stations")
+	idleGauge := reg.Gauge("lexa_ocpp_uncommissioned_idle")
+
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
 		log.Fatalf("lexa-ocpp: %v", err)
@@ -89,90 +99,114 @@ func main() {
 	}
 	defer mc.Disconnect(500)
 
-	srv := ocppserver.New(ocppserver.Config{
-		Port:          cfg.Port,
-		CertPath:      cfg.CertPath,
-		KeyPath:       cfg.KeyPath,
-		BasicAuthUser: cfg.BasicAuthUser,
-		BasicAuthPass: cfg.BasicAuthPass,
-	})
+	// Unit 6.1 (amended): "stations": [] and not bench is a VALID
+	// uncommissioned-idle state (docs/DEVICE_ROADMAP.md §6/§9; the factory
+	// profile configs/factory/ocpp.json) — loadConfig above already accepts
+	// it (config.go's uncommissionedIdle/benchProfile). In that state, skip
+	// building/starting the OCPP CSMS entirely: ocppserver.New/newMQTTBridge
+	// are never called, so no socket is ever bound. Everything else — MQTT
+	// connect (above), metrics, watchdog Ready, and the kick ticker below —
+	// still runs unconditionally.
+	if uncommissionedIdle(cfg) {
+		idleGauge.Set(1)
+		log.Printf("lexa-ocpp: uncommissioned idle — no stations configured; CSMS listener not started")
+	} else {
+		idleGauge.Set(0)
 
-	bridge := newMQTTBridge(mc, srv.CSMS())
-	bridge.transactionsTotal = transactionsTotalCtr
+		srv := ocppserver.New(ocppserver.Config{
+			Port:          cfg.Port,
+			CertPath:      cfg.CertPath,
+			KeyPath:       cfg.KeyPath,
+			BasicAuthUser: cfg.BasicAuthUser,
+			BasicAuthPass: cfg.BasicAuthPass,
+		})
 
-	// lexa_ocpp_connected_stations (TASK-044): the connection-state gauge for
-	// this service — computed at scrape time from the bridge's own station
-	// map rather than incremented/decremented at each connect/disconnect
-	// handler, so it can never drift from the bridge's actual state.
-	reg.Collect(func(r *metrics.Registry) {
-		r.Gauge("lexa_ocpp_connected_stations").Set(float64(bridge.connectedStationCount()))
-	})
+		bridge := newMQTTBridge(mc, srv.CSMS(), cfg.Stations, pendingGauge)
+		bridge.transactionsTotal = transactionsTotalCtr
+		// Unit 6.1: clear any stale retained lexa/ocpp/pending left over from
+		// a prior run (since-approved or long-departed entries) even before
+		// anything has connected this time around — see
+		// pendingStations.publishStartup's doc.
+		bridge.pending.publishStartup(time.Now())
 
-	// Pre-register known station limits.
-	for _, sc := range cfg.Stations {
-		bridge.setStationConfig(sc.ID, sc.MaxCurrentA, sc.VoltageV)
-	}
+		// lexa_ocpp_connected_stations (TASK-044): the connection-state gauge for
+		// this service — computed at scrape time from the bridge's own station
+		// map rather than incremented/decremented at each connect/disconnect
+		// handler, so it can never drift from the bridge's actual state.
+		reg.Collect(func(r *metrics.Registry) {
+			r.Gauge("lexa_ocpp_connected_stations").Set(float64(bridge.connectedStationCount()))
+		})
 
-	// TASK-030: one reconciler shell per configured station when the EVSE
-	// reconciler is shadow or active. Shadow is a recorder (no SetChargingProfile
-	// from the reconciler); active makes it own the profile via the SAME driver
-	// (bridge.Apply) and adds reassert-on-reconnect. Legacy commands keep
-	// flowing either way (belt and braces for instant rollback).
-	evseMode := cfg.ReconcilerMode()
-	evseActive := evseMode == ReconcilerActive
-	if evseMode == ReconcilerShadow || evseMode == ReconcilerActive {
-		mode := modeShadow
-		var drv profileDriver
-		if evseActive {
-			mode = modeActive
-			drv = bridge
-		}
-		shells := make(map[string]*evseShell)
+		// Pre-register known station limits.
 		for _, sc := range cfg.Stations {
-			sh := newEVSEShell(sc.ID, reg, mode, drv)
-			// TASK-031: forward device-level non-convergence to the hub's
-			// breach-episode component (active mode only).
-			if mode == modeActive {
-				sh.pub = newReconcileReportPublisher(mc)
-			}
-			shells[sc.ID] = sh
+			bridge.setStationConfig(sc.ID, sc.MaxCurrentA, sc.VoltageV)
 		}
-		bridge.shells = shells
-		if err := mqttutil.Subscribe(mc, bus.SubDesired, func(topic string, doc bus.DesiredState) {
-			if bus.ClassFromDesiredTopic(topic) != bus.DesiredClassEVSE {
-				return
-			}
-			if sh, ok := shells[bus.DeviceFromDesiredTopic(topic)]; ok {
-				sh.setDesired(doc, time.Now())
-			}
-		}); err != nil {
-			log.Printf("lexa-ocpp: subscribe desired (reconciler): %v", err)
-		}
-		go runEVSEShellTicker(shells, 60*time.Second)
-		log.Printf("lexa-ocpp: EVSE reconciler %s mode for %d station(s)", evseMode, len(shells))
-	}
 
-	// TASK-032: the legacy lexa/evse/{station}/command subscription was deleted.
-	// The EVSE reconciler (above) owns SetChargingProfile via the retained
-	// lexa/desired/evse/{station} doc, so config must set reconciler = "active".
+		// TASK-030: one reconciler shell per configured station when the EVSE
+		// reconciler is shadow or active. Shadow is a recorder (no SetChargingProfile
+		// from the reconciler); active makes it own the profile via the SAME driver
+		// (bridge.Apply) and adds reassert-on-reconnect. Legacy commands keep
+		// flowing either way (belt and braces for instant rollback).
+		evseMode := cfg.ReconcilerMode()
+		evseActive := evseMode == ReconcilerActive
+		if evseMode == ReconcilerShadow || evseMode == ReconcilerActive {
+			mode := modeShadow
+			var drv profileDriver
+			if evseActive {
+				mode = modeActive
+				drv = bridge
+			}
+			shells := make(map[string]*evseShell)
+			for _, sc := range cfg.Stations {
+				sh := newEVSEShell(sc.ID, reg, mode, drv)
+				// TASK-031: forward device-level non-convergence to the hub's
+				// breach-episode component (active mode only).
+				if mode == modeActive {
+					sh.pub = newReconcileReportPublisher(mc)
+				}
+				shells[sc.ID] = sh
+			}
+			bridge.shells = shells
+			if err := mqttutil.Subscribe(mc, bus.SubDesired, func(topic string, doc bus.DesiredState) {
+				if bus.ClassFromDesiredTopic(topic) != bus.DesiredClassEVSE {
+					return
+				}
+				if sh, ok := shells[bus.DeviceFromDesiredTopic(topic)]; ok {
+					sh.setDesired(doc, time.Now())
+				}
+			}); err != nil {
+				log.Printf("lexa-ocpp: subscribe desired (reconciler): %v", err)
+			}
+			go runEVSEShellTicker(shells, 60*time.Second)
+			log.Printf("lexa-ocpp: EVSE reconciler %s mode for %d station(s)", evseMode, len(shells))
+		}
+
+		// TASK-032: the legacy lexa/evse/{station}/command subscription was deleted.
+		// The EVSE reconciler (above) owns SetChargingProfile via the retained
+		// lexa/desired/evse/{station} doc, so config must set reconciler = "active".
+
+		go srv.Start()
+		defer srv.Stop()
+	}
 
 	metrics.Serve(cfg.MetricsAddr, reg)
 
-	go srv.Start()
-	defer srv.Stop()
-
-	// sd_notify READY (TASK-008): the OCPP WS listener goroutine has been
-	// started. Weaker liveness than northbound/modbus — see the WatchdogSec
-	// comment in lexa-ocpp.service: process + MQTT connectivity, not OCPP
-	// listener health (follow-up TASK-044).
+	// sd_notify READY (TASK-008): process + MQTT are up and, when not
+	// uncommissioned-idle, the OCPP WS listener goroutine has been started.
+	// Weaker liveness than northbound/modbus — see the WatchdogSec comment in
+	// lexa-ocpp.service: process + MQTT connectivity, not OCPP listener
+	// health (follow-up TASK-044).
 	watchdog.Ready()
 
 	// TASK-008: no tight control loop exists here (srv.Start runs the OCPP
-	// listener in its own goroutine) — this ticker is the liveness proxy,
-	// gated on MQTT connectivity so a genuinely dead process (not just a
-	// disconnected broker) is what trips the watchdog. A sustained broker
-	// outage (> WatchdogSec) DOES restart this service; that is accepted
-	// crash-only behavior (AD-011), noted in the PR.
+	// listener in its own goroutine, when one is started at all) — this
+	// ticker is the liveness proxy, gated on MQTT connectivity so a genuinely
+	// dead process (not just a disconnected broker) is what trips the
+	// watchdog. Unaffected by the Unit 6.1 idle gate: an idle instance with
+	// no stations is exactly as alive as one serving chargers from the
+	// watchdog's point of view. A sustained broker outage (> WatchdogSec)
+	// DOES restart this service; that is accepted crash-only behavior
+	// (AD-011), noted in the PR.
 	kick := time.NewTicker(10 * time.Second)
 	defer kick.Stop()
 
@@ -249,6 +283,12 @@ type mqttBridge struct {
 	// Set once at startup before any OCPP connection is accepted, then read-only,
 	// so it needs no lock of its own.
 	shells map[string]*evseShell
+
+	// pending is the Unit 6.1 pending-station surface: chargers seen but not
+	// in cfg.Stations. Set once at construction (newMQTTBridge), then only
+	// ever accessed through its own mutex — never bridge.mu — so nothing here
+	// needs bridge's lock.
+	pending *pendingStations
 }
 
 // connectedStationCount returns how many known stations currently have an
@@ -267,40 +307,28 @@ func (b *mqttBridge) connectedStationCount() int {
 	return n
 }
 
-func newMQTTBridge(mc mqtt.Client, csms ocpp2.CSMS) *mqttBridge {
+// newMQTTBridge builds a bridge and wires every CSMS handler, including the
+// pending-station surface (Unit 6.1): configuredStations is cfg.Stations at
+// startup (the set newPendingStations must never track as pending), and
+// pendingGauge is lexa_ocpp_pending_stations (nil-safe — tests without a
+// metrics.Registry pass nil).
+func newMQTTBridge(mc mqtt.Client, csms ocpp2.CSMS, configuredStations []StationConfig, pendingGauge *metrics.Gauge) *mqttBridge {
+	ids := make([]string, len(configuredStations))
+	for i, sc := range configuredStations {
+		ids[i] = sc.ID
+	}
 	b := &mqttBridge{
 		mc:       mc,
 		csms:     csms,
 		stations: make(map[string]*stationState),
 	}
+	b.pending = newPendingStations(ids, func(doc bus.PendingStations) error {
+		return mqttutil.PublishJSONRetained(mc, bus.TopicOCPPPending, doc)
+	}, pendingGauge)
 
-	csms.SetNewChargingStationHandler(func(cs ocpp2.ChargingStationConnection) {
-		b.mu.Lock()
-		s := b.getOrCreateLocked(cs.ID())
-		s.connected = true
-		b.mu.Unlock()
-		log.Printf("[ocpp] connected: %s addr=%s", cs.ID(), cs.RemoteAddr())
-		// TASK-030: reassert-on-reconnect — signal the reconciler (outside mu) so
-		// a charger that dropped and returned gets its standing current limit
-		// re-sent immediately instead of waiting on the hub's 60 s watchdog. This
-		// is the gap the legacy path never closed (it only publishes state here).
-		if sh, ok := b.shells[cs.ID()]; ok {
-			sh.markReconnected()
-		}
-		b.publishAll(cs.ID())
-		go b.triggerStatusNotification(cs.ID())
-	})
-
-	csms.SetChargingStationDisconnectedHandler(func(cs ocpp2.ChargingStationConnection) {
-		b.mu.Lock()
-		if s, ok := b.stations[cs.ID()]; ok {
-			s.connected = false
-		}
-		b.mu.Unlock()
-		log.Printf("[ocpp] disconnected: %s", cs.ID())
-		b.publishAll(cs.ID())
-	})
-
+	csms.SetNewChargingStationHandler(b.onConnect)
+	csms.SetChargingStationDisconnectedHandler(b.onDisconnect)
+	csms.SetProvisioningHandler(&provisioningForwarder{bridge: b})
 	csms.SetAvailabilityHandler(&availForwarder{bridge: b})
 	csms.SetMeterHandler(&meterForwarder{bridge: b})
 	csms.SetTransactionsHandler(&txForwarder{bridge: b})
@@ -308,11 +336,57 @@ func newMQTTBridge(mc mqtt.Client, csms ocpp2.CSMS) *mqttBridge {
 	return b
 }
 
-// getOrCreateLocked returns the stationState for id, creating it if absent.
-// Caller must hold mu for writing.
-func (b *mqttBridge) getOrCreateLocked(id string) *stationState {
+// onConnect handles SetNewChargingStationHandler: a new OCPP WebSocket
+// connection. Extracted to a named method (rather than an inline closure,
+// as before Unit 6.1) so tests can drive it directly with a fake
+// ocpp2.ChargingStationConnection, without a live WebSocket handshake.
+func (b *mqttBridge) onConnect(cs ocpp2.ChargingStationConnection) {
+	b.mu.Lock()
+	s, created := b.getOrCreateLocked(cs.ID())
+	s.connected = true
+	b.mu.Unlock()
+	log.Printf("[ocpp] connected: %s addr=%s", cs.ID(), cs.RemoteAddr())
+	// Unit 6.1: a station this bridge did not already know about is, by
+	// construction, not in cfg.Stations (every configured station is
+	// pre-registered via setStationConfig before any connection is
+	// accepted) — surface it on the pending-station bus doc instead of
+	// silently adopting it. Behavior of the station itself is unchanged:
+	// it is still tracked below exactly as before, still gets its
+	// measurements published, and gets no shell/driver either way.
+	if created {
+		b.pending.upsert(cs.ID(), "", "", cs.RemoteAddr().String(), time.Now())
+	}
+	// TASK-030: reassert-on-reconnect — signal the reconciler (outside mu) so
+	// a charger that dropped and returned gets its standing current limit
+	// re-sent immediately instead of waiting on the hub's 60 s watchdog. This
+	// is the gap the legacy path never closed (it only publishes state here).
+	if sh, ok := b.shells[cs.ID()]; ok {
+		sh.markReconnected()
+	}
+	b.publishAll(cs.ID())
+	go b.triggerStatusNotification(cs.ID())
+}
+
+// onDisconnect handles SetChargingStationDisconnectedHandler.
+func (b *mqttBridge) onDisconnect(cs ocpp2.ChargingStationConnection) {
+	b.mu.Lock()
+	if s, ok := b.stations[cs.ID()]; ok {
+		s.connected = false
+	}
+	b.mu.Unlock()
+	log.Printf("[ocpp] disconnected: %s", cs.ID())
+	b.publishAll(cs.ID())
+}
+
+// getOrCreateLocked returns the stationState for id, creating it if absent,
+// and reports whether this call created a NEW entry. Since every station in
+// cfg.Stations is pre-registered via setStationConfig before any OCPP
+// connection is accepted, "created" here is equivalent to "not in
+// cfg.Stations" — the signal the pending-station surface (Unit 6.1) upserts
+// on. Caller must hold mu for writing.
+func (b *mqttBridge) getOrCreateLocked(id string) (*stationState, bool) {
 	if s, ok := b.stations[id]; ok {
-		return s
+		return s, false
 	}
 	s := &stationState{
 		id:          id,
@@ -322,12 +396,12 @@ func (b *mqttBridge) getOrCreateLocked(id string) *stationState {
 		soc:         math.NaN(),
 	}
 	b.stations[id] = s
-	return s
+	return s, true
 }
 
 func (b *mqttBridge) setStationConfig(id string, maxCurrentA, voltageV float64) {
 	b.mu.Lock()
-	s := b.getOrCreateLocked(id)
+	s, _ := b.getOrCreateLocked(id)
 	s.maxCurrentA = maxCurrentA
 	s.voltageV = voltageV
 	b.mu.Unlock()
@@ -488,6 +562,37 @@ func (b *mqttBridge) triggerStatusNotification(stationID string) {
 
 // ── OCPP handler forwarders ───────────────────────────────────────────────────
 
+// provisioningForwarder overrides lexa-proto/ocppserver's default provisioning
+// handler (which only logs) so BootNotification's vendor/model reach the
+// pending-station surface (Unit 6.1). Registered via
+// csms.SetProvisioningHandler in newMQTTBridge, exactly like
+// availForwarder/meterForwarder/txForwarder below override their defaults.
+type provisioningForwarder struct{ bridge *mqttBridge }
+
+// OnBootNotification captures req.ChargingStation.VendorName/Model — the one
+// place this information is ever offered by the OCPP protocol — and feeds it
+// into the pending-station upsert (a no-op merge for an already-configured
+// station; see pendingStations.upsert). Response shape mirrors
+// lexa-proto/ocppserver/handlers.go's default handler exactly (Accepted,
+// 60s heartbeat interval) since this override's only job is to ALSO capture
+// vendor/model, not to change registration behavior.
+func (h *provisioningForwarder) OnBootNotification(csID string, req *provisioning.BootNotificationRequest) (*provisioning.BootNotificationResponse, error) {
+	log.Printf("[ocpp] BootNotification cs=%s reason=%s model=%s vendor=%s",
+		csID, req.Reason, req.ChargingStation.Model, req.ChargingStation.VendorName)
+	h.bridge.pending.upsert(csID, req.ChargingStation.VendorName, req.ChargingStation.Model, "", time.Now())
+	resp := provisioning.NewBootNotificationResponse(
+		types.NewDateTime(time.Now()),
+		60, // heartbeat interval in seconds
+		provisioning.RegistrationStatusAccepted,
+	)
+	return resp, nil
+}
+
+func (h *provisioningForwarder) OnNotifyReport(csID string, req *provisioning.NotifyReportRequest) (*provisioning.NotifyReportResponse, error) {
+	log.Printf("[ocpp] NotifyReport cs=%s requestId=%d seqNo=%d", csID, req.RequestID, req.SeqNo)
+	return &provisioning.NotifyReportResponse{}, nil
+}
+
 type availForwarder struct{ bridge *mqttBridge }
 
 func (h *availForwarder) OnHeartbeat(csID string, _ *availability.HeartbeatRequest) (*availability.HeartbeatResponse, error) {
@@ -498,9 +603,16 @@ func (h *availForwarder) OnHeartbeat(csID string, _ *availability.HeartbeatReque
 func (h *availForwarder) OnStatusNotification(csID string, req *availability.StatusNotificationRequest) (*availability.StatusNotificationResponse, error) {
 	status := connectorStatus(req.ConnectorStatus)
 	h.bridge.mu.Lock()
-	s := h.bridge.getOrCreateLocked(csID)
+	s, created := h.bridge.getOrCreateLocked(csID)
 	s.connectors[req.ConnectorID] = &connState{connectorID: req.ConnectorID, status: status}
 	h.bridge.mu.Unlock()
+	// Unit 6.1: the "OnStatusNotification twin" of onConnect's auto-create
+	// path (docs/DEVICE_ROADMAP.md §6) — defensive symmetry for the same
+	// getOrCreateLocked auto-adoption, in case a StatusNotification is ever
+	// the first this bridge hears of a station.
+	if created {
+		h.bridge.pending.upsert(csID, "", "", "", time.Now())
+	}
 	log.Printf("[ocpp] StatusNotification cs=%s connector=%d status=%s", csID, req.ConnectorID, status)
 	h.bridge.publishAll(csID)
 	return &availability.StatusNotificationResponse{}, nil
@@ -565,7 +677,7 @@ func applySamplesLocked(s *stationState, meterValues []types.MeterValue) {
 
 func (h *meterForwarder) OnMeterValues(csID string, req *meter.MeterValuesRequest) (*meter.MeterValuesResponse, error) {
 	h.bridge.mu.Lock()
-	s := h.bridge.getOrCreateLocked(csID)
+	s, _ := h.bridge.getOrCreateLocked(csID)
 	applySamplesLocked(s, req.MeterValue)
 	currentA, soc, energyWh := s.currentA, s.soc, s.energyWh
 	connected, maxA := s.connected, s.maxCurrentA
@@ -595,7 +707,7 @@ func (h *txForwarder) OnTransactionEvent(csID string, req *transactions.Transact
 		h.bridge.transactionsTotal.Inc() // lexa_ocpp_transactions_total (TASK-044)
 	}
 	h.bridge.mu.Lock()
-	s := h.bridge.getOrCreateLocked(csID)
+	s, _ := h.bridge.getOrCreateLocked(csID)
 	applySamplesLocked(s, req.MeterValue)
 	if req.EventType == transactions.TransactionEventEnded {
 		s.currentA = 0
