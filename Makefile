@@ -13,7 +13,7 @@ BINS     := $(addprefix $(BINDIR)/lexa-, $(SERVICES))
 
 all: build
 
-build: $(BINS) $(BINDIR)/lexa-migrate
+build: $(BINS) $(BINDIR)/lexa-migrate $(BINDIR)/lexactl
 
 $(BINDIR)/lexa-%: cmd/%/*.go internal/**/*.go go.mod
 	@mkdir -p $(BINDIR)
@@ -26,6 +26,12 @@ $(BINDIR)/lexa-%: cmd/%/*.go internal/**/*.go go.mod
 $(BINDIR)/lexa-migrate: cmd/lexa-migrate/*.go go.mod
 	@mkdir -p $(BINDIR)
 	go build -o $@ ./cmd/lexa-migrate
+
+# lexactl is the operator CLI (unit 7.1): binary is named `lexactl` (what a
+# user types), so the lexa-% pattern rule can't serve it either.
+$(BINDIR)/lexactl: cmd/lexactl/*.go go.mod
+	@mkdir -p $(BINDIR)
+	go build -o $@ ./cmd/lexactl
 
 # Cross-compile for Digi ConnectCore 93 (ARM64 Linux).
 #
@@ -62,6 +68,7 @@ build-arm64:
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-healthcheck ./cmd/healthcheck
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-migrate     ./cmd/lexa-migrate
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-cloudlink   ./cmd/cloudlink
+	$(GOARM64)     -o $(BINDIR)/arm64/lexactl          ./cmd/lexactl
 	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-northbound ./cmd/northbound
 	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-telemetry  ./cmd/telemetry
 
@@ -93,6 +100,7 @@ install: build
 		install -m 755 $(BINDIR)/lexa-$$svc $(SBINDIR)/lexa-$$svc; \
 	done
 	install -m 755 $(BINDIR)/lexa-migrate $(SBINDIR)/lexa-migrate
+	install -m 755 $(BINDIR)/lexactl $(SBINDIR)/lexactl
 
 # Install example configs (does not overwrite existing files)
 install-configs:
