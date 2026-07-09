@@ -130,3 +130,64 @@ func TestStack_ZeroTimestampFallsBack(t *testing.T) {
 		t.Errorf("zero-timestamp state should fall back to now()")
 	}
 }
+
+// ── FIX-F: AxisAuthors ──────────────────────────────────────────────────────
+
+// AxisAuthors must reflect each demand-pipeline axis's winning Source after
+// Optimize, keyed exactly like a divergence's Device/Axis pair would combine
+// (device + "/" + axis.String()) — the contract Wrapper.compose/attributeAndFilter
+// rely on.
+func TestStack_AxisAuthorsReflectsResolvedDemands(t *testing.T) {
+	c := true
+	cs := []Constraint{
+		fakeConstraint{name: "solar", tier: TierCompliance, demands: []Demand{
+			CeilingDemand("inv1", AxisSolarCeilingW, 3000, TierCompliance, "solar"),
+		}},
+		fakeConstraint{name: "batt", tier: TierEconomics, demands: []Demand{
+			PointDemand("bat1", AxisBatterySetpointW, -1500, TierEconomics, "batt"),
+			{Device: "bat1", Axis: AxisConnect, Connect: &c, Tier: TierEconomics, Source: "batt"},
+		}},
+		fakeConstraint{name: "ev", tier: TierCompliance, demands: []Demand{
+			CeilingDemand("evse1", AxisEVSECurrentA, 16, TierCompliance, "ev"),
+		}},
+	}
+	stack := NewStack(Plant{}, 0, cs...)
+	stack.Optimize(orchestrator.SystemState{Timestamp: time.Unix(1, 0)})
+
+	authors := stack.AxisAuthors()
+	want := map[string]string{
+		"inv1/solar-ceiling-w":    "solar",
+		"bat1/battery-setpoint-w": "batt",
+		"bat1/connect":            "batt",
+		"evse1/evse-current-a":    "ev",
+	}
+	for k, v := range want {
+		if authors[k] != v {
+			t.Errorf("authors[%q] = %q, want %q (full map: %+v)", k, authors[k], v, authors)
+		}
+	}
+}
+
+// AxisAuthors is empty before the first Optimize call and rebuilt (not
+// accumulated) on every subsequent call.
+func TestStack_AxisAuthorsEmptyBeforeFirstOptimizeAndRebuiltEachTick(t *testing.T) {
+	stack := NewStack(Plant{}, 0, fakeConstraint{name: "solar", tier: TierCompliance})
+	if got := stack.AxisAuthors(); len(got) != 0 {
+		t.Fatalf("authors before first Optimize = %+v, want empty", got)
+	}
+
+	stack2 := NewStack(Plant{}, 0, fakeConstraint{name: "solar", tier: TierCompliance, demands: []Demand{
+		CeilingDemand("inv1", AxisSolarCeilingW, 3000, TierCompliance, "solar"),
+	}})
+	stack2.Optimize(orchestrator.SystemState{Timestamp: time.Unix(1, 0)})
+	if len(stack2.AxisAuthors()) != 1 {
+		t.Fatalf("authors after tick 1 = %+v, want 1 entry", stack2.AxisAuthors())
+	}
+	// Tick 2: the constraint stops demanding — the axis's authorship must NOT
+	// linger from tick 1 (the map is rebuilt wholesale, not accumulated).
+	stack2.constraints[0] = fakeConstraint{name: "solar", tier: TierCompliance}
+	stack2.Optimize(orchestrator.SystemState{Timestamp: time.Unix(2, 0)})
+	if got := stack2.AxisAuthors(); len(got) != 0 {
+		t.Fatalf("authors after tick 2 (no demand) = %+v, want empty (stale authorship must not linger)", got)
+	}
+}
