@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/journal"
+	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/orchestrator"
 )
 
@@ -531,6 +533,181 @@ func TestDesiredPublishingEVSEActuator_Mapping(t *testing.T) {
 	}
 	if mc.publishes[0].topic != bus.DesiredTopic(bus.DesiredClassEVSE, "cs-001") || !mc.publishes[0].retained {
 		t.Fatalf("evse doc must be retained on the evse topic")
+	}
+}
+
+// ---------------------------------------------------------------------
+// WS-2 fix 1: heartbeat re-stamp (desiredHeartbeatInterval)
+// ---------------------------------------------------------------------
+
+// TestDesiredPublishingBatteryActuator_HeartbeatRestampsWithoutContentChange
+// is WS-2 fix 1's core acceptance criterion: an actuator whose standing
+// intent has not changed content must still re-publish, with a fresh
+// IssuedAt/Seq, once desiredHeartbeatInterval has elapsed since the last
+// publish — otherwise the retained doc's IssuedAt ages past the reconciler's
+// StaleAfter bound and a restarting consumer rejects it outright (the WS-2
+// fail-open).
+func TestDesiredPublishingBatteryActuator_HeartbeatRestampsWithoutContentChange(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, nil)
+	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
+
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("first command: got %d publishes, want 1", len(mc.publishes))
+	}
+	firstIssuedAt := a.lastPublished.IssuedAt
+
+	// Well within the cadence: identical content must not republish (this is
+	// the content-dedupe path staying intact — see the sibling test below).
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("repeat within desiredHeartbeatInterval: got %d publishes, want still 1", len(mc.publishes))
+	}
+
+	// Back-date the believed-live doc past the heartbeat cadence, simulating
+	// a converged optimizer that hasn't changed content in that long — the
+	// STOCK-realistic quiescence scenario WS-2 exploits.
+	backdatedIssuedAt := firstIssuedAt - int64(desiredHeartbeatInterval/time.Second)
+	a.lastPublished.IssuedAt = backdatedIssuedAt
+
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("after desiredHeartbeatInterval elapsed: got %d publishes, want 2 (heartbeat re-stamp)", len(mc.publishes))
+	}
+
+	var doc bus.DesiredState
+	if err := json.Unmarshal(mc.publishes[1].payload, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.SetpointW == nil || *doc.SetpointW != -500 || doc.Connect == nil || !*doc.Connect {
+		t.Fatalf("heartbeat re-stamp must carry the SAME content, got %+v", doc)
+	}
+	// IssuedAt has 1-second resolution and this test runs well within a
+	// single wall-clock second, so the re-stamp can legitimately equal
+	// firstIssuedAt — assert it moved forward from the artificially
+	// backdated value (proving a genuine re-stamp happened) rather than
+	// requiring strict inequality against firstIssuedAt.
+	if doc.IssuedAt <= backdatedIssuedAt {
+		t.Fatalf("heartbeat re-stamp must carry a FRESH IssuedAt, got %d, backdated was %d", doc.IssuedAt, backdatedIssuedAt)
+	}
+	if doc.Seq != 1 {
+		t.Fatalf("heartbeat re-stamp must still consume the next Seq (async path, not bypassed), got %d", doc.Seq)
+	}
+}
+
+// TestDesiredPublishingSolarActuator_NoHeartbeatBeforeCadence pins the other
+// side of the boundary: a republish must NOT fire before
+// desiredHeartbeatInterval has elapsed, even down to one second short — the
+// heartbeat must not degrade into a per-tick publish (which would defeat the
+// "retained doc is standing intent, not a tick stream" contract TASK-046
+// established).
+func TestDesiredPublishingSolarActuator_NoHeartbeatBeforeCadence(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil, nil, nil)
+	cmd := orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 2000}
+
+	if err := a.ApplySolarCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("got %d publishes, want 1", len(mc.publishes))
+	}
+
+	// One second short of the cadence: must not republish.
+	a.lastPublished.IssuedAt -= int64(desiredHeartbeatInterval/time.Second) - 1
+	if err := a.ApplySolarCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("1s short of desiredHeartbeatInterval: got %d publishes, want still 1", len(mc.publishes))
+	}
+
+	// Exactly at the cadence: must republish.
+	a.lastPublished.IssuedAt -= 1
+	if err := a.ApplySolarCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("at desiredHeartbeatInterval: got %d publishes, want 2", len(mc.publishes))
+	}
+}
+
+// TestDesiredPublishingBatteryActuator_HeartbeatDoesNotJournalDispatch is
+// WS-2 fix 1's "keep desiredContentEqual for the write-to-hardware dedupe"
+// requirement made concrete on the hub side: a heartbeat re-stamp flows
+// through the same async publish path (it must, so its failures are counted
+// the same way — see the publishes/asyncFailures assertions in the sibling
+// tests), but it is NOT a new command, so it must not journal a TASK-040
+// dispatch event — that log is the audit trail of actual commands, and its
+// "post-dedupe only" contract (TestDesiredPublishingBatteryActuator_
+// JournalsDispatchPostDedupeOnly) must hold for heartbeats too.
+func TestDesiredPublishingBatteryActuator_HeartbeatDoesNotJournalDispatch(t *testing.T) {
+	dir := t.TempDir()
+	jw, err := journal.Open(journal.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	defer jw.Close()
+
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", nil, nil, nil, jw)
+	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
+
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	a.lastPublished.IssuedAt -= int64(desiredHeartbeatInterval / time.Second)
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("got %d publishes, want 2 (initial + heartbeat)", len(mc.publishes))
+	}
+	if err := jw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	events := journalEventsByType(t, dir)
+	if got := len(events[journal.TypeDispatch]); got != 1 {
+		t.Fatalf("dispatch events = %d, want 1 (heartbeat re-stamp must not journal a second dispatch)", got)
+	}
+}
+
+// TestDesiredPublishingBatteryActuator_HeartbeatCountsPublishesAndFailures
+// verifies the heartbeat re-stamp flows through the SAME metrics the
+// TASK-046 async path already counts (publishes.Inc() on fire,
+// asyncFailures.Inc() on a harvested failure) rather than a bypass — a
+// silently-uncounted heartbeat failure would hide exactly the "publisher
+// wedged" condition WS-2 fix 1 exists to surface.
+func TestDesiredPublishingBatteryActuator_HeartbeatCountsPublishesAndFailures(t *testing.T) {
+	reg := metrics.New()
+	publishes := reg.Counter("test_desired_publishes_total")
+	asyncFailures := reg.Counter("test_desired_publish_failures_total")
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingBatteryActuator(mc, "battery-0", publishes, asyncFailures, nil, nil)
+	cmd := orchestrator.BatteryCommand{Name: "battery-0", SetpointW: -500, Connect: ptr(true)}
+
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	a.lastPublished.IssuedAt -= int64(desiredHeartbeatInterval / time.Second)
+	mc.failNext = true
+	if err := a.ApplyBatteryCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	out := reg.Format()
+	if !strings.Contains(out, "test_desired_publishes_total 1\n") {
+		t.Fatalf("publishes counter: want 1 (only the first fire succeeded; the heartbeat failed), got:\n%s", out)
+	}
+	if !strings.Contains(out, "test_desired_publish_failures_total 1\n") {
+		t.Fatalf("asyncFailures counter: want 1 (heartbeat failure must be counted, not bypassed), got:\n%s", out)
 	}
 }
 
