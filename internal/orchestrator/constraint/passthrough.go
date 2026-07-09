@@ -171,9 +171,11 @@ const (
 // Connect for all three classes, but only the battery reconciler executes it
 // today — cmd/modbus's solarFieldsToControl drops Connect (no OpModConnect
 // emit) and cmd/ocpp's applyActionLocked reads only MaxCurrentA. Gateway
-// cease-to-energize for solar/EVSE therefore rides the compliance tier's
-// power/current limits (0 W ceiling / 0 A) until the reconciler-side
-// follow-up (unit 6.2 on the campaign board) lands.
+// cease-to-energize for solar/EVSE is EXECUTED as of unit 6.2: solar's
+// shell writes OpModConnect (no connect readback on the poll path — the
+// completeness gate holds while Connect is expressed, the documented
+// battery-pattern tradeoff), and EVSE folds disconnect into an effective
+// 0 A ceiling verified by metered current.
 type CSIPPassthrough struct {
 	// policy is resolved (WithDefaults applied) at construction time, like
 	// EconomicsConstraint's constructor arguments — not re-defaulted on every
