@@ -1,0 +1,14 @@
+#!/bin/sh
+# Mender ArtifactInstall_Leave state script -- a log marker only, no
+# health-gating logic here.
+#
+# Runs once the new artifact has been written to the INACTIVE A/B slot,
+# still before that slot is ever booted. This is well before the commit
+# decision: ArtifactCommit_Enter_00_lexa-health (the actual
+# commit-or-rollback gate) only runs after the new slot has booted and
+# become active. This script's sole purpose is to leave a timestamped
+# breadcrumb in the journal so `journalctl` shows exactly when an install
+# happened relative to the eventual commit/rollback outcome -- useful when
+# diagnosing why a device ended up on a slot nobody expected.
+
+logger -t mender-lexa "ArtifactInstall_Leave: new lexa artifact written to the inactive slot, awaiting reboot + ArtifactCommit_Enter_00_lexa-health"

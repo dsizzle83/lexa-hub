@@ -1,0 +1,56 @@
+#!/bin/sh
+# Mender ArtifactCommit_Enter state script — the OTA commit-or-rollback gate.
+#
+# CONTRACT (read this before touching the exit codes below): Mender runs
+# every ArtifactCommit_Enter_* script AFTER a new A/B rootfs slot has
+# already booted, but BEFORE that slot is committed as the new permanent
+# default. Any script here that exits NON-ZERO tells Mender the update is
+# BAD: Mender does NOT commit, and — because the slot was never committed —
+# the bootloader falls back to the previous (known-good) slot on its own,
+# no separate rollback step and no operator action required. Exit 0 tells
+# Mender the new slot is healthy and it becomes permanent.
+#
+# This script's only job is to ask lexa-healthcheck
+# (cmd/healthcheck in lexa-hub, see its package doc for exactly what each
+# of the seven DEVICE_ROADMAP.md §8.1 checks verifies and why) whether
+# every lexa-* service plus mosquitto is up and doing its job on THIS booted
+# slot, and let its exit code decide the update's fate. -commit makes
+# lexa-healthcheck retry the full check set every 5s for up to the given
+# budget (services legitimately take a few seconds to settle after a
+# reboot — a single point-in-time check run immediately at ArtifactCommit
+# time would false-FAIL on that startup transient and roll back a perfectly
+# good release).
+#
+# A false PASS here ships a broken hub as "good" (bricks trust in every
+# future OTA); a false FAIL rolls back a working release (blocks it
+# entirely) — both directions matter equally, which is the whole reason
+# lexa-healthcheck's checks are individually documented and bounded rather
+# than a single opaque "is it up" probe.
+#
+# Never gates on WAN/cloud reachability: lexa-healthcheck's cloudlink check
+# is offline-safe by construction (SKIPs when unconfigured/disabled, and
+# never requires the cloud endpoint itself to be reachable when enabled) —
+# an air-gapped bench unit or a device that has not yet been claimed by the
+# cloud must still be able to commit an update.
+#
+# Overridable via environment for bench/dev use (meta-lexa's recipe should
+# not need to override these on a real device):
+#   LEXA_HEALTHCHECK        path to the binary (default /usr/local/sbin/lexa-healthcheck)
+#   LEXA_HEALTHCHECK_BUDGET total retry budget, lexa-healthcheck's -budget syntax (default 120s)
+
+LEXA_HEALTHCHECK="${LEXA_HEALTHCHECK:-/usr/local/sbin/lexa-healthcheck}"
+LEXA_HEALTHCHECK_BUDGET="${LEXA_HEALTHCHECK_BUDGET:-120s}"
+
+if [ ! -x "$LEXA_HEALTHCHECK" ]; then
+    echo "ArtifactCommit_Enter_00_lexa-health: $LEXA_HEALTHCHECK not found or not executable -- failing closed (rollback)" >&2
+    exit 1
+fi
+
+logger -t mender-lexa "ArtifactCommit_Enter: running lexa-healthcheck -commit -budget $LEXA_HEALTHCHECK_BUDGET" 2>/dev/null
+
+# Deliberately the LAST command in the script: its exit status becomes
+# this script's exit status, which is exactly the signal Mender acts on.
+# lexa-healthcheck already prints one "[healthcheck] <name> PASS|FAIL|SKIP
+# (<detail>)" line per check to stderr (captured by Mender's own logging)
+# plus a JSON summary to stdout, so no extra echo is needed around it here.
+"$LEXA_HEALTHCHECK" -commit -budget "$LEXA_HEALTHCHECK_BUDGET"

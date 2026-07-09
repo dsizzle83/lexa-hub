@@ -3,7 +3,10 @@ SBINDIR := /usr/local/sbin
 CFGDIR  := /etc/lexa
 SVCDIR  := /etc/systemd/system
 
-SERVICES := hub northbound modbus ocpp telemetry api
+# healthcheck is not a service (no unit file, no daemon) but builds/installs
+# through the same pattern rule: bin/lexa-healthcheck → /usr/local/sbin, the
+# path scripts/mender/ArtifactCommit_Enter_00_lexa-health expects (unit 1.5).
+SERVICES := hub northbound modbus ocpp telemetry api healthcheck
 BINS     := $(addprefix $(BINDIR)/lexa-, $(SERVICES))
 
 .PHONY: all build install install-configs install-services clean tidy test test-nocgo fuzz sweep-sunspec
@@ -48,6 +51,7 @@ build-arm64:
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-modbus     ./cmd/modbus
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-ocpp       ./cmd/ocpp
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-api        ./cmd/api
+	$(GOARM64)     -o $(BINDIR)/arm64/lexa-healthcheck ./cmd/healthcheck
 	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-northbound ./cmd/northbound
 	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-telemetry  ./cmd/telemetry
 
