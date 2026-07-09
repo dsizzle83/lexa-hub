@@ -51,8 +51,14 @@ type PlannerParams struct {
 	// Missing steps treated as zero.
 	SolarForecastKw []float64
 
-	// LoadForecastKw is the expected site load (kW) excluding EV. Flat for now.
+	// LoadForecastKw is the expected site load (kW) excluding EV. Used as the
+	// flat/scalar load for every step when LoadProfileKw is empty.
 	LoadForecastKw float64
+
+	// LoadProfileKw is the per-step site load (kW) on the 288-slot 5-min grid,
+	// excluding EV. Empty ⇒ the scalar LoadForecastKw is used for every step;
+	// a missing/out-of-range step falls back to LoadForecastKw too (planStepLoad).
+	LoadProfileKw []float64
 
 	// ImportPricePerKwh and ExportPricePerKwh are $/kWh per step.
 	// nil → FallbackTOU is used.
@@ -353,7 +359,7 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 
 		c := planStepConstraint(p, t)
 		solarKw := planStepSolar(p, t)
-		loadKw := p.LoadForecastKw
+		loadKw := planStepLoad(p, t)
 		stepT := ws + int64(t)*planStepSec
 		impPrice := planStepImportPrice(p, t, stepT)
 		expPrice := planStepExportPrice(p, t, stepT)
@@ -515,7 +521,7 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 		if math.IsNaN(bKw) {
 			bKw = 0
 		}
-		gridW := (p.LoadForecastKw + evKw - solarKw - bKw) * 1000
+		gridW := (planStepLoad(p, t) + evKw - solarKw - bKw) * 1000
 		stepT := ws + int64(t)*planStepSec
 		impP := planStepImportPrice(p, t, stepT)
 		expP := planStepExportPrice(p, t, stepT)
@@ -585,6 +591,19 @@ func planStepSolar(p PlannerParams, t int) float64 {
 		return p.SolarForecastKw[t]
 	}
 	return 0
+}
+
+// planStepLoad returns the site load (kW) for step t: the per-step profile value
+// when a LoadProfileKw is set and covers t, otherwise the scalar LoadForecastKw.
+// Mirrors planStepSolar, but the empty/out-of-range fallback is the scalar
+// LoadForecastKw (not zero) — an unspecified step is "typical load", never "no
+// load". Behaviour is identical to reading p.LoadForecastKw directly whenever
+// LoadProfileKw is empty.
+func planStepLoad(p PlannerParams, t int) float64 {
+	if t >= 0 && t < len(p.LoadProfileKw) {
+		return p.LoadProfileKw[t]
+	}
+	return p.LoadForecastKw
 }
 
 // Daylight window for the clear-sky forecast shape (local hours).

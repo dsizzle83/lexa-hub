@@ -12,11 +12,54 @@ import (
 
 // plannerInput holds the external inputs consumed by the daily planner.
 // Published via Engine.state.planIn (see engine_state.go) — set by
-// SetDERConstraints/SetPrices, read by replan().
+// SetDERConstraints/SetPrices and the intent setters (SetEVGoal/
+// SetBackupReserve/SetSolarForecast/SetLoadProfile/SetFallbackTOU), read by
+// replan(). A nil pointer / empty slice means "not set" — buildPlannerParams
+// falls back to config/diurnal defaults for each unset field independently.
 type plannerInput struct {
 	derConstraints []StepConstraint
 	importPrices   []float64 // per planSteps step; nil = use FallbackTOU
 	exportPrices   []float64
+
+	// Intent-fed inputs (Unit 3.1 / DEVICE_ROADMAP §3.2). Each is nil/empty
+	// until the matching setter is called; buildPlannerParams overlays them on
+	// top of the config-derived params.
+	evGoal        *EVGoal           // app/cloud EV charging goal; overrides cfg EV target/departure
+	reservePct    *float64          // user backup-reserve floor (percent of capacity); RAISE-only
+	solarForecast *ExternalForecast // external solar forecast; wins over the diurnal curve when fresh
+	loadProfileKw []float64         // per-step site load (kW) on the 288 grid; empty = scalar load
+	fallbackTOU   *TOUCostModel     // tariff-intent TOU model; used when CSIP price slices are nil
+}
+
+// EVGoal is an externally-supplied EV charging goal (app or cloud), overlaid
+// on the config-derived EV parameters in buildPlannerParams. Energy terms are
+// kWh so the planner stays unit-simple (PlannerParams already works in kWh).
+type EVGoal struct {
+	// TargetSocKwh is the required EV pack energy at departure (kWh).
+	TargetSocKwh float64
+	// DepartureUnix is the departure instant (Unix seconds, server/tariff zone).
+	DepartureUnix int64
+	// InitialSocKwh is the user's stated pack energy at plug-in (kWh). Negative
+	// means "not stated" — the live EVSE SOC (if any) is used instead.
+	InitialSocKwh float64
+}
+
+// ExternalForecast is a solar-generation forecast supplied from outside the box
+// (a weather model, via lexa/intent/solarforecast). StepKw is on the planner's
+// 5-min grid starting at WindowStart.
+type ExternalForecast struct {
+	// StepKw is the per-step generation forecast (kW), indexed from WindowStart
+	// on the 5-min grid (<=288 useful entries; extra are ignored, short is
+	// zero-filled by resampleForecast).
+	StepKw []float64
+	// WindowStart is the Unix second the StepKw series begins at (5-min aligned).
+	WindowStart int64
+	// ReceivedUnix is the ARRIVAL time of this forecast on THIS box (Unix s),
+	// not the weather model's own timestamp. Staleness is judged against the
+	// local monotone-ish wall clock so a warped/stepped utility clock can never
+	// make a fresh forecast look stale or vice-versa (same clock-warp-safe
+	// stance as lexa-api's plan heartbeat).
+	ReceivedUnix int64
 }
 
 // Engine is the central orchestrator.  It runs a continuous control loop that:
@@ -83,7 +126,27 @@ type Engine struct {
 	done        chan struct{}
 	plannerDone chan struct{} // closed when plannerLoop exits
 	urgentWake  chan struct{} // poked by Wake on urgent controls (OpModConnect=false)
+
+	// forecastSource records which solar-forecast path buildPlannerParams last
+	// took: forecastExternal (a fresh external forecast was resampled onto the
+	// plan grid) or forecastDiurnal (the clear-sky fallback ran — no forecast,
+	// or a stale one). Written by the planner goroutine (buildPlannerParams,
+	// which replan() calls single-threaded), read by any caller via
+	// ForecastSource(). Holds a string; Load()==nil ⇒ "" before the first plan.
+	forecastSource atomic.Value
+	// forecastAgeSecs is the age (seconds) of the external solar forecast at the
+	// last buildPlannerParams evaluation: now-ReceivedUnix when an external
+	// forecast was present (fresh OR stale), else -1. Same writer/reader split
+	// as forecastSource; initialised to -1 in New.
+	forecastAgeSecs atomic.Int64
 }
+
+// Solar-forecast source labels stored in Engine.forecastSource and reported by
+// ForecastSource(). cmd/hub's planObserver stamps these onto the plan log.
+const (
+	forecastExternal = "external"
+	forecastDiurnal  = "diurnal"
+)
 
 // Config groups optional Engine tunables.
 type Config struct {
@@ -128,6 +191,9 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 		plannerDone:    make(chan struct{}),
 		urgentWake:     make(chan struct{}, 1),
 	}
+	// No external forecast has been evaluated yet: report age -1 until the first
+	// plan that sees one (ForecastSource() stays "" until the first plan runs).
+	e.forecastAgeSecs.Store(-1)
 	// Wire the fast protection loop only if BOTH the optimizer and reader support
 	// it; otherwise safety runs on the economic tick (inside Optimize) as before.
 	if se, ok := optimizer.(SafetyEvaluator); ok {
@@ -167,6 +233,93 @@ func (e *Engine) signalReplan() {
 	case e.plannerWake <- struct{}{}:
 	default:
 	}
+}
+
+// Intent setters (Unit 3.1 / DEVICE_ROADMAP §3.2). Each is a byte-for-byte copy
+// of the SetPrices idiom: enqueue a closure onto cmdCh (cap 16, drop-and-count
+// on overflow), which the control goroutine applies via setPlanIn's atomic
+// read-modify-write, then poke the planner. Latency contract, unchanged from
+// SetPrices/SetDERConstraints: the mutation takes effect no later than the next
+// tick/safetyTick/forced-Wake tick, because drainCmds runs immediately before
+// every one of them. All are safe for concurrent use from any goroutine.
+
+// SetEVGoal overlays an externally-supplied EV charging goal (app/cloud) on top
+// of the config-derived EV target/departure. Triggers an immediate re-plan.
+func (e *Engine) SetEVGoal(g EVGoal) {
+	e.enqueue(func(s *engineState) {
+		s.setPlanIn(func(in *plannerInput) { in.evGoal = &g })
+	})
+	e.signalReplan()
+}
+
+// SetBackupReserve sets the user backup-reserve floor (percent of battery
+// capacity). It can only RAISE the reserve above the configured safety floor —
+// see buildPlannerParams — never lower it. Triggers an immediate re-plan.
+func (e *Engine) SetBackupReserve(pct float64) {
+	e.enqueue(func(s *engineState) {
+		s.setPlanIn(func(in *plannerInput) { in.reservePct = &pct })
+	})
+	e.signalReplan()
+}
+
+// SetSolarForecast supplies an external solar-generation forecast that wins over
+// the diurnal clear-sky curve while it is fresh (buildPlannerParams' age gate).
+// Triggers an immediate re-plan.
+//
+// Unlike SetPrices — which stores the caller's slices directly, since the CSIP
+// converter builds a fresh slice per pricing update — this copies f.StepKw
+// defensively: the retained lexa/intent/solarforecast handler may reuse its
+// decode buffer across broker redeliveries, so a shared slice could be mutated
+// under the planner. The copy is <=288 float64 and off the tick path.
+func (e *Engine) SetSolarForecast(f ExternalForecast) {
+	f.StepKw = append([]float64(nil), f.StepKw...)
+	e.enqueue(func(s *engineState) {
+		s.setPlanIn(func(in *plannerInput) { in.solarForecast = &f })
+	})
+	e.signalReplan()
+}
+
+// SetLoadProfile supplies a per-step site-load forecast (kW) on the 288-slot
+// 5-min grid; empty restores the scalar LoadForecastKw. Triggers an immediate
+// re-plan. Copies stepKw defensively for the same retained-handler reason as
+// SetSolarForecast.
+func (e *Engine) SetLoadProfile(stepKw []float64) {
+	cp := append([]float64(nil), stepKw...)
+	e.enqueue(func(s *engineState) {
+		s.setPlanIn(func(in *plannerInput) { in.loadProfileKw = cp })
+	})
+	e.signalReplan()
+}
+
+// SetFallbackTOU supplies a tariff-intent TOU model, used when CSIP price slices
+// are absent (utility pricing still wins by the planner's nil-slice fallback
+// rule). The *TOUCostModel is compiled fresh per tariff intent, so the pointer
+// is stored as-is (no copy needed). Triggers an immediate re-plan.
+func (e *Engine) SetFallbackTOU(m *TOUCostModel) {
+	e.enqueue(func(s *engineState) {
+		s.setPlanIn(func(in *plannerInput) { in.fallbackTOU = m })
+	})
+	e.signalReplan()
+}
+
+// ForecastSource reports which solar-forecast path the most recent plan used:
+// "external" (a fresh external forecast was resampled onto the plan grid) or
+// "diurnal" (the clear-sky fallback ran — no forecast, or a stale one). Empty
+// before the first plan. Safe for concurrent use from any goroutine.
+func (e *Engine) ForecastSource() string {
+	if v, ok := e.forecastSource.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// ForecastAgeSeconds reports the age (seconds) of the external solar forecast at
+// the most recent plan evaluation, or -1 when no external forecast was in effect
+// (including before the first plan). A large value alongside
+// ForecastSource()=="diurnal" means a stale forecast was rejected in favour of
+// the fallback. Safe for concurrent use from any goroutine.
+func (e *Engine) ForecastAgeSeconds() int64 {
+	return e.forecastAgeSecs.Load()
 }
 
 // enqueue, drainCmds, mustNotBeStarted, and Register*Actuator — the Engine
@@ -371,6 +524,12 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 	// all day and zero sun for the whole horizon on any post-sunset replan).
 	// Back out the clear-sky peak from the live generation and the time of day,
 	// and keep a high-water mark so a replan after dark still forecasts tomorrow.
+	//
+	// The high-water OBSERVATION runs UNCONDITIONALLY — above the external-
+	// forecast gate below — because it is an independent sensor-derived estimate
+	// the diurnal fallback needs kept warm: if an external forecast arrives fresh
+	// today but goes stale tomorrow, the fallback must still have a peak to shape.
+	// Only the diurnal ASSIGNMENT to p.SolarForecastKw is gated (Unit 3.1 §3.3).
 	if curKw := state.TotalSolarW() / 1000; curKw > 0 {
 		if shape := clearSkyShape(localHourOf(now.Unix())); shape > 0.15 {
 			if est := curKw / shape; est > e.state.lastSolarPeakKw {
@@ -378,11 +537,29 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 			}
 		}
 	}
-	peakKw := e.state.lastSolarPeakKw
-	if cfg.SolarPeakKw > peakKw {
-		peakKw = cfg.SolarPeakKw
+	// Solar forecast gate (§11 staleness rule): a FRESH external forecast wins;
+	// otherwise fall back to the clear-sky diurnal curve (the block below is the
+	// pre-existing forecast code, unchanged, just moved into the else arm).
+	const maxForecastAgeS = 12 * 3600 // §11 staleness rule; config-overridable later
+	if fc := inp.solarForecast; fc != nil && now.Unix()-fc.ReceivedUnix <= maxForecastAgeS {
+		p.SolarForecastKw = resampleForecast(fc, p.WindowStart)
+		e.forecastSource.Store(forecastExternal)
+		e.forecastAgeSecs.Store(now.Unix() - fc.ReceivedUnix)
+	} else {
+		peakKw := e.state.lastSolarPeakKw
+		if cfg.SolarPeakKw > peakKw {
+			peakKw = cfg.SolarPeakKw
+		}
+		p.SolarForecastKw = diurnalSolarForecast(p.WindowStart, peakKw)
+		e.forecastSource.Store(forecastDiurnal)
+		if fc := inp.solarForecast; fc != nil {
+			// A stale external forecast exists: the fallback ran, but record its
+			// age so ForecastAgeSeconds()/the plan log surface the staleness.
+			e.forecastAgeSecs.Store(now.Unix() - fc.ReceivedUnix)
+		} else {
+			e.forecastAgeSecs.Store(-1) // no external forecast at all
+		}
 	}
-	p.SolarForecastKw = diurnalSolarForecast(p.WindowStart, peakKw)
 
 	// Fallback TOU if no live pricing.
 	if p.ImportPricePerKwh == nil {
@@ -451,9 +628,78 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 				p.EVDepartureUnix = nextDailyOccurrence(now, cfg.EVDepartureHH, cfg.EVDepartureMM).Unix()
 			}
 		}
+		// EV goal override (Unit 3.1 §3.3): an app/cloud goal wins over the
+		// config-derived target/departure just set. A stated initial SOC seeds
+		// the energy integration; <0 leaves the live-EVSE SOC (above) in place.
+		if g := inp.evGoal; g != nil {
+			p.EVTargetSocKwh = g.TargetSocKwh
+			p.EVDepartureUnix = g.DepartureUnix
+			if g.InitialSocKwh >= 0 {
+				p.InitialEVSocKwh = g.InitialSocKwh
+			}
+		}
+	}
+
+	// Reserve + load profile + fallback TOU overlays (Unit 3.1 §3.3), next to
+	// the TerminalReservePct derivation above. p.BattCapacityKwh was set by the
+	// battery loop (0 when no connected battery, making the reserve a no-op).
+	if r := inp.reservePct; r != nil {
+		// Intents may only RAISE the reserve floor, never lower it — a safety
+		// invariant. We clamp against the CFG-DERIVED floor (the same 20%
+		// default the battery loop applies), not the raw cfg field, so a lowball
+		// intent can never drop TerminalSocKwh below the floor the loop set.
+		// Planner economics only: the optimizer's SOCReserve safety checks and
+		// the Tier-0 interlock floor are untouched.
+		floorPct := cfg.TerminalReservePct
+		if floorPct <= 0 {
+			floorPct = 20
+		}
+		pct := math.Max(*r, floorPct)
+		p.TerminalSocKwh = p.BattCapacityKwh * pct / 100
+		p.MinBattSocKwh = math.Max(p.MinBattSocKwh, p.BattCapacityKwh*pct/100)
+	}
+	if lp := inp.loadProfileKw; len(lp) > 0 {
+		p.LoadProfileKw = lp
+	}
+	if inp.fallbackTOU != nil {
+		p.FallbackTOU = inp.fallbackTOU
 	}
 
 	return p
+}
+
+// resampleForecast shifts an external solar forecast's per-step kW series onto
+// the plan window's 5-min grid. fc.StepKw is indexed from fc.WindowStart; align
+// it to windowStart by a whole-step offset ((windowStart-fc.WindowStart)/
+// planStepSec). A forecast that STARTS in the future (fc.WindowStart >
+// windowStart) yields a negative offset, which is deliberately NOT clamped:
+// the leading plan steps (before the forecast's own start) zero-fill via the
+// src<0 branch below, and the series lands at its temporally correct steps.
+// Start-aligning instead (clamping the offset to 0) would shift the whole
+// solar curve EARLIER by the gap — wrong peak timing, mispricing every
+// battery/EV decision the DP makes off it (principal review finding, unit 3.1).
+// Out-of-range steps are zero-filled — the same rule planStepSolar applies to a
+// short SolarForecastKw. Each value is clamped >= 0, and any non-finite entry
+// maps to 0: the bus layer already rejects NaN/Inf upstream (GAP-09), so this
+// is pure defense-in-depth against a forecast that slipped through.
+func resampleForecast(fc *ExternalForecast, windowStart int64) []float64 {
+	out := make([]float64, planSteps)
+	if fc == nil {
+		return out
+	}
+	offset := (windowStart - fc.WindowStart) / planStepSec
+	for t := 0; t < planSteps; t++ {
+		src := int64(t) + offset
+		if src < 0 || src >= int64(len(fc.StepKw)) {
+			continue // zero-fill out-of-range
+		}
+		v := fc.StepKw[src]
+		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+			continue // clamp negatives / non-finite to zero (defense-in-depth)
+		}
+		out[t] = v
+	}
+	return out
 }
 
 // nextDailyOccurrence returns the next occurrence of HH:MM local time at or after now.
