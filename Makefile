@@ -6,7 +6,7 @@ SVCDIR  := /etc/systemd/system
 # healthcheck is not a service (no unit file, no daemon) but builds/installs
 # through the same pattern rule: bin/lexa-healthcheck → /usr/local/sbin, the
 # path scripts/mender/ArtifactCommit_Enter_00_lexa-health expects (unit 1.5).
-SERVICES := hub northbound modbus ocpp telemetry api healthcheck
+SERVICES := hub northbound modbus ocpp telemetry api healthcheck cloudlink
 BINS     := $(addprefix $(BINDIR)/lexa-, $(SERVICES))
 
 .PHONY: all build install install-configs install-services clean tidy test test-nocgo fuzz sweep-sunspec
@@ -61,6 +61,7 @@ build-arm64:
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-api        ./cmd/api
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-healthcheck ./cmd/healthcheck
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-migrate     ./cmd/lexa-migrate
+	$(GOARM64)     -o $(BINDIR)/arm64/lexa-cloudlink   ./cmd/cloudlink
 	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-northbound ./cmd/northbound
 	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-telemetry  ./cmd/telemetry
 
@@ -107,14 +108,14 @@ install-services:
 	install -m 644 systemd/lexa-*.service $(SVCDIR)/
 	install -m 644 systemd/mosquitto-lexa.conf /etc/mosquitto/conf.d/lexa.conf
 	systemctl daemon-reload
-	systemctl enable mosquitto lexa-migrate lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-hub lexa-api
+	systemctl enable mosquitto lexa-migrate lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-hub lexa-api lexa-cloudlink
 
 # Start all services (after install-services)
 start:
-	systemctl start mosquitto lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-hub lexa-api
+	systemctl start mosquitto lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-hub lexa-api lexa-cloudlink
 
 stop:
-	systemctl stop lexa-api lexa-hub lexa-ocpp lexa-telemetry lexa-northbound lexa-modbus
+	systemctl stop lexa-cloudlink lexa-api lexa-hub lexa-ocpp lexa-telemetry lexa-northbound lexa-modbus
 
 status:
 	systemctl status lexa-hub lexa-northbound lexa-modbus lexa-ocpp lexa-telemetry lexa-api --no-pager

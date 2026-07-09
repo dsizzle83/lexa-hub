@@ -129,7 +129,7 @@ jobs:
           go vet $(go list ./... | grep -v -e internal/wolfssl -e internal/tlsclient -e cmd/northbound -e cmd/telemetry)
 
       - name: build (cgo-free services)
-        run: CGO_ENABLED=0 go build ./cmd/hub ./cmd/modbus ./cmd/ocpp ./cmd/api ./cmd/healthcheck ./cmd/lexa-migrate
+        run: CGO_ENABLED=0 go build ./cmd/hub ./cmd/modbus ./cmd/ocpp ./cmd/api ./cmd/healthcheck ./cmd/lexa-migrate ./cmd/cloudlink
 
       # TASK-053: the generative int16/scale-factor boundary sweep (GAP-07)
       # needs no new step here — it lands as ordinary _test.go files in
@@ -231,7 +231,7 @@ jobs:
           go-version-file: go.mod
 
       - name: cross-compile arm64 (deploy artifacts, pure-Go)
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./cmd/hub ./cmd/modbus ./cmd/ocpp ./cmd/api ./cmd/healthcheck ./cmd/lexa-migrate
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./cmd/hub ./cmd/modbus ./cmd/ocpp ./cmd/api ./cmd/healthcheck ./cmd/lexa-migrate ./cmd/cloudlink
 
   # TASK-005: pinned govulncheck (scripts/ci/govulncheck.sh) + triage
   # allowlist (scripts/ci/vuln-allowlist.txt). Reuses the `cgo` job's wolfSSL

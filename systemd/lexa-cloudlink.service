@@ -1,0 +1,87 @@
+[Unit]
+# StartLimit* MUST live in [Unit] (systemd >=v230 ignores them in
+# [Service]); the default 5-in-10s otherwise applies and a crash
+# burst (e.g. the power-cut-retained scenario) permanently disables
+# the service. (V1RC FINDING A, 2026-07-06.)
+StartLimitIntervalSec=120
+StartLimitBurst=5
+Description=LEXA Cloud Link (cloud command/telemetry bridge)
+Documentation=https://github.com/lexa/lexa-hub
+# time-sync.target (Unit 1.6, DEVICE_ROADMAP.md §9): once 2.3 lands, the
+# cloud mTLS session validates cert NotBefore/NotAfter the same way
+# lexa-northbound/lexa-telemetry's wolfSSL handshakes already do, so it
+# needs a sane clock. Ordering ONLY — deliberately no
+# Wants=time-sync.target and no ConditionClockSynchronized=: a SOM whose
+# clock never syncs (no NTP reachable, no RTC) must still boot and run this
+# service. This unit (2.1) makes no cloud connection at all yet, and even
+# once 2.3 lands the correct degraded behavior is the same fail-closed
+# retry loop every other lexa-* service already uses, not a boot hang.
+After=network-online.target mosquitto.service time-sync.target
+# Wants= not Requires=: a clean mosquitto stop/restart must NOT stop-propagate
+# to the lexa services — they survive broker restarts via paho auto-reconnect
+# (the crash-only/reconnect design; mqtt-broker-restart scenario proves it).
+# Requires+stop-propagation left lexa-api/telemetry permanently dead when a
+# scenario cleanly stopped mosquitto. (V1RC FINDING A root fix, 2026-07-06.)
+Wants=mosquitto.service
+Wants=network-online.target
+
+[Service]
+# StateDirectory=lexa auto-creates /var/lib/lexa: this unit's journal
+# (/var/lib/lexa/journal/cloudlink, wired unconditionally at startup — see
+# cmd/cloudlink/main.go) lives under it now, and 2.2's spool
+# (/var/lib/lexa/spool) will once it lands.
+StateDirectory=lexa
+# WS-1 sandboxing (V1.0 punch list convention, applied here for consistency
+# with every other lexa-*.service): bounds blast radius on top of the
+# existing User=lexa. StateDirectory=lexa above already implies a
+# read-write bind-mount for /var/lib/lexa even under ProtectSystem=strict —
+# no separate ReadWritePaths= needed.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+# Type=notify + WatchdogSec (TASK-008 pattern, docs/DEVICE_ROADMAP.md
+# §2.1/§2.9): like lexa-telemetry, lexa-cloudlink has no tight control loop
+# in this unit — no cloud session, no batcher — so the 10s kick ticker
+# (cmd/cloudlink/main.go) is the liveness proxy, gated on mc.IsConnected()
+# AND healthy() (a seam this unit stubs to always-true; 2.2 tightens it to
+# also require the spool be healthy) rather than riding a real loop the way
+# lexa-hub's tick or lexa-northbound's walk do.
+#
+# WatchdogSec=60 sizing: matches lexa-telemetry/lexa-ocpp/lexa-api's
+# WatchdogSec=60 — comfortably above the 10s kick cadence, for the same
+# "no per-tick real-time budget this unit depends on yet" reasons those
+# services document in their own unit files.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
+User=lexa
+Group=lexa
+ExecStart=/usr/local/sbin/lexa-cloudlink -config /etc/lexa/cloudlink.json
+Restart=on-failure
+RestartSec=10s
+
+# journald rate cap (TASK-009, review §11 flash wear / RSK-14): this unit
+# logs a handful of startup lines plus one retained-status publish
+# confirmation every health_interval_s (900s default) — negligible volume
+# next to every other lexa-*.service's budget (see
+# lexa-hub/docs/FLASH_BUDGET.md). LogRateLimitIntervalSec=30/Burst=150
+# matches lexa-telemetry's sizing (same "no tight per-tick loop" shape) as
+# a conservative starting point; 2.2-2.4 (uplink batching, downlink intent
+# traffic) are the units expected to actually exercise this budget and may
+# need to revisit it then.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=150
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lexa-cloudlink
+
+# Device/cloud identity (serial_file, cloud_ca/cloud_cert/cloud_key —
+# docs/DEVICE_ROADMAP.md §2.2) must be readable by the lexa user but never
+# writable by this process.
+ReadOnlyPaths=/etc/lexa/identity
+
+[Install]
+WantedBy=multi-user.target
