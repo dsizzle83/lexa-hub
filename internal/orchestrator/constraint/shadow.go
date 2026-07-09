@@ -3,8 +3,10 @@ package constraint
 import (
 	"fmt"
 	"math"
+	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -184,6 +186,10 @@ type Options struct {
 	// signature (the sorted set of diverging device+axis keys). ≤0 ⇒ 1 minute.
 	// Bounds journald/flash pressure when a divergence persists (05 §9).
 	RateLimit time.Duration
+	// OnPanic, when non-nil, is invoked once per candidate panic with the
+	// recovered value and stack. Same contract as OnDiverge: must not block,
+	// runs on the control goroutine.
+	OnPanic func(recovered any, stack []byte)
 }
 
 // Wrapper is the shadow harness. It implements orchestrator.Optimizer (and,
@@ -199,6 +205,20 @@ type Wrapper struct {
 	// count is the running divergent-tick total. Atomic: read by a metrics
 	// scrape on another goroutine (cmd/hub Collect), written only here.
 	count uint64
+	// safetyCount is the running divergent-tick total for the Tier-1 fast
+	// path shadow diff (EvaluateSafety). The flip gate carves out NOTHING on
+	// this counter — any safety divergence is a flip blocker. Atomic.
+	safetyCount uint64
+	// panics counts candidate panics; latched flips to 1 on the first panic
+	// and permanently disables candidate observation for the process
+	// lifetime (WS-5.1). A latch trip fails the soak gate. Both atomic.
+	panics  uint64
+	latched uint32
+	// axisCounts tallies divergent ticks per axis key (small fixed
+	// vocabulary; "safety:"-prefixed for the fast path). sync.Map because a
+	// metrics scrape reads concurrently with control-goroutine writes.
+	axisCounts sync.Map // string -> *uint64
+	onPanic    func(recovered any, stack []byte)
 
 	// ── single-goroutine (control-loop) state ──
 	// breachMismatch counts consecutive ticks the candidate holds a breach
@@ -237,6 +257,7 @@ func Wrap(legacy, candidate orchestrator.Optimizer, opts Options) *Wrapper {
 		tol:        tol,
 		now:        now,
 		onDiverge:  opts.OnDiverge,
+		onPanic:    opts.OnPanic,
 		rateLimit:  rl,
 		lastEmit:   make(map[string]time.Time),
 		suppressed: make(map[string]uint64),
@@ -247,34 +268,101 @@ func Wrap(legacy, candidate orchestrator.Optimizer, opts Options) *Wrapper {
 // any goroutine (atomic) — cmd/hub mirrors it into a metric at scrape time.
 func (w *Wrapper) Divergences() uint64 { return atomic.LoadUint64(&w.count) }
 
+// SafetyDivergences returns the running count of Tier-1 fast-path divergent
+// ticks (WS-5.3 shadow-safety diff). Safe from any goroutine.
+func (w *Wrapper) SafetyDivergences() uint64 { return atomic.LoadUint64(&w.safetyCount) }
+
+// Panics returns the number of candidate panics recovered; Latched reports
+// whether candidate observation is permanently disabled (WS-5.1).
+func (w *Wrapper) Panics() uint64 { return atomic.LoadUint64(&w.panics) }
+func (w *Wrapper) Latched() bool  { return atomic.LoadUint32(&w.latched) == 1 }
+
+// AxisDivergences snapshots the per-axis divergent-tick tallies ("safety:"
+// prefix marks the fast path). Safe from any goroutine.
+func (w *Wrapper) AxisDivergences() map[string]uint64 {
+	out := make(map[string]uint64)
+	w.axisCounts.Range(func(k, v any) bool {
+		out[k.(string)] = atomic.LoadUint64(v.(*uint64))
+		return true
+	})
+	return out
+}
+
+func (w *Wrapper) bumpAxis(key string) {
+	v, _ := w.axisCounts.LoadOrStore(key, new(uint64))
+	atomic.AddUint64(v.(*uint64), 1)
+}
+
 // Optimize runs both optimizers on the same state, diffs, and returns the
 // LEGACY plan unmodified. The candidate plan is observed and discarded — it
 // never reaches executePlan. This passthrough is the safety invariant of the
 // whole harness (unit-tested by TestWrapper_ReturnsLegacyPlan).
+//
+// The candidate runs under a recover() latch (WS-5.1): a panic anywhere in
+// the candidate stack must never kill the process controlling hardware. The
+// first panic permanently disables observation (latch) — a tripped latch
+// fails the soak gate, it is never silently tolerated.
 func (w *Wrapper) Optimize(state orchestrator.SystemState) orchestrator.Plan {
 	legacy := w.legacy.Optimize(state)
-	candidate := w.candidate.Optimize(state)
-	w.compare(state, legacy, candidate)
+	if atomic.LoadUint32(&w.latched) == 0 {
+		w.observeCandidate(state, legacy)
+	}
 	return legacy
 }
 
-// EvaluateSafety delegates the Tier-1 fast protection pass to the LEGACY
-// optimizer only. Candidate safety is TASK-062; until then the cascade remains
-// the sole author of protective disconnects, so the shadow harness must not
-// perturb the safety loop at all. When the legacy optimizer is not itself a
-// SafetyEvaluator (only in tests — the product wires DefaultOptimizer, which
-// is), this returns an inert safety plan so the engine's fast loop is a no-op.
+func (w *Wrapper) observeCandidate(state orchestrator.SystemState, legacy orchestrator.Plan) {
+	defer w.recoverCandidate()
+	candidate := w.candidate.Optimize(state)
+	w.compare(state, legacy, candidate, "")
+}
+
+// EvaluateSafety returns the LEGACY optimizer's Tier-1 fast protection plan —
+// the cascade remains the sole author of protective disconnects until the
+// flip. As of WS-5.3 the candidate Stack's safety path (EvaluateSafety →
+// EvaluateFast) is ALSO run, observe-only under the same panic latch, and
+// diffed into safetyCount/"safety:"-prefixed axes: the fast path accrues real
+// bench hours during the soak instead of arriving at the flip with zero.
+// When the legacy optimizer is not itself a SafetyEvaluator (only in tests —
+// the product wires DefaultOptimizer, which is), this returns an inert safety
+// plan so the engine's fast loop is a no-op.
 func (w *Wrapper) EvaluateSafety(state orchestrator.SystemState) orchestrator.Plan {
+	legacyPlan := orchestrator.Plan{Timestamp: state.Timestamp, Safety: true}
 	if se, ok := w.legacy.(orchestrator.SafetyEvaluator); ok {
-		return se.EvaluateSafety(state)
+		legacyPlan = se.EvaluateSafety(state)
 	}
-	return orchestrator.Plan{Timestamp: state.Timestamp, Safety: true}
+	if atomic.LoadUint32(&w.latched) == 0 {
+		if cse, ok := w.candidate.(orchestrator.SafetyEvaluator); ok {
+			w.observeCandidateSafety(state, legacyPlan, cse)
+		}
+	}
+	return legacyPlan
+}
+
+func (w *Wrapper) observeCandidateSafety(state orchestrator.SystemState, legacyPlan orchestrator.Plan, cse orchestrator.SafetyEvaluator) {
+	defer w.recoverCandidate()
+	candidatePlan := cse.EvaluateSafety(state)
+	w.compare(state, legacyPlan, candidatePlan, "safety:")
+}
+
+// recoverCandidate is the WS-5.1 latch: record the panic, disable observation
+// for the process lifetime, and let the control loop continue on legacy.
+func (w *Wrapper) recoverCandidate() {
+	if r := recover(); r != nil {
+		atomic.AddUint64(&w.panics, 1)
+		atomic.StoreUint32(&w.latched, 1)
+		if w.onPanic != nil {
+			w.onPanic(r, debug.Stack())
+		}
+	}
 }
 
 // compare diffs the two plans, updates the counter, and (rate-limited) emits.
 // Breach is evaluated FIRST and unconditionally so its debounce counter tracks
-// every tick regardless of whether any command axis diverged.
-func (w *Wrapper) compare(state orchestrator.SystemState, legacy, candidate orchestrator.Plan) {
+// every tick regardless of whether any command axis diverged. prefix "" is the
+// slow (Optimize) path; "safety:" is the Tier-1 fast-path diff (WS-5.3),
+// which counts into safetyCount and prefixes its axis keys so the two streams
+// are separable in metrics, signatures, and the soak-gate classification.
+func (w *Wrapper) compare(state orchestrator.SystemState, legacy, candidate orchestrator.Plan, prefix string) {
 	var axes []AxisDivergence
 
 	if bd := w.diffBreach(legacy, candidate); bd != nil {
@@ -287,9 +375,16 @@ func (w *Wrapper) compare(state orchestrator.SystemState, legacy, candidate orch
 	if len(axes) == 0 {
 		return
 	}
-	atomic.AddUint64(&w.count, 1)
+	counter := &w.count
+	if prefix != "" {
+		counter = &w.safetyCount
+	}
+	atomic.AddUint64(counter, 1)
+	for _, a := range axes {
+		w.bumpAxis(prefix + a.Axis)
+	}
 
-	sig := signature(axes)
+	sig := prefix + signature(axes)
 	now := w.now()
 	if !w.allow(sig, now) {
 		w.suppressed[sig]++
@@ -302,7 +397,7 @@ func (w *Wrapper) compare(state orchestrator.SystemState, legacy, candidate orch
 		Ts:         timestampOf(legacy, candidate, now),
 		Axes:       axes,
 		State:      snapshot(state),
-		Total:      atomic.LoadUint64(&w.count),
+		Total:      atomic.LoadUint64(counter),
 		Suppressed: w.suppressed[sig],
 	}
 	if ns, ok := w.candidate.(interface{ SessionNames() []string }); ok {

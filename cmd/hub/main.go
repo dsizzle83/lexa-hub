@@ -35,11 +35,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"math"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -248,15 +250,39 @@ func main() {
 					slog.Warn("constraint-shadow divergence", "diff", string(b))
 				}
 			},
+			// WS-5.1: a candidate panic must never kill the process
+			// controlling hardware. The wrapper recovers, permanently
+			// disables candidate observation (latch), and we alarm here —
+			// a tripped latch FAILS the soak gate.
+			OnPanic: func(recovered any, stack []byte) {
+				slog.Error("constraint-shadow candidate PANIC — shadow latched OFF (soak gate fails)",
+					"panic", fmt.Sprint(recovered), "stack", string(stack))
+			},
 		})
 		optimizer = wrapper
 		shadowDivergences = wrapper.Divergences
-		// Mirror the wrapper's running count into the metric at scrape time
+		// Mirror the wrapper's running counts into metrics at scrape time
 		// (Counter.Set mirrors an external monotonic source — metrics.go).
+		// Per-axis counters (WS-5.2) make the flip gate's per-axis carve-outs
+		// measurable; the safety counter (WS-5.3) tracks the Tier-1 fast-path
+		// shadow diff, which carves out NOTHING. Axis names are sanitized to
+		// metric-name charset (small fixed vocabulary).
 		reg.Collect(func(r *metrics.Registry) {
 			r.Counter("lexa_constraint_shadow_divergence_total").Set(wrapper.Divergences())
+			r.Counter("lexa_constraint_shadow_safety_divergence_total").Set(wrapper.SafetyDivergences())
+			r.Counter("lexa_constraint_shadow_panics_total").Set(wrapper.Panics())
+			var latched uint64
+			if wrapper.Latched() {
+				latched = 1
+			}
+			r.Gauge("lexa_constraint_shadow_panic_latched").Set(float64(latched))
+			for axis, n := range wrapper.AxisDivergences() {
+				name := "lexa_constraint_shadow_divergence_axis_" +
+					strings.NewReplacer("-", "_", ":", "_").Replace(axis) + "_total"
+				r.Counter(name).Set(n)
+			}
 		})
-		log.Printf("lexa-hub: constraint shadow ENABLED (observe-only; legacy cascade authoritative)")
+		log.Printf("lexa-hub: constraint shadow ENABLED (observe-only; legacy cascade authoritative; panic-latch + per-axis + Tier-1 safety diff armed)")
 	}
 
 	// Compliance-breach reporting (TASK-031). The named breachEpisodes component

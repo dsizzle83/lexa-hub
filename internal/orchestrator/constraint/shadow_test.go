@@ -77,11 +77,19 @@ func TestWrapper_ReturnsLegacyPlanUnmodified(t *testing.T) {
 	}
 }
 
-func TestWrapper_EvaluateSafetyDelegatesToLegacyOnly(t *testing.T) {
-	legacy := &safetyStub{safetyPlan: orchestrator.Plan{Safety: true, BatteryCommands: []orchestrator.BatteryCommand{{Name: "b0"}}}}
-	// Candidate is ALSO a SafetyEvaluator; it must never be consulted.
-	cand := &safetyStub{}
-	w := Wrap(legacy, cand, Options{})
+func TestWrapper_EvaluateSafetyReturnsLegacyObservesCandidate(t *testing.T) {
+	// WS-5.3: the candidate's Tier-1 safety path IS consulted (observe-only,
+	// shadow-diffed into safetyCount) but the RETURNED plan is always the
+	// legacy one — the cascade stays the sole author of protective
+	// disconnects until the flip. (Supersedes the pre-WS-5.3 invariant that
+	// the candidate was never consulted on this path.)
+	legacy := &safetyStub{safetyPlan: orchestrator.Plan{Safety: true, BatteryCommands: []orchestrator.BatteryCommand{
+		{Name: "b0", SetpointW: 0, Connect: boolPtr(true)},
+	}}}
+	cand := &safetyStub{safetyPlan: orchestrator.Plan{Safety: true, BatteryCommands: []orchestrator.BatteryCommand{
+		{Name: "b0", SetpointW: 0, Connect: boolPtr(false)}, // exact-diff axis
+	}}}
+	w := Wrap(legacy, cand, Options{Now: newFixedClock().now, OnDiverge: (&collector{}).sink})
 
 	// The engine type-asserts optimizer.(SafetyEvaluator); prove the wrapper passes.
 	se, ok := orchestrator.Optimizer(w).(orchestrator.SafetyEvaluator)
@@ -89,14 +97,94 @@ func TestWrapper_EvaluateSafetyDelegatesToLegacyOnly(t *testing.T) {
 		t.Fatal("Wrapper must implement orchestrator.SafetyEvaluator")
 	}
 	plan := se.EvaluateSafety(orchestrator.SystemState{})
-	if legacy.safetyCalls != 1 {
-		t.Fatalf("legacy EvaluateSafety calls = %d, want 1", legacy.safetyCalls)
+	if legacy.safetyCalls != 1 || cand.safetyCalls != 1 {
+		t.Fatalf("calls legacy=%d cand=%d, want 1/1", legacy.safetyCalls, cand.safetyCalls)
 	}
-	if cand.safetyCalls != 0 {
-		t.Fatalf("candidate EvaluateSafety must NOT be called, got %d", cand.safetyCalls)
+	if !plan.Safety || len(plan.BatteryCommands) != 1 || *plan.BatteryCommands[0].Connect != true {
+		t.Fatalf("legacy safety plan not returned unmodified: %+v", plan)
 	}
+	if w.SafetyDivergences() != 1 {
+		t.Fatalf("safety divergence count = %d, want 1", w.SafetyDivergences())
+	}
+	if w.Divergences() != 0 {
+		t.Fatalf("slow-path count must stay 0, got %d", w.Divergences())
+	}
+	ac := w.AxisDivergences()
+	if ac["safety:"+AxisConnect.String()] != 1 {
+		t.Fatalf("want safety-prefixed connect axis tally, got %v", ac)
+	}
+}
+
+// panicOptimizer panics on every Optimize/EvaluateSafety call after recording it.
+type panicOptimizer struct {
+	calls       int
+	safetyCalls int
+}
+
+func (p *panicOptimizer) Optimize(orchestrator.SystemState) orchestrator.Plan {
+	p.calls++
+	panic("candidate boom")
+}
+func (p *panicOptimizer) EvaluateSafety(orchestrator.SystemState) orchestrator.Plan {
+	p.safetyCalls++
+	panic("candidate safety boom")
+}
+
+func TestWrapper_PanicLatchDisablesCandidate(t *testing.T) {
+	// WS-5.1: a candidate panic never escapes to the control loop; the first
+	// panic latches the shadow OFF for the process lifetime.
+	legacy := &safetyStub{
+		stubOptimizer: stubOptimizer{plan: orchestrator.Plan{BatteryCommands: []orchestrator.BatteryCommand{{Name: "b0", SetpointW: 500}}}},
+		safetyPlan:    orchestrator.Plan{Safety: true},
+	}
+	cand := &panicOptimizer{}
+	var gotPanic any
+	w := Wrap(legacy, cand, Options{Now: newFixedClock().now,
+		OnPanic: func(r any, _ []byte) { gotPanic = r }})
+
+	plan := w.Optimize(orchestrator.SystemState{}) // must not panic
+	if len(plan.BatteryCommands) != 1 || plan.BatteryCommands[0].SetpointW != 500 {
+		t.Fatalf("legacy plan not returned after candidate panic: %+v", plan)
+	}
+	if gotPanic == nil || w.Panics() != 1 || !w.Latched() {
+		t.Fatalf("panic not latched: onPanic=%v panics=%d latched=%v", gotPanic, w.Panics(), w.Latched())
+	}
+	// Latched: candidate must not be consulted again on either path.
+	w.Optimize(orchestrator.SystemState{})
+	w.EvaluateSafety(orchestrator.SystemState{})
+	if cand.calls != 1 || cand.safetyCalls != 0 {
+		t.Fatalf("latched candidate consulted again: calls=%d safetyCalls=%d", cand.calls, cand.safetyCalls)
+	}
+	if w.Panics() != 1 {
+		t.Fatalf("panics grew after latch: %d", w.Panics())
+	}
+}
+
+func TestWrapper_SafetyPanicLatches(t *testing.T) {
+	legacy := &safetyStub{safetyPlan: orchestrator.Plan{Safety: true, BatteryCommands: []orchestrator.BatteryCommand{{Name: "b0"}}}}
+	cand := &panicOptimizer{}
+	w := Wrap(legacy, cand, Options{Now: newFixedClock().now})
+	plan := w.EvaluateSafety(orchestrator.SystemState{})
 	if !plan.Safety || len(plan.BatteryCommands) != 1 {
-		t.Fatalf("delegated safety plan not returned: %+v", plan)
+		t.Fatalf("legacy safety plan not returned after candidate safety panic: %+v", plan)
+	}
+	if !w.Latched() || w.Panics() != 1 {
+		t.Fatalf("safety panic did not latch: latched=%v panics=%d", w.Latched(), w.Panics())
+	}
+}
+
+func TestWrapper_AxisCountsSlowPath(t *testing.T) {
+	legacy := &stubOptimizer{plan: orchestrator.Plan{BatteryCommands: []orchestrator.BatteryCommand{
+		{Name: "b0", SetpointW: 1000, Connect: boolPtr(true)},
+	}}}
+	cand := &stubOptimizer{plan: orchestrator.Plan{BatteryCommands: []orchestrator.BatteryCommand{
+		{Name: "b0", SetpointW: 1100, Connect: boolPtr(false)},
+	}}}
+	w := Wrap(legacy, cand, Options{Now: newFixedClock().now, OnDiverge: (&collector{}).sink})
+	w.Optimize(orchestrator.SystemState{})
+	ac := w.AxisDivergences()
+	if ac[AxisConnect.String()] != 1 {
+		t.Fatalf("want unprefixed connect tally 1, got %v", ac)
 	}
 }
 
