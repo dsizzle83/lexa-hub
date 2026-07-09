@@ -590,6 +590,16 @@ binary-only deploy + hand-set Pi config (05 §6 discipline).
   right — pinned by `internal/orchestrator/costmodel_test.go` /`planner_test.go`'s DST
   tables (`TestTOU_UTCvsLA_Divergence_DeploymentHazard` pins the zone-mismatch
   divergence specifically).
+  **WS-8 (V1.0 punch list, TASK-079/GAP-05, 2026-07-09) enforces the
+  deployment requirement above with a startup assertion, additive only —
+  no control behavior changes:** `hub.json`'s `tariff_zone` config key names
+  the tariff's IANA zone (e.g. `"America/Los_Angeles"`); at startup
+  `cmd/hub/tariffzone.go` compares `time.Local`'s offset behavior against
+  `time.LoadLocation(tariff_zone)` across a year sample (catches DST-rule
+  differences, not just today's offset) and, on mismatch or an invalid zone
+  name, logs a LOUD error and sets the `lexa_tariff_zone_mismatch` gauge to
+  1. An empty `tariff_zone` (the shipped default) leaves the check disabled
+  with a WARN — today's unenforced behavior, unchanged.
 
 ## Defensive fault-handling (do not strip — each backs a mayhem-QA finding)
 

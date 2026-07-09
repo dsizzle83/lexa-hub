@@ -113,6 +113,21 @@ type Config struct {
 	// on (no code change accompanies that flip).
 	Snapshot *SnapshotConfig `json:"snapshot,omitempty"`
 
+	// TariffZone is an IANA time zone name (e.g. "America/Los_Angeles") that
+	// the TOU tariff `TOUCostModel`/planner `localHourOf`/price-shaping
+	// helpers (internal/orchestrator/costmodel.go, planner.go) are written
+	// in local clock time for (TASK-079/WS-8, GAP-05; see CLAUDE.md "SOM
+	// zone must match the tariff zone"). Those helpers key on t.Hour() in
+	// WHATEVER zone the caller's time.Time carries — correct only when the
+	// process's configured zone (time.Local, i.e. the SOM's /etc/localtime)
+	// actually IS the tariff's zone. An empty TariffZone (the default)
+	// leaves today's behavior unchanged (no assertion, just a startup WARN);
+	// a non-empty value makes main() compare time.Local's offset behavior
+	// against LoadLocation(TariffZone) across a year sample and, on
+	// mismatch, log a LOUD error and set the lexa_tariff_zone_mismatch gauge
+	// to 1 — an additive assertion only, it changes no control behavior.
+	TariffZone string `json:"tariff_zone"`
+
 	// RetainedAdoptionMaxAgeS bounds (in seconds) how old a retained
 	// lexa/csip/control message's Ts may be at ADOPTION time before the hub
 	// treats it as a stale-suspect resurrection (TASK-042, §8.3/GAP-01):
