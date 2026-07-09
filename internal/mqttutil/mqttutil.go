@@ -179,13 +179,12 @@ func ConnectAuth(broker, clientID, user, pass string) (mqtt.Client, error) {
 	return connect(broker, clientID, user, pass, Instrumentation{})
 }
 
-// connect is the shared implementation behind ConnectAuth and
-// ConnectAuthInstrumented — identical behavior either way, the only
-// difference being whether inst's callbacks are non-nil.
-func connect(broker, clientID, user, pass string, inst Instrumentation) (mqtt.Client, error) {
-	reg := &subRegistry{}
-	state := &instState{inst: inst}
-
+// buildClientOptions constructs the *mqtt.ClientOptions shared by every
+// client this package creates. Split out from connect() so the option
+// plumbing — in particular the WS-9.2 Store/WriteTimeout settings — is
+// unit-testable without dialing a real broker (connect() blocks on a network
+// round trip via client.Connect()).
+func buildClientOptions(broker, clientID, user, pass string, reg *subRegistry, state *instState) *mqtt.ClientOptions {
 	opts := mqtt.NewClientOptions().
 		AddBroker(broker).
 		SetClientID(clientID).
@@ -193,6 +192,24 @@ func connect(broker, clientID, user, pass string, inst Instrumentation) (mqtt.Cl
 		SetMaxReconnectInterval(30 * time.Second).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(5 * time.Second).
+		// WS-9.2: paho's default Store (plain MemoryStore, used whenever
+		// ClientOptions.Store is left nil — see NewClient/c.persist.Open())
+		// iterates its internal Go map in undefined order, so a resend after
+		// a reconnect (ResumeSubs / in-flight QoS>0 messages) can replay
+		// queued messages out of the order they were originally published.
+		// OrderedMemoryStore (vendor/.../memstore_ordered.go) records each
+		// message's insertion time and sorts by it in All(), fixing that —
+		// still purely in-memory (no on-disk persistence added or implied).
+		SetStore(mqtt.NewOrderedMemoryStore()).
+		// WS-9.2: bounds how long a single underlying net.Conn write may
+		// block (default 0 = unbounded, options.go's SetWriteTimeout doc).
+		// A wedged TCP write would otherwise stall paho's internal write
+		// goroutine indefinitely — which would in turn stall the ordered
+		// resend the Store change above exists to guarantee, and every
+		// other publish on this client. Reuses publishTimeout (5s) so a
+		// write-level stall and this package's own publish-ack wait share
+		// one bound instead of introducing a second unrelated constant.
+		SetWriteTimeout(publishTimeout).
 		SetOnConnectHandler(func(c mqtt.Client) {
 			if user != "" {
 				// Deliberately logged so journal evidence can confirm which
@@ -222,6 +239,16 @@ func connect(broker, clientID, user, pass string, inst Instrumentation) (mqtt.Cl
 			}
 		})
 	applyAuth(opts, user, pass)
+	return opts
+}
+
+// connect is the shared implementation behind ConnectAuth and
+// ConnectAuthInstrumented — identical behavior either way, the only
+// difference being whether inst's callbacks are non-nil.
+func connect(broker, clientID, user, pass string, inst Instrumentation) (mqtt.Client, error) {
+	reg := &subRegistry{}
+	state := &instState{inst: inst}
+	opts := buildClientOptions(broker, clientID, user, pass, reg, state)
 
 	client := mqtt.NewClient(opts)
 	registries.Store(client, reg)

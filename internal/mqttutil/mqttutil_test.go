@@ -298,6 +298,38 @@ func TestApplyAuth_SetsCredentialsOnlyWhenUserNonEmpty(t *testing.T) {
 	}
 }
 
+// TestBuildClientOptions_OrderedStoreAndWriteTimeout is WS-9.2's option-
+// plumbing test: every client this package builds must use an
+// *mqtt.OrderedMemoryStore (not paho's default, unordered MemoryStore) and a
+// non-zero WriteTimeout, without dialing a real broker (buildClientOptions
+// is the piece of connect() that runs before client.Connect()'s network
+// round trip).
+//
+// What this does NOT cover: proving OrderedMemoryStore.All() actually
+// replays queued messages in original-publish order end-to-end. That would
+// need a real or fake broker connection driving an actual resend after a
+// reconnect — this package has no fake-broker test harness today (its
+// existing tests, e.g. TestPublishJSONQoS0DoesNotBlockOnUnackedPublish and
+// mqttutil_async_test.go's Harvest tests, all drive fakeClient/token doubles
+// rather than a real handshake+resend). Accepted gap; OrderedMemoryStore's
+// own replay-ordering correctness is paho's to prove, not this package's —
+// this test only pins that connect() actually asks for it.
+func TestBuildClientOptions_OrderedStoreAndWriteTimeout(t *testing.T) {
+	reg := &subRegistry{}
+	state := &instState{}
+	opts := buildClientOptions("tcp://localhost:1883", "lexa-test", "", "", reg, state)
+
+	if _, ok := opts.Store.(*mqtt.OrderedMemoryStore); !ok {
+		t.Fatalf("opts.Store = %T, want *mqtt.OrderedMemoryStore", opts.Store)
+	}
+	if opts.WriteTimeout != publishTimeout {
+		t.Fatalf("opts.WriteTimeout = %s, want publishTimeout (%s)", opts.WriteTimeout, publishTimeout)
+	}
+	if opts.WriteTimeout <= 0 {
+		t.Fatalf("opts.WriteTimeout = %s, want a bounded (>0) duration — 0 means paho never times out a write", opts.WriteTimeout)
+	}
+}
+
 // TestPublishFailInstrumentationHook is TASK-044's mqttutil instrumentation
 // test: a publish that never gets acked (the same neverToken/fakeClient
 // forced-failure setup as TestPublishJSONQoS0DoesNotBlockOnUnackedPublish)
