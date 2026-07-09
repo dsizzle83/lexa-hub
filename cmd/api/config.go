@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -28,8 +29,21 @@ type Config struct {
 	MQTTUser     string `json:"mqtt_user"`
 	MQTTPassFile string `json:"mqtt_pass_file"`
 
-	// ListenAddr is the HTTP listen address (host:port). Default ":9100".
+	// ListenAddr is the HTTP listen address (host:port). Default
+	// "127.0.0.1:9100" (WS-1, V1.0 punch list: loopback-only is the product
+	// default — a wildcard/LAN bind with no token is refused below unless
+	// Bench is set). The bench's deployed api.json explicitly overrides this
+	// to a LAN-reachable ":9100" (dashboard/metersim on other 69.0.0.x hosts
+	// need to reach it), same bench-vs-product framing as MetricsAddr in
+	// cmd/hub/config.go.
 	ListenAddr string `json:"listen_addr"`
+
+	// Bench is the explicit escape hatch (WS-1) that lets lexa-api bind a
+	// non-loopback ListenAddr with no APITokenFile configured — the pre-WS-1
+	// default, and still what the bench's LAN-reachable :9100 needs when
+	// deploy-hub-pi.sh's --bench-insecure opt-out is used. PRODUCT deploys
+	// must leave this false/absent.
+	Bench bool `json:"bench"`
 
 	// StaleAfterS is the seconds since the last measurement after which a
 	// device is reported as Connected=false. Default 30.
@@ -79,7 +93,7 @@ func loadConfig(path string) (*Config, error) {
 		cfg.MQTTClientID = "lexa-api"
 	}
 	if cfg.ListenAddr == "" {
-		cfg.ListenAddr = ":9100"
+		cfg.ListenAddr = "127.0.0.1:9100"
 	}
 	if cfg.StaleAfterS == 0 {
 		cfg.StaleAfterS = 30
@@ -93,7 +107,40 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.PlanStallAfterS == 0 {
 		cfg.PlanStallAfterS = 75
 	}
+	// WS-1 (V1.0 punch list, security fail-closed by default): a wildcard/LAN
+	// bind with no bearer-token auth is an unauthenticated control-adjacent
+	// HTTP surface reachable from the whole LAN. Refuse it unless Bench opts
+	// out — deploy-hub-pi.sh's default path now always provisions
+	// api_token_file (see its header), so this only fires for a hand-edited
+	// or pre-WS-1 config, or the explicit --bench-insecure path (which also
+	// sets bench:true).
+	if !cfg.Bench && cfg.APITokenFile == "" && !isLoopbackAddr(cfg.ListenAddr) {
+		return nil, fmt.Errorf("api: refusing to bind non-loopback listen_addr %q with no api_token_file configured: the product default requires bearer-token auth on any externally-reachable bind (TASK-014, WS-1) — set \"bench\": true in the config to run open on the air-gapped bench LAN, or configure api_token_file", cfg.ListenAddr)
+	}
 	return &cfg, nil
+}
+
+// isLoopbackAddr reports whether addr (host:port, or a bare host/port form
+// such as ":9100") resolves to a loopback-only bind (127.0.0.1, ::1,
+// localhost) as opposed to a wildcard ("", "0.0.0.0") or LAN-reachable
+// interface address.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// No ":port" present (or a malformed addr) — treat the whole string
+		// as the host part so "localhost" (no port) still classifies right;
+		// an addr net.Listen would itself reject is not our problem to
+		// diagnose here.
+		host = addr
+	}
+	if host == "" {
+		return false // wildcard bind (":9100" form)
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (c *Config) StaleAfter() time.Duration {

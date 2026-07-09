@@ -17,6 +17,14 @@ Wants=mosquitto.service
 Wants=network-online.target lexa-modbus.service
 
 [Service]
+# WS-1 sandboxing (V1.0 punch list, 2026-07-09): bounds blast radius on top
+# of the existing User=lexa. lexa-telemetry writes nothing to disk (it only
+# reads telemetry.json + certs) — no ReadWritePaths= needed.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
 # Type=notify + WatchdogSec (TASK-008, review §11 item 5): lexa-telemetry has
 # no tight control loop like northbound/modbus, so this is a weaker liveness
 # signal by design (documented here and in cmd/telemetry/main.go): a 10s kick
