@@ -142,6 +142,11 @@ func main() {
 			// TASK-031: forward device-level non-convergence to the hub's
 			// breach-episode component (active mode only).
 			if mode == modeActive {
+				// WS-4.5: heal a retained NonConvergedBegin left over from a
+				// PREVIOUS process instance of this shell BEFORE this
+				// instance's own reconciler starts publishing (sh.pub, right
+				// below) — see healStaleRetainedReport's doc.
+				healStaleRetainedReport(mc, bus.DesiredClassEVSE, sc.ID, time.Now())
 				sh.pub = newReconcileReportPublisher(mc)
 			}
 			shells[sc.ID] = sh
