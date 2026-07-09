@@ -185,6 +185,29 @@ func TestLoadConfig_RetainedAdoptionMaxAgeOverride(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_ShippedSnapshotEnabled pins WS-4.1 (2026-07-09): the
+// shipped configs/hub.json must ship snapshot.enabled:true (flipped from
+// the write-only-soak default after the 2026-07-08 8-cycle
+// hub-restart-mid-cap campaign passed with restore off — see
+// SnapshotConfig's doc). A regression back to false here would silently
+// resurrect the duplicate-CannotComply-after-restart bug TASK-041 closed —
+// this test exists so that resurrection fails CI instead of a bench.
+func TestLoadConfig_ShippedSnapshotEnabled(t *testing.T) {
+	cfg, err := loadConfig("../../configs/hub.json")
+	if err != nil {
+		t.Fatalf("loadConfig(configs/hub.json): %v", err)
+	}
+	if cfg.Snapshot == nil {
+		t.Fatal("Snapshot = nil, want the shipped snapshot block")
+	}
+	if !cfg.Snapshot.Enabled {
+		t.Fatal("Snapshot.Enabled = false, want true (WS-4.1 shipped default)")
+	}
+	if cfg.Snapshot.Path == "" {
+		t.Fatal("Snapshot.Path = \"\", want the shipped path")
+	}
+}
+
 // writeTempConfig writes body to a temp file and returns its path — a tiny
 // helper so the two loadConfig tests above don't each hand-roll os.CreateTemp.
 func writeTempConfig(t *testing.T, body string) string {
