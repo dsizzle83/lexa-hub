@@ -270,6 +270,18 @@ type SolarCommand struct {
 
 	// CurtailToW caps the inverter output. math.NaN() means "no curtailment".
 	CurtailToW float64
+
+	// Connect requests the inverter's connect (true) / cease-to-energize
+	// (false) state; nil means "no opinion — leave unchanged", matching
+	// BatteryCommand.Connect and the desired-doc layer's absence semantics
+	// (bus.DesiredState.Connect). Added by the gateway fan-out (Unit 3.6): the
+	// constraint arbiter resolves a per-device AxisConnect into Desired.Connect,
+	// and stack.go's emitCommands fans that onto the owning class's command —
+	// solar for an inverter device. The legacy DefaultOptimizer never sets it
+	// (nil), so its plans are unchanged. Ownership: authored ONLY by the
+	// constraint Stack's emitCommands; the meter/reconciler execution side is
+	// documented in cmd/hub (the solar reconciler does not yet act on it).
+	Connect *bool
 }
 
 // EVSECommand sets a current limit on an EV charger.
@@ -278,6 +290,13 @@ type EVSECommand struct {
 	ConnectorID int
 	// MaxCurrentA: 0 = suspend session, >0 = set limit.
 	MaxCurrentA float64
+
+	// Connect requests the connector's connect (true) / cease-to-energize
+	// (false) state; nil means "no opinion — leave unchanged". Same ownership
+	// and absence semantics as SolarCommand.Connect (Unit 3.6 gateway fan-out).
+	// A 0 A MaxCurrentA is the metered suspend path; Connect=false is the
+	// explicit disconnect intent the desired doc carries.
+	Connect *bool
 }
 
 // Decision records one reasoning step in the optimizer.

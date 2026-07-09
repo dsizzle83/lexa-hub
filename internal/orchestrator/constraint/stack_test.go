@@ -130,3 +130,148 @@ func TestStack_ZeroTimestampFallsBack(t *testing.T) {
 		t.Errorf("zero-timestamp state should fall back to now()")
 	}
 }
+
+// TestEmitCommands_ConnectFanOutPerClass pins the Unit 3.6 AxisConnect fan-out:
+// a resolved Desired.Connect is routed onto the SAME class its value axis names
+// (solar/EVSE/battery), never spuriously onto a battery command for a solar or
+// EVSE device — closing the 3.4/3.5-documented gap. It also proves nil-safety
+// (a nil Connect leaves the class command's Connect nil) and that the standalone
+// bare-connect battery path (the Tier-1 safety force-disconnect) is unchanged.
+func TestEmitCommands_ConnectFanOutPerClass(t *testing.T) {
+	solarCeil := func(max float64) map[Axis]Interval {
+		return map[Axis]Interval{AxisSolarCeilingW: {Min: nan(), Max: max}}
+	}
+	evseCur := func(max float64) map[Axis]Interval {
+		return map[Axis]Interval{AxisEVSECurrentA: {Min: nan(), Max: max}}
+	}
+	battSet := func(w float64) map[Axis]Interval {
+		return map[Axis]Interval{AxisBatterySetpointW: {Min: w, Max: w}}
+	}
+
+	tests := []struct {
+		name    string
+		desired map[string]Desired
+		check   func(t *testing.T, plan orchestrator.Plan)
+	}{
+		{
+			name: "solar ceiling + disconnect → SolarCommand.Connect, no battery command",
+			desired: map[string]Desired{
+				"inv1": {Device: "inv1", Bounds: solarCeil(3000), Connect: boolPtr(false)},
+			},
+			check: func(t *testing.T, plan orchestrator.Plan) {
+				if len(plan.SolarCommands) != 1 || plan.SolarCommands[0].Connect == nil || *plan.SolarCommands[0].Connect {
+					t.Fatalf("want SolarCommand.Connect=false, got %+v", plan.SolarCommands)
+				}
+				if plan.SolarCommands[0].CurtailToW != 3000 {
+					t.Fatalf("solar ceiling lost: %+v", plan.SolarCommands)
+				}
+				if len(plan.BatteryCommands) != 0 {
+					t.Fatalf("solar device must not emit a battery command: %+v", plan.BatteryCommands)
+				}
+			},
+		},
+		{
+			name: "evse current + disconnect → EVSECommand.Connect, no battery command",
+			desired: map[string]Desired{
+				"cs-1": {Device: "cs-1", Bounds: evseCur(16), Connect: boolPtr(false)},
+			},
+			check: func(t *testing.T, plan orchestrator.Plan) {
+				if len(plan.EVSECommands) != 1 || plan.EVSECommands[0].Connect == nil || *plan.EVSECommands[0].Connect {
+					t.Fatalf("want EVSECommand.Connect=false, got %+v", plan.EVSECommands)
+				}
+				if plan.EVSECommands[0].MaxCurrentA != 16 || plan.EVSECommands[0].StationID != "cs-1" {
+					t.Fatalf("evse limit/station lost: %+v", plan.EVSECommands)
+				}
+				if len(plan.BatteryCommands) != 0 {
+					t.Fatalf("evse device must not emit a battery command: %+v", plan.BatteryCommands)
+				}
+			},
+		},
+		{
+			name: "battery setpoint + disconnect → BatteryCommand carries both",
+			desired: map[string]Desired{
+				"bat1": {Device: "bat1", Bounds: battSet(-1500), Connect: boolPtr(false)},
+			},
+			check: func(t *testing.T, plan orchestrator.Plan) {
+				if len(plan.BatteryCommands) != 1 {
+					t.Fatalf("want 1 battery command, got %+v", plan.BatteryCommands)
+				}
+				c := plan.BatteryCommands[0]
+				if c.SetpointW != -1500 || c.Connect == nil || *c.Connect {
+					t.Fatalf("want battery {setpoint -1500, connect false}, got %+v", c)
+				}
+			},
+		},
+		{
+			name: "bare connect (no value axis) → battery force-disconnect path unchanged",
+			desired: map[string]Desired{
+				"bat1": {Device: "bat1", Bounds: map[Axis]Interval{}, Connect: boolPtr(false)},
+			},
+			check: func(t *testing.T, plan orchestrator.Plan) {
+				if len(plan.SolarCommands) != 0 || len(plan.EVSECommands) != 0 {
+					t.Fatalf("bare connect must not touch solar/evse: %+v", plan)
+				}
+				if len(plan.BatteryCommands) != 1 || plan.BatteryCommands[0].Connect == nil || *plan.BatteryCommands[0].Connect {
+					t.Fatalf("bare connect must emit a battery disconnect: %+v", plan.BatteryCommands)
+				}
+				if !math.IsNaN(plan.BatteryCommands[0].SetpointW) {
+					t.Fatalf("bare connect battery setpoint must stay NaN (leave unchanged): %+v", plan.BatteryCommands[0])
+				}
+			},
+		},
+		{
+			name: "nil connect is class-safe: solar ceiling only, no battery command",
+			desired: map[string]Desired{
+				"inv1": {Device: "inv1", Bounds: solarCeil(2000), Connect: nil},
+			},
+			check: func(t *testing.T, plan orchestrator.Plan) {
+				if len(plan.SolarCommands) != 1 || plan.SolarCommands[0].Connect != nil {
+					t.Fatalf("nil connect must leave SolarCommand.Connect nil: %+v", plan.SolarCommands)
+				}
+				if len(plan.BatteryCommands) != 0 {
+					t.Fatalf("nil-connect solar must not emit a battery command: %+v", plan.BatteryCommands)
+				}
+			},
+		},
+		{
+			name: "nil connect is class-safe: evse current only, no battery command",
+			desired: map[string]Desired{
+				"cs-1": {Device: "cs-1", Bounds: evseCur(24), Connect: nil},
+			},
+			check: func(t *testing.T, plan orchestrator.Plan) {
+				if len(plan.EVSECommands) != 1 || plan.EVSECommands[0].Connect != nil {
+					t.Fatalf("nil connect must leave EVSECommand.Connect nil: %+v", plan.EVSECommands)
+				}
+				if len(plan.BatteryCommands) != 0 {
+					t.Fatalf("nil-connect evse must not emit a battery command: %+v", plan.BatteryCommands)
+				}
+			},
+		},
+		{
+			name: "connect true fans onto solar and evse",
+			desired: map[string]Desired{
+				"inv1": {Device: "inv1", Bounds: solarCeil(4000), Connect: boolPtr(true)},
+				"cs-1": {Device: "cs-1", Bounds: evseCur(32), Connect: boolPtr(true)},
+			},
+			check: func(t *testing.T, plan orchestrator.Plan) {
+				if len(plan.SolarCommands) != 1 || plan.SolarCommands[0].Connect == nil || !*plan.SolarCommands[0].Connect {
+					t.Fatalf("want SolarCommand.Connect=true, got %+v", plan.SolarCommands)
+				}
+				if len(plan.EVSECommands) != 1 || plan.EVSECommands[0].Connect == nil || !*plan.EVSECommands[0].Connect {
+					t.Fatalf("want EVSECommand.Connect=true, got %+v", plan.EVSECommands)
+				}
+				if len(plan.BatteryCommands) != 0 {
+					t.Fatalf("no battery device present: %+v", plan.BatteryCommands)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var plan orchestrator.Plan
+			emitCommands(&plan, tt.desired)
+			tt.check(t, plan)
+		})
+	}
+}

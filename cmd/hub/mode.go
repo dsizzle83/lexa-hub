@@ -29,14 +29,31 @@ package main
 // exactly what was passed to New before. SystemState already carries CSIPControl;
 // the mode is only which author reads it.
 //
-// Known interim gap (Unit 3.5 finding, closed by Unit 3.6): the gateway stack's
-// AxisConnect demands fan out to BatteryCommand.Connect only — stack.go's
-// emitCommands does not yet map connect onto solar/EVSE commands
-// (passthrough.go's "Known Stack-wiring gap" doc). Gateway mode therefore ships
-// FUNCTIONAL for solar-ceiling / battery-setpoint / EVSE-current, with
-// cease-to-energize for solar/EVSE still arriving via the compliance tier's own
-// demands where applicable; full connect fan-out is Unit 3.6's additive
-// emitCommands change, not a modeManager concern.
+// AxisConnect fan-out (Unit 3.5 finding, CLOSED by Unit 3.6): the gateway
+// stack's AxisConnect demands now fan out to the OWNING class's command —
+// stack.go's emitCommands routes a resolved Desired.Connect onto
+// SolarCommand.Connect / EVSECommand.Connect / BatteryCommand.Connect by the
+// value axis the same device carries. cmd/hub's solar and EVSE actuators fold
+// that Connect into the retained desired doc (desired.go). CAVEAT the desired
+// DOC carries Connect for all three classes, but EXECUTION of cease-to-energize
+// is complete only for battery today (its reconciler writes OpModConnect); the
+// lexa-modbus solar reconciler (solarFieldsToControl) and the lexa-ocpp EVSE
+// reconciler (applyActionLocked) still drop the Connect field on the write path
+// — a reconciler-side follow-up (see the Unit 3.6 report). Gateway-mode
+// solar/EVSE curtailment (ceiling / current, incl. 0 A suspend) is fully
+// functional; hard disconnect for those two classes is doc-complete,
+// execution-pending.
+//
+// Gateway mode × constraint_shadow (soak note — where an operator will look):
+// the two are orthogonal wirings of the SAME shadow-validated constraint code.
+// In OPTIMIZER mode with constraint_shadow on, the shadow wrapper runs the
+// candidate Stack observe-only and diffs it against the legacy cascade (the P5
+// gate). In GATEWAY mode, modeManager.Optimize routes to the gateway Stack
+// directly — modeMgr.optimizer (the shadow wrapper) is NOT called at all, so
+// the economic shadow diff IDLES for the duration of gateway mode (its
+// divergence counters simply stop advancing; a soak reading zero divergences
+// while the hub is in gateway mode is expected, not a passing economic gate).
+// Tier-1 safety still routes to the legacy evaluator either way (below).
 
 import (
 	"log/slog"

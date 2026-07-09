@@ -8,6 +8,12 @@
   "engine_interval_s": 15,
   "debug": false,
   "constraint_shadow": false,
+  "mode": "optimizer",
+  "gateway": {
+    "evse_policy": "scheduled",
+    "evse_window": { "start_hh": 23, "end_hh": 7 },
+    "evse_full_a": 32.0
+  },
   "devices": [
     {
       "name": "inverter-0",

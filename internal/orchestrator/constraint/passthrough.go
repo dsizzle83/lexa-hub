@@ -164,20 +164,16 @@ const (
 // compliance constraints' job, unaffected by which constraint occupies the
 // economics slot.
 //
-// Known Stack-wiring gap (documented, not fixed here — out of this unit's
-// scope; the house convention is naming a Stack limitation in the emitting
-// constraint's doc rather than reaching into stack.go, see export.go's
-// EV-emission-deferred note for precedent): stack.go's emitCommands maps
-// AxisConnect only onto BatteryCommand.Connect (constraint.go:59-62) — an
-// AxisConnect demand keyed to an inverter or EVSE device name is therefore
-// currently inert once past arbitration (no SolarCommand/EVSECommand carries
-// a Connect field yet). Wiring or actuating this constraint (a later unit)
-// needs that Stack gap closed, or must accept that gateway-mode
-// cease-to-energize for solar/EVSE stays legacy-owned in the interim (the
-// fallback ECOSYSTEM_ROADMAP §14 already names: "a passthrough-only gateway
-// … weeks, not months, but document its […] gap prominently"). This unit
-// only builds and unit-tests the constraint in isolation — nothing
-// constructs or calls it outside passthrough_test.go.
+// Stack-wiring gap CLOSED (unit 3.6): stack.go's emitCommands now fans
+// AxisConnect out per class (SolarCommand/EVSECommand gained Connect *bool;
+// the fan-out routes a connect onto the class its value axis names). The
+// remaining honest caveat is EXECUTION, not emission: the desired docs carry
+// Connect for all three classes, but only the battery reconciler executes it
+// today — cmd/modbus's solarFieldsToControl drops Connect (no OpModConnect
+// emit) and cmd/ocpp's applyActionLocked reads only MaxCurrentA. Gateway
+// cease-to-energize for solar/EVSE therefore rides the compliance tier's
+// power/current limits (0 W ceiling / 0 A) until the reconciler-side
+// follow-up (unit 6.2 on the campaign board) lands.
 type CSIPPassthrough struct {
 	// policy is resolved (WithDefaults applied) at construction time, like
 	// EconomicsConstraint's constructor arguments — not re-defaulted on every

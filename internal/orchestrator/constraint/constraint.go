@@ -58,7 +58,10 @@ const (
 	AxisEVSECurrentA
 	// AxisConnect is the connect/disconnect axis; the interval fields are unused
 	// and Demand.Connect carries the desired state. false (disconnect) is the
-	// safe value and always wins. Maps to BatteryCommand.Connect.
+	// safe value and always wins. Maps to the Connect field of the command class
+	// the device's value axis names — SolarCommand for a ceiling-bound device,
+	// EVSECommand for a current-bound one, else BatteryCommand (unit 3.6's
+	// emitCommands fan-out; before that it mapped to BatteryCommand only).
 	AxisConnect
 )
 

@@ -148,6 +148,18 @@ func main() {
 	// live, 0 in optimizer mode. Set by modeManager on every flip and at boot
 	// re-seed, so a scrape always reflects which author is authoring plans.
 	modeGatewayGauge := reg.Gauge("lexa_hub_mode_gateway")
+	// lexa_hub_forecast_* (Unit 3.6/§3.1): solar-forecast provenance, stamped by
+	// planObserver every pass from engine.ForecastSource()/ForecastAgeSeconds().
+	//   forecast_external    — 1 while the planner uses a fresh EXTERNAL forecast,
+	//                          0 on the diurnal clear-sky fallback.
+	//   forecast_age_seconds — age (s) of the external forecast at the last plan;
+	//                          -1 means none in effect (documented sentinel, not 0).
+	//   forecast_stale       — 1 while a stale external forecast forced the diurnal
+	//                          fallback (the edge-alarmed condition), else 0.
+	forecastExternalGauge := reg.Gauge("lexa_hub_forecast_external")
+	forecastAgeGauge := reg.Gauge("lexa_hub_forecast_age_seconds")
+	forecastStaleGauge := reg.Gauge("lexa_hub_forecast_stale")
+	staleAlarm := newForecastStaleAlarm(forecastStaleGauge)
 
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
@@ -429,6 +441,17 @@ func main() {
 	// needed even though it is closed over here.
 	var planLogPending *mqttutil.PendingPub
 
+	// Plan-log enrichment seams (Unit 3.6). planObserver is defined here, before
+	// modeMgr/eng exist, so it reaches them through these function values —
+	// harmless no-op defaults until they are wired to modeMgr.Mode /
+	// eng.ForecastSource / eng.ForecastAgeSeconds just after those are built.
+	// The engine only calls PlanObserver from its control goroutine, which does
+	// not start until eng.Start() (well after the wiring below), so the closure
+	// always sees the real accessors — the happens-before is the goroutine spawn.
+	modeOf := func() string { return "optimizer" }
+	forecastSourceOf := func() string { return "" }
+	forecastAgeOf := func() int64 { return -1 }
+
 	// tickBudget is this task's Phase 4 exit-criterion threshold: half the
 	// economic engine interval. Exceeding it — measured as this pass's own
 	// synchronous work plus the PRIOR pass's actuator Apply* time, see
@@ -497,6 +520,20 @@ func main() {
 		if shadowDivergences != nil {
 			pl.ShadowDivergences = shadowDivergences()
 		}
+		// Unit 3.6 observability: stamp the live plan author + solar-forecast
+		// provenance onto the plan log, mirror them onto the forecast gauges, and
+		// edge-alarm a stale external forecast (the 3.1 finding, surfaced here in
+		// cmd/hub rather than per-tick inside the radioactive orchestrator).
+		fSource := forecastSourceOf()
+		fAge := forecastAgeOf()
+		enrichPlanLog(&pl, modeOf(), fSource, fAge)
+		forecastAgeGauge.Set(float64(fAge))
+		if fSource == "external" {
+			forecastExternalGauge.Set(1)
+		} else {
+			forecastExternalGauge.Set(0)
+		}
+		staleAlarm.observe(fSource, fAge)
 		for _, dec := range plan.Decisions {
 			pl.Decisions = append(pl.Decisions, bus.PlanDecision{
 				Rule: dec.Rule, Reason: dec.Reason, Impact: dec.Impact,
@@ -585,6 +622,13 @@ func main() {
 		PlanObserver:   planObserver,
 	})
 	modeMgr.setEngine(eng) // post-construction: modeMgr.request pokes eng.Wake on a flip
+
+	// Wire the Unit 3.6 plan-log enrichment seams now that both authors exist
+	// (see their forward declaration above planObserver). Reassigned before
+	// eng.Start(), so planObserver reads the real accessors on its first pass.
+	modeOf = modeMgr.Mode
+	forecastSourceOf = eng.ForecastSource
+	forecastAgeOf = eng.ForecastAgeSeconds
 
 	// Subscribe to all state topics.
 	if err := mqttutil.Subscribe(mc, bus.SubMeasurements, reader.onMeasurement); err != nil {
@@ -754,6 +798,62 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("lexa-hub: shutting down")
+}
+
+// enrichPlanLog stamps the Unit 3.6 observability fields — the live plan author
+// (mode) and the solar-forecast provenance (source + age) — onto a PlanLog.
+// Pure and additive: the wire version is unchanged (PlanLogV) and every field
+// is omitempty, so an optimizer-mode hub with no external forecast produces
+// JSON byte-identical to pre-3.6 EXCEPT for the always-present "mode" key (a
+// live hub always sets a non-empty mode). Kept a free function so plan_test.go
+// can pin the stamping at a clean seam without standing up an Engine.
+func enrichPlanLog(pl *bus.PlanLog, mode, forecastSource string, forecastAgeS int64) {
+	pl.Mode = mode
+	pl.ForecastSource = forecastSource
+	pl.ForecastAgeS = forecastAgeS
+}
+
+// forecastStaleAlarm edge-triggers a single WARN when the planner falls back to
+// the diurnal clear-sky curve while a (too-old) EXTERNAL solar forecast is still
+// on the books — the Unit 3.1 finding, surfaced here in cmd/hub's planObserver
+// rather than as a per-tick log inside the radioactive orchestrator package. It
+// latches so the warn fires ONCE per stale episode and re-arms when the source
+// recovers (a fresh external forecast, or no external forecast at all). It also
+// mirrors the condition onto lexa_hub_forecast_stale (0/1).
+type forecastStaleAlarm struct {
+	latched bool
+	gauge   *metrics.Gauge                // lexa_hub_forecast_stale; nil-safe
+	warn    func(msg string, args ...any) // slog.Warn in production; a test seam
+}
+
+// newForecastStaleAlarm builds the alarm around a (nil-safe) stale gauge.
+func newForecastStaleAlarm(gauge *metrics.Gauge) *forecastStaleAlarm {
+	return &forecastStaleAlarm{gauge: gauge, warn: slog.Warn}
+}
+
+// observe applies this pass's forecast source/age. "stale" is a diurnal
+// fallback WITH a recorded external-forecast age (>= 0): a real forecast exists
+// but was rejected as too old. It returns whether it emitted a NEW edge warn
+// this call (for tests; production ignores the return).
+func (a *forecastStaleAlarm) observe(source string, ageS int64) bool {
+	stale := source == "diurnal" && ageS >= 0
+	if a.gauge != nil {
+		if stale {
+			a.gauge.Set(1)
+		} else {
+			a.gauge.Set(0)
+		}
+	}
+	switch {
+	case stale && !a.latched:
+		a.warn("lexa-hub: solar forecast stale — planner using diurnal fallback",
+			"forecast_source", source, "forecast_age_s", ageS)
+		a.latched = true
+		return true
+	case !stale && a.latched:
+		a.latched = false
+	}
+	return false
 }
 
 // configFingerprint returns a short, deterministic hash of cfg's JSON

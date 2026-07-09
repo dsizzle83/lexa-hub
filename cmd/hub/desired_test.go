@@ -534,6 +534,128 @@ func TestDesiredPublishingEVSEActuator_Mapping(t *testing.T) {
 	}
 }
 
+// TestDesiredPublishingSolarActuator_NilConnectByteStable is the Unit 3.6
+// upgrade-storm guard for solar: a SolarCommand with a nil Connect (optimizer
+// mode — DefaultOptimizer never sets it) must leave the published doc's Connect
+// ABSENT, byte-identical to pre-3.6, so an unchanged ceiling still dedupes to a
+// single publish rather than storming a republish on upgrade.
+func TestDesiredPublishingSolarActuator_NilConnectByteStable(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil, nil, nil)
+
+	for i := 0; i < 3; i++ {
+		if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 2000}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("nil-Connect identical ceiling must publish once (no upgrade republish storm), got %d", len(mc.publishes))
+	}
+	var doc bus.DesiredState
+	if err := json.Unmarshal(mc.publishes[0].payload, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Connect != nil {
+		t.Fatalf("nil-Connect solar doc must omit Connect (byte-stable), got %v", doc.Connect)
+	}
+}
+
+// TestDesiredPublishingSolarActuator_ConnectFolds proves a non-nil Connect
+// (gateway cease-to-energize, Unit 3.6) lands on the doc and is carried forward
+// like the battery actuator's standing intent — a later nil Connect leaves it
+// unchanged (no republish), a changed Connect republishes.
+func TestDesiredPublishingSolarActuator_ConnectFolds(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingSolarActuator(mc, "inverter-0", nil, nil, nil, nil)
+
+	// Disconnect while capped.
+	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 3000, Connect: ptr(false)}); err != nil {
+		t.Fatal(err)
+	}
+	var doc bus.DesiredState
+	if err := json.Unmarshal(mc.publishes[0].payload, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Connect == nil || *doc.Connect != false {
+		t.Fatalf("Connect = %v, want false", doc.Connect)
+	}
+
+	// Same ceiling, nil Connect: standing intent holds false → no republish.
+	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 3000}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("nil Connect must carry the standing false forward (no republish), got %d publishes", len(mc.publishes))
+	}
+
+	// Reconnect: Connect flips true → republish.
+	if err := a.ApplySolarCommand(orchestrator.SolarCommand{Name: "inverter-0", CurtailToW: 3000, Connect: ptr(true)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("connect true→republish, got %d publishes", len(mc.publishes))
+	}
+	if err := json.Unmarshal(mc.publishes[1].payload, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Connect == nil || *doc.Connect != true {
+		t.Fatalf("Connect = %v, want true", doc.Connect)
+	}
+}
+
+// TestDesiredPublishingEVSEActuator_NilConnectDefaultsTrue is the EVSE
+// upgrade-storm guard: the EVSE doc has ALWAYS asserted connect=true, so a nil
+// EVSECommand.Connect (optimizer mode) must keep Connect=true and dedupe an
+// unchanged limit to a single publish — byte-stable with pre-3.6.
+func TestDesiredPublishingEVSEActuator_NilConnectDefaultsTrue(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, nil, nil, nil)
+
+	for i := 0; i < 3; i++ {
+		if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("nil-Connect identical limit must publish once, got %d", len(mc.publishes))
+	}
+	var doc bus.DesiredState
+	if err := json.Unmarshal(mc.publishes[0].payload, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Connect == nil || *doc.Connect != true {
+		t.Fatalf("nil-Connect EVSE doc must default Connect=true (historical), got %v", doc.Connect)
+	}
+}
+
+// TestDesiredPublishingEVSEActuator_ConnectFalseFolds proves a gateway
+// cease-to-energize (Connect=false) overrides the historical true default and
+// republishes.
+func TestDesiredPublishingEVSEActuator_ConnectFalseFolds(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, nil, nil, nil)
+
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16, Connect: ptr(false)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("connect false on an unchanged limit must republish, got %d publishes", len(mc.publishes))
+	}
+	var doc bus.DesiredState
+	if err := json.Unmarshal(mc.publishes[1].payload, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Connect == nil || *doc.Connect != false {
+		t.Fatalf("Connect = %v, want false (cease-to-energize)", doc.Connect)
+	}
+	if doc.MaxCurrentA == nil || *doc.MaxCurrentA != 16 {
+		t.Fatalf("MaxCurrentA lost on connect fold: %v", doc.MaxCurrentA)
+	}
+}
+
 func TestDesiredContentEqual(t *testing.T) {
 	base := bus.DesiredState{DeviceClass: "battery", DeviceID: "battery-0", Source: "economic", SetpointW: ptr(-500.0), Connect: ptr(true)}
 	same := base

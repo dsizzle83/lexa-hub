@@ -190,15 +190,34 @@ func emitCommands(plan *orchestrator.Plan, desired map[string]Desired) {
 	for _, dev := range devices {
 		d := desired[dev]
 
+		// AxisConnect fan-out (Unit 3.6): the arbiter resolves ONE Desired.Connect
+		// per device, but a device is exactly one class (each name appears in one
+		// plant map). Route the connect onto the SAME class its value axis names —
+		// solar if it carries a ceiling, EVSE if it carries a current, battery
+		// otherwise. This closes the 3.4/3.5-documented gap where AxisConnect fell
+		// through to BatteryCommand only, mis-emitting a battery command for a
+		// solar/EVSE device that carried a connect. nil Connect ⇒ no opinion ⇒
+		// leave the class command's Connect nil (byte-identical to pre-3.6 for the
+		// legacy/shadow paths, which never emit solar/EVSE connect demands).
+		_, hasSolarCeiling := d.Bounds[AxisSolarCeilingW]
+		evIV, hasEVSE := d.Bound(AxisEVSECurrentA)
+		hasEVSE = hasEVSE && !math.IsNaN(evIV.Max)
+
 		if iv, ok := d.Bound(AxisSolarCeilingW); ok {
 			plan.SolarCommands = append(plan.SolarCommands, orchestrator.SolarCommand{
 				Name:       dev,
 				CurtailToW: iv.Max, // NaN ⇒ no curtailment / restore to nameplate
+				Connect:    d.Connect,
 			})
 		}
 
+		// Battery: a setpoint, OR a standalone connect that belongs to no other
+		// class (the Tier-1 safety force-disconnect emits a bare battery connect).
+		// A connect alongside a solar ceiling or EVSE current is THAT class's, not
+		// the battery's — so exclude those to avoid the spurious battery command
+		// the old `d.Connect != nil` guard produced for solar/EVSE devices.
 		_, hasSetpoint := d.Bounds[AxisBatterySetpointW]
-		if hasSetpoint || d.Connect != nil {
+		if hasSetpoint || (d.Connect != nil && !hasSolarCeiling && !hasEVSE) {
 			cmd := orchestrator.BatteryCommand{Name: dev, SetpointW: math.NaN(), Connect: d.Connect}
 			if iv, ok := d.Bound(AxisBatterySetpointW); ok {
 				cmd.SetpointW = projectSetpoint(iv)
@@ -206,7 +225,7 @@ func emitCommands(plan *orchestrator.Plan, desired map[string]Desired) {
 			plan.BatteryCommands = append(plan.BatteryCommands, cmd)
 		}
 
-		if iv, ok := d.Bound(AxisEVSECurrentA); ok && !math.IsNaN(iv.Max) {
+		if hasEVSE {
 			// EVSE demands carry the OCPP connector in the device key
 			// ("station#connector", see evseKey/economics.go). A bare device name
 			// (the 058 skeleton and any whole-EVSE demand) maps to connector 0.
@@ -214,7 +233,8 @@ func emitCommands(plan *orchestrator.Plan, desired map[string]Desired) {
 			plan.EVSECommands = append(plan.EVSECommands, orchestrator.EVSECommand{
 				StationID:   station,
 				ConnectorID: connector,
-				MaxCurrentA: math.Max(0, iv.Max),
+				MaxCurrentA: math.Max(0, evIV.Max),
+				Connect:     d.Connect,
 			})
 		}
 

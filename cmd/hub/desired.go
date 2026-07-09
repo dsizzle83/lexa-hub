@@ -331,6 +331,15 @@ type desiredPublishingSolarActuator struct {
 	mc     mqtt.Client
 	device string
 
+	// connect is the standing connect intent (Unit 3.6 gateway fan-out). A nil
+	// SolarCommand.Connect means "no opinion — leave unchanged"; the last
+	// non-nil value is carried forward exactly like the battery actuator's
+	// connect fold. It stays nil in optimizer mode (DefaultOptimizer never sets
+	// SolarCommand.Connect), so the published doc omits Connect entirely and is
+	// byte-identical to pre-3.6 — the upgrade-storm guard (a nil Connect must
+	// never change existing doc content and trigger a spurious republish).
+	connect *bool
+
 	lastPublished *bus.DesiredState
 	seq           uint64
 
@@ -396,12 +405,24 @@ func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.Sola
 		ceiling = math.Max(0, cmd.CurtailToW)
 	}
 
+	// Fold the gateway connect intent (Unit 3.6): carry a non-nil opinion
+	// forward; a nil Connect leaves the standing value untouched (nil stays nil
+	// in optimizer mode ⇒ Connect omitted from the doc, byte-stable on upgrade).
+	if cmd.Connect != nil {
+		c := *cmd.Connect
+		a.connect = &c
+	}
+
 	doc := bus.DesiredState{
 		Envelope:    bus.Envelope{V: bus.DesiredStateV},
 		DeviceClass: bus.DesiredClassSolar,
 		DeviceID:    a.device,
 		CeilingW:    &ceiling,
 		Source:      "economic",
+	}
+	if a.connect != nil {
+		c := *a.connect
+		doc.Connect = &c
 	}
 
 	if desiredContentEqual(a.lastPublished, doc) {
@@ -431,7 +452,7 @@ func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.Sola
 
 	a.publishes.Inc()
 	if a.jw != nil {
-		if ev, err := journal.NewDispatchEvent("hub", journal.NewDispatch(a.device, journal.KindSolar, nil, doc.CeilingW, nil, nil)); err == nil {
+		if ev, err := journal.NewDispatchEvent("hub", journal.NewDispatch(a.device, journal.KindSolar, nil, doc.CeilingW, nil, doc.Connect)); err == nil {
 			_ = a.jw.Append(ev)
 		}
 	}
@@ -449,12 +470,21 @@ func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.Sola
 // orchestrator.EVSECommand.MaxCurrentA == 0 is an explicit suspend (not "no
 // opinion"), so it is published as MaxCurrentA == &0 — the reconciler maps that
 // to a 0 A SetChargingProfile. ConnectorID rides inside the document (the EVSE
-// keeps one retained doc per station, topic device == stationID). Connect is
-// reserved for future disconnect semantics and always published true (TASK-030
-// blast-radius note: connect=false is a follow-up, not this task).
+// keeps one retained doc per station, topic device == stationID). Connect: the
+// EVSE doc has ALWAYS asserted connect (TASK-030 hardcoded true); Unit 3.6's
+// gateway fan-out lets a non-nil EVSECommand.Connect (a CSIP OpModConnect
+// cease-to-energize) override it — carried forward like the battery actuator's
+// fold, defaulting to true when no command has expressed an opinion (so an
+// upgrade with a nil Connect keeps the doc byte-stable).
 type desiredPublishingEVSEActuator struct {
 	mc        mqtt.Client
 	stationID string
+
+	// connect is the standing connect intent. It defaults to true (see the type
+	// doc) — set lazily on first Apply — so optimizer-mode docs (nil
+	// EVSECommand.Connect) publish Connect=true exactly as they always have; a
+	// non-nil command Connect overrides and is carried forward.
+	connect *bool
 
 	lastPublished *bus.DesiredState
 	seq           uint64
@@ -513,8 +543,19 @@ func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECo
 
 	a.harvestPending()
 
+	// Fold the gateway connect intent (Unit 3.6). Default to true — the EVSE doc
+	// has always asserted connect — so a nil cmd.Connect (optimizer mode) keeps
+	// the doc byte-stable; a non-nil value overrides and is carried forward.
+	if a.connect == nil {
+		t := true
+		a.connect = &t
+	}
+	if cmd.Connect != nil {
+		c := *cmd.Connect
+		a.connect = &c
+	}
 	maxA := cmd.MaxCurrentA
-	connect := true
+	connect := *a.connect
 	doc := bus.DesiredState{
 		Envelope:    bus.Envelope{V: bus.DesiredStateV},
 		DeviceClass: bus.DesiredClassEVSE,

@@ -408,6 +408,26 @@ type PlanLog struct {
 	// version unchanged, PlanLogV) whenever the shadow harness is off or has
 	// seen zero divergences; a legacy decoder ignores the unknown key.
 	ShadowDivergences uint64 `json:"shadow_divergences,omitempty"`
+
+	// Mode is the live plan author at this pass — "optimizer" or "gateway"
+	// (Unit 3.6/§3.7). Stamped by cmd/hub's planObserver from modeManager.Mode().
+	// Additive; omitempty ⇒ absent on a legacy publisher (the wire version stays
+	// PlanLogV). A live hub always sets it non-empty, so it is normally present.
+	Mode string `json:"mode,omitempty"`
+
+	// ForecastSource is the solar-forecast path the most recent plan used —
+	// "external" (a fresh forecast was resampled onto the plan grid) or "diurnal"
+	// (the clear-sky fallback ran: no forecast, or one rejected as too old).
+	// Empty before the first plan. From engine.ForecastSource() (Unit 3.6/3.1).
+	ForecastSource string `json:"forecast_source,omitempty"`
+
+	// ForecastAgeS is the age (seconds) of the external solar forecast at the
+	// most recent plan, or -1 when none was in effect. From
+	// engine.ForecastAgeSeconds(). NOTE the omitempty semantics: -1 (no external
+	// forecast) IS serialized; the omitted case is the zero value 0, which here
+	// reads as "unset/absent", never a genuine 0-second-old forecast (that
+	// momentary case is disambiguated by ForecastSource=="external").
+	ForecastAgeS int64 `json:"forecast_age_s,omitempty"`
 }
 
 // PlanDecision mirrors orchestrator.Decision for the bus.
