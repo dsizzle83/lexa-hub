@@ -378,6 +378,9 @@ func TestLoadConfig_ConstraintModesValidBlockParses(t *testing.T) {
 	}
 	if modes["export"] != ModeActive || modes["gen"] != ModeShadow || modes["import"] != ModeOff {
 		t.Fatalf("modes = %+v, want export=active gen=shadow import=off", modes)
+	}
+}
+
 // TestLoadConfig_ShippedSnapshotEnabled pins WS-4.1 (2026-07-09): the
 // shipped configs/hub.json must ship snapshot.enabled:true (flipped from
 // the write-only-soak default after the 2026-07-08 8-cycle
