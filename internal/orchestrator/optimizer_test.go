@@ -1153,3 +1153,81 @@ func TestOptimizer_ExportChurnEscalatesCannotComply(t *testing.T) {
 		t.Errorf("breach fired at tick %d — too early, the sustained gate must ride out a normal ramp", firedAt)
 	}
 }
+
+// TestOptimizer_CommandsStampedWithActiveControlMRID is WS-4.3's optimizer
+// test: every per-device command Optimize() produces this tick must carry
+// state.CSIPControl.MRID, the same source plan.Breach.MRID already used —
+// mirroring, not duplicating, the existing Breach.MRID stamp. A battery
+// (connected, dischargeable), a solar inverter, and a session-active EVSE
+// together guarantee at least one command lands in all three Plan slices
+// (BatteryCommands via the restore/idle fallback, SolarCommands via the
+// restore fallback, EVSECommands via applyEVChargingRule — see
+// applyRestoreRule/applyEVChargingRule), so this is not a vacuous check.
+func TestOptimizer_CommandsStampedWithActiveControlMRID(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 50, 5000)}
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 1000, 5000)}
+	s.EVSEs = []orchestrator.EVSEState{evse("cs-001", true, 0, 16.0, 230.0)}
+	s.CSIPControl = &orchestrator.CSIPControlState{
+		Source: "event", MRID: "mrid-active-1",
+	}
+
+	plan := opt.Optimize(s)
+
+	if len(plan.BatteryCommands) == 0 || len(plan.SolarCommands) == 0 || len(plan.EVSECommands) == 0 {
+		t.Fatalf("expected at least one command in every slice, got battery=%d solar=%d evse=%d",
+			len(plan.BatteryCommands), len(plan.SolarCommands), len(plan.EVSECommands))
+	}
+	for _, c := range plan.BatteryCommands {
+		if c.MRID != "mrid-active-1" {
+			t.Errorf("BatteryCommand[%s].MRID = %q, want mrid-active-1", c.Name, c.MRID)
+		}
+	}
+	for _, c := range plan.SolarCommands {
+		if c.MRID != "mrid-active-1" {
+			t.Errorf("SolarCommand[%s].MRID = %q, want mrid-active-1", c.Name, c.MRID)
+		}
+	}
+	for _, c := range plan.EVSECommands {
+		if c.MRID != "mrid-active-1" {
+			t.Errorf("EVSECommand[%s].MRID = %q, want mrid-active-1", c.StationID, c.MRID)
+		}
+	}
+}
+
+// TestOptimizer_CommandsUnstampedWithNoActiveControl is the counterpart
+// guard: with state.CSIPControl == nil (no real CSIP control active — the
+// pure-economic case), every command's MRID must stay "" — the brief's
+// "if a device axis is authored with no CSIP control active, MRID stays
+// empty and that's correct" behavior, not a regression of the fix above.
+func TestOptimizer_CommandsUnstampedWithNoActiveControl(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 50, 5000)}
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 1000, 5000)}
+	s.EVSEs = []orchestrator.EVSEState{evse("cs-001", true, 0, 16.0, 230.0)}
+	// s.CSIPControl left nil.
+
+	plan := opt.Optimize(s)
+
+	if len(plan.BatteryCommands) == 0 || len(plan.SolarCommands) == 0 || len(plan.EVSECommands) == 0 {
+		t.Fatalf("expected at least one command in every slice, got battery=%d solar=%d evse=%d",
+			len(plan.BatteryCommands), len(plan.SolarCommands), len(plan.EVSECommands))
+	}
+	for _, c := range plan.BatteryCommands {
+		if c.MRID != "" {
+			t.Errorf("BatteryCommand[%s].MRID = %q, want empty (no active CSIP control)", c.Name, c.MRID)
+		}
+	}
+	for _, c := range plan.SolarCommands {
+		if c.MRID != "" {
+			t.Errorf("SolarCommand[%s].MRID = %q, want empty (no active CSIP control)", c.Name, c.MRID)
+		}
+	}
+	for _, c := range plan.EVSECommands {
+		if c.MRID != "" {
+			t.Errorf("EVSECommand[%s].MRID = %q, want empty (no active CSIP control)", c.StationID, c.MRID)
+		}
+	}
+}
