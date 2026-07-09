@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"lexa-hub/internal/utilitytime"
@@ -177,6 +178,18 @@ type DefaultOptimizer struct {
 	// by Optimize and read by EvaluateSafety on the same control goroutine, so it
 	// needs no lock.
 	lastBattCmd map[string]float64
+
+	// costModelOverride, when set via SwapCostModel (tariff-intent path,
+	// TASK-094/§3.4), atomically replaces the CostModel field for all INTERNAL
+	// reads (which go through costModel()). nil = no override = use the
+	// constructor-time CostModel field. An atomic.Pointer so a tariff swap on
+	// any goroutine is race-free against Optimize reading it on the control
+	// goroutine — no lock is added, and the exported CostModel field stays
+	// construction-time-only (its own reads are the accessor's nil-override
+	// fallback). Zero value (nil) means behaviour is bit-identical to reading
+	// CostModel directly, so pre-swap construction and existing tests are
+	// unaffected.
+	costModelOverride atomic.Pointer[TOUCostModel]
 }
 
 // tunedTickInterval is the engine cadence the *BreachTicks constants were
@@ -189,6 +202,28 @@ const tunedTickInterval = 3 * time.Second
 // wall-clock meaning of the breach/debounce thresholds constant across cadences.
 // Safe to call once at construction, before Start.
 func (o *DefaultOptimizer) SetTickInterval(d time.Duration) { o.tickInterval = d }
+
+// SwapCostModel atomically replaces the TOU cost model that the reactive
+// peak-discharge rule (Rule 5) consults, without adding a lock to the control
+// loop. It is the optimizer half of the tariff-intent path (TASK-094/§3.4): a
+// compiled TariffSpec model is installed here while the planner half rides
+// Engine.SetFallbackTOU. Passing nil REVERTS to the constructor-time CostModel
+// field — a tariff-intent clear falls back to the shipped DefaultTOUCostModel
+// (or to nil/disabled if the field was never set). Safe to call from any
+// goroutine while Optimize runs on the control goroutine.
+func (o *DefaultOptimizer) SwapCostModel(m *TOUCostModel) { o.costModelOverride.Store(m) }
+
+// costModel returns the effective TOU model for INTERNAL reads: the swapped
+// override when set, else the constructor-time CostModel field (which may
+// itself be nil, meaning TOU peak-shift is disabled). Callers must read it once
+// into a local — the override can change between calls, so re-reading would
+// risk a nil-deref if a concurrent SwapCostModel(nil) landed mid-sequence.
+func (o *DefaultOptimizer) costModel() *TOUCostModel {
+	if m := o.costModelOverride.Load(); m != nil {
+		return m
+	}
+	return o.CostModel
+}
 
 // scaleTicks converts a threshold expressed in tuned-cadence ticks into the
 // equivalent tick count at the configured engine cadence, preserving the
@@ -324,10 +359,13 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 		// same now.Unix()+state.ClockOffset arithmetic, single-owned. orchestrator
 		// stays I/O-free — this is a pure function call, no Clock/wall-time read.
 		serverNow := time.Unix(utilitytime.ServerNowAt(now, state.ClockOffset), 0)
-		isPeak := o.CostModel != nil && o.CostModel.IsPeakHour(serverNow)
+		// cm is read once (not re-fetched per use) so a concurrent SwapCostModel
+		// can't null it out between the nil-check and the method calls.
+		cm := o.costModel()
+		isPeak := cm != nil && cm.IsPeakHour(serverNow)
 		peakReason := ""
 		if isPeak {
-			peakReason = fmt.Sprintf("peak TOU hour (rate=%.3f/kWh)", o.CostModel.CurrentRate(serverNow))
+			peakReason = fmt.Sprintf("peak TOU hour (rate=%.3f/kWh)", cm.CurrentRate(serverNow))
 		}
 		// An active export limit caps the discharge: the export-limit rule
 		// only corrects on the *next* tick, so an uncapped MaxDischargeW
