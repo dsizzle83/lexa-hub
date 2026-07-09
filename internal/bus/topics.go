@@ -135,6 +135,45 @@ func SupportedV(topic string) int {
 		return DesiredStateV
 	case strings.HasPrefix(topic, "lexa/reconcile/") && strings.HasSuffix(topic, "/report"):
 		return ReconcileReportV
+	case strings.HasPrefix(topic, "lexa/intent/"):
+		// One arm for the whole "lexa/intent/*" family (TASK-082), dispatching
+		// per exact kind — this is the "no wildcard subscription" prefix from
+		// TopicIntentMode's doc comment, but SupportedV still needs to name
+		// each kind's constant precisely (TopicIntentResult included: it
+		// shares the prefix but is a distinct schema, IntentResultV, not one
+		// of the seven request kinds).
+		switch topic {
+		case TopicIntentMode:
+			return ModeIntentV
+		case TopicIntentEVGoal:
+			return EVGoalIntentV
+		case TopicIntentReserve:
+			return BackupReserveIntentV
+		case TopicIntentTariff:
+			return TariffIntentV
+		case TopicIntentSolarForecast:
+			return SolarForecastIntentV
+		case TopicIntentLoadProfile:
+			return LoadProfileIntentV
+		case TopicIntentChargeNow:
+			return ChargeNowIntentV
+		case TopicIntentResult:
+			return IntentResultV
+		default:
+			return 1
+		}
+	case topic == TopicHubMode:
+		return ModeStatusV
+	case topic == TopicCloudlinkStatus:
+		return CloudlinkStatusV
+	case topic == TopicScanRequest:
+		return ScanRequestV
+	case topic == TopicScanStatus:
+		return ScanStatusV
+	case topic == TopicScanResult:
+		return ScanResultV
+	case topic == TopicOCPPPending:
+		return PendingStationsV
 	default:
 		return 1
 	}
@@ -206,6 +245,64 @@ const TopicNorthboundCertStatus = "lexa/northbound/certstatus"
 // doubles as an engine heartbeat: a hub whose /status last_plan timestamp
 // stops advancing has a wedged control loop (QA gaps doc, "wedge detection").
 const TopicHubPlan = "lexa/hub/plan"
+
+// Intent/scan/mode/status topics (TASK-082, docs/DEVICE_ROADMAP.md §1.1/§1.3).
+//
+// Retained/edge semantics, inherited from the AD-013/TASK-042 disciplines
+// (§1.1's design rules):
+//   - State-like intents (mode, evgoal, reserve, tariff, solarforecast,
+//     loadprofile) are RETAINED, one topic per kind, exactly like
+//     lexa/desired/{class}/{device}: a restarting hub re-seeds every user/
+//     cloud goal from the broker, and a broker reconnect redelivers them, so
+//     adoption is ID-deduped (IntentMeta.ID) rather than re-journaled as a
+//     fresh event.
+//   - TopicIntentChargeNow is the one EDGE intent: NOT retained, and its
+//     IntentMeta.TTLS is mandatory — a chargenow stuck behind a WAN outage
+//     must not fire hours late.
+//   - TopicIntentResult is NOT retained (one reply per received intent; an
+//     edge, not state) and TopicHubMode/TopicCloudlinkStatus ARE retained
+//     (authoritative current state, republished on every change and re-served
+//     to a restarting subscriber).
+//   - TopicScanRequest/TopicScanStatus are NOT retained (one-shot commands and
+//     transient progress lines); TopicScanResult and TopicOCPPPending ARE
+//     retained (the last completed scan / current pending-station set stay
+//     available to a client that connects late, until commissioning
+//     supersedes them).
+//
+// No wildcard subscription on "lexa/intent/+" anywhere: TopicIntentResult
+// ("lexa/intent/result") would match it, and a hub subscribing its own
+// result topic back to itself is exactly the kind of self-feedback loop the
+// per-kind subscribe blocks (seven explicit mqttutil.Subscribe calls, one per
+// request kind — never a "lexa/intent/+" catch-all) are designed to avoid.
+// This also keeps the mosquitto ACL exact: each topic is its own grant, never
+// a prefix wildcard.
+const (
+	TopicIntentMode          = "lexa/intent/mode"
+	TopicIntentEVGoal        = "lexa/intent/evgoal"
+	TopicIntentReserve       = "lexa/intent/reserve"
+	TopicIntentTariff        = "lexa/intent/tariff"
+	TopicIntentSolarForecast = "lexa/intent/solarforecast"
+	TopicIntentLoadProfile   = "lexa/intent/loadprofile"
+	TopicIntentChargeNow     = "lexa/intent/chargenow"
+	TopicIntentResult        = "lexa/intent/result"
+	TopicHubMode             = "lexa/hub/mode"
+	TopicCloudlinkStatus     = "lexa/cloudlink/status"
+	TopicScanRequest         = "lexa/scan/request"
+	TopicScanStatus          = "lexa/scan/status"
+	TopicScanResult          = "lexa/scan/result"
+	TopicOCPPPending         = "lexa/ocpp/pending"
+)
+
+// IntentTopic returns lexa/intent/{kind} for a request-kind string ("mode",
+// "evgoal", "reserve", "tariff", "solarforecast", "loadprofile", "chargenow")
+// — the builder a caller holding only the kind string (e.g. cloudlink's
+// downlink dispatch table, or IntentResult.Kind on the way back) uses instead
+// of a Topic* constant, mirroring DesiredTopic/ReconcileReportTopic's builder
+// shape. It is not meant to be called with "result": lexa/intent/result is a
+// distinct reply topic (TopicIntentResult), not a request kind.
+func IntentTopic(kind string) string {
+	return fmt.Sprintf("lexa/intent/%s", kind)
+}
 
 func EVSEStateTopic(stationID string) string {
 	return fmt.Sprintf("lexa/evse/%s/state", stationID)

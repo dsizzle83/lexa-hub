@@ -38,6 +38,15 @@ const (
 	TypeServiceStart       = "service_start"
 	TypeSnapshotWritten    = "snapshot_written"
 	TypeSnapshotRestored   = "snapshot_restored"
+
+	// Intent/mode/config/scan vocabulary (TASK-082, docs/DEVICE_ROADMAP.md
+	// §3.6). Append-only, same as every type above — no SchemaV bump.
+	TypeIntentReceived = "intent_received"
+	TypeIntentApplied  = "intent_applied"
+	TypeIntentRejected = "intent_rejected"
+	TypeModeChange     = "mode_change"
+	TypeConfigWrite    = "config_write"
+	TypeScanRun        = "scan_run"
 )
 
 // ControlReleased.Reason values.
@@ -236,6 +245,156 @@ func NewSnapshotWrittenEvent(svc string, p Snapshot) (Event, error) {
 // NewSnapshotRestoredEvent wraps a Snapshot payload as a snapshot_restored Event.
 func NewSnapshotRestoredEvent(svc string, p Snapshot) (Event, error) {
 	return newEvent(TypeSnapshotRestored, svc, p)
+}
+
+// ─── Intent/mode/config/scan vocabulary (TASK-082, §3.6) ─────────────────────
+//
+// Deliberately decoupled from internal/bus, same as every payload type above:
+// constructors take plain scalar fields (mirroring the relevant bus.* type's
+// fields) rather than importing bus.IntentMeta/bus.ScanResult directly — see
+// ControlAdopted's constructor for the precedent (it mirrors bus.ActiveControl
+// field-for-field without importing bus).
+
+// IntentReceived is the intent_received payload: an intent was accepted for
+// forwarding onto the bus (cloudlink's downlink choke point, §2.6, or the
+// hub's own adopter, §3.1) — logged BEFORE the forwarding publish/apply
+// takes effect, as an audit trail independent of whether that next step
+// succeeds. Fields mirror bus.IntentMeta.
+type IntentReceived struct {
+	Kind     string `json:"kind"` // "mode" | "evgoal" | …
+	ID       string `json:"id"`
+	Origin   string `json:"origin"` // "cloud" | "app" | "cli"
+	Actor    string `json:"actor,omitempty"`
+	IssuedAt int64  `json:"issued_at"`
+}
+
+// NewIntentReceived builds an IntentReceived payload.
+func NewIntentReceived(kind, id, origin, actor string, issuedAt int64) IntentReceived {
+	return IntentReceived{Kind: kind, ID: id, Origin: origin, Actor: actor, IssuedAt: issuedAt}
+}
+
+// NewIntentReceivedEvent wraps an IntentReceived payload as an Event.
+func NewIntentReceivedEvent(svc string, p IntentReceived) (Event, error) {
+	return newEvent(TypeIntentReceived, svc, p)
+}
+
+// IntentApplied is the intent_applied payload: an intent kind's adopter
+// (§3.1's intentAdopter.adopt) applied the intent to engine state. Outcome
+// stays on the payload even though the event Type already distinguishes
+// applied from rejected, because "applied" vs "clamped" remain meaningfully
+// different in a journalctl grep of one kind's history — a clamp is the
+// reserve-floor rule (or a forecast/load plausibility bound) actively firing,
+// not a plain accept.
+type IntentApplied struct {
+	Kind    string `json:"kind"`
+	ID      string `json:"id"`
+	Outcome string `json:"outcome"` // "applied" | "clamped"
+	Detail  string `json:"detail,omitempty"`
+	Actor   string `json:"actor,omitempty"`
+}
+
+// NewIntentApplied builds an IntentApplied payload.
+func NewIntentApplied(kind, id, outcome, detail, actor string) IntentApplied {
+	return IntentApplied{Kind: kind, ID: id, Outcome: outcome, Detail: detail, Actor: actor}
+}
+
+// NewIntentAppliedEvent wraps an IntentApplied payload as an Event.
+func NewIntentAppliedEvent(svc string, p IntentApplied) (Event, error) {
+	return newEvent(TypeIntentApplied, svc, p)
+}
+
+// IntentRejected is the intent_rejected payload: an intent kind's adopter did
+// NOT apply the intent. Outcome names why — "rejected" (failed validation),
+// "expired" (chargenow/evgoal past its TTL/departure), or any other
+// non-apply outcome a validation chain produces (e.g. cloudlink's downlink,
+// §2.6: "malformed" | "unknown-kind" | "non-finite" | "origin-forgery" |
+// "rate-limited"). A retained-redelivery "duplicate" is deliberately NOT one
+// of these — §3.1's adopter answers those before ever reaching this
+// constructor, exactly to avoid journal spam on every broker reconnect.
+type IntentRejected struct {
+	Kind    string `json:"kind"`
+	ID      string `json:"id"`
+	Outcome string `json:"outcome"` // "rejected" | "expired" | ...
+	Detail  string `json:"detail,omitempty"`
+	Actor   string `json:"actor,omitempty"`
+}
+
+// NewIntentRejected builds an IntentRejected payload.
+func NewIntentRejected(kind, id, outcome, detail, actor string) IntentRejected {
+	return IntentRejected{Kind: kind, ID: id, Outcome: outcome, Detail: detail, Actor: actor}
+}
+
+// NewIntentRejectedEvent wraps an IntentRejected payload as an Event.
+func NewIntentRejectedEvent(svc string, p IntentRejected) (Event, error) {
+	return newEvent(TypeIntentRejected, svc, p)
+}
+
+// ModeChange is the mode_change payload: the hub's plan author switched
+// between "optimizer" and "gateway" (§3.5's modeManager.request). Both
+// transition directions journal this, anchoring which author was live at any
+// point in the journal's timeline — the same anchor role ControlAdopted/
+// ControlReleased play for CSIP control.
+type ModeChange struct {
+	From     string `json:"from"`
+	To       string `json:"to"`
+	Actor    string `json:"actor,omitempty"`
+	Origin   string `json:"origin,omitempty"`
+	IntentID string `json:"intent_id,omitempty"`
+}
+
+// NewModeChange builds a ModeChange payload.
+func NewModeChange(from, to, actor, origin, intentID string) ModeChange {
+	return ModeChange{From: from, To: to, Actor: actor, Origin: origin, IntentID: intentID}
+}
+
+// NewModeChangeEvent wraps a ModeChange payload as an Event.
+func NewModeChangeEvent(svc string, p ModeChange) (Event, error) {
+	return newEvent(TypeModeChange, svc, p)
+}
+
+// ConfigWrite is the config_write payload (§4.5): a commissioning write to
+// /etc/lexa/<service>.json via lexa-api's POST /config/{service}. BeforeSHA/
+// AfterSHA are sha256 hex digests of the file's content immediately before
+// and immediately after the staged-rename write — proof of exactly what
+// changed without journaling the full (possibly secret-adjacent) config body
+// itself, matching the exact shape §4.5 specifies:
+// config_write{service, actor, sha256(before), sha256(after)}.
+type ConfigWrite struct {
+	Service   string `json:"service"`
+	Actor     string `json:"actor,omitempty"`
+	BeforeSHA string `json:"before_sha256"`
+	AfterSHA  string `json:"after_sha256"`
+}
+
+// NewConfigWrite builds a ConfigWrite payload.
+func NewConfigWrite(service, actor, beforeSHA, afterSHA string) ConfigWrite {
+	return ConfigWrite{Service: service, Actor: actor, BeforeSHA: beforeSHA, AfterSHA: afterSHA}
+}
+
+// NewConfigWriteEvent wraps a ConfigWrite payload as an Event.
+func NewConfigWriteEvent(svc string, p ConfigWrite) (Event, error) {
+	return newEvent(TypeConfigWrite, svc, p)
+}
+
+// ScanRun is the scan_run payload (§5.2): the outcome of one commissioning
+// Modbus sweep request — refused (a reconciler already owns the bus) or
+// completed, in which case DevicesFound mirrors the retained ScanResult's
+// device count at the moment this ran.
+type ScanRun struct {
+	ID           string `json:"id"`    // echoes ScanRequest.ID
+	Phase        string `json:"phase"` // "refused" | "done"
+	DevicesFound int    `json:"devices_found,omitempty"`
+	Detail       string `json:"detail,omitempty"` // refusal reason, when Phase == "refused"
+}
+
+// NewScanRun builds a ScanRun payload.
+func NewScanRun(id, phase string, devicesFound int, detail string) ScanRun {
+	return ScanRun{ID: id, Phase: phase, DevicesFound: devicesFound, Detail: detail}
+}
+
+// NewScanRunEvent wraps a ScanRun payload as an Event.
+func NewScanRunEvent(svc string, p ScanRun) (Event, error) {
+	return newEvent(TypeScanRun, svc, p)
 }
 
 // newEvent marshals payload into Data and stamps Type/Svc/V. Ts and Seq are

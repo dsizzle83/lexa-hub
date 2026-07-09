@@ -52,6 +52,23 @@ const (
 	ReconcileReportV        = 1 // lexa/reconcile/{class}/{device}/report   (ReconcileReport, TASK-031)
 	RewalkRequestV          = 1 // lexa/csip/rewalk                        (RewalkRequest, TASK-042)
 	CertStatusV             = 1 // lexa/northbound/certstatus               (CertStatus, TASK-072)
+
+	// Intent/scan/mode/status schemas (TASK-082, docs/DEVICE_ROADMAP.md §1.3).
+	// All born at 1, same convention as every family above.
+	ModeIntentV          = 1 // lexa/intent/mode
+	EVGoalIntentV        = 1 // lexa/intent/evgoal
+	BackupReserveIntentV = 1 // lexa/intent/reserve
+	TariffIntentV        = 1 // lexa/intent/tariff
+	SolarForecastIntentV = 1 // lexa/intent/solarforecast
+	LoadProfileIntentV   = 1 // lexa/intent/loadprofile
+	ChargeNowIntentV     = 1 // lexa/intent/chargenow
+	IntentResultV        = 1 // lexa/intent/result
+	ModeStatusV          = 1 // lexa/hub/mode
+	CloudlinkStatusV     = 1 // lexa/cloudlink/status
+	ScanRequestV         = 1 // lexa/scan/request
+	ScanStatusV          = 1 // lexa/scan/status
+	ScanResultV          = 1 // lexa/scan/result
+	PendingStationsV     = 1 // lexa/ocpp/pending
 )
 
 // LegacyV0Accepted is the transition switch for AD-006's compatibility

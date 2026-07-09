@@ -193,3 +193,74 @@ func (d DERScheduleMsg) Finite() error {
 	}
 	return nil
 }
+
+// Finite is EVGoalIntent's counterpart to Measurement.Finite (TASK-082).
+func (g EVGoalIntent) Finite() error {
+	if err := finite("target_soc_kwh", g.TargetSocKwh); err != nil {
+		return err
+	}
+	if err := finite("initial_soc_kwh", g.InitialSocKwh); err != nil {
+		return err
+	}
+	if err := finite("capacity_kwh", g.CapacityKwh); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is BackupReserveIntent's counterpart to Measurement.Finite (TASK-082).
+func (r BackupReserveIntent) Finite() error {
+	return finite("reserve_pct", r.ReservePct)
+}
+
+// Finite is SolarForecastIntent's counterpart to Measurement.Finite
+// (TASK-082). StepKw is a plain []float64 (no absent-value convention for a
+// slice element — an entry that shouldn't carry an opinion is simply not in
+// the slice), so each entry is checked with finiteVal rather than finite's
+// nil-skip wrapper, same reasoning as DERScheduleMsg's slot walk above.
+func (f SolarForecastIntent) Finite() error {
+	for i, v := range f.StepKw {
+		if err := finiteVal("step_kw", v); err != nil {
+			return fmt.Errorf("step_kw[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// Finite is LoadProfileIntent's counterpart to Measurement.Finite (TASK-082),
+// following SolarForecastIntent.Finite's per-entry StepKw walk.
+func (l LoadProfileIntent) Finite() error {
+	for i, v := range l.StepKw {
+		if err := finiteVal("step_kw", v); err != nil {
+			return fmt.Errorf("step_kw[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// Finite is TariffIntent's counterpart to Measurement.Finite (TASK-082): it
+// walks Tariff.Periods and checks each period's rates — ImportPerKwh (always
+// present, via finiteVal) and ExportPerKwh (optional, via finite's nil-skip
+// wrapper).
+func (t TariffIntent) Finite() error {
+	for i, p := range t.Tariff.Periods {
+		if err := finiteVal("import_per_kwh", p.ImportPerKwh); err != nil {
+			return fmt.Errorf("tariff.periods[%d]: %w", i, err)
+		}
+		if err := finite("export_per_kwh", p.ExportPerKwh); err != nil {
+			return fmt.Errorf("tariff.periods[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// Finite is ScanResult's counterpart to Measurement.Finite (TASK-082): it
+// walks Devices and checks each hit's NameplateW.
+func (s ScanResult) Finite() error {
+	for i, d := range s.Devices {
+		if err := finite("nameplate_w", d.NameplateW); err != nil {
+			return fmt.Errorf("devices[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
