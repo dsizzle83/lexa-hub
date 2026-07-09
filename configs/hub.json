@@ -7,6 +7,13 @@
   "engine_interval_s": 15,
   "debug": false,
   "constraint_shadow": false,
+  "constraint_modes": {
+    "export": "off",
+    "gen": "off",
+    "import": "off",
+    "economics": "off",
+    "battery_safety": "off"
+  },
   "devices": [
     {
       "name": "inverter-0",

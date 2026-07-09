@@ -85,6 +85,26 @@ type Config struct {
 	// false ⇒ zero behaviour change (the wrapper is not even constructed).
 	ConstraintShadow bool `json:"constraint_shadow"`
 
+	// ConstraintModes is the per-constraint off|shadow|active map (FIX-F,
+	// TASK-060 §4 / TASK-061 §4): keys "export", "gen", "import", "economics",
+	// "battery_safety". Back-compat is ABSOLUTE (see ResolveConstraintModes for
+	// the exact resolution this field feeds):
+	//
+	//   - absent/nil (every hub.json before FIX-F, and the common case after)
+	//     with constraint_shadow true  ⇒ every key defaults to "shadow" —
+	//     today's shadow-everything behaviour, bit-identical;
+	//   - absent/nil with constraint_shadow false ⇒ irrelevant: the wrapper is
+	//     not constructed at all regardless of this field;
+	//   - present ⇒ a key it OMITS defaults to "off" (TASK-060 step 4's
+	//     "off (default; stack has no export constraint)" — the per-constraint
+	//     task docs' individual flip default, not the TASK-059-era
+	//     shadow-everything one).
+	//
+	// "active" on ANY key requires constraint_shadow true (the wrapper is what
+	// hosts composition) — ResolveConstraintModes fails loud otherwise (05 §6),
+	// it never silently downgrades to shadow or off.
+	ConstraintModes map[string]ConstraintMode `json:"constraint_modes,omitempty"`
+
 	// LogLevel selects the slog level ("debug"|"info"|"warn"|"error");
 	// default "info" (TASK-045). See internal/logutil.ParseLevel.
 	LogLevel string `json:"log_level"`
@@ -128,6 +148,83 @@ type Config struct {
 	// comfortably above normal republish jitter and comfortably below "this
 	// might be a resurrected corpse."
 	RetainedAdoptionMaxAgeS int `json:"retained_adoption_max_age_s"`
+}
+
+// ConstraintMode is one FIX-F constraint's per-axis operating mode.
+type ConstraintMode string
+
+const (
+	// ModeOff: the constraint is not constructed into the candidate Stack at
+	// all — the legacy cascade owns every axis it would have owned, exactly
+	// as if FIX-F did not exist for that constraint.
+	ModeOff ConstraintMode = "off"
+	// ModeShadow: constructed into the candidate Stack and observed
+	// (diffed against legacy) every tick, never actuated — TASK-059's
+	// shadow harness, unchanged.
+	ModeShadow ConstraintMode = "shadow"
+	// ModeActive: constructed into the candidate Stack AND its Name() is in
+	// the Wrapper's ActiveConstraints set, so the axes its demand wins each
+	// tick are composed into the actuated plan (constraint/shadow.go compose).
+	ModeActive ConstraintMode = "active"
+)
+
+// constraintKeys is the fixed FIX-F vocabulary: hub.json config key →
+// constraint.Constraint.Name(). Every key but "battery_safety" matches its
+// Name() verbatim; battery_safety/battery-safety differ only because the
+// config key convention is snake_case and the constraint identity (also used
+// as Demand.Source and the metrics axis vocabulary) is hyphenated.
+var constraintKeys = map[string]string{
+	"export":         "export",
+	"gen":            "gen",
+	"import":         "import",
+	"economics":      "economics",
+	"battery_safety": "battery-safety",
+}
+
+// ResolveConstraintModes validates cfg.ConstraintModes against constraintKeys
+// and applies the back-compat defaults documented on the field, returning the
+// effective mode for every config key (never a partial map — every one of the
+// five keys is always present in the result). It fails loud (05 §6) on an
+// unknown key, an unknown mode value, or "active" set without
+// constraint_shadow — never silently coerces any of those into a safer mode.
+func (c *Config) ResolveConstraintModes() (map[string]ConstraintMode, error) {
+	out := make(map[string]ConstraintMode, len(constraintKeys))
+
+	if c.ConstraintModes == nil {
+		// Back-compat: constraint_shadow is the sole switch, as it was before
+		// FIX-F. true ⇒ every key defaults to "shadow" (today's behaviour,
+		// bit-identical); false ⇒ the values here are moot (cmd/hub never
+		// constructs the wrapper), but "off" is the honest answer regardless.
+		def := ModeOff
+		if c.ConstraintShadow {
+			def = ModeShadow
+		}
+		for key := range constraintKeys {
+			out[key] = def
+		}
+		return out, nil
+	}
+
+	for key := range constraintKeys {
+		out[key] = ModeOff // present map ⇒ an omitted key is "off", not "shadow"
+	}
+	for key, mode := range c.ConstraintModes {
+		if _, known := constraintKeys[key]; !known {
+			return nil, fmt.Errorf("constraint_modes: unknown key %q (want one of export|gen|import|economics|battery_safety)", key)
+		}
+		switch mode {
+		case ModeOff, ModeShadow, ModeActive:
+		default:
+			return nil, fmt.Errorf("constraint_modes[%q]: unknown mode %q (want off|shadow|active)", key, mode)
+		}
+		out[key] = mode
+	}
+	for key, mode := range out {
+		if mode == ModeActive && !c.ConstraintShadow {
+			return nil, fmt.Errorf(`constraint_modes[%q]: "active" requires constraint_shadow=true (the wrapper hosts composition)`, key)
+		}
+	}
+	return out, nil
 }
 
 // JournalConfig is the on-disk "journal" block. It intentionally has its
@@ -199,6 +296,14 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if err := decodePlantBlocks(&cfg); err != nil {
 		return nil, err
+	}
+	// Fail loud at LOAD time (05 §6) on a malformed constraint_modes block —
+	// an unknown key/value or "active" without constraint_shadow is an
+	// authoring bug, not a degraded default. cmd/hub (main.go) calls
+	// ResolveConstraintModes again to get the map for wiring; recomputing is
+	// cheap and keeps this function's job to parsing/validation only.
+	if _, err := cfg.ResolveConstraintModes(); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return &cfg, nil
 }
