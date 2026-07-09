@@ -35,6 +35,33 @@
 // the shell stores the connector from the desired doc (0 → 1, per applyCommand)
 // and drives it explicitly, so nothing entrenches the single-connector
 // assumption in new code (§8.5).
+//
+// Connect execution (Unit 6.2): OCPP SP-limits give this reconciler exactly
+// ONE hardware verb — a charging-current ceiling via SetChargingProfile — so
+// a desired doc's Connect opinion is deliberately never fed to
+// internal/reconcile as its own Field. Doing so would wedge the core's
+// completeness gate FOREVER, and unlike the rare battery/solar case (Connect
+// is only occasionally expressed under gateway mode), cmd/hub's EVSE
+// actuator has asserted a non-nil Connect on EVERY published doc since
+// TASK-030 (desired.go's ApplyEVSECommand: "the EVSE doc has ALWAYS asserted
+// connect") — so feeding it straight through would permanently disable
+// Observe-driven divergence detection for MaxCurrentA too, not just Connect
+// (internal/reconcile's completeness check is all-or-nothing across the
+// whole desiredFields set; see reconcile.go's matches() doc). Instead,
+// setDesired FOLDS Connect into the EFFECTIVE current handed to the core:
+// Connect==false forces an effective 0 A regardless of any MaxCurrentA
+// carried in the same doc ("disconnect WINS", the safety ordering this unit
+// calls for); Connect==true, or no opinion yet, passes the doc's own
+// MaxCurrentA through unfolded ("reconnect defers to the doc's current").
+// Cease-to-energize IS a 0 A current limit for OCPP — there is no separate
+// disconnect register to write — so folding it into the SAME Field the core
+// already tracks and reads back (TransactionEvent Ended forces measured-0,
+// per CLAUDE.md) is the honest representation of what actually happens on
+// the wire, not a workaround: the EXISTING one-sided MaxCurrentA convergence
+// check (metered current at/under the limit is compliant;
+// TestEVSEShell_SuspendConvergesAtZero already pins 0 A converging) verifies
+// Connect=false naturally, confirming the spec's expectation with ZERO core
+// changes and zero new reconcile.Field usage.
 package main
 
 import (
@@ -88,6 +115,16 @@ type evseShell struct {
 
 	desiredMaxA    float64
 	haveDesiredMax bool
+
+	// desiredConnect is the shell's own standing connect opinion (Unit 6.2) —
+	// carried forward across desired docs whose Connect is nil ("no opinion",
+	// AD-013 field-absence semantics), mirroring cmd/hub's actuator-side
+	// connect fold (desired.go's ApplyEVSECommand). nil until the first doc
+	// ever expresses one — a doc that never opines writes MaxCurrentA
+	// unfolded, byte-identical to pre-Unit-6.2 behavior. NEVER fed to
+	// internal/reconcile directly; see the file doc's "Connect execution"
+	// section for why setDesired folds it into MaxCurrentA instead.
+	desiredConnect *bool
 
 	// reconnectPending: set by the reconnect hook without taking mu; consumed by
 	// observe. markReconnected does only an atomic store (no lock), so calling it
@@ -146,12 +183,36 @@ func (s *evseShell) tag() string {
 
 // setDesired feeds one accepted/rejected AD-013 EVSE document to the reconciler.
 // In active mode a Write action (a NEW current limit) is applied via the driver.
+//
+// Unit 6.2: Connect is folded into the EFFECTIVE current fed to the core
+// BEFORE SetDesired ever sees it — see the file doc's "Connect execution"
+// section. s.desiredConnect carries the opinion forward across docs that
+// omit it (nil ⇒ "no opinion," never resets the standing value); a doc that
+// has never expressed one leaves desiredConnect nil, so its fold is a no-op
+// and MaxCurrentA passes through exactly as it always has.
 func (s *evseShell) setDesired(doc bus.DesiredState, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	action, reports := s.r.SetDesired(doc, now)
-	if !rejected(reports) && doc.MaxCurrentA != nil {
-		s.desiredMaxA = *doc.MaxCurrentA
+
+	if doc.Connect != nil {
+		c := *doc.Connect
+		s.desiredConnect = &c
+	}
+	coreDoc := doc
+	if s.desiredConnect != nil && !*s.desiredConnect {
+		// Disconnect WINS over any explicit current in the same doc (safety
+		// ordering): force the effective limit to 0 A regardless of
+		// doc.MaxCurrentA, even if that field was absent.
+		zero := 0.0
+		coreDoc.MaxCurrentA = &zero
+	}
+	// Never fed to internal/reconcile as its own Field (see the file doc) —
+	// it has already been folded into coreDoc.MaxCurrentA above.
+	coreDoc.Connect = nil
+
+	action, reports := s.r.SetDesired(coreDoc, now)
+	if !rejected(reports) && coreDoc.MaxCurrentA != nil {
+		s.desiredMaxA = *coreDoc.MaxCurrentA
 		s.haveDesiredMax = true
 		s.connectorID = doc.ConnectorID
 		if s.connectorID == 0 {
@@ -242,6 +303,11 @@ func (s *evseShell) tick(now time.Time) {
 // applyActionLocked executes one reconciler Write in ACTIVE mode via the profile
 // driver. A rejected/failed profile is a write FAILURE (L11), counted and
 // logged; the reconcile core retries per its ≥10 s backoff. Must hold mu.
+//
+// Unit 6.2 note: limitA below is already the EFFECTIVE current setDesired
+// folded Connect into (0 A for a disconnect, the doc's own MaxCurrentA
+// otherwise) — this function needs no Connect-specific branch of its own;
+// "honoring Connect" and "writing MaxCurrentA" are the same write for OCPP.
 func (s *evseShell) applyActionLocked(action reconcile.Action) {
 	if action.Kind != reconcile.ActionWrite {
 		return

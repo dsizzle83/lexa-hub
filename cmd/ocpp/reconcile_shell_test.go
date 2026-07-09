@@ -236,3 +236,128 @@ func TestEVSEShell_NoDesiredNoWrite(t *testing.T) {
 	}
 	_ = math.NaN
 }
+
+// evseConnectDoc builds an EVSE desired doc carrying an explicit Connect
+// opinion alongside a current limit (Unit 6.2 gateway cease-to-energize
+// fan-out — mirrors cmd/hub's ApplyEVSECommand shape).
+func evseConnectDoc(maxA float64, connect bool, seq uint64, at time.Time) bus.DesiredState {
+	d := evseDoc(maxA, 0, seq, at)
+	c := connect
+	d.Connect = &c
+	return d
+}
+
+// TestEVSEShell_DisconnectWritesZeroAmps: Connect=false must drive the ONLY
+// disconnect verb OCPP SP-limits give us — a 0 A SetChargingProfile — even
+// though the doc also carries an explicit non-zero MaxCurrentA (disconnect
+// WINS, the unit 6.2 safety ordering).
+func TestEVSEShell_DisconnectWritesZeroAmps(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingProfileDriver{}
+	s := newEVSEShell("cs-001", mreg, modeActive, drv)
+	t0 := time.Now()
+	s.setDesired(evseConnectDoc(20, false, 1, t0), t0)
+	if len(drv.applied) != 1 || drv.applied[0] != 0 {
+		t.Fatalf("disconnect must apply 0 A regardless of MaxCurrentA=20, applied=%v", drv.applied)
+	}
+}
+
+// TestEVSEShell_ReconnectRestoresStandingCurrent: Connect flipping back to
+// true in a later doc restores THAT doc's own current (not some
+// separately-cached "last connected" value) — "reconnect defers to the
+// doc's current" per the unit 6.2 spec.
+func TestEVSEShell_ReconnectRestoresStandingCurrent(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingProfileDriver{}
+	s := newEVSEShell("cs-001", mreg, modeActive, drv)
+	t0 := time.Now()
+	s.setDesired(evseConnectDoc(20, false, 1, t0), t0)                                  // disconnect → 0 A
+	s.setDesired(evseConnectDoc(16, true, 2, t0.Add(time.Second)), t0.Add(time.Second)) // reconnect at 16 A
+	if len(drv.applied) != 2 || drv.applied[1] != 16 {
+		t.Fatalf("reconnect must restore the doc's own current (16A), applied=%v", drv.applied)
+	}
+}
+
+// TestEVSEShell_ConnectToggleAloneWrites: a doc that changes ONLY Connect
+// (the raw MaxCurrentA field value is unchanged) must still be treated as a
+// new target — the fold changes the EFFECTIVE current even though the doc's
+// own MaxCurrentA didn't move.
+func TestEVSEShell_ConnectToggleAloneWrites(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingProfileDriver{}
+	s := newEVSEShell("cs-001", mreg, modeActive, drv)
+	t0 := time.Now()
+	s.setDesired(evseConnectDoc(16, true, 1, t0), t0)                                    // applied #1: 16A
+	s.setDesired(evseConnectDoc(16, false, 2, t0.Add(time.Second)), t0.Add(time.Second)) // same 16A field, disconnect
+	if len(drv.applied) != 2 || drv.applied[1] != 0 {
+		t.Fatalf("connect toggle alone must still fold to a new write, applied=%v", drv.applied)
+	}
+}
+
+// TestEVSEShell_DisconnectConvergesAtMeteredZero verifies the unit 6.2 spec's
+// central claim: cease-to-energize's convergence "verifies naturally" via
+// the EXISTING one-sided MaxCurrentA check, with ZERO core/observe changes —
+// a metered ≈0 A reading after a fold-to-0 write is a match.
+func TestEVSEShell_DisconnectConvergesAtMeteredZero(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingProfileDriver{}
+	s := newEVSEShell("cs-001", mreg, modeActive, drv)
+	t0 := time.Now()
+	s.setDesired(evseConnectDoc(20, false, 1, t0), t0) // → 0 A, applied #1
+	s.observe(0, true, true, t0.Add(time.Second))
+	if len(drv.applied) != 1 {
+		t.Fatalf("metered 0A after disconnect must converge (no correction), applied=%d", len(drv.applied))
+	}
+	if !strings.Contains(mreg.Format(), "lexa_ocpp_shadow_matches_total 1") {
+		t.Errorf("disconnect converging at 0A must count as a match, got:\n%s", mreg.Format())
+	}
+}
+
+// TestEVSEShell_DisconnectStillDrawingDiverges: metered current above ~0
+// after a disconnect is commanded is genuine divergence — the
+// ev-accept-but-ignore lesson applies to Connect too, via a corrective
+// 0 A rewrite.
+func TestEVSEShell_DisconnectStillDrawingDiverges(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingProfileDriver{}
+	s := newEVSEShell("cs-001", mreg, modeActive, drv)
+	t0 := time.Now()
+	s.setDesired(evseConnectDoc(20, false, 1, t0), t0) // → 0 A, applied #1
+	s.observe(6, true, true, t0.Add(time.Second))      // still drawing despite disconnect
+	if len(drv.applied) != 2 || drv.applied[1] != 0 {
+		t.Fatalf("still-drawing after disconnect must correct back to 0A, applied=%v", drv.applied)
+	}
+}
+
+// TestEVSEShell_ConnectTrueDoesNotWedgeCurrentConvergence guards the
+// systemic bug this design choice avoids: cmd/hub's EVSE actuator has
+// asserted a non-nil Connect on EVERY published doc since TASK-030, so had
+// Connect been fed straight through to internal/reconcile as its own Field,
+// the completeness gate would hold FOREVER and this corrective write would
+// never fire in production. Folding Connect into MaxCurrentA before
+// SetDesired keeps this axis exactly as verifiable as it was before Unit 6.2.
+func TestEVSEShell_ConnectTrueDoesNotWedgeCurrentConvergence(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingProfileDriver{}
+	s := newEVSEShell("cs-001", mreg, modeActive, drv)
+	t0 := time.Now()
+	s.setDesired(evseConnectDoc(10, true, 1, t0), t0) // applied #1: 10A, Connect=true
+	s.observe(16, true, true, t0.Add(time.Second))    // still over → corrective write
+	if len(drv.applied) != 2 {
+		t.Fatalf("a Connect=true doc must not wedge MaxCurrentA convergence, applied=%d", len(drv.applied))
+	}
+}
+
+// TestEVSEShell_AbsentConnectUnchanged: a doc with no Connect opinion at all
+// (today's shape, and every existing test fixture in this file) must write
+// MaxCurrentA byte-identically to pre-Unit-6.2 behavior — the upgrade guard.
+func TestEVSEShell_AbsentConnectUnchanged(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingProfileDriver{}
+	s := newEVSEShell("cs-001", mreg, modeActive, drv)
+	t0 := time.Now()
+	s.setDesired(evseDoc(10, 0, 1, t0), t0)
+	if len(drv.applied) != 1 || drv.applied[0] != 10 {
+		t.Fatalf("absent Connect must write MaxCurrentA unfolded, applied=%v", drv.applied)
+	}
+}

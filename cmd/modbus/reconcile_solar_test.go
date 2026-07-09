@@ -272,4 +272,109 @@ func TestSolarFieldsToControl(t *testing.T) {
 	if wattsFromActivePower(*legacy.OpModMaxLimW) != wattsFromActivePower(*ctrl.OpModMaxLimW) {
 		t.Errorf("fields mapping must match legacy solarCommandToControl encoding")
 	}
+	// Unit 6.2 upgrade guard: a Connect-free Fields map (today's shape, and
+	// every optimizer-mode write) must leave OpModConnect nil.
+	if ctrl.OpModConnect != nil {
+		t.Errorf("absent Connect must leave OpModConnect nil, got %v", *ctrl.OpModConnect)
+	}
+}
+
+// solarConnectDoc builds a solar desired doc carrying an explicit Connect
+// opinion alongside a ceiling (Unit 6.2 gateway cease-to-energize fan-out).
+func solarConnectDoc(ceilingW float64, connect bool, seq uint64, at time.Time) bus.DesiredState {
+	d := solarCapDoc(ceilingW, seq, at)
+	c := connect
+	d.Connect = &c
+	return d
+}
+
+// TestSolarFieldsToControl_Connect pins Connect materializing as a REAL
+// OpModConnect write (Unit 6.2), alongside — never instead of — CeilingW.
+func TestSolarFieldsToControl_Connect(t *testing.T) {
+	ctrl := solarFieldsToControl(map[reconcile.Field]float64{reconcile.CeilingW: 3000, reconcile.Connect: 0})
+	if ctrl.OpModConnect == nil || *ctrl.OpModConnect != false {
+		t.Fatalf("expected OpModConnect=false, got %v", ctrl.OpModConnect)
+	}
+	if w := wattsFromActivePower(*ctrl.OpModMaxLimW); math.Abs(w-3000) > 0.5 {
+		t.Errorf("ceiling must still be carried alongside Connect, got %.0f", w)
+	}
+
+	ctrl2 := solarFieldsToControl(map[reconcile.Field]float64{reconcile.CeilingW: 3000, reconcile.Connect: 1})
+	if ctrl2.OpModConnect == nil || *ctrl2.OpModConnect != true {
+		t.Fatalf("expected OpModConnect=true, got %v", ctrl2.OpModConnect)
+	}
+}
+
+// TestSolarActive_ConnectDemandWritesOpModConnect: a desired doc expressing
+// Connect=false alongside a ceiling drives a SINGLE write carrying BOTH
+// OpModMaxLimW and OpModConnect — the gateway cease-to-energize execution
+// this unit closes for solar.
+func TestSolarActive_ConnectDemandWritesOpModConnect(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingDriver{}
+	s := newSolarShell("inverter-0", reconcile.Config{}, mreg, modeActive, drv)
+	t0 := time.Now()
+	s.setDesired(solarConnectDoc(3000, false, 1, t0), t0)
+
+	if len(drv.applied) != 1 {
+		t.Fatalf("expected 1 applied control, got %d", len(drv.applied))
+	}
+	ctrl := drv.applied[0]
+	if ctrl.OpModConnect == nil || *ctrl.OpModConnect != false {
+		t.Fatalf("expected OpModConnect=false in the write, got %v", ctrl.OpModConnect)
+	}
+	if w := lastMaxW(ctrl); math.Abs(w-3000) > 0.5 {
+		t.Errorf("ceiling must still be carried alongside Connect, got %.0f", w)
+	}
+}
+
+// TestSolarActive_ConnectReconnectRestoresTrue: Connect flipping back to true
+// in a later doc still materializes as an explicit OpModConnect=true write
+// (never merely an absence).
+func TestSolarActive_ConnectReconnectRestoresTrue(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingDriver{}
+	s := newSolarShell("inverter-0", reconcile.Config{}, mreg, modeActive, drv)
+	t0 := time.Now()
+	s.setDesired(solarConnectDoc(3000, false, 1, t0), t0)
+	s.setDesired(solarConnectDoc(3000, true, 2, t0.Add(time.Second)), t0.Add(time.Second))
+
+	if len(drv.applied) != 2 {
+		t.Fatalf("expected 2 applied controls, got %d", len(drv.applied))
+	}
+	ctrl := drv.applied[1]
+	if ctrl.OpModConnect == nil || *ctrl.OpModConnect != true {
+		t.Fatalf("expected OpModConnect=true on reconnect, got %v", ctrl.OpModConnect)
+	}
+}
+
+// TestSolarActive_ConnectExpressedHoldsCompleteness documents the accepted,
+// TASK-027-style limitation this unit inherits rather than works around: an
+// inverter has no register this shell can read connect/energize state back
+// from (confirmed by inspection — see the file doc), so once a doc opines on
+// Connect, internal/reconcile's completeness gate holds FOREVER for that
+// device: no match, no divergence, no corrective write out of Observe, no
+// matter how far over-ceiling the readback is. This is NOT a bug — it must
+// simply never be misreported as a match — and the write path itself
+// (SetDesired/Reconnected/Tick) is entirely unaffected by it.
+func TestSolarActive_ConnectExpressedHoldsCompleteness(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingDriver{}
+	s := newSolarShell("inverter-0", reconcile.Config{}, mreg, modeActive, drv)
+	t0 := time.Now()
+	s.setDesired(solarConnectDoc(3000, false, 1, t0), t0) // applied #1: new target
+	for i := 0; i < 5; i++ {
+		s.observe(solarMeas(4500), true, t0.Add(time.Duration(i+1)*40*time.Second)) // wildly over ceiling
+	}
+
+	out := mreg.Format()
+	if !strings.Contains(out, "lexa_mb_shadow_matches_total 0") {
+		t.Errorf("Connect-expressed doc must never count a match, got:\n%s", out)
+	}
+	if !strings.Contains(out, "lexa_mb_shadow_divergences_total 0") {
+		t.Errorf("Connect-expressed doc must never count a divergence via Observe, got:\n%s", out)
+	}
+	if len(drv.applied) != 1 {
+		t.Fatalf("incomplete (Connect-expressed) reads must never write via Observe, applied=%d", len(drv.applied))
+	}
 }

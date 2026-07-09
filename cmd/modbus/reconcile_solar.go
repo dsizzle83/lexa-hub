@@ -37,6 +37,39 @@
 // applied unconditionally through the SAME registry path legacy solar used
 // (registry.ApplyControlTo → retryDevice.ApplyControl, via solarFieldsToControl
 // which is byte-identical to solarCommandToControl's non-nil branch).
+//
+// Connect execution (Unit 6.2): a desired doc's Connect opinion (the gateway
+// cease-to-energize demand, AxisConnect fanned onto SolarCommand.Connect —
+// internal/orchestrator/constraint/passthrough.go, stack.go's emitCommands)
+// now materializes as a REAL OpModConnect write via solarFieldsToControl,
+// alongside whatever CeilingW the same doc carries — a genuinely distinct
+// hardware action from curtailing to a low ceiling (it is the actual Conn bit
+// in SunSpec model 123, not a 0 W cap), so it is never folded into CeilingW
+// the way cmd/ocpp folds Connect into current (inverters have their own
+// register for it; EVSE/OCPP does not).
+//
+// Readback reality check: device.Measurements has no connect-state field, and
+// device.Device.Status() (Connected/Energized) is never wired through
+// registry.MeasurementUpdate into this shell's observe() feed — there is no
+// live signal this shell could use to verify a Connect opinion even if it
+// wanted to (confirmed by inspection: no live call site invokes Status()
+// today). Rather than invent one (which would mean touching the registry —
+// out of scope and radioactive-adjacent), this shell reuses the EXACT
+// documented limitation TASK-027 accepted for the battery shell: Connect is
+// still fed to internal/reconcile as a Field (setDesired passes the doc
+// through unchanged), so a WRITE still fires correctly on every new target
+// (including a Connect-only change) and Reconnected()/Tick() still reassert
+// it — but internal/reconcile's completeness gate (matches()) then holds
+// FOREVER for that device for as long as Connect stays expressed: Observe
+// never again reports a match OR a divergence for CeilingW either, because
+// completeness is all-or-nothing across the whole desiredFields set (see
+// reconcile.go's matches() doc). desiredHasConnect (below) exists solely so
+// this shell's OWN would/match/divergence counters never misreport that hold
+// as a false "match" — exactly batteryShell.desiredHasConnect's role. This is
+// an accepted, documented limitation, not a bug: gateway mode is the only
+// caller that ever expresses solar Connect, and while it does, one-sided
+// over-ceiling divergence detection is paused for that device — the write
+// path (new-desired / reconnect / tick-driven reassert) is unaffected.
 package main
 
 import (
@@ -72,6 +105,15 @@ type solarShell struct {
 	// initial-desired seed) so a rejected/stale doc never moves it.
 	desiredCeilingW    float64
 	haveDesiredCeiling bool
+
+	// desiredHasConnect tracks whether the current standing desired doc
+	// expresses a Connect opinion (Unit 6.2). This shell can never read
+	// Connect/energize state back from the device (see the file doc), so
+	// whenever the doc also opines on Connect, internal/reconcile's
+	// completeness gate (matches()) holds FOREVER for this device — a real,
+	// documented limitation mirroring batteryShell's TASK-027 note, not a
+	// bug — and this shell must not misreport that hold as a "match".
+	desiredHasConnect bool
 
 	// reconnectPending: set by retryDevice's onReconnect callback (active only)
 	// without taking mu; consumed by observe. Same lock-order discipline as
@@ -161,6 +203,12 @@ func (s *solarShell) tag() string {
 func (s *solarShell) setDesired(doc bus.DesiredState, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Unit 6.2: fed through to the core UNCHANGED, including Connect — see
+	// the file doc's "Connect execution" section for why (no readback exists
+	// to feed reconcile.Field Connect from, so this shell accepts the same
+	// forever-hold completeness limitation TASK-027 documented for battery,
+	// rather than inventing an unverifiable readback).
+	s.desiredHasConnect = doc.Connect != nil
 	action, reports := s.r.SetDesired(doc, now)
 	if !rejected(reports) && doc.CeilingW != nil {
 		s.desiredCeilingW = *doc.CeilingW
@@ -222,8 +270,11 @@ func (s *solarShell) observe(m device.Measurements, plausible bool, now time.Tim
 
 	// Same counting semantics as batteryShell: a Write is unambiguous divergence;
 	// a plausible, complete, non-write sample is a match. "Complete" for solar is
-	// simply "we had a W to compare" (there is no unreadable-Connect ambiguity).
-	complete := haveW && s.haveDesiredCeiling
+	// "we had a W to compare" AND the standing desired carries no unreadable
+	// Connect opinion (Unit 6.2 — mirrors batteryShell.desiredHasConnect;
+	// otherwise internal/reconcile's own completeness gate already holds
+	// every Observe to None, and this shell must not call that hold a match).
+	complete := haveW && s.haveDesiredCeiling && !s.desiredHasConnect
 	if action.Kind == reconcile.ActionWrite {
 		s.divergences.Inc()
 	} else if plausible && complete {
@@ -328,15 +379,29 @@ func (s *solarShell) ceilingTolerance() float64 {
 const reconcileCeilingTolerance = 1.0
 
 // solarFieldsToControl converts a reconcile Write Action's Fields into a Modbus
-// DERControlBase — byte-identical to solarCommandToControl's non-nil branch
-// (OpModMaxLimW via activePowerFromWatts, the GS-1/MTR-1 multiplier scaling). A
-// missing CeilingW yields an empty control (never happens for a solar write).
+// DERControlBase. The CeilingW branch is byte-identical to
+// solarCommandToControl's non-nil branch (OpModMaxLimW via
+// activePowerFromWatts, the GS-1/MTR-1 multiplier scaling); a missing CeilingW
+// yields no OpModMaxLimW (never happens for a solar write — every solar
+// desired doc always expresses a full ceiling opinion, restore or a real cap).
+//
+// Connect (Unit 6.2): a present reconcile.Connect field materializes as a real
+// OpModConnect write — the actual Conn bit in SunSpec model 123, alongside
+// whatever ceiling the same write carries — closing the gateway
+// cease-to-energize gap passthrough.go's doc named for solar. Absent Connect
+// (the overwhelming majority of writes — optimizer mode never expresses it)
+// leaves OpModConnect nil, byte-identical to pre-Unit-6.2 output.
 func solarFieldsToControl(fields map[reconcile.Field]float64) model.DERControlBase {
+	var ctrl model.DERControlBase
 	if v, ok := fields[reconcile.CeilingW]; ok {
 		ap := activePowerFromWatts(math.Max(0, v))
-		return model.DERControlBase{OpModMaxLimW: &ap}
+		ctrl.OpModMaxLimW = &ap
 	}
-	return model.DERControlBase{}
+	if v, ok := fields[reconcile.Connect]; ok {
+		b := v != 0
+		ctrl.OpModConnect = &b
+	}
+	return ctrl
 }
 
 // rejected reports whether a SetDesired report set contains a RejectedDoc — the
