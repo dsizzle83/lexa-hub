@@ -109,6 +109,7 @@ func main() {
 	var spStats spoolStats = stubSpoolStats{}
 	var sp *spool.Spool
 	lastUplink := func() int64 { return 0 }
+	certDaysLeft := func() int { return 0 }
 
 	if cfg.Enabled {
 		sp, err = spool.Open(cfg.SpoolDir, cfg.SpoolMaxBytes, m.spoolMetrics())
@@ -130,6 +131,27 @@ func main() {
 		}
 		lastUplink = b.LastUplinkTs
 		go b.run(ctx)
+
+		// Downlink (unit 2.4/§2.6): cloud→intent validation chain, subscribed
+		// on the CLOUD session. dlCloud's assertion always succeeds in
+		// practice (*cloudMQTT and stubCloudSession both satisfy
+		// cloudCmdSubscriber, downlink.go) — kept as a checked assertion
+		// rather than a bare one so a future cloud.go change that drops the
+		// interface fails loud at startup instead of panicking deep inside
+		// runDownlink.
+		dlCloud, ok := cloud.(cloudCmdSubscriber)
+		if !ok {
+			log.Fatalf("lexa-cloudlink: cloud session does not support downlink subscribe")
+		}
+		dl := newDownlink(mc, jw, m)
+		go runDownlink(ctx, dlCloud, dl)
+
+		// Cloud cert monitor (unit 2.5/§2.7): startup + daily inspection of
+		// cloud_cert/cloud_ca, feeding CertDaysLeft into the status overlay
+		// below. No MQTT publish of its own — CloudlinkStatus carries it.
+		certMon := newCloudCertMon(cfg, m)
+		go certMon.Run(ctx, cloudCertCheckInterval)
+		certDaysLeft = certMon.CloudDaysLeft
 	} else {
 		// First-class local-only operation: everything else still runs (local
 		// MQTT session, metrics, watchdog, retained status). Info, not Warn —
@@ -138,9 +160,10 @@ func main() {
 	}
 
 	// Publishes the retained CloudlinkStatus once now and every
-	// cfg.HealthInterval() thereafter (spec item 4). lastUplink is the batcher's
-	// atomic when enabled, else a constant 0.
-	go statusPublisher(ctx, mc, cfg, cloud, spStats, lastUplink, m)
+	// cfg.HealthInterval() thereafter (spec item 4). lastUplink/certDaysLeft
+	// are the batcher's/cert monitor's atomics when enabled, else constant
+	// zero values.
+	go statusPublisher(ctx, mc, cfg, cloud, spStats, lastUplink, certDaysLeft, m)
 
 	watchdog.Ready()
 

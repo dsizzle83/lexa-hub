@@ -30,6 +30,10 @@ type cloudlinkMetrics struct {
 
 	intentsForwarded *metrics.Counter // lexa_cloudlink_intents_forwarded_total — wired by 2.4/2.6's downlink
 	intentsRejected  *metrics.Counter // lexa_cloudlink_intents_rejected_total — wired by 2.4/2.6's downlink
+	intentPubFail    *metrics.Counter // lexa_cloudlink_intent_pub_fail_total — downlink's local-bus forward failed AFTER a command was already accepted; distinct from a rejection (mirrors uplinkFail/uplinkFrames' "accepted vs delivered" split)
+
+	certExpirySeconds *metrics.Gauge // lexa_cloudlink_cert_expiry_seconds — driven by cloudCertMon (2.7)
+	certExpiring      *metrics.Gauge // lexa_cloudlink_cert_expiring — driven by cloudCertMon (2.7)
 
 	// mqttPubFail/mqttReconn are the standard local-MQTT-session pair every
 	// service wires (see cmd/telemetry/main.go's mqttFailCtr/mqttReconnCtr)
@@ -43,17 +47,20 @@ type cloudlinkMetrics struct {
 // and returns them bundled for main()/status.go to reference.
 func newCloudlinkMetrics(reg *metrics.Registry) *cloudlinkMetrics {
 	return &cloudlinkMetrics{
-		connected:        reg.Gauge("lexa_cloudlink_connected"),
-		spoolBytes:       reg.Gauge("lexa_cloudlink_spool_bytes"),
-		spoolDrops:       reg.Counter("lexa_cloudlink_spool_drops_total"),
-		batchBytes:       reg.Gauge("lexa_cloudlink_batch_bytes"),
-		uplinkFrames:     reg.Counter("lexa_cloudlink_uplink_frames_total"),
-		uplinkFail:       reg.Counter("lexa_cloudlink_uplink_fail_total"),
-		cloudReconn:      reg.Counter("lexa_cloudlink_cloud_reconnects_total"),
-		intentsForwarded: reg.Counter("lexa_cloudlink_intents_forwarded_total"),
-		intentsRejected:  reg.Counter("lexa_cloudlink_intents_rejected_total"),
-		mqttPubFail:      reg.Counter("lexa_mqtt_publish_failures_total"),
-		mqttReconn:       reg.Counter("lexa_mqtt_reconnects_total"),
+		connected:         reg.Gauge("lexa_cloudlink_connected"),
+		spoolBytes:        reg.Gauge("lexa_cloudlink_spool_bytes"),
+		spoolDrops:        reg.Counter("lexa_cloudlink_spool_drops_total"),
+		batchBytes:        reg.Gauge("lexa_cloudlink_batch_bytes"),
+		uplinkFrames:      reg.Counter("lexa_cloudlink_uplink_frames_total"),
+		uplinkFail:        reg.Counter("lexa_cloudlink_uplink_fail_total"),
+		cloudReconn:       reg.Counter("lexa_cloudlink_cloud_reconnects_total"),
+		intentsForwarded:  reg.Counter("lexa_cloudlink_intents_forwarded_total"),
+		intentsRejected:   reg.Counter("lexa_cloudlink_intents_rejected_total"),
+		intentPubFail:     reg.Counter("lexa_cloudlink_intent_pub_fail_total"),
+		certExpirySeconds: reg.Gauge("lexa_cloudlink_cert_expiry_seconds"),
+		certExpiring:      reg.Gauge("lexa_cloudlink_cert_expiring"),
+		mqttPubFail:       reg.Counter("lexa_mqtt_publish_failures_total"),
+		mqttReconn:        reg.Counter("lexa_mqtt_reconnects_total"),
 	}
 }
 

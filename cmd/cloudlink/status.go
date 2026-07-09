@@ -93,11 +93,20 @@ func buildStatus(cfg *Config, session cloudSession, sp spoolStats, now time.Time
 // the cloud link is enabled, else a constant 0. It is overlaid AFTER buildStatus
 // so buildStatus's pure (cfg, session, sp, now) signature stays exactly as unit
 // 2.1 pinned it (status_test.go); the batcher, not buildStatus, owns that field.
-func statusPublisher(ctx context.Context, mc mqtt.Client, cfg *Config, session cloudSession, sp spoolStats, lastUplink func() int64, m *cloudlinkMetrics) {
+//
+// certDaysLeft is the same overlay pattern for CloudlinkStatus.CertDaysLeft
+// (§2.7): cloudCertMon's CloudDaysLeft when the cloud link is enabled, else
+// main.go's constant-0 default (no cert monitor runs disabled — mirroring
+// lastUplink's disabled-path shape exactly). nil is also tolerated (tests)
+// and leaves the field at its omitempty zero.
+func statusPublisher(ctx context.Context, mc mqtt.Client, cfg *Config, session cloudSession, sp spoolStats, lastUplink func() int64, certDaysLeft func() int, m *cloudlinkMetrics) {
 	publish := func() {
 		st := buildStatus(cfg, session, sp, time.Now())
 		if lastUplink != nil {
 			st.LastUplinkTs = lastUplink()
+		}
+		if certDaysLeft != nil {
+			st.CertDaysLeft = certDaysLeft()
 		}
 		if err := mqttutil.PublishJSONRetained(mc, bus.TopicCloudlinkStatus, st); err != nil {
 			slog.Warn("lexa-cloudlink: publish status failed", "err", err)
