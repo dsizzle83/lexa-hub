@@ -70,3 +70,26 @@ func loadConfig(path string) (*Config, error) {
 func (c *Config) MUPPostRate() time.Duration {
 	return time.Duration(c.MUPPostRateS) * time.Second
 }
+
+// Uncommissioned reports whether this config describes a factory-fresh or
+// factory-reset unit with nothing to post to (Unit 1.7, closing a gap found
+// in unit 1.6: DEVICE_ROADMAP.md §9 / configs/factory/README.md "Known
+// gaps" #1, same discipline as cmd/northbound/config.go's Uncommissioned).
+// The factory profile (configs/factory/telemetry.json) ships Server == ""
+// precisely to mean this — MUP registration/posting has nowhere to go
+// without a server, regardless of how many (if any) devices are
+// configured.
+//
+// Cert paths (CACert/ClientCert/ClientKey) do NOT factor in, even though
+// the factory profile ships them pointing at the standard
+// /etc/lexa/certs/* locations (the same files lexa-northbound points at —
+// see cmd/northbound/certmon.go's package doc for why telemetry does not
+// run its own monitor). Those paths may not exist on disk yet on a virgin
+// device; their presence/absence is not what "uncommissioned" means, only
+// whether a server has been configured. A config with Server set but a
+// missing/unreadable cert file is configured-but-broken and must keep
+// failing loudly at TLS-fetcher construction, exactly as it does today —
+// this method must never mask that.
+func (c *Config) Uncommissioned() bool {
+	return c.Server == ""
+}

@@ -53,6 +53,17 @@ func main() {
 	}
 	logutil.Setup("lexa-telemetry", logutil.ParseLevel(cfg.LogLevel)) // TASK-045
 
+	// Unit 1.7 (DEVICE_ROADMAP.md §9, closing a gap found in unit 1.6): an
+	// uncommissioned unit has no server to post to, so wolfSSL init, TLS
+	// fetcher construction (which loads cert/key files that may not exist
+	// yet on a factory-fresh/-reset unit), LFDI derivation from the client
+	// cert, and MUP registration/posting all stay unstarted — see runIdle's
+	// doc comment for exactly what still runs.
+	if cfg.Uncommissioned() {
+		runIdle(cfg)
+		return
+	}
+
 	wolfssl.Init()
 	defer wolfssl.Cleanup()
 
@@ -264,6 +275,87 @@ func main() {
 					connectedGauge.Set(1)
 					ep.fails = 0
 				}
+			}
+		}
+	}
+}
+
+// runIdle is the uncommissioned-idle path (Unit 1.7, DEVICE_ROADMAP.md §9):
+// no server is configured, so there is nothing to post to and — critically
+// — nothing that requires the cert/key files at cfg.CACert/ClientCert/
+// ClientKey to exist yet. wolfSSL init, TLS fetcher construction, LFDI
+// derivation from the client cert (lfdiFromCert), and MUP registration/
+// posting all touch those files (directly or via wolfSSL) and are skipped
+// entirely, not deferred — a factory-fresh or factory-reset unit (no certs
+// on disk) must idle cleanly instead of crash-looping into systemd's
+// StartLimit (V1RC FINDING A; configs/factory/README.md "Known gaps" #1
+// names this exact failure — it also notes the "no MUPs registered" Fatal
+// this codepath would otherwise hit immediately with zero configured
+// devices, independent of the cert bug).
+//
+// Everything that does NOT depend on a server or certs still runs: the
+// metrics registry + /metrics listener (standard gauges, MQTT fail/reconnect
+// counters, the bus-decode-failure gauge — all keep working), MQTT connect
+// (the broker credentials exist even on an uncommissioned unit; if the
+// broker itself is unreachable, ordinary crash-only behavior applies,
+// AD-011), and the watchdog: Ready() plus the same "10s ticker gated on
+// mc.IsConnected()" idle-kick shape lexa-ocpp/lexa-api already use (see
+// CLAUDE.md's watchdog table), so the process stays alive and
+// systemd-healthy (healthcheck check #1) indefinitely until commissioning
+// replaces this config and restarts the service.
+func runIdle(cfg *Config) {
+	slog.Info("uncommissioned idle — no server configured; commissioning will restart this service with a live config")
+
+	// TASK-044: metrics registry + standard process gauges, wired before the
+	// MQTT connect below so its instrumentation hooks have counters ready —
+	// same ordering as the configured path above.
+	reg := metrics.New()
+	metrics.StandardGauges(reg)
+	mqttFailCtr := reg.Counter("lexa_mqtt_publish_failures_total")
+	mqttReconnCtr := reg.Counter("lexa_mqtt_reconnects_total")
+	reg.Collect(func(r *metrics.Registry) {
+		var total uint64
+		for _, n := range bus.VersionRejects() {
+			total += n
+		}
+		for _, n := range bus.DecodeFailures() {
+			total += n
+		}
+		r.Counter("lexa_bus_decode_failures_total").Set(total)
+	})
+
+	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
+	if err != nil {
+		log.Fatalf("lexa-telemetry: %v", err)
+	}
+	mc, err := mqttutil.ConnectAuthInstrumented(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass, mqttutil.Instrumentation{
+		OnPublishFail: mqttFailCtr.Inc,
+		OnReconnect:   mqttReconnCtr.Inc,
+	})
+	if err != nil {
+		log.Fatalf("lexa-telemetry: %v", err)
+	}
+	defer mc.Disconnect(500)
+
+	metrics.Serve(cfg.MetricsAddr, reg)
+
+	// sd_notify READY (TASK-008): there is no MUP registration to wait on —
+	// idle is the terminal state until a config/restart from commissioning.
+	watchdog.Ready()
+
+	kick := time.NewTicker(10 * time.Second)
+	defer kick.Stop()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	for {
+		select {
+		case <-quit:
+			log.Println("lexa-telemetry: shutting down (uncommissioned idle)")
+			return
+		case <-kick.C:
+			if mc.IsConnected() {
+				watchdog.Kick()
 			}
 		}
 	}

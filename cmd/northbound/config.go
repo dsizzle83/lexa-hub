@@ -142,6 +142,28 @@ func (c *Config) DiscoveryInterval() time.Duration {
 	return time.Duration(c.DiscoveryIntervalS) * time.Second
 }
 
+// Uncommissioned reports whether this config describes a factory-fresh or
+// factory-reset unit with nothing to walk (Unit 1.7, closing a gap found in
+// unit 1.6: DEVICE_ROADMAP.md §9 / configs/factory/README.md "Known gaps"
+// #1). The factory profile (configs/factory/northbound.json) ships
+// Server == "" precisely to mean this; DEVICE_ROADMAP.md §9 describes the
+// intended state as "no server URL + discovery disabled", but there is no
+// separate discovery-enable config key today — an empty Server already
+// means discovery has nothing to dial, so Server alone decides.
+//
+// Cert paths (CACert/ClientCert/ClientKey) do NOT factor in, even though
+// the factory profile ships them pointing at the standard
+// /etc/lexa/certs/* locations: those paths are baked into every profile
+// and may not exist on disk yet on a virgin device, but their presence or
+// absence is not what "uncommissioned" means — only whether a server has
+// been configured to talk to. A config with Server set but a missing/
+// unreadable cert file is a configured-but-broken unit and must keep
+// failing loudly at TLS-fetcher construction, exactly as it does today —
+// this method must never mask that.
+func (c *Config) Uncommissioned() bool {
+	return c.Server == ""
+}
+
 // PollRateMode returns the configured run.PollRateMode (TASK-071). Any
 // value other than the literal "honor" string is treated as
 // run.PollRateOverride by run.effectiveInterval — see that function's doc —

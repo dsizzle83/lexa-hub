@@ -81,6 +81,14 @@ treat as "plan heartbeat `never` is fine" rather than a fault.
 
 ## Known gaps (found while building this profile — read before relying on it)
 
+**1. RESOLVED (unit 1.7, 2026-07-09)** — option (a) below was implemented:
+`cfg.Uncommissioned()` (`server == ""`) gates `main()` in both services onto
+an idle path (`runIdle`) that skips wolfSSL init, fetcher construction, LFDI
+derivation, and (northbound) certmon/rotation entirely while keeping MQTT,
+/metrics, and watchdog Ready+kicks alive — a factory-fresh or freshly-reset
+unit now idles cleanly instead of crash-looping into StartLimit. The
+original analysis is kept below for provenance.
+
 **1. `lexa-northbound` and `lexa-telemetry` both load their CA/client
 cert/key files eagerly, unconditionally, at process construction** —
 `cmd/northbound/main.go`'s `mustFetcher`/`tlsclient.NewWolfSSLFetcher` and
