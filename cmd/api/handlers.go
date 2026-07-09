@@ -36,6 +36,12 @@ type statusResp struct {
 	// retained lexa/northbound/certstatus message arrives — additive field,
 	// existing /status consumers that don't know about it are unaffected.
 	CertStatus *certStatusJSON `json:"cert_status,omitempty"`
+	// APICertFP is this lexa-api instance's own HTTPS server certificate
+	// fingerprint (cmd/api/tlscert.go's ensureServerCert, DEVICE_ROADMAP.md
+	// §4.1/§4.4) — lowercase hex SHA-256 of the leaf DER, the same value
+	// logged at startup and advertised for TOFU comparison. Empty/omitted
+	// when TLS is disabled (Config.TLS false). Additive field.
+	APICertFP string `json:"api_cert_fp,omitempty"`
 }
 
 // certStatusJSON is /status's stable, hand-rolled shape for bus.CertStatus —
@@ -306,8 +312,11 @@ func buildStatus(snap snapshot, hb heartbeatStatus) statusResp {
 
 // statusHandler serves GET /status as JSON. hb supplies the plan heartbeat
 // field (TASK-045), evaluated fresh on every request (not cached from the
-// periodic ticker) so /status always reflects the live state.
-func statusHandler(store *stateStore, hb *planHeartbeat) http.HandlerFunc {
+// periodic ticker) so /status always reflects the live state. certFP is
+// this process's TLS cert fingerprint (empty when TLS is disabled) —
+// static for the process lifetime, so it's stamped directly onto the
+// response rather than threaded through buildStatus's pure reduction.
+func statusHandler(store *stateStore, hb *planHeartbeat, certFP string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if r.Method == http.MethodOptions {
@@ -316,6 +325,7 @@ func statusHandler(store *stateStore, hb *planHeartbeat) http.HandlerFunc {
 			return
 		}
 		resp := buildStatus(store.snapshot(), hb.evaluate(time.Now()))
+		resp.APICertFP = certFP
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			log.Printf("lexa-api: /status encode: %v", err)

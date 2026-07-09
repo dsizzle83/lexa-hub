@@ -8,9 +8,14 @@
   "log_buffer_size": 256,
   "api_token_file": "",
   "bench": false,
+  "tls": false,
+  "mdns": true,
+  "serial_file": "/etc/lexa/identity/serial",
+  "cert_dir": "/var/lib/lexa/api",
   "devices": [
     {"name": "inverter-0", "role": "inverter", "max_w": 5000},
     {"name": "battery-0",  "role": "battery",  "max_w": 5000},
     {"name": "meter-0",    "role": "meter",    "max_w": 0}
-  ]
+  ],
+  "schema_version": 1
 }

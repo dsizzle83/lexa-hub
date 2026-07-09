@@ -29,3 +29,31 @@ func requireBearer(token string, next http.HandlerFunc) http.HandlerFunc {
 		next(w, r)
 	}
 }
+
+// requireBearerStrict is requireBearer's write-route counterpart
+// (DEVICE_ROADMAP.md §4.2): unlike requireBearer, an EMPTY token does NOT
+// open the gate. requireBearer's empty-token escape hatch exists for the
+// staged bearer-token ROLLOUT on read routes (/status, /logs) — it must
+// never apply to a route that changes state. A write route wrapped in
+// requireBearerStrict with no api_token_file configured returns 401
+// unconditionally: "no token configured" must fail closed for writes, not
+// fail open the way it deliberately does for reads.
+//
+// No route wires this in yet — unit 4.3 (POST /intent, /scan,
+// /config/{service}) will — but it is exported package-internally and
+// tested now so its behavior is pinned ahead of any caller.
+func requireBearerStrict(token string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if token == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		want := "Bearer " + token
+		got := r.Header.Get("Authorization")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}

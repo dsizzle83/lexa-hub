@@ -74,6 +74,36 @@ type Config struct {
 	// the hub's actual interval, so this is its own config rather than derived.
 	PlanStallAfterS int `json:"plan_stall_after_s"`
 
+	// TLS enables HTTPS on ListenAddr via a per-device self-signed cert
+	// (cmd/api/tlscert.go, DEVICE_ROADMAP.md §4.1). nil/absent ⇒ true —
+	// this is the PRODUCT default (a field-deployed Digi i.MX93 unit ships
+	// TLS on). Bench/dev configs set this to false explicitly as the
+	// escape hatch (see this repo's checked-in configs/api.json, which
+	// does exactly that) until the dashboard/proxy chain learns the
+	// fingerprint TOFU flow. A misprovisioned unit that fails to load/
+	// generate its cert does NOT fall back to plaintext — see main.go,
+	// where that failure is fatal at startup.
+	TLS *bool `json:"tls"`
+
+	// MDNS enables the _lexa-hub._tcp mDNS advertisement (cmd/api/mdns.go,
+	// DEVICE_ROADMAP.md §4.4). nil/absent ⇒ true. Set false for a
+	// multicast-hostile network or a privacy-sensitive deployment — mDNS
+	// registration failure is already non-fatal (logged WARN once), this
+	// key is for an operator who wants it off outright.
+	MDNS *bool `json:"mdns"`
+
+	// SerialFile is the device-identity serial used for the TLS cert's
+	// CN/SAN (cmd/api/tlscert.go) and the mDNS TXT record's "serial="
+	// field. Default "/etc/lexa/identity/serial"; an unreadable/empty file
+	// (no identity partition provisioned yet — a bench box, or a factory
+	// unit ahead of commissioning) falls back to os.Hostname().
+	SerialFile string `json:"serial_file"`
+
+	// CertDir is where the generated HTTPS server cert/key persist across
+	// restarts (cmd/api/tlscert.go's ensureServerCert). Default
+	// "/var/lib/lexa/api".
+	CertDir string `json:"cert_dir"`
+
 	Devices []DeviceConfig `json:"devices"`
 }
 
@@ -106,6 +136,12 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.PlanStallAfterS == 0 {
 		cfg.PlanStallAfterS = 75
+	}
+	if cfg.SerialFile == "" {
+		cfg.SerialFile = defaultSerialFile
+	}
+	if cfg.CertDir == "" {
+		cfg.CertDir = "/var/lib/lexa/api"
 	}
 	// WS-1 (V1.0 punch list, security fail-closed by default): a wildcard/LAN
 	// bind with no bearer-token auth is an unauthenticated control-adjacent
@@ -150,6 +186,18 @@ func (c *Config) StaleAfter() time.Duration {
 // PlanStallAfter is PlanStallAfterS as a time.Duration (TASK-045).
 func (c *Config) PlanStallAfter() time.Duration {
 	return time.Duration(c.PlanStallAfterS) * time.Second
+}
+
+// TLSEnabled reports whether the HTTPS listener is on. nil/absent TLS ⇒
+// true — the product default (DEVICE_ROADMAP.md §4.1).
+func (c *Config) TLSEnabled() bool {
+	return c.TLS == nil || *c.TLS
+}
+
+// MDNSEnabled reports whether the mDNS advertisement is on. nil/absent MDNS
+// ⇒ true — the product default (DEVICE_ROADMAP.md §4.4).
+func (c *Config) MDNSEnabled() bool {
+	return c.MDNS == nil || *c.MDNS
 }
 
 // LoadAPIToken reads the bearer token from APITokenFile. An unset

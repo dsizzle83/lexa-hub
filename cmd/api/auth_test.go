@@ -83,6 +83,39 @@ func TestHealthzHandlerAlwaysOpen(t *testing.T) {
 	}
 }
 
+// requireBearerStrict (DEVICE_ROADMAP.md §4.2) is requireBearer's
+// write-route counterpart: an empty token must NEVER open the gate, unlike
+// requireBearer's staged-rollout escape hatch for reads.
+func TestRequireBearerStrict_Table(t *testing.T) {
+	cases := []struct {
+		name  string
+		token string
+		hdr   string
+		want  int
+	}{
+		{"empty token, no header, always 401", "", "", http.StatusUnauthorized},
+		{"empty token, WITH a header, still 401", "", "Bearer anything", http.StatusUnauthorized},
+		{"configured token, missing header", "s3cret", "", http.StatusUnauthorized},
+		{"configured token, wrong value", "s3cret", "Bearer wrong", http.StatusUnauthorized},
+		{"configured token, malformed header", "s3cret", "s3cret", http.StatusUnauthorized},
+		{"configured token, correct value", "s3cret", "Bearer s3cret", http.StatusOK},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := requireBearerStrict(c.token, okHandler)
+			req := httptest.NewRequest(http.MethodPost, "/intent", nil)
+			if c.hdr != "" {
+				req.Header.Set("Authorization", c.hdr)
+			}
+			rec := httptest.NewRecorder()
+			h(rec, req)
+			if rec.Code != c.want {
+				t.Errorf("token=%q hdr=%q: got %d, want %d", c.token, c.hdr, rec.Code, c.want)
+			}
+		})
+	}
+}
+
 func TestLoadAPIToken_UnsetFileMeansDisabled(t *testing.T) {
 	cfg := &Config{}
 	tok, err := cfg.LoadAPIToken()

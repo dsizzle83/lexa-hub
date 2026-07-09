@@ -99,6 +99,123 @@ func TestLoadConfig_NonLoopback_NoToken_BenchTrue_Succeeds(t *testing.T) {
 	}
 }
 
+// DEVICE_ROADMAP.md §4.1/§4.4: TLS/mDNS default ON (product default), and
+// SerialFile/CertDir get their fixed defaults when absent.
+
+func TestLoadConfig_TLSDefaultsTrueWhenAbsent(t *testing.T) {
+	path := writeTempAPIConfig(t, `{"mqtt_broker": "tcp://localhost:1883"}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !cfg.TLSEnabled() {
+		t.Fatal("TLSEnabled() = false with tls absent from config, want true (product default)")
+	}
+}
+
+func TestLoadConfig_TLSExplicitFalse(t *testing.T) {
+	path := writeTempAPIConfig(t, `{
+		"mqtt_broker": "tcp://localhost:1883",
+		"tls": false
+	}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.TLSEnabled() {
+		t.Fatal("TLSEnabled() = true with tls:false configured, want false")
+	}
+}
+
+func TestLoadConfig_TLSExplicitTrue(t *testing.T) {
+	path := writeTempAPIConfig(t, `{
+		"mqtt_broker": "tcp://localhost:1883",
+		"tls": true
+	}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !cfg.TLSEnabled() {
+		t.Fatal("TLSEnabled() = false with tls:true configured, want true")
+	}
+}
+
+func TestLoadConfig_MDNSDefaultsTrueWhenAbsent(t *testing.T) {
+	path := writeTempAPIConfig(t, `{"mqtt_broker": "tcp://localhost:1883"}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !cfg.MDNSEnabled() {
+		t.Fatal("MDNSEnabled() = false with mdns absent from config, want true (product default)")
+	}
+}
+
+func TestLoadConfig_MDNSExplicitFalse(t *testing.T) {
+	path := writeTempAPIConfig(t, `{
+		"mqtt_broker": "tcp://localhost:1883",
+		"mdns": false
+	}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.MDNSEnabled() {
+		t.Fatal("MDNSEnabled() = true with mdns:false configured, want false")
+	}
+}
+
+func TestLoadConfig_SerialFileDefault(t *testing.T) {
+	path := writeTempAPIConfig(t, `{"mqtt_broker": "tcp://localhost:1883"}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.SerialFile != "/etc/lexa/identity/serial" {
+		t.Fatalf("SerialFile = %q, want the default %q", cfg.SerialFile, "/etc/lexa/identity/serial")
+	}
+}
+
+func TestLoadConfig_SerialFileOverride(t *testing.T) {
+	path := writeTempAPIConfig(t, `{
+		"mqtt_broker": "tcp://localhost:1883",
+		"serial_file": "/custom/serial"
+	}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.SerialFile != "/custom/serial" {
+		t.Fatalf("SerialFile = %q, want %q", cfg.SerialFile, "/custom/serial")
+	}
+}
+
+func TestLoadConfig_CertDirDefault(t *testing.T) {
+	path := writeTempAPIConfig(t, `{"mqtt_broker": "tcp://localhost:1883"}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.CertDir != "/var/lib/lexa/api" {
+		t.Fatalf("CertDir = %q, want the default %q", cfg.CertDir, "/var/lib/lexa/api")
+	}
+}
+
+func TestLoadConfig_CertDirOverride(t *testing.T) {
+	path := writeTempAPIConfig(t, `{
+		"mqtt_broker": "tcp://localhost:1883",
+		"cert_dir": "/custom/certs"
+	}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.CertDir != "/custom/certs" {
+		t.Fatalf("CertDir = %q, want %q", cfg.CertDir, "/custom/certs")
+	}
+}
+
 func TestIsLoopbackAddr(t *testing.T) {
 	cases := []struct {
 		addr string

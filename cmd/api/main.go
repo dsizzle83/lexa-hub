@@ -16,9 +16,11 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -159,11 +161,35 @@ func main() {
 		log.Fatalf("lexa-api: subscribe hub plan: %v", err)
 	}
 
+	// DEVICE_ROADMAP.md §4.1: the HTTPS server cert. Generated once on
+	// first boot and persisted (cmd/api/tlscert.go); a load/generate
+	// failure is FATAL here — a misprovisioned unit must not silently fall
+	// back to serving plaintext. certFP is "" when TLS is disabled.
+	var tlsConfig *tls.Config
+	var certFP string
+	if cfg.TLSEnabled() {
+		cert, fp, err := ensureServerCertFor(cfg.CertDir, cfg.SerialFile)
+		if err != nil {
+			log.Fatalf("lexa-api: TLS cert (cert_dir=%s): %v", cfg.CertDir, err)
+		}
+		certFP = fp
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		// Installers/TOFU consumers (lexactl, the mobile app) read this
+		// line to learn the fingerprint they should pin — one INFO line,
+		// not a repeated log source.
+		log.Printf("lexa-api: TLS enabled — server cert fingerprint sha256:%s (cert_dir=%s)", fp, cfg.CertDir)
+	} else {
+		log.Printf("lexa-api: TLS disabled (tls:false) — serving plain HTTP; product deploys must not ship this")
+	}
+
 	mux := http.NewServeMux()
 	// /healthz is NEVER wrapped — TASK-008's api watchdog self-probe (and any
 	// future load-balancer check) needs an unauthenticated liveness endpoint.
 	mux.HandleFunc("/healthz", healthzHandler)
-	mux.HandleFunc("/status", requireBearer(apiToken, statusHandler(store, planHB)))
+	mux.HandleFunc("/status", requireBearer(apiToken, statusHandler(store, planHB, certFP)))
 	mux.HandleFunc("/logs", requireBearer(apiToken, logsHandler(lb)))
 	// /metrics is NEVER wrapped either (TASK-044): same reasoning as
 	// /healthz — a Prometheus scraper is infra, not a dashboard consumer of
@@ -173,18 +199,60 @@ func main() {
 	// listener, new route" per the task: no new auth surface, no new port.
 	mux.Handle("/metrics", reg.Handler())
 
-	srv := &http.Server{Addr: cfg.ListenAddr, Handler: mux}
+	srv := &http.Server{Addr: cfg.ListenAddr, Handler: mux, TLSConfig: tlsConfig}
+	scheme := "http"
+	if cfg.TLSEnabled() {
+		scheme = "https"
+	}
 	go func() {
-		log.Printf("lexa-api: HTTP listening on %s", cfg.ListenAddr)
-		lb.Emit(fmt.Sprintf("lexa-api: HTTP listening on %s", cfg.ListenAddr))
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("lexa-api: %s listening on %s", scheme, cfg.ListenAddr)
+		lb.Emit(fmt.Sprintf("lexa-api: %s listening on %s", scheme, cfg.ListenAddr))
+		var err error
+		if cfg.TLSEnabled() {
+			// Cert/key already loaded into srv.TLSConfig above — passing
+			// empty paths here tells ListenAndServeTLS to use that config
+			// rather than re-reading from disk.
+			err = srv.ListenAndServeTLS("", "")
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			log.Fatalf("lexa-api: listen: %v", err)
 		}
 	}()
 
-	// TASK-008: cfg.ListenAddr is host:port form (default ":9100") — prefixing
-	// the loopback host gives a same-process self-probe URL for /healthz.
-	healthzURL := "http://127.0.0.1" + cfg.ListenAddr + "/healthz"
+	// TASK-008: cfg.ListenAddr is host:port form — extract just the port so
+	// the self-probe always targets 127.0.0.1 regardless of what host
+	// ListenAddr itself binds (loopback, wildcard, or a LAN address on the
+	// bench). The previous "http://127.0.0.1" + cfg.ListenAddr
+	// concatenation was only correct for a host-less ListenAddr like
+	// ":9100" — since WS-1 defaulted ListenAddr to "127.0.0.1:9100" it
+	// produced a malformed "http://127.0.0.1127.0.0.1:9100/healthz" that
+	// probeHealthz would always fail to reach, silently starving every
+	// watchdog kick gated on it. Fixed here as part of wiring the
+	// TLS-conditional scheme (DEVICE_ROADMAP.md §4.1's "keep http when
+	// off, https when on" — both need a clean host:port join either way).
+	_, healthzPort, err := net.SplitHostPort(cfg.ListenAddr)
+	if err != nil {
+		log.Fatalf("lexa-api: parse listen_addr %q: %v", cfg.ListenAddr, err)
+	}
+	healthzURL := scheme + "://127.0.0.1:" + healthzPort + "/healthz"
+
+	// healthzClient probes the loopback /healthz above. When TLS is on this
+	// is a same-process LIVENESS check, not an identity check — the whole
+	// point is "does this process's own HTTP server answer", so
+	// InsecureSkipVerify is correct here even though it would not be for a
+	// real client (see tlscert.go's fingerprint-pinning doc for how a real
+	// client is expected to verify this cert instead).
+	healthzClient := &http.Client{Timeout: 2 * time.Second}
+	if cfg.TLSEnabled() {
+		healthzClient = &http.Client{
+			Timeout: 2 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // loopback liveness only, not identity
+			},
+		}
+	}
 
 	// Give the ListenAndServe goroutine above a moment to bind before the
 	// single startup probe (task spec: "probe once before Ready"). A failed
@@ -194,9 +262,23 @@ func main() {
 	// the kick loop below (which gates on the same probe) be the ongoing
 	// signal of whether /healthz is actually up.
 	time.Sleep(100 * time.Millisecond)
-	if !probeHealthz(healthzURL) {
+	if !probeHealthz(healthzClient, healthzURL) {
 		log.Printf("lexa-api: startup healthz probe failed (%s) — sending Ready anyway; watchdog kicks will gate on this same probe", healthzURL)
 	}
+
+	// DEVICE_ROADMAP.md §4.4: mDNS advertisement. resolveSerial mirrors the
+	// same serial-file/hostname resolution ensureServerCertFor used above
+	// for the cert's CN, so the mDNS TXT "serial=" field and the cert
+	// identity always agree. Non-fatal by construction (startMDNS logs and
+	// returns nil on any failure); refreshLoop and Shutdown are both
+	// nil-receiver-safe so no "if configured" guard is needed below.
+	serial := resolveSerial(cfg.SerialFile)
+	var mdnsAdv *mdnsAdvertiser
+	if cfg.MDNSEnabled() {
+		mdnsAdv = startMDNS(serial, cfg.ListenAddr, cfg.TLSEnabled())
+	}
+	mdnsStop := make(chan struct{})
+	go mdnsAdv.refreshLoop(mdnsStop)
 
 	// sd_notify READY (TASK-008): the HTTP listener goroutine is up (probed
 	// once, above) and all MQTT subscriptions were established earlier in
@@ -224,10 +306,12 @@ func main() {
 		select {
 		case <-quit:
 			log.Println("lexa-api: shutting down")
+			close(mdnsStop)
+			mdnsAdv.Shutdown()
 			_ = srv.Close()
 			return
 		case <-kick.C:
-			if mc.IsConnected() && probeHealthz(healthzURL) {
+			if mc.IsConnected() && probeHealthz(healthzClient, healthzURL) {
 				watchdog.Kick()
 			}
 		case <-hbTicker.C:
@@ -237,12 +321,15 @@ func main() {
 }
 
 // probeHealthz performs a single bounded GET against the local /healthz
-// endpoint, returning true only on a 200 response. Used both for the
-// startup probe and for gating each watchdog kick (TASK-008): the api
-// service has no tight control loop, so an actual, current HTTP round trip
-// is the strongest liveness signal available.
-func probeHealthz(url string) bool {
-	client := http.Client{Timeout: 2 * time.Second}
+// endpoint using client, returning true only on a 200 response. Used both
+// for the startup probe and for gating each watchdog kick (TASK-008): the
+// api service has no tight control loop, so an actual, current HTTP round
+// trip is the strongest liveness signal available. client is caller-
+// supplied (rather than constructed here) so main() can hand in a TLS
+// transport with InsecureSkipVerify when the listener is HTTPS — see the
+// call site's doc for why that's the right trust model for a loopback
+// liveness probe.
+func probeHealthz(client *http.Client, url string) bool {
 	resp, err := client.Get(url)
 	if err != nil {
 		return false
