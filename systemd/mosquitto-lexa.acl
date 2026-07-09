@@ -49,6 +49,14 @@ topic write lexa/scan/status
 # publishes the completed sweep; retained until commissioning supersedes it.
 topic write lexa/scan/result
 
+# bus.ReconcileReportTopic(class, dev) (TASK-031) — retained NonConverged
+# begin/end verdicts from the battery/solar reconciler shells. HOTFIX
+# 2026-07-09 (found by unit 1.3 review): this family had NO grants since
+# TASK-031 — enforcement-on deploys (WS-1 default) would silently drop
+# the device-level breach evidence feeding breachEpisodes/CannotComply.
+topic write lexa/reconcile/battery/+/report
+topic write lexa/reconcile/solar/+/report
+
 user lexa-northbound
 # bus.TopicCSIPControl (retained) — resolved CSIP DERControl limits.
 topic write lexa/csip/control
@@ -143,6 +151,11 @@ topic write lexa/intent/result
 # see their stanzas).
 topic write lexa/hub/mode
 
+# bus.SubReconcileReport (TASK-031) — hub re-seeds breach-episode state
+# from the retained reconciler verdicts (HOTFIX 2026-07-09, see modbus
+# stanza note).
+topic read lexa/reconcile/+/+/report
+
 user lexa-ocpp
 # bus.EVSEStateTopic("<station>").
 topic write lexa/evse/+/state
@@ -155,6 +168,10 @@ topic read lexa/desired/evse/+
 # stations that dialed the CSMS, for installer approval instead of silent
 # adoption; lexa-api (unit 4.2) projects it into GET /devices.
 topic write lexa/ocpp/pending
+
+# bus.ReconcileReportTopic("evse", station) (TASK-030/031) — EVSE
+# reconciler verdicts (HOTFIX 2026-07-09, see modbus stanza note).
+topic write lexa/reconcile/evse/+/report
 
 user lexa-telemetry
 # bus.SubMeasurements — telemetry posts MUP measurements upstream over CSIP.
