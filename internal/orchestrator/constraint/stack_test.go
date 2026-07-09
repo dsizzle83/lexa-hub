@@ -191,3 +191,40 @@ func TestStack_AxisAuthorsEmptyBeforeFirstOptimizeAndRebuiltEachTick(t *testing.
 		t.Fatalf("authors after tick 2 (no demand) = %+v, want empty (stale authorship must not linger)", got)
 	}
 }
+
+// TestStack_CommandsCarryActiveControlMRID pins WS-4.3 parity with the legacy
+// cascade: Stack commands carry state.CSIPControl.MRID (breach.go's device
+// evidence path), and stay "" with no active control.
+func TestStack_CommandsCarryActiveControlMRID(t *testing.T) {
+	cs := []Constraint{
+		fakeConstraint{name: "solar", tier: TierCompliance, demands: []Demand{
+			CeilingDemand("inv1", AxisSolarCeilingW, 3000, TierCompliance, "solar"),
+		}},
+		fakeConstraint{name: "batt", tier: TierEconomics, demands: []Demand{
+			PointDemand("bat1", AxisBatterySetpointW, -1500, TierEconomics, "batt"),
+		}},
+	}
+	state := orchestrator.SystemState{Timestamp: time.Unix(1, 0),
+		CSIPControl: &orchestrator.CSIPControlState{MRID: "MRID-STACK-1"}}
+	plan := NewStack(Plant{}, 0, cs...).Optimize(state)
+	if len(plan.SolarCommands) == 0 || len(plan.BatteryCommands) == 0 {
+		t.Fatalf("expected commands, got %+v", plan)
+	}
+	for _, c := range plan.SolarCommands {
+		if c.MRID != "MRID-STACK-1" {
+			t.Fatalf("solar cmd MRID = %q, want MRID-STACK-1", c.MRID)
+		}
+	}
+	for _, c := range plan.BatteryCommands {
+		if c.MRID != "MRID-STACK-1" {
+			t.Fatalf("battery cmd MRID = %q, want MRID-STACK-1", c.MRID)
+		}
+	}
+	state.CSIPControl = nil
+	plan = NewStack(Plant{}, 0, cs...).Optimize(state)
+	for _, c := range plan.BatteryCommands {
+		if c.MRID != "" {
+			t.Fatalf("battery cmd MRID = %q, want empty with no control", c.MRID)
+		}
+	}
+}
