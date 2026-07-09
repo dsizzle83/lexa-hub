@@ -20,8 +20,8 @@ import (
 	"math"
 	"time"
 
-	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/southbound/device"
+	model "lexa-proto/csipmodel"
 	"lexa-proto/modbus"
 	"lexa-proto/sunspec"
 )

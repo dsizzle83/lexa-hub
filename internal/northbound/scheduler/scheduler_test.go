@@ -13,7 +13,7 @@ import (
 
 const epoch int64 = 1700000000 // fixed reference time for all tests
 
-func boolPtr(v bool) *bool   { return &v }
+func boolPtr(v bool) *bool    { return &v }
 func int32Ptr(v int32) *int32 { return &v }
 func int16Ptr(v int16) *int16 { return &v }
 
@@ -295,7 +295,7 @@ func TestEvaluate_HighPriorityEventWins(t *testing.T) {
 	s := New()
 	// SP (primacy=1) has an active event; SYS (primacy=10) also has one.
 	// SP wins because it has lower primacy (higher priority).
-	spEvt := scheduledEvent("SP-E1", epoch-600, epoch-60, 600, 2000) // SP active
+	spEvt := scheduledEvent("SP-E1", epoch-600, epoch-60, 600, 2000)  // SP active
 	sysEvt := scheduledEvent("SY-E1", epoch-600, epoch-60, 600, 8000) // SYS active
 
 	programs := []discovery.ProgramState{

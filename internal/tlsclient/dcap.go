@@ -18,10 +18,10 @@ type DeviceCapability struct {
 	XMLName xml.Name `xml:"DeviceCapability"`
 	Href    string   `xml:"href,attr"`
 
-	EndDeviceListLink     *Link `xml:"EndDeviceListLink"`
-	MirrorUsagePointLink  *Link `xml:"MirrorUsagePointListLink"`
-	SelfDeviceLink        *Link `xml:"SelfDeviceLink"`
-	TimeLink              *Link `xml:"TimeLink"`
+	EndDeviceListLink    *Link `xml:"EndDeviceListLink"`
+	MirrorUsagePointLink *Link `xml:"MirrorUsagePointListLink"`
+	SelfDeviceLink       *Link `xml:"SelfDeviceLink"`
+	TimeLink             *Link `xml:"TimeLink"`
 }
 
 // Link is a 2030.5 hyperlink to another resource. The All attribute

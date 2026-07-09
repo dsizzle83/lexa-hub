@@ -146,13 +146,13 @@ func Build(tree *discovery.ResourceTree, serverNow int64) *DER24hSchedule {
 
 // candidate is a pre-filtered event entry extracted from a DERControlList.
 type candidate struct {
-	start, end   int64
-	creationTime int64
-	mrid         string
+	start, end            int64
+	creationTime          int64
+	mrid                  string
 	potentiallySuperseded bool
-	cancelled    bool
-	ext          *model.ExtendedDERControl // non-nil if program has extended controls
-	simple       *model.DERControl
+	cancelled             bool
+	ext                   *model.ExtendedDERControl // non-nil if program has extended controls
+	simple                *model.DERControl
 }
 
 // eventEntry is a clipped, winner-selected event ready for timeline insertion.
