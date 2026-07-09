@@ -45,6 +45,15 @@
 #     allow_anonymous is false and password_file/acl_file are enforced BY
 #     DEFAULT; --bench-insecure flips allow_anonymous back to true (today's
 #     pre-WS-1 behavior) for the air-gapped LAN.
+#   - ALSO provisions a lexa-cloudlink broker user + /etc/lexa/mqtt/
+#     cloudlink.pass (TASK-082, unit 1.3 — same idempotent generation as the
+#     six services above) so systemd/mosquitto-lexa.acl's lexa-cloudlink
+#     stanza is backed by real credentials from day one. The lexa-cloudlink
+#     service/binary/config ship with unit 2.1+; this is pre-provisioning
+#     only. If /etc/lexa/cloudlink.json already exists on the target (a
+#     later deploy that staged it), mqtt_user/mqtt_pass_file are patched into
+#     it the same way as the six services; if it doesn't exist yet (today),
+#     that patch step is skipped rather than failing the deploy.
 #   - stages the OCPP CSMS TLS cert/key + generates an idempotent Basic Auth
 #     secret (/etc/lexa/ocpp-auth.pass, 0600 lexa:lexa) and wires
 #     cert_path/key_path/basic_auth_user/basic_auth_pass into ocpp.json —
@@ -148,6 +157,31 @@ for svc in $SERVICES; do
     mosquitto_passwd -b -c "$PASSWD_FILE" "lexa-$svc" "$pass"
   fi
 done
+# lexa-cloudlink broker credential (TASK-082, unit 1.3 — pre-provisioning
+# only; the cloudlink service/binary/config ship with unit 2.1+). Mirrors the
+# loop above exactly (idempotent pass-file, 0600 lexa:lexa, mosquitto_passwd
+# upsert) but is deliberately NOT folded into the $SERVICES loop: that loop
+# also drives the mqtt_user/mqtt_pass_file config-patch further below, which
+# assumes /etc/lexa/<svc>.json already exists (installed from configs/*.json
+# just above) — /etc/lexa/cloudlink.json won't exist until unit 2.1+ actually
+# ships it, and under set -euo pipefail a missing file there would abort the
+# whole deploy. The pass-file name (cloudlink.pass, not lexa-cloudlink.pass)
+# matches configs/cloudlink.json's shipped mqtt_pass_file value verbatim
+# (docs/DEVICE_ROADMAP.md §2.2) even though it breaks the lexa-<svc>.pass
+# pattern above — the username itself (lexa-cloudlink) still follows house
+# convention.
+CLOUDLINK_PASSFILE=/etc/lexa/mqtt/cloudlink.pass
+if [[ ! -s "$CLOUDLINK_PASSFILE" ]]; then
+  ( umask 077 && openssl rand -hex 16 > "$CLOUDLINK_PASSFILE" )
+  chown lexa:lexa "$CLOUDLINK_PASSFILE"
+  chmod 600 "$CLOUDLINK_PASSFILE"
+fi
+cloudlink_pass="$(cat "$CLOUDLINK_PASSFILE")"
+if [[ -s "$PASSWD_FILE" ]]; then
+  mosquitto_passwd -b "$PASSWD_FILE" lexa-cloudlink "$cloudlink_pass"
+else
+  mosquitto_passwd -b -c "$PASSWD_FILE" lexa-cloudlink "$cloudlink_pass"
+fi
 # CORRECTED 2026-07-05 (TASK-006 bench validation): the 06931cc change to
 # root:root 0600 was based on a false premise. strace of a fresh
 # `systemctl restart mosquitto` on the hub Pi shows this package's
@@ -220,6 +254,34 @@ with open(path, "w") as f:
 PY
 done
 echo "  mqtt_user/mqtt_pass_file patched into every /etc/lexa/*.json"
+
+# lexa-cloudlink mqtt_user/mqtt_pass_file (TASK-082, unit 1.3). Guarded on
+# the config existing: the cloudlink service/binary/config ship with unit
+# 2.1+, so on every deploy before then /etc/lexa/cloudlink.json is absent
+# (the configs/*.json install above only copies what's staged, and
+# configs/cloudlink.json isn't shipped in this repo yet) — this must be a
+# no-op, not a failure, or every plain deploy breaks the moment this landed.
+# Once 2.1+ ships configs/cloudlink.json and it starts getting installed
+# above, this block patches it exactly like the loop above patches the six
+# services, just with the cloudlink.pass filename set by the credential
+# block earlier (matches configs/cloudlink.json's shipped mqtt_pass_file
+# value, docs/DEVICE_ROADMAP.md §2.2).
+if [[ -f /etc/lexa/cloudlink.json ]]; then
+  python3 - <<'PY'
+import json
+path = "/etc/lexa/cloudlink.json"
+with open(path) as f:
+    cfg = json.load(f)
+cfg["mqtt_user"] = "lexa-cloudlink"
+cfg["mqtt_pass_file"] = "/etc/lexa/mqtt/cloudlink.pass"
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PY
+  echo "  mqtt_user/mqtt_pass_file patched into /etc/lexa/cloudlink.json"
+else
+  echo "  /etc/lexa/cloudlink.json not present — skipped cloudlink mqtt cred patch (service ships with unit 2.1+)"
+fi
 
 # lexa-api bearer-token auth (TASK-014 / AD-008 / WS-1). The config install
 # above just overwrote /etc/lexa/api.json from the repo's example

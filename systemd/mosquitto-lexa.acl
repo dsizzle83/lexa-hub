@@ -35,6 +35,19 @@ topic read lexa/desired/battery/+
 # bus.DesiredTopic("solar", <device>) (retained) — TASK-029 solar reconciler
 # consumes the hub's retained inverter desired-state doc (explicit CeilingW).
 topic read lexa/desired/solar/+
+# bus.TopicScanRequest (TASK-082) — unit 5.2 scan controller subscribes;
+# lexa-api's POST /scan (unit 4.3) is the writer. Refused
+# (ScanStatus{Phase:"refused"}) unless the service owns zero live devices or
+# every configured reconciler is "off" — cmd/modbus/scan.go's arming rule,
+# roadmap §5.2 — so a scan never shares a serial line/TCP session with live
+# polling/control.
+topic read lexa/scan/request
+# bus.TopicScanStatus (TASK-082) — unit 5.2 scan controller publishes sweep
+# progress; lexa-api (unit 4.2) projects it to GET /scan.
+topic write lexa/scan/status
+# bus.TopicScanResult (retained) (TASK-082) — unit 5.2 scan controller
+# publishes the completed sweep; retained until commissioning supersedes it.
+topic write lexa/scan/result
 
 user lexa-northbound
 # bus.TopicCSIPControl (retained) — resolved CSIP DERControl limits.
@@ -97,6 +110,38 @@ topic read lexa/evse/+/state
 topic read lexa/northbound/schedule
 # bus.TopicCSIPPricing (retained).
 topic read lexa/csip/pricing
+# bus.TopicIntentMode (retained) (TASK-082) — unit 3.3 hub intent adopter
+# subscribes this kind explicitly (no lexa/intent/+ wildcard — topics.go's
+# design rule, kept exact here too); lexa-cloudlink (unit 2.4) and lexa-api
+# (unit 4.3) are the writers.
+topic read lexa/intent/mode
+# bus.TopicIntentEVGoal (retained) (TASK-082) — unit 3.3 hub intent adopter.
+topic read lexa/intent/evgoal
+# bus.TopicIntentReserve (retained) (TASK-082) — unit 3.3 hub intent adopter;
+# intents can only RAISE the configured safety floor (unit 3.1's clamp).
+topic read lexa/intent/reserve
+# bus.TopicIntentTariff (retained) (TASK-082) — unit 3.3 hub intent adopter;
+# compiled into a TOUCostModel via SwapCostModel (unit 3.2).
+topic read lexa/intent/tariff
+# bus.TopicIntentSolarForecast (retained) (TASK-082) — unit 3.3 hub intent
+# adopter. Cloud-only kind: only lexa-cloudlink (unit 2.4) writes it — no
+# lexa-api grant exists for this topic (see the lexa-api stanza's asymmetry
+# note below).
+topic read lexa/intent/solarforecast
+# bus.TopicIntentLoadProfile (retained) (TASK-082) — unit 3.3 hub intent
+# adopter, cloud-only writer, same asymmetry as solarforecast above.
+topic read lexa/intent/loadprofile
+# bus.TopicIntentChargeNow (TASK-082) — unit 3.3 hub intent adopter (the one
+# EDGE intent — not retained, TTL mandatory and enforced at adoption here,
+# not by the broker/ACL).
+topic read lexa/intent/chargenow
+# bus.TopicIntentResult (TASK-082) — unit 3.3 is the SOLE writer (topics.go:
+# "nobody but the hub writes lexa/intent/result").
+topic write lexa/intent/result
+# bus.TopicHubMode (retained) (TASK-082) — unit 3.4 mode manager is the SOLE
+# writer (authoritative mode state; lexa-api and lexa-cloudlink only read it,
+# see their stanzas).
+topic write lexa/hub/mode
 
 user lexa-ocpp
 # bus.EVSEStateTopic("<station>").
@@ -106,6 +151,10 @@ topic read lexa/evse/+/command
 # bus.DesiredTopic("evse", <station>) (retained) — TASK-030 EVSE reconciler
 # consumes the hub's retained charging-current desired-state doc (AD-013).
 topic read lexa/desired/evse/+
+# bus.TopicOCPPPending (retained) (TASK-082) — unit 6.1 surfaces unknown
+# stations that dialed the CSMS, for installer approval instead of silent
+# adoption; lexa-api (unit 4.2) projects it into GET /devices.
+topic write lexa/ocpp/pending
 
 user lexa-telemetry
 # bus.SubMeasurements — telemetry posts MUP measurements upstream over CSIP.
@@ -126,6 +175,102 @@ topic read lexa/evse/+/state
 topic read lexa/northbound/schedule
 # bus.TopicHubPlan (retained).
 topic read lexa/hub/plan
+# bus.TopicIntentMode (retained) (TASK-082) — unit 4.3 POST /intent forwards
+# the app-origin intent (Origin:"app"); unit 3.3 (hub) is the reader.
+topic write lexa/intent/mode
+# bus.TopicIntentEVGoal (retained) (TASK-082) — unit 4.3 POST /intent.
+topic write lexa/intent/evgoal
+# bus.TopicIntentReserve (retained) (TASK-082) — unit 4.3 POST /intent.
+topic write lexa/intent/reserve
+# bus.TopicIntentTariff (retained) (TASK-082) — unit 4.3 POST /intent.
+topic write lexa/intent/tariff
+# bus.TopicIntentChargeNow (TASK-082) — unit 4.3 POST /intent (edge intent;
+# TTL/expiry enforced at hub adoption, unit 3.3, not by the broker).
+topic write lexa/intent/chargenow
+# NOTE (TASK-082, roadmap §1.4's deliberate asymmetry): lexa-api CANNOT write
+# lexa/intent/solarforecast or lexa/intent/loadprofile — cloud-computed data
+# with no local source. Unit 4.3's localIntentKinds table excludes both by
+# construction; this ACL enforces the same rule mechanically. Only
+# lexa-cloudlink (unit 2.4, see its stanza below) may write those two kinds.
+# bus.TopicScanRequest (TASK-082) — unit 4.3 POST /scan; unit 5.2 (modbus
+# scan controller) is the reader.
+topic write lexa/scan/request
+# bus.TopicIntentResult (TASK-082) — unit 4.3 resultWaiter muxes the hub's
+# outcome back to the HTTP caller by intent ID; unit 3.3 (hub) is the SOLE
+# writer.
+topic read lexa/intent/result
+# bus.TopicHubMode (retained) (TASK-082) — unit 4.2 GET /mode projection;
+# unit 3.4 (hub mode manager) is the SOLE writer.
+topic read lexa/hub/mode
+# bus.TopicCloudlinkStatus (retained) (TASK-082) — unit 4.2 read projection
+# (site/health surface); unit 2.1 (cloudlink) is the writer.
+topic read lexa/cloudlink/status
+# bus.TopicScanStatus (TASK-082) — unit 4.2 GET /scan projection; unit 5.2
+# (modbus) is the writer.
+topic read lexa/scan/status
+# bus.TopicScanResult (retained) (TASK-082) — unit 4.2 GET /scan and
+# GET /devices projections; unit 5.2 (modbus) is the writer.
+topic read lexa/scan/result
+# bus.TopicOCPPPending (retained) (TASK-082) — unit 4.2 GET /devices
+# projection; unit 6.1 (ocpp pending-station surface) is the writer.
+topic read lexa/ocpp/pending
+
+user lexa-cloudlink
+# bus.SubMeasurements (TASK-082) — unit 2.2 uplink collector, telemetry
+# stream (gzip-batched to the cloud, roadmap §2.4); lexa-modbus is the
+# writer (existing grant above).
+topic read lexa/measurements/+
+# bus.SubBattMetrics (TASK-082) — unit 2.2 uplink collector, telemetry stream.
+topic read lexa/battery/+/metrics
+# bus.SubEVSEState (TASK-082) — unit 2.2 uplink collector, telemetry stream.
+topic read lexa/evse/+/state
+# bus.TopicHubPlan (retained) (TASK-082) — unit 2.2 uplink collector, plan
+# stream.
+topic read lexa/hub/plan
+# bus.TopicHubMode (retained) (TASK-082) — unit 2.2 uplink collector, events
+# stream; unit 3.4 (hub mode manager) is the writer.
+topic read lexa/hub/mode
+# bus.TopicCSIPComplianceAlert (TASK-082) — unit 2.2 uplink collector, events
+# stream. Read-only here: cloudlink never authors compliance state (compare
+# the write grants on lexa-hub/lexa-northbound above).
+topic read lexa/csip/compliance/alert
+# bus.SubReconcileReport (TASK-082) — unit 2.2 uplink collector, events
+# stream.
+topic read lexa/reconcile/+/+/report
+# bus.TopicNorthboundCertStatus (retained) (TASK-082) — unit 2.2 uplink
+# collector, health stream.
+topic read lexa/northbound/certstatus
+# bus.TopicIntentResult (TASK-082) — unit 2.2 uplink collector, events
+# stream; unit 3.3 (hub) is the SOLE writer.
+topic read lexa/intent/result
+# bus.TopicScanResult (retained) (TASK-082) — unit 2.2 uplink collector
+# surfaces the last completed scan to the cloud; unit 5.2 (modbus scan
+# controller) is the writer.
+topic read lexa/scan/result
+# bus.TopicIntentMode (retained) (TASK-082) — unit 2.4 downlink validator
+# narrows cloud commands to this exact kind (no lexa/intent/+ wildcard, per
+# topics.go); unit 3.3 (hub) is the reader.
+topic write lexa/intent/mode
+# bus.TopicIntentEVGoal (retained) (TASK-082) — unit 2.4 downlink validator.
+topic write lexa/intent/evgoal
+# bus.TopicIntentReserve (retained) (TASK-082) — unit 2.4 downlink validator.
+topic write lexa/intent/reserve
+# bus.TopicIntentTariff (retained) (TASK-082) — unit 2.4 downlink validator.
+topic write lexa/intent/tariff
+# bus.TopicIntentSolarForecast (retained) (TASK-082) — unit 2.4 downlink
+# validator. Cloud-only kind (roadmap §1.4's deliberate asymmetry): lexa-api
+# has no write grant for this topic — see its stanza above.
+topic write lexa/intent/solarforecast
+# bus.TopicIntentLoadProfile (retained) (TASK-082) — unit 2.4 downlink
+# validator, cloud-only, same asymmetry as solarforecast above.
+topic write lexa/intent/loadprofile
+# bus.TopicIntentChargeNow (TASK-082) — unit 2.4 downlink validator (the one
+# EDGE intent; TTL is mandatory and checked at hub adoption, unit 3.3).
+topic write lexa/intent/chargenow
+# bus.TopicCloudlinkStatus (retained) (TASK-082) — unit 2.1 cloudlink status
+# publisher (connectivity/spool/cert-days-left); lexa-api is the only other
+# reader (its own grant above).
+topic write lexa/cloudlink/status
 
 # qa-inject: the QA mqttproxy's /inject endpoint (csip-tls-test cmd/mqttproxy,
 # deployed only by scripts/mqtt-chaos.sh during a Mayhem run). It forges
