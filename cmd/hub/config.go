@@ -125,12 +125,15 @@ type Config struct {
 	// Snapshot is the optional breach-episode snapshot block (TASK-041,
 	// AD-005 second half). A nil/absent "snapshot" key, or one with an empty
 	// path, disables snapshot writing entirely (true no-op, matching
-	// Journal's rollout shape). When Path is set but Enabled is false (the
-	// shipped default for one full campaign — see TASK-041's "Implementation
-	// strategy"), the hub still WRITES a snapshot on every breach begin/end
-	// and every 60 s while a breach is open, but never reads one back at
-	// start: a write-only soak before an ops-only config flip turns restore
-	// on (no code change accompanies that flip).
+	// Journal's rollout shape). Whenever Path is set, the hub WRITES a
+	// snapshot on every breach begin/end transition and every 60 s while a
+	// breach is open, independent of Enabled. Enabled additionally gates
+	// RESTORE-ON-START (main.go, below): the shipped configs/hub.json ran
+	// one full write-only soak campaign (TASK-041's "Implementation
+	// strategy") — the 2026-07-08 8-cycle campaign passed hub-restart-mid-cap
+	// with restore off — and now ships Enabled:true (WS-4.1, 2026-07-09);
+	// restore never touches a device command path (main.go's TASK-041
+	// restore block seeds only breachEpisodes' identity fields).
 	Snapshot *SnapshotConfig `json:"snapshot,omitempty"`
 
 	// TariffZone is an IANA time zone name (e.g. "America/Los_Angeles") that

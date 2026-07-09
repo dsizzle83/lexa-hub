@@ -62,7 +62,7 @@
     "max_files": 4
   },
   "snapshot": {
-    "enabled": false,
+    "enabled": true,
     "path": "/var/lib/lexa/snapshot/hub.json",
     "max_age_s": 300
   },

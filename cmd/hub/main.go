@@ -385,8 +385,9 @@ func main() {
 	}
 	episodes := newBreachEpisodes(jw, snapPath)
 
-	// TASK-041 restore-on-start: gated behind cfg.Snapshot.Enabled (default
-	// false — see SnapshotConfig's doc). This MUST run before the reconciler
+	// TASK-041 restore-on-start: gated behind cfg.Snapshot.Enabled (WS-4.1,
+	// 2026-07-09: ships true in configs/hub.json after the write-only soak
+	// campaign — see SnapshotConfig's doc). This MUST run before the reconciler
 	// report subscription and eng.Start() below, and it seeds identity ONLY
 	// (activeMRID/episodeID/counter) — never a device command path (grep:
 	// nothing here touches an actuator). No ordering assumption is made
