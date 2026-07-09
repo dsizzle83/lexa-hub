@@ -11,6 +11,7 @@ import (
 
 	"lexa-hub/internal/journal"
 	"lexa-hub/internal/orchestrator"
+	"lexa-hub/internal/orchestrator/constraint"
 )
 
 // DeviceConfig describes a device role and capacity for the orchestrator.
@@ -46,6 +47,41 @@ type StationConfig struct {
 	// OCPP MeterValues lag. Same rules as DeviceConfig.Plant.
 	Plant     json.RawMessage        `json:"plant,omitempty"`
 	EVSEPlant orchestrator.EVSEPlant `json:"-"` // decoded; unused until TASK-064
+}
+
+// GatewayConfig is hub.json's optional "gateway" block (Unit 3.4, §3.7): the
+// operator's blanket EV-charging policy while the hub runs in gateway mode
+// (a pure CSIP gateway has no cost-optimal EV opinion of its own). Its wire
+// keys — evse_policy / evse_window{start_hh,end_hh} / evse_full_a — match
+// DEVICE_ROADMAP §3.7; GatewayPolicy() maps them onto the constraint package's
+// GatewayEVSEPolicy, which owns the actual defaulting (WithDefaults). An absent
+// block ⇒ the constraint defaults (scheduled 23→7, 32 A). The window hours are
+// read in the process's local zone (the GAP-05 provenance the TOU model and
+// planner already depend on — see GatewayEVSEPolicy's doc).
+type GatewayConfig struct {
+	EVSEPolicy string `json:"evse_policy"` // "scheduled" | "full"
+	EVSEWindow struct {
+		StartHH int `json:"start_hh"` // local hour [0,23], inclusive
+		EndHH   int `json:"end_hh"`   // local hour [0,23], exclusive; wraps midnight when start>end
+	} `json:"evse_window"`
+	EVSEFullA float64 `json:"evse_full_a"` // current ceiling (A) offered inside the window / at every hour in "full"
+}
+
+// GatewayPolicy maps the optional "gateway" block onto the constraint package's
+// GatewayEVSEPolicy. An absent block ⇒ a zero policy that WithDefaults fills to
+// the shipped defaults (scheduled 23→7, 32 A). WithDefaults is idempotent, so
+// applying it here (and again inside NewCSIPPassthrough) is harmless and makes
+// the returned policy self-consistent for any reader.
+func (c *Config) GatewayPolicy() constraint.GatewayEVSEPolicy {
+	if c.Gateway == nil {
+		return constraint.GatewayEVSEPolicy{}.WithDefaults()
+	}
+	return constraint.GatewayEVSEPolicy{
+		Mode:          c.Gateway.EVSEPolicy,
+		WindowStartHH: c.Gateway.EVSEWindow.StartHH,
+		WindowEndHH:   c.Gateway.EVSEWindow.EndHH,
+		FullCurrentA:  c.Gateway.EVSEFullA,
+	}.WithDefaults()
 }
 
 // Config is the JSON configuration for lexa-hub (orchestrator).
@@ -84,6 +120,21 @@ type Config struct {
 	// author of actuated plans — the candidate's plan is discarded. Default
 	// false ⇒ zero behaviour change (the wrapper is not even constructed).
 	ConstraintShadow bool `json:"constraint_shadow"`
+
+	// Mode selects the live plan author (Unit 3.4, §3.5): "optimizer" (the
+	// default — the cost-optimal DefaultOptimizer cascade) or "gateway" (a pure
+	// CSIP passthrough that forwards utility control with no economic opinion).
+	// Empty ⇒ "optimizer"; any other value is a FATAL config error (loadConfig),
+	// never a silent fallback — a typo must not quietly leave the hub optimizing
+	// when the operator asked for gateway, or vice-versa. A retained
+	// lexa/hub/mode message takes precedence over this at boot (modeManager's
+	// re-seed, §3.5): retained value ▸ this ▸ "optimizer".
+	Mode string `json:"mode"`
+
+	// Gateway is the optional gateway-mode EVSE policy block (§3.7); nil/absent
+	// ⇒ the constraint package's defaults (scheduled 23→7, 32 A) via
+	// GatewayPolicy()'s WithDefaults. Read only in gateway mode.
+	Gateway *GatewayConfig `json:"gateway,omitempty"`
 
 	// LogLevel selects the slog level ("debug"|"info"|"warn"|"error");
 	// default "info" (TASK-045). See internal/logutil.ParseLevel.
@@ -208,6 +259,15 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
+	}
+	// Mode (Unit 3.4, §3.5): empty ⇒ "optimizer"; anything else unknown is a
+	// FATAL config error, not a silent fallback — a typo'd mode must not quietly
+	// leave the hub running the wrong plan author.
+	if cfg.Mode == "" {
+		cfg.Mode = "optimizer"
+	}
+	if cfg.Mode != "optimizer" && cfg.Mode != "gateway" {
+		return nil, fmt.Errorf("invalid mode %q: want \"optimizer\" or \"gateway\"", cfg.Mode)
 	}
 	if cfg.RetainedAdoptionMaxAgeS <= 0 {
 		cfg.RetainedAdoptionMaxAgeS = 300

@@ -701,3 +701,69 @@ func TestIntentAdopter_NilJournalIsNoop(t *testing.T) {
 		t.Errorf("outcome = %q, want applied", got.Outcome)
 	}
 }
+
+// ---------------------------------------------------------------------
+// mode (Unit 3.4): the seventh kind, routed through adopt → applyMode →
+// modeManager.request. These pin the routing/validation surface intent.go
+// owns; modeManager's own behavior is covered in mode_test.go.
+// ---------------------------------------------------------------------
+
+// wireMode attaches a modeManager (sharing the fixture's fake MQTT client and
+// clock) so applyMode can reach it, mirroring main.go's adopter.modes wiring.
+func (f *testAdopterFixture) wireMode(t *testing.T, initialMode string) *modeManager {
+	t.Helper()
+	mm := newModeManager(initialMode,
+		&fakeOptimizer{marker: "opt"}, &fakeOptimizer{marker: "gw"}, &fakeSafety{marker: "safe"},
+		nil, f.mc, nil)
+	mm.setEngine(&fakeWaker{})
+	mm.now = f.adopter.now
+	f.adopter.modes = mm
+	return mm
+}
+
+func TestIntentAdopter_Mode_AppliedRoutesThroughRequest(t *testing.T) {
+	f := newTestAdopter(t, nil)
+	mm := f.wireMode(t, "optimizer")
+
+	msg := bus.ModeIntent{IntentMeta: bus.IntentMeta{ID: "m1", Actor: "a@b", Origin: "app"}, Mode: "gateway"}
+	f.adopter.adopt("mode", msg.IntentMeta, func() (string, string) { return f.adopter.applyMode(msg) })
+
+	if mm.Mode() != "gateway" {
+		t.Errorf("mode = %q, want gateway (routed through request)", mm.Mode())
+	}
+	res := lastResult(t, f.mc) // IntentResult is the LAST publish (after the retained ModeStatus)
+	if res.Kind != "mode" || res.ID != "m1" || res.Outcome != "applied" {
+		t.Errorf("result = %+v, want kind=mode id=m1 outcome=applied", res)
+	}
+}
+
+func TestIntentAdopter_Mode_InvalidValueRejectedBeforeManager(t *testing.T) {
+	f := newTestAdopter(t, nil)
+	mm := f.wireMode(t, "optimizer")
+
+	outcome, detail := f.adopter.applyMode(bus.ModeIntent{Mode: "turbo"})
+	if outcome != "rejected" || detail == "" {
+		t.Errorf("outcome/detail = %q/%q, want rejected/non-empty", outcome, detail)
+	}
+	if mm.Mode() != "optimizer" {
+		t.Errorf("mode = %q, want unchanged optimizer (invalid value must not reach the manager)", mm.Mode())
+	}
+}
+
+func TestIntentAdopter_Mode_SameModeIsDuplicate(t *testing.T) {
+	f := newTestAdopter(t, nil)
+	f.wireMode(t, "gateway")
+
+	outcome, _ := f.adopter.applyMode(bus.ModeIntent{IntentMeta: bus.IntentMeta{ID: "m2"}, Mode: "gateway"})
+	if outcome != "duplicate" {
+		t.Errorf("outcome = %q, want duplicate (already in gateway)", outcome)
+	}
+}
+
+func TestIntentAdopter_Mode_NilManagerRejects(t *testing.T) {
+	f := newTestAdopter(t, nil) // modes left nil
+	outcome, detail := f.adopter.applyMode(bus.ModeIntent{Mode: "gateway"})
+	if outcome != "rejected" || detail != "mode manager not wired" {
+		t.Errorf("outcome/detail = %q/%q, want rejected/\"mode manager not wired\"", outcome, detail)
+	}
+}

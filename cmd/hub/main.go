@@ -144,6 +144,10 @@ func main() {
 	// "duplicate" (retained-redelivery dedupe) increments neither.
 	intentsAppliedCtr := reg.Counter("lexa_hub_intents_applied_total")
 	intentsRejectedCtr := reg.Counter("lexa_hub_intents_rejected_total")
+	// lexa_hub_mode_gateway (Unit 3.4/§3.7): 1 while the gateway plan author is
+	// live, 0 in optimizer mode. Set by modeManager on every flip and at boot
+	// re-seed, so a scrape always reflects which author is authoring plans.
+	modeGatewayGauge := reg.Gauge("lexa_hub_mode_gateway")
 
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
@@ -531,13 +535,56 @@ func main() {
 		emitAlerts(episodes.OnPlan(plan, time.Now()))
 	}
 
-	eng := orchestrator.New(reader, optimizer, orchestrator.Config{
+	// Unit 3.4 (§3.5): the mode manager is the runtime switch between the two
+	// plan authors. Its optimizer-mode author is EXACTLY what was passed to
+	// orchestrator.New before this unit (`optimizer` above — the raw
+	// DefaultOptimizer, or the TASK-059 shadow wrapper when constraint_shadow is
+	// on). Its gateway-mode author is a constraint.Stack whose economics slot is
+	// CSIPPassthrough (Unit 3.5), reusing the EXACT compliance constraints the
+	// shadow wiring builds (BatterySafety/Export/GenLimit/ImportLimit) with
+	// Economics swapped for the passthrough — so the site ExpLimW/ImpLimW/MaxLimW
+	// envelopes are narrowed by the same shadow-validated code in both modes. The
+	// gateway stack gets its OWN EV-import cooldown (the shadow stack's is a
+	// separate instance); CSIPPassthrough does not read it — only ImportLimit
+	// does. Built unconditionally (cheap) but only ever run when Mode()=="gateway".
+	//
+	// Tier-1 safety ALWAYS routes to the LEGACY safety evaluator, NEVER the
+	// gateway stack: a protection relay is mode-invariant (ADR-0001; ecosystem
+	// roadmap §14). See modeManager.EvaluateSafety.
+	gatewayStack := constraint.NewStack(buildConstraintPlant(cfg), cfg.EngineInterval(),
+		constraint.NewBatterySafetyConstraint(opt.SOCReserve),
+		constraint.NewExportConstraint(),
+		constraint.NewGenLimitConstraint(),
+		constraint.NewImportLimitConstraint(constraint.NewEVImportCooldown()),
+		constraint.NewCSIPPassthrough(cfg.GatewayPolicy()))
+	// The safety delegate is whatever the engine's fast loop would have used
+	// BEFORE the mode manager existed: the shadow wrapper when
+	// constraint_shadow is on, else the raw optimizer (principal review,
+	// unit 3.4). The wrapper's EvaluateSafety returns the LEGACY plan
+	// unmodified by contract (TASK-059/shadow.go), so mode-invariance holds
+	// through it — and wiring it here preserves WS-5.3's Tier-1 safety
+	// shadow-diff telemetry during constraint-stack soaks, which routing to
+	// the raw opt would have silently disconnected.
+	safetyEval := orchestrator.SafetyEvaluator(opt)
+	if se, ok := optimizer.(orchestrator.SafetyEvaluator); ok {
+		safetyEval = se
+	}
+	modeMgr := newModeManager(cfg.Mode, optimizer, gatewayStack, safetyEval, jw, mc, modeGatewayGauge)
+
+	// THE one structural touch (§3.5): the engine's optimizer argument is the
+	// mode manager, not the bare optimizer. The engine type-asserts this arg to
+	// orchestrator.SafetyEvaluator to wire its fast loop (engine.go); modeMgr
+	// satisfies both Optimizer and SafetyEvaluator, and wraps whatever was passed
+	// before — so this changes which AUTHOR runs (mode-gated) without changing the
+	// engine, the reader wiring, or the fast-loop gating.
+	eng := orchestrator.New(reader, modeMgr, orchestrator.Config{
 		Interval:       cfg.EngineInterval(),
 		SafetyInterval: cfg.SafetyInterval(),
 		Debug:          cfg.Debug,
 		Planner:        cfg.Planner,
 		PlanObserver:   planObserver,
 	})
+	modeMgr.setEngine(eng) // post-construction: modeMgr.request pokes eng.Wake on a flip
 
 	// Subscribe to all state topics.
 	if err := mqttutil.Subscribe(mc, bus.SubMeasurements, reader.onMeasurement); err != nil {
@@ -588,12 +635,13 @@ func main() {
 		log.Fatalf("lexa-hub: subscribe csip pricing: %v", err)
 	}
 
-	// Intent adoption layer (Unit 3.3, TASK-082/DEVICE_ROADMAP.md §3.1): six
+	// Intent adoption layer (Unit 3.3, TASK-082/DEVICE_ROADMAP.md §3.1): seven
 	// explicit subscribe blocks — never a "lexa/intent/+" wildcard, since
-	// that would also match lexa/intent/result (topics.go's doc). "mode" is
-	// NOT subscribed here — Unit 3.4 owns lexa/intent/mode + modeManager +
-	// the retained lexa/hub/mode status topic.
+	// that would also match lexa/intent/result (topics.go's doc). The seventh
+	// kind, "mode" (Unit 3.4), funnels through the SAME adopter via applyMode →
+	// modeMgr.request; wire adopter.modes here so applyMode can reach the manager.
 	adopter := newIntentAdopter(eng, opt, jw, mc, cfg, intentsAppliedCtr, intentsRejectedCtr)
+	adopter.modes = modeMgr
 	if err := mqttutil.Subscribe(mc, bus.TopicIntentEVGoal, func(_ string, msg bus.EVGoalIntent) {
 		adopter.adopt("evgoal", msg.IntentMeta, func() (string, string) { return adopter.applyEVGoal(msg) })
 	}); err != nil {
@@ -623,6 +671,26 @@ func main() {
 		adopter.adopt("chargenow", msg.IntentMeta, func() (string, string) { return adopter.applyChargeNow(msg) })
 	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe intent chargenow: %v", err)
+	}
+	// Seventh intent kind, "mode" (Unit 3.4/§3.5): funnels through the SAME
+	// adopter (ID-dedupe + IntentResult + generic intent_applied/rejected), but
+	// applyMode delegates the transition to modeMgr.request (mode_change journal,
+	// retained lexa/hub/mode status, eng.Wake).
+	if err := mqttutil.Subscribe(mc, bus.TopicIntentMode, func(_ string, msg bus.ModeIntent) {
+		adopter.adopt("mode", msg.IntentMeta, func() (string, string) { return adopter.applyMode(msg) })
+	}); err != nil {
+		log.Fatalf("lexa-hub: subscribe intent mode: %v", err)
+	}
+	// Boot re-seed (§3.5): subscribe the retained lexa/hub/mode status BEFORE
+	// eng.Start() so the persisted mode is adopted (silently, mode.Store only)
+	// before the control loop reads it. modeMgr.SealBoot() (after Start) then
+	// closes this window — the hub is the sole writer of its own mode, so a
+	// later/echoed message on this topic must not flip it (only the intent path
+	// does). Precedence: this retained value ▸ cfg.Mode ▸ "optimizer".
+	if err := mqttutil.Subscribe(mc, bus.TopicHubMode, func(_ string, msg bus.ModeStatus) {
+		modeMgr.onModeStatus(msg)
+	}); err != nil {
+		log.Fatalf("lexa-hub: subscribe hub mode: %v", err)
 	}
 
 	// Subscribe to reconciler reports (TASK-031): device-level non-convergence
@@ -665,6 +733,12 @@ func main() {
 
 	eng.Start()
 	defer eng.Stop()
+
+	// Boot re-seed window closes now (§3.5): the retained lexa/hub/mode message,
+	// if any, was delivered on the subscription above during the subscribe→Start
+	// window and has already re-seeded modeMgr's mode. After this, onModeStatus
+	// ignores every lexa/hub/mode message — only the intent path flips the mode.
+	modeMgr.SealBoot()
 
 	// sd_notify READY (TASK-007): tells systemd (Type=notify) the hub has
 	// finished starting and is now ticking, so the watchdog deadline starts

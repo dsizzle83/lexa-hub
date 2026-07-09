@@ -4,14 +4,18 @@ package main
 // docs/DEVICE_ROADMAP.md §3.1): the single place lexa/intent/{kind} messages
 // become engine state. intentAdopter.adopt is the funnel every per-kind
 // mqttutil.Subscribe handler in main.go calls through — ID-dedupe, apply,
-// journal, publish bus.IntentResult — for six of the seven intent kinds:
+// journal, publish bus.IntentResult — for all seven intent kinds:
 //
-//	evgoal, reserve, tariff, solarforecast, loadprofile, chargenow
+//	evgoal, reserve, tariff, solarforecast, loadprofile, chargenow, mode
 //
-// NOT handled here: "mode" (lexa/intent/mode, and the retained lexa/hub/mode
-// status it drives) belongs to Unit 3.4's modeManager — do not add a mode
-// subscribe block or a mode_change journal entry to this file; wire it
-// alongside modeManager instead.
+// "mode" (Unit 3.4) routes through the SAME adopt funnel via applyMode (below),
+// so it gets the identical ID-dedupe + IntentResult + generic intent_applied/
+// rejected surface as every other kind — but its engine-state EFFECT (the mode
+// flip, the mode_change journal written BEFORE the flip, the retained
+// lexa/hub/mode status, and eng.Wake) lives in modeManager.request (mode.go),
+// NOT here: this file adds no mode_change journal entry, and the mode subscribe
+// block lives in main.go beside the other six. applyMode only validates the
+// value and delegates.
 //
 // Binding contract (docs/extension/00_PROGRESS.md review log, unit 1.1+1.2
 // finding (a)): journal constructors are bus-decoupled SCALAR-FIELD PAIRS —
@@ -85,6 +89,13 @@ type intentAdopter struct {
 	jw  *journal.Writer
 	mc  mqtt.Client
 	cfg *Config
+
+	// modes routes "mode" intents (Unit 3.4): applyMode validates the value and
+	// delegates the transition to modeManager.request (mode.go). Set by main.go
+	// after both the adopter and the modeManager exist (the modeManager is
+	// orchestrator.New's optimizer argument, built first; the adopter is built
+	// after the engine). nil in the Unit 3.3 tests, which never route "mode".
+	modes *modeManager
 
 	// lastID dedupes retained redelivery per kind (IntentMeta.ID): a broker
 	// reconnect or hub restart redelivers every retained intent topic, and
@@ -460,4 +471,27 @@ func (a *intentAdopter) revertChargeNow(gen uint64, goal orchestrator.EVGoal) {
 	}
 	a.chargeNowRevert = nil
 	a.eng.SetEVGoal(goal)
+}
+
+// applyMode validates a mode intent (lexa/intent/mode) and routes it to the
+// modeManager (Unit 3.4, mode.go). This is the seventh kind's apply funnel — it
+// reuses adopt()'s ID-dedupe + IntentResult + generic intent_applied/rejected
+// surface like every other kind, but the engine-state effect (the mode flip,
+// the mode_change journal written BEFORE the flip, the retained lexa/hub/mode
+// status, and eng.Wake) lives entirely in modeManager.request, NOT here — this
+// file adds no mode_change journal entry (see the package doc's split).
+//
+// A same-mode request returns request()'s "duplicate" (a no-op flip); an unknown
+// value is "rejected" here before ever reaching the manager.
+func (a *intentAdopter) applyMode(msg bus.ModeIntent) (outcome, detail string) {
+	if msg.Mode != "optimizer" && msg.Mode != "gateway" {
+		return "rejected", fmt.Sprintf("mode must be \"optimizer\" or \"gateway\", got %q", msg.Mode)
+	}
+	if a.modes == nil {
+		// Defensive: main.go always sets a.modes before registering the mode
+		// subscribe. A nil here means a mode intent reached an adopter never
+		// wired for it (only reachable in a misconfigured test).
+		return "rejected", "mode manager not wired"
+	}
+	return a.modes.request(msg.Mode, msg.IntentMeta)
 }
