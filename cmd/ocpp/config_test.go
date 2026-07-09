@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // WS-1 (V1.0 punch list, security fail-closed by default): loadConfig must
@@ -124,5 +125,39 @@ func TestLoadConfig_ProductProfile_NoStations_BlankSP2StillFails(t *testing.T) {
 	path := writeTempConfig(t, `{"mqtt_broker": "tcp://localhost:1883"}`)
 	if _, err := loadConfig(path); err == nil {
 		t.Fatal("loadConfig succeeded with no stations, no bench profile, blank SP2; want a fail-closed error")
+	}
+}
+
+// WS-9.1: mqtt_deaf_restart_after_s defaults to 300s (5 min) when unset, and
+// carries through an explicit override.
+func TestLoadConfig_MQTTDeafRestartAfter_Default(t *testing.T) {
+	path := writeTempConfig(t, `{
+		"mqtt_broker": "tcp://localhost:1883",
+		"bench": true
+	}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.MQTTDeafRestartAfterS != 300 {
+		t.Fatalf("MQTTDeafRestartAfterS default = %d, want 300", cfg.MQTTDeafRestartAfterS)
+	}
+	if got, want := cfg.MQTTDeafRestartAfter(), 300*time.Second; got != want {
+		t.Fatalf("MQTTDeafRestartAfter() = %s, want %s", got, want)
+	}
+}
+
+func TestLoadConfig_MQTTDeafRestartAfter_Override(t *testing.T) {
+	path := writeTempConfig(t, `{
+		"mqtt_broker": "tcp://localhost:1883",
+		"bench": true,
+		"mqtt_deaf_restart_after_s": 60
+	}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.MQTTDeafRestartAfterS != 60 {
+		t.Fatalf("MQTTDeafRestartAfterS = %d, want 60", cfg.MQTTDeafRestartAfterS)
 	}
 }
