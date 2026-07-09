@@ -2,9 +2,23 @@
 # Deploys the full lexa-hub service set to a Raspberry Pi (interim hub while
 # the ConnectCore dev kit is unavailable).
 #
-# Usage:   bash scripts/deploy-hub-pi.sh <pi-ip> [ssh-user] [--enable-api-auth] [--enable-mqtt-acl] [--enable-ocpp-sp2]
+# WS-1 (V1.0 punch list, security fail-closed by default, 2026-07-09):
+# api-token auth and the MQTT broker ACL are now the DEFAULT — a plain
+# invocation with no flags provisions and enables both. The former
+# --enable-api-auth / --enable-mqtt-acl opt-in flags are kept as accepted
+# no-op aliases (today's default already does what they used to turn on) so
+# existing call sites don't break. Use --bench-insecure to restore the
+# pre-WS-1 permissive behavior (anonymous MQTT, unauthenticated lexa-api) on
+# the air-gapped 69.0.0.x LAN. --enable-ocpp-sp2 is UNCHANGED (still opt-in:
+# it needs a staged CSMS cert + the same-session evsim lockstep below) —
+# its plain/off path now explicitly sets ocpp.json's "bench": true so
+# lexa-ocpp's new fail-closed startup gate (cmd/ocpp/config.go) doesn't
+# block a plain bench deploy.
+#
+# Usage:   bash scripts/deploy-hub-pi.sh <pi-ip> [ssh-user] [--bench-insecure] [--enable-ocpp-sp2]
 # Example: bash scripts/deploy-hub-pi.sh 69.0.0.14 pi
-#          bash scripts/deploy-hub-pi.sh 69.0.0.1 dmitri --enable-api-auth --enable-mqtt-acl --enable-ocpp-sp2
+#          bash scripts/deploy-hub-pi.sh 69.0.0.1 dmitri --enable-ocpp-sp2
+#          bash scripts/deploy-hub-pi.sh 69.0.0.1 dmitri --bench-insecure   # pre-WS-1 permissive bench mode
 #
 # Prereqs (already done if you're following the bench bring-up):
 #   - make build-arm64 (bin/arm64/lexa-* present, incl. northbound/telemetry)
@@ -19,41 +33,40 @@
 #   - creates the lexa system user, /etc/lexa{,/certs}
 #   - installs binaries to /usr/local/sbin, configs, systemd units
 #   - generates /etc/lexa/api.token (idempotent) for lexa-api's bearer-token
-#     auth (TASK-014 / AD-008); the token is only wired into api.json's
-#     api_token_file when --enable-api-auth is passed — staged rollout, so a
-#     plain deploy never flips auth on before the dashboard/metersim have the
-#     token distributed to them (see docs/BENCH.md)
+#     auth (TASK-014 / AD-008 / WS-1) and wires it into api.json's
+#     api_token_file BY DEFAULT — a plain deploy now starts with auth on.
+#     --bench-insecure leaves api_token_file unset (today's pre-WS-1
+#     behavior) and sets api.json's "bench": true so lexa-api's fail-closed
+#     startup gate on its LAN-reachable listen_addr doesn't block it.
 #   - generates per-service MQTT broker passwords (idempotent) under
 #     /etc/lexa/mqtt/<svc>.pass and always patches them into each service's
-#     mqtt_user/mqtt_pass_file (TASK-013 / W7 / AD-008) — this always runs, so
-#     a plain deploy leaves every service holding valid credentials while the
-#     broker still accepts anonymous connections. allow_anonymous only flips
-#     to false, and the broker only starts enforcing password_file/acl_file,
-#     when --enable-mqtt-acl is passed — staged rollout, mirrors
-#     --enable-api-auth. Re-run with --enable-mqtt-acl only after confirming
-#     (journal evidence) every service reconnected using its username.
+#     mqtt_user/mqtt_pass_file (TASK-013 / W7 / AD-008) — independent of
+#     --bench-insecure, every service always holds valid credentials.
+#     allow_anonymous is false and password_file/acl_file are enforced BY
+#     DEFAULT; --bench-insecure flips allow_anonymous back to true (today's
+#     pre-WS-1 behavior) for the air-gapped LAN.
 #   - stages the OCPP CSMS TLS cert/key + generates an idempotent Basic Auth
 #     secret (/etc/lexa/ocpp-auth.pass, 0600 lexa:lexa) and wires
 #     cert_path/key_path/basic_auth_user/basic_auth_pass into ocpp.json —
 #     ONLY when --enable-ocpp-sp2 is passed (TASK-074 / AD-008 / 09 Security
-#     hard gate). LOCKSTEP: evsim must flip to wss:// in the SAME session —
-#     see csip-tls-test's `scripts/update-sim-pis.sh --enable-ocpp-sp2`, or
-#     lexa-ocpp starts requiring TLS+auth while evsim still dials plain
-#     ws://, which blinds every EV Mayhem scenario instantly.
+#     hard gate; unchanged by WS-1, still opt-in). LOCKSTEP: evsim must flip
+#     to wss:// in the SAME session — see csip-tls-test's
+#     `scripts/update-sim-pis.sh --enable-ocpp-sp2`, or lexa-ocpp starts
+#     requiring TLS+auth while evsim still dials plain ws://, which blinds
+#     every EV Mayhem scenario instantly.
 #   - enables + starts: mosquitto → lexa-modbus, lexa-ocpp, lexa-api,
 #     lexa-northbound, lexa-telemetry → lexa-hub
 set -euo pipefail
 
-PI="${1:?usage: deploy-hub-pi.sh <pi-ip> [ssh-user] [--enable-api-auth] [--enable-mqtt-acl] [--enable-ocpp-sp2]}"
+PI="${1:?usage: deploy-hub-pi.sh <pi-ip> [ssh-user] [--bench-insecure] [--enable-ocpp-sp2]}"
 shift
 SSHUSER="pi"
-ENABLE_API_AUTH=0
-ENABLE_MQTT_ACL=0
+BENCH_INSECURE=0
 ENABLE_OCPP_SP2=0
 for arg in "$@"; do
   case "$arg" in
-    --enable-api-auth) ENABLE_API_AUTH=1 ;;
-    --enable-mqtt-acl) ENABLE_MQTT_ACL=1 ;;
+    --bench-insecure) BENCH_INSECURE=1 ;;
+    --enable-api-auth|--enable-mqtt-acl) echo "note: $arg is now the default behavior (WS-1); no-op" >&2 ;;
     --enable-ocpp-sp2) ENABLE_OCPP_SP2=1 ;;
     *) SSHUSER="$arg" ;;
   esac
@@ -87,12 +100,11 @@ if [[ "$ENABLE_OCPP_SP2" == "1" ]]; then
 fi
 
 echo "── Installing on the Pi (sudo)"
-ssh "$SSHUSER@$PI" "sudo bash -s -- $ENABLE_API_AUTH $ENABLE_MQTT_ACL $ENABLE_OCPP_SP2" <<'REMOTE'
+ssh "$SSHUSER@$PI" "sudo bash -s -- $BENCH_INSECURE $ENABLE_OCPP_SP2" <<'REMOTE'
 set -euo pipefail
 D=/tmp/lexa-deploy
-ENABLE_API_AUTH="${1:-0}"
-ENABLE_MQTT_ACL="${2:-0}"
-ENABLE_OCPP_SP2="${3:-0}"
+BENCH_INSECURE="${1:-0}"
+ENABLE_OCPP_SP2="${2:-0}"
 SERVICES="modbus ocpp api northbound telemetry hub"
 PASSWD_FILE=/etc/mosquitto/lexa-passwd
 ACL_FILE=/etc/mosquitto/lexa-acl
@@ -115,9 +127,9 @@ install -d -m 750 -o lexa -g lexa /etc/lexa/certs
 install -d -m 750 -o lexa -g lexa /etc/lexa/mqtt
 
 # Per-service MQTT broker credentials (TASK-013 / W7 / AD-008). This always
-# runs, independent of --enable-mqtt-acl: every service gets a real password
+# runs, independent of --bench-insecure: every service gets a real password
 # and mosquitto broker user on every deploy, so flipping allow_anonymous off
-# later is just a config flip, never a race against credential generation.
+# (the WS-1 default below) is never a race against credential generation.
 # Idempotent: an existing pass-file's password is reused (mosquitto_passwd
 # -b upserts the entry either way), so re-deploys don't rotate secrets or
 # bounce every service's session for no reason.
@@ -150,29 +162,31 @@ done
 chown root:mosquitto "$PASSWD_FILE" "$ACL_FILE" 2>/dev/null || true
 chmod 640 "$PASSWD_FILE" "$ACL_FILE"
 
-if [[ "$ENABLE_MQTT_ACL" == "1" ]]; then
+if [[ "$BENCH_INSECURE" == "1" ]]; then
   cat > /etc/mosquitto/conf.d/lexa.conf <<'CONF'
 # LEXA hub listener (installed by deploy-hub-pi.sh).
-# localhost-only; credentials + ACL are defense-in-depth behind that, not a
-# LAN opening (TASK-013 / W7). See systemd/mosquitto-lexa.conf in lexa-hub
-# for the rationale and systemd/mosquitto-lexa.acl for the topic matrix.
+# localhost-only. Anonymous access is ON (--bench-insecure, pre-WS-1
+# behavior): every service already carries broker credentials
+# (/etc/lexa/mqtt/<svc>.pass, patched into mqtt_user/mqtt_pass_file below),
+# but the broker isn't checking them. Re-run without --bench-insecure to
+# flip allow_anonymous off and install password_file/acl_file.
 listener 1883 localhost
-allow_anonymous false
-password_file /etc/mosquitto/lexa-passwd
-acl_file /etc/mosquitto/lexa-acl
+allow_anonymous true
 max_inflight_messages 20
 max_queued_messages 1000
 CONF
 else
   cat > /etc/mosquitto/conf.d/lexa.conf <<'CONF'
 # LEXA hub listener (installed by deploy-hub-pi.sh).
-# localhost-only. Anonymous access is still ON (staged rollout, TASK-013 /
-# W7): every service already carries broker credentials
-# (/etc/lexa/mqtt/<svc>.pass, patched into mqtt_user/mqtt_pass_file below),
-# but the broker isn't checking them yet. Re-run with --enable-mqtt-acl once
-# journal evidence shows every service connected using its username.
+# localhost-only; credentials + ACL are defense-in-depth behind that, not a
+# LAN opening (TASK-013 / W7 / WS-1 — this is now the DEFAULT). See
+# systemd/mosquitto-lexa.conf in lexa-hub for the rationale and
+# systemd/mosquitto-lexa.acl for the topic matrix. --bench-insecure restores
+# allow_anonymous true.
 listener 1883 localhost
-allow_anonymous true
+allow_anonymous false
+password_file /etc/mosquitto/lexa-passwd
+acl_file /etc/mosquitto/lexa-acl
 max_inflight_messages 20
 max_queued_messages 1000
 CONF
@@ -189,10 +203,8 @@ install -m 600 -o lexa -g lexa $D/certs/client-key.pem /etc/lexa/certs/
 
 # Patch each service's mqtt_user/mqtt_pass_file (the config install above just
 # overwrote /etc/lexa/*.json from the repo's example, mqtt_user/
-# mqtt_pass_file both ""). Always populated, independent of --enable-mqtt-acl
-# — see the credential block above; this is the "configs already carry
-# credentials while the broker still allows anonymous" half of the staged
-# rollout (step 6 of TASK-013).
+# mqtt_pass_file both ""). Always populated, independent of --bench-insecure
+# — see the credential block above (step 6 of TASK-013).
 for svc in $SERVICES; do
   python3 - "$svc" <<'PY'
 import json, sys
@@ -209,10 +221,14 @@ PY
 done
 echo "  mqtt_user/mqtt_pass_file patched into every /etc/lexa/*.json"
 
-# lexa-api bearer-token auth (TASK-014 / AD-008). The config install above
-# just overwrote /etc/lexa/api.json from the repo's example (api_token_file
-# ""), so any enabling of auth has to happen AFTER install, patched in like
-# hub-replay-tune.sh patches timing — never re-declared wholesale.
+# lexa-api bearer-token auth (TASK-014 / AD-008 / WS-1). The config install
+# above just overwrote /etc/lexa/api.json from the repo's example
+# (api_token_file "", listen_addr "127.0.0.1:9100" — WS-1's loopback-only
+# product default), so patching happens AFTER install, like
+# hub-replay-tune.sh patches timing — never re-declared wholesale. This
+# script also always overrides listen_addr to ":9100" (LAN-reachable) here: the
+# bench's dashboard/metersim on other 69.0.0.x hosts need to reach lexa-api,
+# same bench-vs-product framing as MetricsAddr (cmd/hub/config.go).
 TOKEN_FILE=/etc/lexa/api.token
 if [[ ! -s "$TOKEN_FILE" ]]; then
   ( umask 077 && openssl rand -hex 32 > "$TOKEN_FILE" )
@@ -222,20 +238,37 @@ if [[ ! -s "$TOKEN_FILE" ]]; then
 else
   echo "  $TOKEN_FILE already present — left untouched"
 fi
-if [[ "$ENABLE_API_AUTH" == "1" ]]; then
+if [[ "$BENCH_INSECURE" == "1" ]]; then
+  # --bench-insecure: leave api_token_file unset (pre-WS-1 open behavior),
+  # but the LAN-reachable listen_addr below needs "bench": true or lexa-api's
+  # fail-closed startup gate refuses to bind non-loopback with no token.
   python3 - <<PY
 import json
 path = "/etc/lexa/api.json"
 with open(path) as f:
     cfg = json.load(f)
+cfg["listen_addr"] = ":9100"
+cfg["api_token_file"] = ""
+cfg["bench"] = True
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PY
+  echo "  --bench-insecure: api_token_file left unset, bench:true set → /etc/lexa/api.json; auth OFF"
+else
+  python3 - <<PY
+import json
+path = "/etc/lexa/api.json"
+with open(path) as f:
+    cfg = json.load(f)
+cfg["listen_addr"] = ":9100"
 cfg["api_token_file"] = "$TOKEN_FILE"
+cfg["bench"] = False
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
 PY
   echo "  api_token_file set → /etc/lexa/api.json; lexa-api will require the bearer token once restarted"
-else
-  echo "  api_token_file left unset — auth still OFF; re-run with --enable-api-auth once the dashboard and metersim carry $TOKEN_FILE's contents"
 fi
 
 # OCPP Security Profile 2 (TASK-074 / AD-008 / 09 Security hard gate: "OCPP
@@ -284,6 +317,28 @@ with open(path, "w") as f:
 PY
   echo "  cert_path/key_path/basic_auth_user/basic_auth_pass set → /etc/lexa/ocpp.json; lexa-ocpp will require TLS+auth once restarted"
 else
+  # WS-1: the shipped configs/ocpp.json now ships SP2 fields populated with
+  # placeholder/deploy-provisioned values (product-default template) so a
+  # config that's never been through this script fails closed. A plain
+  # bench deploy (no --enable-ocpp-sp2) blanks those placeholders back out
+  # and sets "bench": true so lexa-ocpp's fail-closed startup gate
+  # (cmd/ocpp/config.go) lets it start on plaintext ws://, no auth — same
+  # runtime behavior the bench has always had.
+  python3 - <<'PY'
+import json
+path = "/etc/lexa/ocpp.json"
+with open(path) as f:
+    cfg = json.load(f)
+cfg["cert_path"] = ""
+cfg["key_path"] = ""
+cfg["basic_auth_user"] = ""
+cfg["basic_auth_pass"] = ""
+cfg["bench"] = True
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PY
+  echo "  bench:true set, SP2 fields cleared → /etc/lexa/ocpp.json (ws://, no auth, bench-only per docs/BENCH.md)"
   echo "  OCPP Security Profile 2 left OFF (ws://, no auth) — re-run with --enable-ocpp-sp2 once"
   echo "  csip-tls-test/certs/ev-server-cert.pem + certs/vault/ev-server-key.pem exist (gen-ev-cert.sh)"
 fi
@@ -316,26 +371,26 @@ REMOTE
 
 echo
 echo "── Done. Verify from the desktop:"
-if [[ "$ENABLE_API_AUTH" == "1" ]]; then
-  echo "   curl -s http://$PI:9100/status                                        # → 401 (auth on)"
+if [[ "$BENCH_INSECURE" == "1" ]]; then
+  echo "   curl http://$PI:9100/status | python3 -m json.tool | head              # auth off (--bench-insecure)"
+  echo "   Then restart the dashboard with -hub http://$PI:9100"
+  echo "   Re-run WITHOUT --bench-insecure once the dashboard/metersim carry the token (scripts/update-sim-pis.sh, bench-up.sh)."
+else
+  echo "   curl -s http://$PI:9100/status                                        # → 401 (auth on, WS-1 default)"
   echo "   curl -s -H \"Authorization: Bearer \$(ssh $SSHUSER@$PI sudo cat /etc/lexa/api.token)\" http://$PI:9100/status | python3 -m json.tool | head"
   echo "   curl -s http://$PI:9100/healthz                                        # → 200 (never authenticated)"
   echo "   Then restart the dashboard/metersim with -hub-token-file pointing at a copy of that token (see docs/BENCH.md)."
-else
-  echo "   curl http://$PI:9100/status | python3 -m json.tool | head              # auth still off"
-  echo "   Then restart the dashboard with -hub http://$PI:9100"
-  echo "   When the dashboard/metersim carry the token (scripts/update-sim-pis.sh, bench-up.sh), re-run with --enable-api-auth."
 fi
 echo
-if [[ "$ENABLE_MQTT_ACL" == "1" ]]; then
-  echo "── MQTT broker: allow_anonymous false, password_file + acl_file live."
-  echo "   ssh $SSHUSER@$PI sudo journalctl -u mosquitto -n 50 --no-pager | grep -i 'not authorised'   # want: no output"
-  echo "   ssh $SSHUSER@$PI mosquitto_pub -h localhost -t lexa/control/battery/battery-0 -m '{}'        # want: rejected (no creds)"
-else
-  echo "── MQTT broker: still allow_anonymous true (staged rollout) — every service already carries"
+if [[ "$BENCH_INSECURE" == "1" ]]; then
+  echo "── MQTT broker: allow_anonymous true (--bench-insecure) — every service already carries"
   echo "   credentials (/etc/lexa/mqtt/lexa-<svc>.pass). Confirm each connected with its username:"
   echo "   ssh $SSHUSER@$PI sudo journalctl -u lexa-modbus -n 20 --no-pager | grep 'broker user='"
-  echo "   Then re-run with --enable-mqtt-acl to flip allow_anonymous off and install password_file/acl_file."
+  echo "   Re-run WITHOUT --bench-insecure to flip allow_anonymous off and install password_file/acl_file."
+else
+  echo "── MQTT broker: allow_anonymous false, password_file + acl_file live (WS-1 default)."
+  echo "   ssh $SSHUSER@$PI sudo journalctl -u mosquitto -n 50 --no-pager | grep -i 'not authorised'   # want: no output"
+  echo "   ssh $SSHUSER@$PI mosquitto_pub -h localhost -t lexa/control/battery/battery-0 -m '{}'        # want: rejected (no creds)"
 fi
 echo
 if [[ "$ENABLE_OCPP_SP2" == "1" ]]; then

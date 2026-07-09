@@ -22,6 +22,22 @@ Wants=network-online.target
 # StateDirectory=lexa auto-creates /var/lib/lexa for the append-only
 # journal (TASK-039/040). (V1RC FINDING D, 2026-07-06.)
 StateDirectory=lexa
+# WS-1 sandboxing (V1.0 punch list, 2026-07-09): bounds blast radius on top
+# of the existing User=lexa. StateDirectory=lexa above already implies a
+# read-write bind-mount for /var/lib/lexa (journal dir, TASK-039/040) even
+# under ProtectSystem=strict — no separate ReadWritePaths= needed there.
+# NOTE (pre-existing, not introduced by WS-1): TASK-073's cert-rotation
+# controller (rotate.go) os.Rename()s the consumed sentinel file WITHIN
+# /etc/lexa/certs, which the ReadOnlyPaths= line below already makes
+# read-only independent of ProtectSystem= — that rename already cannot
+# succeed today. Left as-is (fixing it would mean relaxing cert-directory
+# write protection, a real security/functionality tradeoff outside WS-1's
+# scope); flagged for the TASK-073 24h churn-soak owner.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
 # Type=notify + WatchdogSec (TASK-008, review §11 item 5 / RSK-08): northbound
 # is the utility-facing path and the service most plausibly wedged by a
 # wolfSSL hang (§8.6) — exactly who most needs this. lexa-northbound sends

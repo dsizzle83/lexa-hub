@@ -20,6 +20,17 @@ Wants=lexa-modbus.service lexa-northbound.service lexa-ocpp.service
 # StateDirectory=lexa auto-creates /var/lib/lexa for the append-only
 # journal (TASK-039/040). (V1RC FINDING D, 2026-07-06.)
 StateDirectory=lexa
+# WS-1 sandboxing (V1.0 punch list, 2026-07-09): bounds blast radius on top
+# of the existing User=lexa. StateDirectory=lexa above already implies a
+# read-write bind-mount for /var/lib/lexa (journal dir + breach snapshot,
+# TASK-039/040/041) even under ProtectSystem=strict — systemd grants that
+# automatically for RuntimeDirectory=/StateDirectory=/etc., no separate
+# ReadWritePaths= needed. Nothing else in this process writes to disk.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
 # Type=notify + WatchdogSec (TASK-007, review §11 / §14 item 5): a crash
 # already restarts the hub via Restart=on-failure below, but a live-but-
 # wedged process (deadlocked tick loop, stalled paho publish, hung state

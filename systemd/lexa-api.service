@@ -17,6 +17,14 @@ Wants=mosquitto.service
 Wants=lexa-modbus.service lexa-northbound.service lexa-ocpp.service lexa-hub.service
 
 [Service]
+# WS-1 sandboxing (V1.0 punch list, 2026-07-09): bounds blast radius on top
+# of the existing User=lexa. lexa-api writes nothing to disk (it only reads
+# api.json + api_token_file) — no ReadWritePaths= needed.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
 # Type=notify + WatchdogSec (TASK-008, review §11 item 5): lexa-api's main
 # goroutine only ever blocked on signal (ListenAndServe runs in its own
 # goroutine) — no natural liveness point exists. A 10s kick ticker

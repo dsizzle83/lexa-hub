@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // StationConfig pre-configures a known charging station.
@@ -30,6 +31,13 @@ type Config struct {
 	// convenience on the air-gapped 69.0.0.x LAN — never ship a product
 	// config with these empty. See scripts/deploy-hub-pi.sh
 	// --enable-ocpp-sp2 (csip-tls-test docs/BENCH.md has the bench runbook).
+	//
+	// WS-1 (V1.0 punch list, security fail-closed by default): loadConfig
+	// below now REFUSES to start with any of CertPath/KeyPath/BasicAuthUser/
+	// BasicAuthPass blank unless Bench is true or OCPP_PROFILE=bench is set
+	// in the environment — see the Bench field doc and benchProfile(). This
+	// closes the CLAUDE.md-vs-code contradiction: the invariant already
+	// claimed SP2 was the product default; now the code enforces it.
 	Port     int    `json:"port"`      // default 8887
 	CertPath string `json:"cert_path"` // TLS cert; plain WS when empty (bench-only)
 	KeyPath  string `json:"key_path"`
@@ -39,6 +47,15 @@ type Config struct {
 	// state is bench-only, same as an empty CertPath/KeyPath above.
 	BasicAuthUser string `json:"basic_auth_user"`
 	BasicAuthPass string `json:"basic_auth_pass"`
+
+	// Bench is the explicit escape hatch (WS-1) that lets lexa-ocpp start
+	// with SP2 fields blank — plaintext ws://, no Basic Auth — on the
+	// air-gapped 69.0.0.x bench LAN. The same effect is available without
+	// editing the config via the OCPP_PROFILE=bench environment variable
+	// (see benchProfile), which is what deploy-hub-pi.sh's plain (no
+	// --enable-ocpp-sp2) path now sets so a fresh bench deploy keeps working
+	// unchanged. PRODUCT deploys must leave this false/absent.
+	Bench bool `json:"bench"`
 
 	Stations []StationConfig `json:"stations"`
 
@@ -76,6 +93,17 @@ func (c *Config) ReconcilerMode() string {
 		return ReconcilerOff
 	}
 	return c.Reconciler
+}
+
+// benchProfile reports whether loadConfig's SP2 fail-closed gate below
+// should be relaxed (WS-1): either the config's explicit "bench": true, or
+// the OCPP_PROFILE=bench environment variable. Two knobs because the config
+// file is a deploy artifact (an operator/script flips it deliberately, as
+// deploy-hub-pi.sh now does on its plain path) while the env var lets an
+// ad-hoc local run (e.g. `go run ./cmd/ocpp`) opt out without editing or
+// generating a config file at all.
+func benchProfile(cfg *Config) bool {
+	return cfg.Bench || os.Getenv("OCPP_PROFILE") == "bench"
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -122,6 +150,30 @@ func loadConfig(path string) (*Config, error) {
 	// disable charging control — a pre-032 backup config must fail loud here.
 	if len(cfg.Stations) > 0 && cfg.ReconcilerMode() != ReconcilerActive {
 		return nil, fmt.Errorf("reconciler must be \"active\" (got %q): the legacy command path was deleted in TASK-032; off/shadow would silently disable EVSE actuation", cfg.ReconcilerMode())
+	}
+	// WS-1 (V1.0 punch list, security fail-closed by default): refuse to
+	// start with OCPP Security Profile 2 disabled unless an explicit bench
+	// profile opts out. Previously only the reconciler field fail-louded
+	// here; SP2's blank fields silently fell back to plaintext ws:// with no
+	// auth — the exact bench-only state CLAUDE.md already claimed was never
+	// the product default. See the Bench field / benchProfile doc above.
+	if !benchProfile(&cfg) {
+		var missing []string
+		if cfg.CertPath == "" {
+			missing = append(missing, "cert_path")
+		}
+		if cfg.KeyPath == "" {
+			missing = append(missing, "key_path")
+		}
+		if cfg.BasicAuthUser == "" {
+			missing = append(missing, "basic_auth_user")
+		}
+		if cfg.BasicAuthPass == "" {
+			missing = append(missing, "basic_auth_pass")
+		}
+		if len(missing) > 0 {
+			return nil, fmt.Errorf("ocpp: refusing to start with OCPP Security Profile 2 disabled (%s empty): the product default requires TLS + HTTP Basic Auth (TASK-074, 09 Security hard gate, WS-1) — set \"bench\": true in the config or OCPP_PROFILE=bench in the environment to run plaintext ws:// on the air-gapped bench LAN", strings.Join(missing, ", "))
+		}
 	}
 	return &cfg, nil
 }

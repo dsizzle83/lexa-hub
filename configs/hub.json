@@ -59,5 +59,6 @@
     "path": "/var/lib/lexa/snapshot/hub.json",
     "max_age_s": 300
   },
-  "retained_adoption_max_age_s": 300
+  "retained_adoption_max_age_s": 300,
+  "tariff_zone": ""
 }

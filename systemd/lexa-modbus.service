@@ -16,6 +16,15 @@ After=network.target mosquitto.service
 Wants=mosquitto.service
 
 [Service]
+# WS-1 sandboxing (V1.0 punch list, 2026-07-09): bounds blast radius on top
+# of the existing User=lexa. lexa-modbus writes nothing to disk (no journal/
+# snapshot block in its config; Modbus/SunSpec reconciler state is in-memory
+# + on the wire only) — no ReadWritePaths= needed.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
 # Type=notify + WatchdogSec (TASK-008, review §11 item 5 / RSK-08): a wedged
 # poll loop silently stops updating measurement freshness, which gates
 # everything downstream (optimizer, compliance, telemetry). lexa-modbus

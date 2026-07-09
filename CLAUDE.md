@@ -33,9 +33,11 @@ Each concern runs as its own process and communicates only via Mosquitto MQTT:
     ├─ lexa-telemetry— subscribes to measurements; POSTs MUP readings to northbound server
     ├─ lexa-ocpp     — OCPP 2.0.1 CSMS for EV chargers
     ├─ lexa-hub      — energy optimizer engine (the "brain")
-    └─ lexa-api      — HTTP /status + /logs on :9100 (legacy dashboard adapter);
-                        bearer-token auth (`api_token_file`), staged rollout —
-                        empty = open (TASK-014, AD-008); /healthz always open
+    └─ lexa-api      — HTTP /status + /logs, default listen_addr 127.0.0.1:9100
+                        (WS-1, V1.0 punch list: loopback-only product default);
+                        bearer-token auth (`api_token_file`) — a non-loopback
+                        bind with no token is refused at startup unless
+                        `bench:true` (TASK-014, AD-008, WS-1); /healthz always open
 ```
 
 Every service also exposes Prometheus `/metrics` (TASK-044) — see "Metrics" below.
@@ -112,14 +114,15 @@ an authorization boundary, not a topic map).
   connect (`mqttutil.Connect`/`ConnectAuth("", "", "", "")`).
 - **Broker enforcement**: `password_file`/`acl_file` in
   `systemd/mosquitto-lexa.conf` (repo target state: `allow_anonymous false`).
-  The deployed Pi conf.d drop-in (`deploy-hub-pi.sh`'s heredoc) stages this
-  behind `--enable-mqtt-acl`: every deploy always generates credentials and
-  patches them into every service's config, but `allow_anonymous` only flips
-  to `false` — and `password_file`/`acl_file` only get installed — when that
-  flag is passed. This lets a plain deploy leave every service holding valid
-  credentials against a broker that still accepts anonymous connections,
-  so credential rollout and ACL enforcement are separate, verifiable steps
-  (journal evidence: `[mqtt] connected to ... (broker user=...)`).
+  **WS-1 (V1.0 punch list, 2026-07-09): this is now the DEFAULT** on the
+  deployed Pi conf.d drop-in (`deploy-hub-pi.sh`'s heredoc) — every plain
+  deploy generates credentials, patches them into every service's config,
+  AND flips `allow_anonymous` to `false` with `password_file`/`acl_file`
+  installed. `--bench-insecure` restores the pre-WS-1 permissive behavior
+  (credentials provisioned, broker still accepts anonymous) for the
+  air-gapped LAN; the old `--enable-mqtt-acl` flag is now a no-op (its
+  behavior is the default). Verify via journal evidence: `[mqtt] connected
+  to ... (broker user=...)`.
 - **qa-inject**: bench-only broker user for `cmd/mqttproxy`'s `/inject`
   endpoint (a hand-rolled MQTT CONNECT, `-user`/`-passfile` flags,
   `sim/mqttproxy.service`'s ExecStart); provisioned by `mqtt-chaos.sh deploy`
@@ -490,18 +493,25 @@ binary-only deploy + hand-set Pi config (05 §6 discipline).
   `main()` of lexa-northbound and lexa-telemetry only. The other three services are
   pure Go and never touch wolfSSL.
 - **Cipher**: `ECDHE-ECDSA-AES128-CCM-8 TLSv1.2` only (CSIP §5.2.1.1).
-- **OCPP Security Profile 2 is the product default** (TASK-074, AD-008, 09
-  Security hard gate): `cert_path`/`key_path`/`basic_auth_user`/
-  `basic_auth_pass` in `ocpp.json` all set, so the CSMS on :8887 requires TLS
-  + HTTP Basic Auth. Plain `ws://` (all four fields empty) is a **bench-only**
-  fallback for dev/demo convenience on the air-gapped 69.0.0.x LAN — never
-  ship a product config with it. Enable via
+- **OCPP Security Profile 2 is the product default, and `cmd/ocpp/config.go`
+  now ENFORCES it** (TASK-074, AD-008, 09 Security hard gate, WS-1 V1.0
+  punch list 2026-07-09): `loadConfig` REFUSES to start with any of
+  `cert_path`/`key_path`/`basic_auth_user`/`basic_auth_pass` blank unless an
+  explicit bench profile is set (`"bench": true` in `ocpp.json`, or
+  `OCPP_PROFILE=bench` in the environment) — closing the prior gap where the
+  invariant was documented but not code-enforced. Plain `ws://` (all four
+  fields empty) is still a **bench-only** fallback for dev/demo convenience
+  on the air-gapped 69.0.0.x LAN, now gated behind that explicit opt-out
+  rather than merely "leave the fields blank." Enable via
   `scripts/deploy-hub-pi.sh --enable-ocpp-sp2` (stages the CSMS cert from
   csip-tls-test's `gen-ev-cert.sh`, generates the Basic Auth secret
-  idempotently); evsim must flip to `wss://` in the SAME session
-  (`csip-tls-test/scripts/update-sim-pis.sh --enable-ocpp-sp2`) or every EV
-  Mayhem scenario goes BLIND. Backlog: Security Profile 3 (mTLS) — AD-008
-  scopes this task to "≥2", see 10_BACKLOG.md.
+  idempotently, leaves `bench` false); evsim must flip to `wss://` in the
+  SAME session (`csip-tls-test/scripts/update-sim-pis.sh --enable-ocpp-sp2`)
+  or every EV Mayhem scenario goes BLIND. A plain deploy (no
+  `--enable-ocpp-sp2`) now explicitly patches `ocpp.json` to `"bench": true`
+  with the SP2 fields cleared, so the bench's existing ws://-no-auth
+  workflow keeps working under the new fail-closed gate. Backlog: Security
+  Profile 3 (mTLS) — AD-008 scopes this task to "≥2", see 10_BACKLOG.md.
 - **Bus messages**: `math.NaN()` never appears in JSON — use `*float64` (nil = absent),
   and the DECODE layer rejects non-finite numeric input (NaN/Inf, quoted or bare) with
   an alarm; a NaN limit never reaches the optimizer (GAP-09, TASK-055: stdlib already
@@ -580,6 +590,16 @@ binary-only deploy + hand-set Pi config (05 §6 discipline).
   right — pinned by `internal/orchestrator/costmodel_test.go` /`planner_test.go`'s DST
   tables (`TestTOU_UTCvsLA_Divergence_DeploymentHazard` pins the zone-mismatch
   divergence specifically).
+  **WS-8 (V1.0 punch list, TASK-079/GAP-05, 2026-07-09) enforces the
+  deployment requirement above with a startup assertion, additive only —
+  no control behavior changes:** `hub.json`'s `tariff_zone` config key names
+  the tariff's IANA zone (e.g. `"America/Los_Angeles"`); at startup
+  `cmd/hub/tariffzone.go` compares `time.Local`'s offset behavior against
+  `time.LoadLocation(tariff_zone)` across a year sample (catches DST-rule
+  differences, not just today's offset) and, on mismatch or an invalid zone
+  name, logs a LOUD error and sets the `lexa_tariff_zone_mismatch` gauge to
+  1. An empty `tariff_zone` (the shipped default) leaves the check disabled
+  with a WARN — today's unenforced behavior, unchanged.
 
 ## Defensive fault-handling (do not strip — each backs a mayhem-QA finding)
 

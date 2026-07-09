@@ -16,6 +16,15 @@ After=network.target mosquitto.service
 Wants=mosquitto.service
 
 [Service]
+# WS-1 sandboxing (V1.0 punch list, 2026-07-09): bounds blast radius on top
+# of the existing User=lexa. lexa-ocpp writes nothing to disk (it only reads
+# ocpp.json + certs/basic-auth-pass files; OCPP session state is in-memory) —
+# no ReadWritePaths= needed.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
 # Type=notify + WatchdogSec (TASK-008, review §11 item 5): lexa-ocpp's main
 # goroutine only ever blocked on signal (srv.Start runs the WS listener in
 # its own goroutine) — no natural liveness point exists. A 10s kick ticker

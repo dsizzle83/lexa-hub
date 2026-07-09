@@ -92,6 +92,13 @@ func main() {
 	// MQTT connect below so its instrumentation hooks have counters ready.
 	reg := metrics.New()
 	metrics.StandardGauges(reg)
+
+	// WS-8 (V1.0 punch list, TASK-079/GAP-05): additive-only startup
+	// assertion that this process's configured zone matches tariff_zone.
+	// Logs loud + sets lexa_tariff_zone_mismatch on mismatch; never changes
+	// control behavior.
+	checkTariffZone(cfg, reg)
+
 	mqttFailCtr := reg.Counter("lexa_mqtt_publish_failures_total")
 	mqttReconnCtr := reg.Counter("lexa_mqtt_reconnects_total")
 	reg.Collect(func(r *metrics.Registry) {
