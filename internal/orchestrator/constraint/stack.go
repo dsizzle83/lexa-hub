@@ -25,6 +25,16 @@ type Stack struct {
 	sessions     map[string]*Session
 	plant        Plant
 	tickInterval time.Duration
+
+	// lastAuthors is the FIX-F per-tick authorship snapshot from the most
+	// recent Optimize call: axisKey(device, axis) → the Constraint.Name() that
+	// authored that device's axis value this tick. Single-goroutine state,
+	// like sessions — rebuilt wholesale every Optimize call (never mutated in
+	// place), so returning the map by reference from AxisAuthors is safe as
+	// long as the caller reads it on the same control goroutine before the
+	// next Optimize call, exactly the Wrapper's existing contract for
+	// SessionNames().
+	lastAuthors map[string]string
 }
 
 // compile-time proof the Stack is a drop-in Optimizer AND, once a fast-safety
@@ -64,6 +74,7 @@ func NewStack(plant Plant, tickInterval time.Duration, constraints ...Constraint
 		sessions:     make(map[string]*Session, len(constraints)),
 		plant:        plant,
 		tickInterval: tickInterval,
+		lastAuthors:  map[string]string{},
 	}
 	for _, c := range constraints {
 		if _, ok := s.sessions[c.Name()]; !ok {
@@ -83,6 +94,18 @@ func (s *Stack) SessionNames() []string {
 		names = append(names, c.Name())
 	}
 	return names
+}
+
+// AxisAuthors returns the FIX-F per-tick authorship snapshot from the last
+// Optimize call: axisKey(device, axis) → the constraint Name() that authored
+// that device's axis value this tick (Desired.Author, plus any post-arbiter
+// override — battery safety's force-disconnect always attributes to
+// "battery-safety" for the axes it actually overrides). The Wrapper
+// (shadow.go) reads this to fill AxisDivergence.Author and to decide which
+// axes active-mode composition may take from the candidate plan. Empty before
+// the first Optimize call.
+func (s *Stack) AxisAuthors() map[string]string {
+	return s.lastAuthors
 }
 
 // tickSeconds is the wall-clock length of one tick (tuned cadence when unset).
@@ -136,14 +159,65 @@ func (s *Stack) Optimize(state orchestrator.SystemState) orchestrator.Plan {
 	desired := Resolve(demands)
 	emitCommands(&plan, desired)
 
+	// FIX-F: snapshot per-axis authorship from the arbiter's fold BEFORE the
+	// post-arbitration pass runs, so a postArbiter's override (below) can be
+	// distinguished from — and takes priority over — the demand-pipeline
+	// authorship the arbiter already resolved.
+	authors := make(map[string]string, len(desired))
+	for dev, d := range desired {
+		for axis, src := range d.Authors {
+			if src != "" {
+				authors[axisKey(dev, axis)] = src
+			}
+		}
+	}
+
 	// Post-arbitration tier (SAFETY, after economics+compliance are resolved):
 	// battery safety reads this tick's arbitrated battery setpoints, may override
 	// a tripped pack with a force-disconnect, and records the FINAL commands for
 	// the fast protection loop.
 	for _, pa := range post {
+		before := snapshotBatteryCommands(plan.BatteryCommands)
 		pa.PostArbitrate(in, s.session(pa), &plan)
+		attributePostArbiterAuthorship(before, plan.BatteryCommands, pa.Name(), authors)
 	}
+	s.lastAuthors = authors
 	return plan
+}
+
+// snapshotBatteryCommands is a minimal comparable view of a plan's battery
+// commands, keyed by device name, for the FIX-F post-arbiter authorship diff
+// below.
+func snapshotBatteryCommands(cmds []orchestrator.BatteryCommand) map[string]orchestrator.BatteryCommand {
+	m := make(map[string]orchestrator.BatteryCommand, len(cmds))
+	for _, c := range cmds {
+		m[c.Name] = c
+	}
+	return m
+}
+
+// attributePostArbiterAuthorship marks every battery-setpoint-w/connect axis a
+// postArbiter's PostArbitrate call actually changed (added or overwrote,
+// relative to the pre-call snapshot) as authored by that postArbiter's Name()
+// (FIX-F). PostArbitrate bypasses the demand pipeline entirely (stack.go's
+// postArbiter doc) — battery safety's force-disconnect override writes
+// straight into plan.BatteryCommands — so authorship for it must be observed
+// by EFFECT rather than read off a Demand/Desired.Author the arbiter never
+// saw. A pack the postArbiter did not touch this tick (not tripped) is
+// unaffected: its authorship, if any, stays whatever the arbiter fold already
+// recorded.
+func attributePostArbiterAuthorship(before map[string]orchestrator.BatteryCommand, after []orchestrator.BatteryCommand, name string, authors map[string]string) {
+	for _, c := range after {
+		b, existed := before[c.Name]
+		setpointChanged := !math.IsNaN(c.SetpointW) && (!existed || b.SetpointW != c.SetpointW)
+		connectChanged := c.Connect != nil && (!existed || b.Connect == nil || *b.Connect != *c.Connect)
+		if setpointChanged {
+			authors[axisKey(c.Name, AxisBatterySetpointW)] = name
+		}
+		if connectChanged {
+			authors[axisKey(c.Name, AxisConnect)] = name
+		}
+	}
 }
 
 // EvaluateSafety implements orchestrator.SafetyEvaluator: the Tier-1 fast

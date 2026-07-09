@@ -101,3 +101,66 @@ func TestStack_EvaluateSafetyInertWithoutSafetyConstraint(t *testing.T) {
 		t.Fatalf("inert safety plan expected, got %+v", sp)
 	}
 }
+
+// ── FIX-F: post-arbiter override authorship ─────────────────────────────────
+
+// When battery safety's PostArbitrate OVERRIDES the arbiter's resolved
+// command (the same wrong-direction inversion TestStack_BatterySafetyPost-
+// ArbitrationClosesLag trips), BOTH axes it overrides — setpoint AND connect —
+// must attribute to "battery-safety", not to whichever constraint (economics)
+// the pre-override arbiter fold had credited. This is the "battery_safety ->
+// connect/disconnect always dominant" axis-ownership rule (FIX-F launch
+// brief deliverable 4), proven by OBSERVED EFFECT since PostArbitrate
+// bypasses the demand pipeline entirely (stack.go's postArbiter doc).
+func TestStack_PostArbiterOverrideAttributesAuthorshipToBatterySafety(t *testing.T) {
+	st := orchestrator.SystemState{
+		Timestamp: offPeakTime(),
+		Solar:     []orchestrator.SolarState{{Name: "pv", PowerW: 6000, MaxW: 8000, Connected: true, Energized: true}},
+		Batteries: []orchestrator.BatteryState{{Name: "bat", PowerW: 4000, SOC: 22, MaxChargeW: 5000, MaxDischargeW: 5000, Connected: true, Energized: true}},
+		Grid:      orchestrator.GridState{NetW: -5000, ImportLimitW: math.NaN(), ExportLimitW: math.NaN(), MaxLimitW: math.NaN()},
+	}
+	stack := safetyStack()
+	plan := stack.Optimize(st)
+
+	// Sanity: the trip actually happened (mirrors the existing lag-closing test).
+	i := -1
+	for idx, c := range plan.BatteryCommands {
+		if c.Name == "bat" {
+			i = idx
+		}
+	}
+	if i < 0 || plan.BatteryCommands[i].Connect == nil || *plan.BatteryCommands[i].Connect != false {
+		t.Fatalf("expected battery safety to trip a force-disconnect, got %+v", plan.BatteryCommands)
+	}
+
+	authors := stack.AxisAuthors()
+	if got := authors[axisKey("bat", AxisBatterySetpointW)]; got != "battery-safety" {
+		t.Errorf("battery-setpoint-w author = %q, want battery-safety (override, not the pre-override economics credit)", got)
+	}
+	if got := authors[axisKey("bat", AxisConnect)]; got != "battery-safety" {
+		t.Errorf("connect author = %q, want battery-safety", got)
+	}
+}
+
+// A pack battery safety does NOT trip keeps whatever authorship the arbiter
+// fold already credited (economics, in this fixture) — PostArbitrate running
+// is not itself a claim on every battery's axes, only the ones it actually
+// overrides.
+func TestStack_PostArbiterNoTripLeavesArbiterAuthorshipUnchanged(t *testing.T) {
+	st := orchestrator.SystemState{
+		Timestamp: offPeakTime(),
+		Solar:     []orchestrator.SolarState{{Name: "pv", PowerW: 6000, MaxW: 8000, Connected: true, Energized: true}},
+		Batteries: []orchestrator.BatteryState{{Name: "bat", PowerW: -1000, SOC: 60, MaxChargeW: 5000, MaxDischargeW: 5000, Connected: true, Energized: true}},
+		Grid:      orchestrator.GridState{NetW: -5000, ImportLimitW: math.NaN(), ExportLimitW: math.NaN(), MaxLimitW: math.NaN()},
+	}
+	stack := safetyStack()
+	plan := stack.Optimize(st)
+	for _, c := range plan.BatteryCommands {
+		if c.Name == "bat" && c.Connect != nil {
+			t.Fatalf("no trip expected this tick, got a connect override: %+v", c)
+		}
+	}
+	if got := stack.AxisAuthors()[axisKey("bat", AxisBatterySetpointW)]; got != "economics" {
+		t.Errorf("battery-setpoint-w author = %q, want economics (no override this tick)", got)
+	}
+}

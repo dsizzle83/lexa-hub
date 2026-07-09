@@ -41,6 +41,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -203,15 +204,31 @@ func main() {
 		opt.EVImportCooldownCycles = 4
 	}
 
-	// TASK-059: the constraint-stack shadow harness. When cfg.ConstraintShadow
-	// is false (the default) NOTHING here runs — the engine drives opt directly
-	// and behaviour is byte-identical. When true, wrap opt so every economic
-	// tick ALSO runs the candidate constraint Stack (observe-only), diffs the
-	// two plans, counts divergences, and logs one rate-limited JSON line per
-	// divergent tick. The wrapper ALWAYS returns opt's plan; the candidate's is
-	// discarded (never actuated) — the legacy cascade stays authoritative until
-	// TASK-060 flips the export constraint active. shadowDivergences is nil when
-	// the flag is off, so the plan-log field below stays absent.
+	// TASK-059/FIX-F: the constraint-stack shadow harness + per-constraint
+	// off|shadow|active modes (TASK-060 §4 / TASK-061 §4). When
+	// cfg.ConstraintShadow is false (the default) NOTHING here runs — the
+	// engine drives opt directly and behaviour is byte-identical;
+	// constraint_modes is irrelevant in that case (config.go's back-compat
+	// rule). When true, modes (resolved below) decides, per constraint,
+	// whether it is left out of the candidate Stack entirely ("off"),
+	// constructed and observe-only ("shadow"), or constructed AND composed
+	// into the actuated plan ("active", constraint/shadow.go Wrapper.compose).
+	// shadowDivergences is nil when the flag is off, so the plan-log field
+	// below stays absent.
+	//
+	// UNWIRED as of this task: nothing in configs/hub.json (bench or repo
+	// default) sets any key to "active" yet — constraint_shadow ships false,
+	// and even a hypothetical constraint_shadow=true default would resolve
+	// every key to "shadow" (today's behaviour) absent an explicit
+	// constraint_modes block. The first PR that flips an axis "active" pays
+	// its own full targeted-scenario + campaign gate (03 §P5), same as every
+	// other flip this program has done.
+	modes, err := cfg.ResolveConstraintModes()
+	if err != nil {
+		// loadConfig already validated this; a second failure here would mean
+		// cfg was mutated between load and here, which nothing in main does.
+		log.Fatalf("lexa-hub: constraint modes: %v", err)
+	}
 	var optimizer orchestrator.Optimizer = opt
 	var shadowDivergences func() uint64
 	if cfg.ConstraintShadow {
@@ -224,21 +241,46 @@ func main() {
 		//   ECONOMICS  — Economics (TASK-063): plan-following, self-consumption, TOU
 		//                peak, EV allocation, emitted as PointDemands the arbiter
 		//                clamps UNDER the caps (economics can never violate a limit).
-		// The candidate now authors every axis, so the shadow diff covers the FULL
-		// controller vs the legacy cascade — the R4 proof — while the wrapper still
-		// returns opt's plan (legacy authoritative until the soak-gated flip). The
-		// economics constraint takes the same config cmd/hub gives the legacy
-		// optimizer (opt.* above), so the two layers are the same controller modulo
-		// the tier seam.
+		// Each is constructed only when its mode is not "off" (FIX-F) — an
+		// "off" constraint is left out of the Stack entirely, exactly as if it
+		// had never been ported (matching the per-constraint task docs' own
+		// "off (default; stack has no export constraint)"). The economics
+		// constraint takes the same config cmd/hub gives the legacy optimizer
+		// (opt.* above), so the two layers are the same controller modulo the
+		// tier seam.
 		// One shared EV-resume cooldown (TASK-064): the import constraint writes it,
-		// economics reads it — a single counter across the tier seam.
+		// economics reads it — a single counter across the tier seam. Always
+		// minted (cheap) even if neither constraint ends up wired.
 		evCooldown := constraint.NewEVImportCooldown()
-		stack := constraint.NewStack(buildConstraintPlant(cfg), cfg.EngineInterval(),
-			constraint.NewBatterySafetyConstraint(opt.SOCReserve),
-			constraint.NewExportConstraint(),
-			constraint.NewGenLimitConstraint(),
-			constraint.NewImportLimitConstraint(evCooldown),
-			constraint.NewEconomicsConstraint(
+
+		active := map[string]bool{}
+		var constraints []constraint.Constraint
+		if m := modes["battery_safety"]; m != ModeOff {
+			constraints = append(constraints, constraint.NewBatterySafetyConstraint(opt.SOCReserve))
+			if m == ModeActive {
+				active["battery-safety"] = true
+			}
+		}
+		if m := modes["export"]; m != ModeOff {
+			constraints = append(constraints, constraint.NewExportConstraint())
+			if m == ModeActive {
+				active["export"] = true
+			}
+		}
+		if m := modes["gen"]; m != ModeOff {
+			constraints = append(constraints, constraint.NewGenLimitConstraint())
+			if m == ModeActive {
+				active["gen"] = true
+			}
+		}
+		if m := modes["import"]; m != ModeOff {
+			constraints = append(constraints, constraint.NewImportLimitConstraint(evCooldown))
+			if m == ModeActive {
+				active["import"] = true
+			}
+		}
+		if m := modes["economics"]; m != ModeOff {
+			constraints = append(constraints, constraint.NewEconomicsConstraint(
 				opt.CostModel,
 				opt.SOCReserve,
 				opt.SOCFullThreshold,
@@ -247,9 +289,17 @@ func main() {
 				opt.EVImportCooldownCycles,
 				evCooldown,
 			))
+			if m == ModeActive {
+				active["economics"] = true
+			}
+		}
+
+		stack := constraint.NewStack(buildConstraintPlant(cfg), cfg.EngineInterval(), constraints...)
 		reg.Counter("lexa_constraint_shadow_divergence_total")
+		reg.Counter("lexa_constraint_active_fallback_total")
 		wrapper := constraint.Wrap(opt, stack, constraint.Options{
-			Now: time.Now,
+			Now:               time.Now,
+			ActiveConstraints: active,
 			OnDiverge: func(d constraint.Divergence) {
 				if b, err := json.Marshal(d); err == nil {
 					// One structured JSON line per divergent tick; the wrapper
@@ -260,7 +310,9 @@ func main() {
 			// WS-5.1: a candidate panic must never kill the process
 			// controlling hardware. The wrapper recovers, permanently
 			// disables candidate observation (latch), and we alarm here —
-			// a tripped latch FAILS the soak gate.
+			// a tripped latch FAILS the soak gate. FIX-F: when any axis is
+			// active this latch also forces composition back to pure legacy
+			// (ActiveFallbacks) — same alarm, now also a composition event.
 			OnPanic: func(recovered any, stack []byte) {
 				slog.Error("constraint-shadow candidate PANIC — shadow latched OFF (soak gate fails)",
 					"panic", fmt.Sprint(recovered), "stack", string(stack))
@@ -288,8 +340,28 @@ func main() {
 					strings.NewReplacer("-", "_", ":", "_").Replace(axis) + "_total"
 				r.Counter(name).Set(n)
 			}
+			// FIX-F: per-axis legacy-write drop count (composition, active
+			// mode only — empty map while every constraint is off/shadow) and
+			// the composition fail-safe fallback tally.
+			for axis, n := range wrapper.LegacyOverrideDropped() {
+				name := "lexa_constraint_legacy_override_dropped_axis_" +
+					strings.NewReplacer("-", "_", ":", "_").Replace(axis) + "_total"
+				r.Counter(name).Set(n)
+			}
+			r.Counter("lexa_constraint_active_fallback_total").Set(wrapper.ActiveFallbacks())
 		})
-		log.Printf("lexa-hub: constraint shadow ENABLED (observe-only; legacy cascade authoritative; panic-latch + per-axis + Tier-1 safety diff armed)")
+		log.Printf("lexa-hub: constraint shadow ENABLED — modes: export=%s gen=%s import=%s economics=%s battery_safety=%s (panic-latch + per-axis + Tier-1 safety diff armed)",
+			modes["export"], modes["gen"], modes["import"], modes["economics"], modes["battery_safety"])
+		if len(active) > 0 {
+			names := make([]string, 0, len(active))
+			for n := range active {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			log.Printf("lexa-hub: *** ACTIVE CONSTRAINT AXES LIVE: %v — these axes are ACTUATED by the constraint stack; the legacy cascade's writes to them are DROPPED (lexa_constraint_legacy_override_dropped_axis_* metrics) ***", names)
+		}
+	} else if len(cfg.ConstraintModes) > 0 {
+		log.Printf("lexa-hub: constraint_modes present but constraint_shadow=false — modes ignored, legacy cascade authoritative on every axis")
 	}
 
 	// Compliance-breach reporting (TASK-031). The named breachEpisodes component
