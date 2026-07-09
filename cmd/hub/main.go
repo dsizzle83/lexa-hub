@@ -139,6 +139,11 @@ func main() {
 	// publishes actually sent by desiredPublishingBatteryActuator (content-change
 	// gated, not per-tick — see its doc).
 	desiredPublishesTotalCtr := reg.Counter("lexa_hub_desired_publishes_total")
+	// lexa_hub_intents_{applied,rejected}_total (Unit 3.3, TASK-082/§3.1):
+	// incremented by intentAdopter.adopt per lexa/intent/{kind} outcome — a
+	// "duplicate" (retained-redelivery dedupe) increments neither.
+	intentsAppliedCtr := reg.Counter("lexa_hub_intents_applied_total")
+	intentsRejectedCtr := reg.Counter("lexa_hub_intents_rejected_total")
 
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
@@ -581,6 +586,43 @@ func main() {
 		}
 	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe csip pricing: %v", err)
+	}
+
+	// Intent adoption layer (Unit 3.3, TASK-082/DEVICE_ROADMAP.md §3.1): six
+	// explicit subscribe blocks — never a "lexa/intent/+" wildcard, since
+	// that would also match lexa/intent/result (topics.go's doc). "mode" is
+	// NOT subscribed here — Unit 3.4 owns lexa/intent/mode + modeManager +
+	// the retained lexa/hub/mode status topic.
+	adopter := newIntentAdopter(eng, opt, jw, mc, cfg, intentsAppliedCtr, intentsRejectedCtr)
+	if err := mqttutil.Subscribe(mc, bus.TopicIntentEVGoal, func(_ string, msg bus.EVGoalIntent) {
+		adopter.adopt("evgoal", msg.IntentMeta, func() (string, string) { return adopter.applyEVGoal(msg) })
+	}); err != nil {
+		log.Fatalf("lexa-hub: subscribe intent evgoal: %v", err)
+	}
+	if err := mqttutil.Subscribe(mc, bus.TopicIntentReserve, func(_ string, msg bus.BackupReserveIntent) {
+		adopter.adopt("reserve", msg.IntentMeta, func() (string, string) { return adopter.applyReserve(msg) })
+	}); err != nil {
+		log.Fatalf("lexa-hub: subscribe intent reserve: %v", err)
+	}
+	if err := mqttutil.Subscribe(mc, bus.TopicIntentTariff, func(_ string, msg bus.TariffIntent) {
+		adopter.adopt("tariff", msg.IntentMeta, func() (string, string) { return adopter.applyTariff(msg) })
+	}); err != nil {
+		log.Fatalf("lexa-hub: subscribe intent tariff: %v", err)
+	}
+	if err := mqttutil.Subscribe(mc, bus.TopicIntentSolarForecast, func(_ string, msg bus.SolarForecastIntent) {
+		adopter.adopt("solarforecast", msg.IntentMeta, func() (string, string) { return adopter.applySolarForecast(msg) })
+	}); err != nil {
+		log.Fatalf("lexa-hub: subscribe intent solarforecast: %v", err)
+	}
+	if err := mqttutil.Subscribe(mc, bus.TopicIntentLoadProfile, func(_ string, msg bus.LoadProfileIntent) {
+		adopter.adopt("loadprofile", msg.IntentMeta, func() (string, string) { return adopter.applyLoadProfile(msg) })
+	}); err != nil {
+		log.Fatalf("lexa-hub: subscribe intent loadprofile: %v", err)
+	}
+	if err := mqttutil.Subscribe(mc, bus.TopicIntentChargeNow, func(_ string, msg bus.ChargeNowIntent) {
+		adopter.adopt("chargenow", msg.IntentMeta, func() (string, string) { return adopter.applyChargeNow(msg) })
+	}); err != nil {
+		log.Fatalf("lexa-hub: subscribe intent chargenow: %v", err)
 	}
 
 	// Subscribe to reconciler reports (TASK-031): device-level non-convergence
