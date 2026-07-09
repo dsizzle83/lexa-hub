@@ -72,6 +72,14 @@ func main() {
 	// working unchanged (slog does not touch the "log" package's output).
 	logutil.Setup("lexa-hub", logutil.ParseLevel(cfg.LogLevel))
 
+	// TASK-044: metrics registry + standard process gauges. Constructed
+	// before the journal below (WS-9.3: journal.Config.Metrics must be set
+	// before journal.Open, and Open must run before anything that might
+	// emit) so the journal's Writes/Rotations/Errors/Dropped counters can be
+	// wired into the same reg every other counter in this file uses.
+	reg := metrics.New()
+	metrics.StandardGauges(reg)
+
 	// TASK-040: the durable event journal. A nil cfg.Journal (no "journal"
 	// block in hub.json) leaves jw nil — every emit call site below is
 	// `if jw != nil`-guarded, so this is a true no-op rollout default, not a
@@ -79,7 +87,17 @@ func main() {
 	// the reader, actuators, breach episodes) so no early transition is lost.
 	var jw *journal.Writer
 	if cfg.Journal != nil {
-		jw, err = journal.Open(cfg.Journal.ToLibrary())
+		jcfg := cfg.Journal.ToLibrary()
+		// WS-9.3: previously nil (log-only drops/writes/rotations/errors —
+		// see journal.go's Metrics doc). Wires real counters using the same
+		// reg every other cmd/hub/main.go metric uses.
+		jcfg.Metrics = &journal.Metrics{
+			Writes:    reg.Counter("lexa_hub_journal_writes_total"),
+			Rotations: reg.Counter("lexa_hub_journal_rotations_total"),
+			Errors:    reg.Counter("lexa_hub_journal_errors_total"),
+			Dropped:   reg.Counter("lexa_hub_journal_dropped_total"),
+		}
+		jw, err = journal.Open(jcfg)
 		if err != nil {
 			log.Fatalf("lexa-hub: open journal: %v", err)
 		}
@@ -88,11 +106,6 @@ func main() {
 			_ = jw.Append(ev)
 		}
 	}
-
-	// TASK-044: metrics registry + standard process gauges, wired before the
-	// MQTT connect below so its instrumentation hooks have counters ready.
-	reg := metrics.New()
-	metrics.StandardGauges(reg)
 
 	// WS-8 (V1.0 punch list, TASK-079/GAP-05): additive-only startup
 	// assertion that this process's configured zone matches tariff_zone.
@@ -605,6 +618,13 @@ func main() {
 		Debug:          cfg.Debug,
 		Planner:        cfg.Planner,
 		PlanObserver:   planObserver,
+	})
+	// lexa_hub_engine_cmd_dropped_total (WS-9.3): mirrors Engine.CmdDropped()
+	// (internal/orchestrator stays decoupled from internal/metrics — same
+	// stance as internal/mqttutil) — the same external-mirroring idiom
+	// already used for lexa_hub_tick_overruns_total via planObserver above.
+	reg.Collect(func(r *metrics.Registry) {
+		r.Counter("lexa_hub_engine_cmd_dropped_total").Set(eng.CmdDropped())
 	})
 
 	// Subscribe to all state topics.
