@@ -1,0 +1,42 @@
+# sudoers fragment for lexa-api's commissioning config-write restart step
+# (DEVICE_ROADMAP.md §4.5, TASK-090).
+#
+# INSTALL: copy this file to /etc/sudoers.d/lexa-api, owned root:root, mode
+# 0440 (deploy-hub-pi.sh / meta-lexa's Yocto recipe installs it verbatim —
+# this repo does not install it itself; visudo -c -f validates its syntax
+# without touching the live sudoers database).
+#
+#   install -o root -g root -m 0440 systemd/sudoers.d-lexa-api /etc/sudoers.d/lexa-api
+#   visudo -c -f /etc/sudoers.d/lexa-api
+#
+# WHY THIS IS THE ENTIRE PRIVILEGE lexa-api HOLDS AS ROOT:
+#
+# lexa-api runs unprivileged (User=lexa/Group=lexa, systemd/lexa-api.service).
+# After a successful commissioning config write, cmd/api/configwrite.go execs
+# `sudo -n /bin/systemctl restart lexa-<service>` so the newly-written config
+# actually takes effect. This grants EXACTLY that, and nothing else:
+#
+#   - "-n" (non-interactive): sudo must never block on a password prompt a
+#     background HTTP handler cannot answer; NOPASSWD below is what makes
+#     that succeed instead of failing closed.
+#   - The six units listed are EXACTLY DEVICE_ROADMAP.md §4.5's
+#     POST /config/{service} allowlist minus "api"/"api-secret": lexa-api
+#     never restarts itself through this path (self-restart would kill the
+#     very HTTP response reporting the restart — see configwrite.go's
+#     handleAPISecretWrite, which never execs sudo at all).
+#   - The list is CLOSED and enumerated BY HAND on purpose. A wildcard
+#     (e.g. "lexa-*" or "/bin/systemctl restart lexa-*") would let a
+#     compromised or merely buggy lexa-api process restart any CURRENT OR
+#     FUTURE unit matching that glob — including a malicious unit someone
+#     managed to name accordingly — without this fragment ever being
+#     re-reviewed. Adding a seventh restartable service means adding a
+#     seventh explicit line here, by hand, reviewed like any other
+#     privilege-boundary change — never widening the pattern to match it.
+#   - No other command, no other user, no shell, no wildcard arguments to
+#     systemctl (not even "restart lexa-hub *" or "restart lexa-*.service").
+#
+# Re-derive this list from cmd/api/configwrite.go's serviceUnit map before
+# changing it — like the MQTT ACL (CLAUDE.md "Broker security"), this file is
+# an authorization boundary reviewed once, not a routine edit target.
+
+lexa ALL=(root) NOPASSWD: /bin/systemctl restart lexa-hub, /bin/systemctl restart lexa-northbound, /bin/systemctl restart lexa-modbus, /bin/systemctl restart lexa-ocpp, /bin/systemctl restart lexa-telemetry, /bin/systemctl restart lexa-cloudlink

@@ -30,6 +30,16 @@ StateDirectory=lexa
 # api.json/api_token_file), lexa-api writes nothing else to disk.
 NoNewPrivileges=yes
 ProtectSystem=strict
+# ReadWritePaths=/etc/lexa: the commissioning config-write path (unit 4.4,
+# POST /config/{service}) stages+renames /etc/lexa/<svc>.json and rotates
+# /etc/lexa/api-secret on UNCOMMISSIONED units. ProtectSystem=strict would
+# otherwise EROFS those writes. NOTE (unit 4.5, tracked): the sudo-based
+# service-restart step is still blocked by NoNewPrivileges above — kept
+# deliberately (this is the LAN-exposed service; we will NOT weaken it).
+# Until 4.5 lands a privilege-free restart mechanism (systemd path-unit
+# trigger), config writes report {restarted:false} honestly and the wizard
+# restarts services via its next step.
+ReadWritePaths=/etc/lexa
 ProtectHome=yes
 PrivateTmp=yes
 # AF_NETLINK (DEVICE_ROADMAP.md §4.1/§4.4): both the mDNS advertisement

@@ -1,0 +1,12 @@
+{
+  "required": ["mqtt_broker"],
+  "enums": {
+    "log_level": ["debug", "info", "warn", "error"],
+    "mode": ["optimizer", "gateway"]
+  },
+  "path_keys": {
+    "mqtt_pass_file": "/etc/lexa/mqtt/",
+    "journal.dir": "",
+    "snapshot.path": ""
+  }
+}

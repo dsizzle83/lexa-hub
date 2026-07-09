@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"lexa-hub/internal/journal"
 )
 
 // DeviceConfig names a southbound device and its role, so the API can label
@@ -111,7 +113,48 @@ type Config struct {
 	SiteCacheFile string `json:"site_cache"`
 
 	Devices []DeviceConfig `json:"devices"`
+
+	// Journal is the "journal" block — DEVICE_ROADMAP.md §4.5/TASK-090's
+	// config_write audit trail (POST /config/{service}). Same non-optional
+	// shape as lexa-cloudlink's JournalConfig (cmd/cloudlink/config.go),
+	// unlike lexa-hub's *JournalConfig (nil ⇒ disabled entirely): the
+	// commissioning write path's audit trail is the whole point of this
+	// unit, so an absent "journal" key means "use the default dir," never
+	// "skip journaling." See JournalConfig's own doc for why this isn't
+	// internal/journal.Config embedded directly.
+	Journal JournalConfig `json:"journal"`
 }
+
+// JournalConfig is the on-disk "journal" block. Its own snake_case JSON tags
+// (rather than embedding internal/journal.Config directly) mirror
+// cmd/hub/config.go's JournalConfig and cmd/cloudlink/config.go's
+// JournalConfig: that library type carries a `Now func() time.Time` and a
+// `*Metrics` field with no sensible JSON representation, and its field names
+// (MaxBytes, MaxFiles) don't match this repo's snake_case wire keys without
+// added tags.
+type JournalConfig struct {
+	Dir            string `json:"dir"`              // default set by loadConfig if empty
+	MaxBytes       int64  `json:"max_bytes"`        // 0 → journal.DefaultMaxBytes
+	MaxFiles       int    `json:"max_files"`        // 0 → journal.DefaultMaxFiles
+	FlushEvery     int    `json:"flush_every"`      // 0 → journal.DefaultFlushEvery
+	FlushIntervalS int    `json:"flush_interval_s"` // 0 → journal.DefaultFlushInterval
+}
+
+// ToLibrary converts jc into a journal.Config for journal.Open, mirroring
+// cmd/hub/config.go's JournalConfig.ToLibrary.
+func (jc JournalConfig) ToLibrary() journal.Config {
+	return journal.Config{
+		Dir:           jc.Dir,
+		MaxBytes:      jc.MaxBytes,
+		MaxFiles:      jc.MaxFiles,
+		FlushEvery:    jc.FlushEvery,
+		FlushInterval: time.Duration(jc.FlushIntervalS) * time.Second,
+	}
+}
+
+// defaultJournalDir is Config.Journal.Dir's default when the "journal" block
+// (or its "dir" key) is absent from api.json.
+const defaultJournalDir = "/var/lib/lexa/journal/api"
 
 func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -151,6 +194,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.SiteCacheFile == "" {
 		cfg.SiteCacheFile = defaultSiteCacheFile
+	}
+	if cfg.Journal.Dir == "" {
+		cfg.Journal.Dir = defaultJournalDir
 	}
 	// WS-1 (V1.0 punch list, security fail-closed by default): a wildcard/LAN
 	// bind with no bearer-token auth is an unauthenticated control-adjacent

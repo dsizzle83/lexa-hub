@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/journal"
 	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
@@ -43,6 +44,17 @@ func main() {
 		log.Fatalf("lexa-api: load config: %v", err)
 	}
 	logutil.Setup("lexa-api", logutil.ParseLevel(cfg.LogLevel)) // TASK-045
+
+	// TASK-090/DEVICE_ROADMAP.md §4.5: the config_write audit journal, wired
+	// unconditionally right after logging (same ordering cmd/cloudlink/main.go
+	// uses) — POST /config/{service} below depends on this being open before
+	// the mux is even built, and cfg.Journal is never optional for this
+	// service (see config.go's JournalConfig doc).
+	jw, err := journal.Open(cfg.Journal.ToLibrary())
+	if err != nil {
+		log.Fatalf("lexa-api: journal: %v", err)
+	}
+	defer jw.Close()
 
 	apiToken, err := cfg.LoadAPIToken()
 	if err != nil {
@@ -61,6 +73,11 @@ func main() {
 	metrics.StandardGauges(reg)
 	mqttFailCtr := reg.Counter("lexa_mqtt_publish_failures_total")
 	mqttReconnCtr := reg.Counter("lexa_mqtt_reconnects_total")
+	// TASK-090/DEVICE_ROADMAP.md §4.5 point 6: one counter for a committed
+	// config_write, one for every rejection (gate/schema/write/restart-setup
+	// failure) — see configwrite.go's call sites.
+	configWritesCtr := reg.Counter("lexa_api_config_writes_total")
+	configWriteRejectsCtr := reg.Counter("lexa_api_config_write_rejects_total")
 	reg.Collect(func(r *metrics.Registry) {
 		var total uint64
 		for _, n := range bus.VersionRejects() {
@@ -261,6 +278,17 @@ func main() {
 	// /scan dispatches GET vs POST to their own auth wrapper internally
 	// (scan.go's scanHandler) since both methods share this one path.
 	mux.HandleFunc("/scan", scanHandler(mc, store, apiToken))
+	// DEVICE_ROADMAP.md §4.5/TASK-090: the commissioning config-write path.
+	// "/config/" (trailing slash) is a classic http.ServeMux SUBTREE pattern —
+	// it matches "/config/hub", "/config/api-secret", etc.; configwrite.go's
+	// handler parses the service name itself from r.URL.Path, same style as
+	// this file's other handlers doing their own method dispatch rather than
+	// relying on Go 1.22+ pattern-based routing. requireBearerStrict applies
+	// here too: the bearer token is required even while uncommissioned (the
+	// per-unit label secret, §4.2) — commissioned-gate enforcement happens
+	// INSIDE the handler (configwrite.go), after auth, not instead of it.
+	mux.HandleFunc("/config/", requireBearerStrict(apiToken,
+		configWriteHandler(cfg.APITokenFile, jw, defaultRestartRunner, configWritesCtr, configWriteRejectsCtr)))
 	// /metrics is NEVER wrapped either (TASK-044): same reasoning as
 	// /healthz — a Prometheus scraper is infra, not a dashboard consumer of
 	// this API's data, and AD-008's bearer-token rollout is scoped to

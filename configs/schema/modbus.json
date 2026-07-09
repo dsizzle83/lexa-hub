@@ -1,0 +1,10 @@
+{
+  "required": ["mqtt_broker"],
+  "enums": {
+    "log_level": ["debug", "info", "warn", "error"],
+    "reconciler": ["off", "shadow", "active"]
+  },
+  "path_keys": {
+    "mqtt_pass_file": "/etc/lexa/mqtt/"
+  }
+}
