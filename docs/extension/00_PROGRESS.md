@@ -465,3 +465,35 @@ resolve to the rootfs slot, not persistent p7 — an A/B update today would wipe
 identity/config/journals/spool. meta-lexa data-partition recipe (bind mounts →
 p7, fail-closed, idempotent seed) closes it; the live hub's current identity
 must be migrated onto p7 BEFORE the first slot switch or it boots factory-blank.
+
+## OTA hardware dry-run (2026-07-10, dev kit) — auto-rollback PROVEN with a real failure
+
+Digi-native SWUpdate A/B, on-board apply to the inactive slot. Sequence, all on 69.0.0.2:
+1. Reversible prep: snapshot U-Boot env + /etc/lexa; **armed rollback** (fw_setenv
+   bootlimit=3 — was empty); migrated live identity → p7; staged the .swu (sha
+   77b8916b...).
+2. `update-firmware <swu>` → SWUpdate wrote inactive slot linux_a SUCCESSFULLY,
+   flipped active_system, rebooted (confirmed by SSH host-key change = new rootfs).
+3. New image UNHEALTHY: services fatalled (config-perms bug — migrated /etc/lexa
+   was root:root, services run as lexa uid 800, mqtt/*.pass 0600 unreadable →
+   LoadPassword fatal). /healthz dead, health-gate correctly did NOT commit.
+4. **altbootcmd AUTO-ROLLED-BACK to linux_b** (the validated slot). SSH+/healthz
+   restored; all 8 services active; constraint_modes flips intact; identity intact
+   (OTA only wrote the inactive slot — linux_b rootfs untouched); plan_heartbeat ok.
+   Reset bootcount=0, left bootlimit=3 armed.
+
+**PROVEN on hardware:** OTA install → slot switch → boot-new-image → health-gate
+detects failure (no false commit) → auto-rollback to good slot → full restore.
+The single most safety-critical OTA property, validated with a GENUINE failure
+(stronger than a contrived one). A bad update cannot brick the fleet.
+
+**Two forward-commit-path fixes (rollback itself was flawless):**
+- meta-lexa 5272db7: lexa-firstboot now `chown -R lexa:lexa /etc/lexa` every boot
+  (migrated root-owned configs → lexa-readable). DONE.
+- Bench SSH access: baked image had no operator key (correct for product, blocks
+  bench ops) → rebuild adds the desktop key (bench-only recipe) + the firstboot
+  fix. Rebuild in progress; forward-commit proof follows on the fixed .swu.
+
+Signing note: this dev unit has no /etc/ssl/certs/key.pub → swupdate accepts the
+UNSIGNED .swu. Field units with signature enforcement need the manufacturing key
+(TRUSTFENCE_ENABLED + SRK/CST) — a key-provisioning step, not a recipe defect.
