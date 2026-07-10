@@ -346,3 +346,30 @@ reconcile-report ACL hole, EVSE completeness wedge); 2 crash-loop classes
 eliminated (factory certs, ocpp SP2 gate); WS-5.3 telemetry preserved
 against a faithful-but-wrong brief instruction; every downstream contract
 logged here at review time.
+
+## Integration day — 2026-07-10 (bench free)
+
+- **Merge f3059ce**: refactor-endgame (R4 flips ACTIVE, 26 commits) ×
+  extension campaign (24 commits). 12 conflicts, zero markers, no test
+  weakened either side; opus-driven, principal-reviewed (composition chain
+  FIX-F wrapper → modeManager → engine verified line-level). Gates: 34/34
+  packages -race. Campaign docs recovered from the extension-wip salvage
+  branch (cherry-pick fec7432; stray 11MB binary stripped).
+- **Deployed to dev kit 69.0.0.2**: all 10 merged ARM64 binaries (unified
+  vintage), new units (cloudlink, migrate, commission.path/.service),
+  commission-apply script; configs migrated to schema_version 1 on-device
+  (backups /root/lexa-cfg-bak-*, .pre-v0 files); flipped constraint_modes
+  PRESERVED (ACTIVE banner confirmed on the merged binary); api tls:false
+  (bench); station-ID mismatch cs-001→evse-001 FIXED (0 "no EVSE actuator"
+  lines on the new process — was every-tick before).
+- **Hardware validation (smoke)**: lexa-healthcheck EXIT=0 first hardware
+  run (clock via RTC weak fallback — NTPSynchronized=no on this image, note
+  for chrony config); cloudlink first boot clean (local-only, retained
+  status on broker); lexactl status/mode/reserve/ev-goal round-trips all
+  `applied`; ocpp pending doc empty (station configured); dispatch journal
+  shows active-stack actuation with Connect folds.
+- **Known cosmetic gap**: `mode: unknown` until the first mode flip — the
+  modeManager publishes retained ModeStatus only in request(); add a boot
+  publish after SealBoot (small fix, post-campaign).
+- **IN PROGRESS**: full FAST Mayhem campaign on the merged build (the
+  radioactive-merge gate) vs the endgame baseline.
