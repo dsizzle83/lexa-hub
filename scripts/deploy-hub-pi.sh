@@ -15,13 +15,31 @@
 # lexa-ocpp's new fail-closed startup gate (cmd/ocpp/config.go) doesn't
 # block a plain bench deploy.
 #
+# Extension campaign catch-up (units 4.5/2.1/1.5/1.6, 2026-07-10): lexa-hub's
+# canonical install set grew to 6 services + lexa-healthcheck + lexa-migrate
+# + lexa-cloudlink + lexactl (see the Makefile's `install`/`install-services`
+# targets), plus two new units — lexa-commission.path/.service (unit 4.5's
+# privilege-free commissioning restart trigger, scripts/lexa-commission-apply)
+# — this script now stages and installs all of it: the four extra binaries,
+# lexa-cloudlink/lexa-migrate/lexa-commission.path/.service unit files, the
+# commission-apply script, and configs/cloudlink.json (installed no-overwrite,
+# unlike the six services' configs — see the remote block). lexa-migrate now
+# runs once, directly, BEFORE the service restart loop (aborts the deploy
+# loudly on nonzero — a botched schema migration must not be masked by
+# restarting services against it); lexa-healthcheck runs once, AFTER, as an
+# advisory-only check (deploys here are operator-attended, so a failure
+# prints loudly but never rolls anything back — there is no A/B slot to fall
+# back to on this Pi, unlike Mender's ArtifactCommit gate on the SOM).
+#
 # Usage:   bash scripts/deploy-hub-pi.sh <pi-ip> [ssh-user] [--bench-insecure] [--enable-ocpp-sp2]
 # Example: bash scripts/deploy-hub-pi.sh 69.0.0.14 pi
 #          bash scripts/deploy-hub-pi.sh 69.0.0.1 dmitri --enable-ocpp-sp2
 #          bash scripts/deploy-hub-pi.sh 69.0.0.1 dmitri --bench-insecure   # pre-WS-1 permissive bench mode
 #
 # Prereqs (already done if you're following the bench bring-up):
-#   - make build-arm64 (bin/arm64/lexa-* present, incl. northbound/telemetry)
+#   - make build-arm64 (bin/arm64/lexa-* present — incl. northbound/telemetry,
+#     healthcheck, migrate, cloudlink — plus bin/arm64/lexactl, which doesn't
+#     match the lexa-* name pattern)
 #   - client certs staged in ../csip-tls-test/certs/client-staging/
 #   - key-based SSH to the Pi with passwordless sudo (or run with -t and type it)
 #   - for --enable-ocpp-sp2: ../csip-tls-test/certs/ev-server-cert.pem +
@@ -48,12 +66,17 @@
 #   - ALSO provisions a lexa-cloudlink broker user + /etc/lexa/mqtt/
 #     cloudlink.pass (TASK-082, unit 1.3 — same idempotent generation as the
 #     six services above) so systemd/mosquitto-lexa.acl's lexa-cloudlink
-#     stanza is backed by real credentials from day one. The lexa-cloudlink
-#     service/binary/config ship with unit 2.1+; this is pre-provisioning
-#     only. If /etc/lexa/cloudlink.json already exists on the target (a
-#     later deploy that staged it), mqtt_user/mqtt_pass_file are patched into
-#     it the same way as the six services; if it doesn't exist yet (today),
-#     that patch step is skipped rather than failing the deploy.
+#     stanza is backed by real credentials from day one.
+#   - installs /etc/lexa/cloudlink.json from configs/cloudlink.json (unit
+#     2.1+, now shipping) ONLY IF ABSENT — unlike the six services' configs
+#     (always overwritten, then immediately re-patched below), cloudlink.json
+#     carries operator-set commissioning state (enabled, endpoint,
+#     serial_file, cert paths) this script never re-patches, so clobbering it
+#     on every redeploy would erase a device's cloud enrollment. Once
+#     present (fresh or pre-existing), mqtt_user/mqtt_pass_file are patched
+#     into it the same way as the six services.
+#   - runs /usr/local/sbin/lexa-migrate once, directly, BEFORE restarting any
+#     service (unit 1.6) — aborts the whole deploy loudly on nonzero exit.
 #   - stages the OCPP CSMS TLS cert/key + generates an idempotent Basic Auth
 #     secret (/etc/lexa/ocpp-auth.pass, 0600 lexa:lexa) and wires
 #     cert_path/key_path/basic_auth_user/basic_auth_pass into ocpp.json —
@@ -64,7 +87,17 @@
 #     requiring TLS+auth while evsim still dials plain ws://, which blinds
 #     every EV Mayhem scenario instantly.
 #   - enables + starts: mosquitto → lexa-modbus, lexa-ocpp, lexa-api,
-#     lexa-northbound, lexa-telemetry → lexa-hub
+#     lexa-northbound, lexa-telemetry, lexa-cloudlink → lexa-hub
+#   - enables (but does not start/restart) lexa-migrate and
+#     lexa-commission.path — lexa-migrate already ran directly above, and
+#     lexa-commission.path is a passive watcher a reboot picks up on its
+#     own; matches the Makefile's install-services (enable-only) vs start
+#     (restart-now) split for these same two units. lexa-commission.service
+#     is never enabled — it's trigger-activated by the .path unit only.
+#   - runs /usr/local/sbin/lexa-healthcheck -budget 60s once, after the
+#     restarts, as an advisory-only check (unit 1.5): a failure PRINTS
+#     LOUDLY but never aborts or rolls back — deploys here are
+#     operator-attended, and there's no A/B slot to fall back to.
 set -euo pipefail
 
 PI="${1:?usage: deploy-hub-pi.sh <pi-ip> [ssh-user] [--bench-insecure] [--enable-ocpp-sp2]}"
@@ -84,9 +117,14 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 CSIP="$(cd "$HERE/../csip-tls-test" && pwd)"
 STAGE="$CSIP/certs/client-staging"
 
-for f in lexa-hub lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry; do
+for f in lexa-hub lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-cloudlink lexa-healthcheck lexa-migrate; do
   [[ -x "$HERE/bin/arm64/$f" ]] || { echo "missing $HERE/bin/arm64/$f — run make build-arm64"; exit 1; }
 done
+# lexactl doesn't fit the lexa-* binary name pattern (it's the operator CLI,
+# unit 7.1) so it needs its own existence check and, further down, its own
+# scp/install lines — the "bin/arm64/lexa-*" globs used everywhere else in
+# this script never match it.
+[[ -x "$HERE/bin/arm64/lexactl" ]] || { echo "missing $HERE/bin/arm64/lexactl — run make build-arm64"; exit 1; }
 for f in ca-cert.pem client-cert.pem client-key.pem; do
   [[ -f "$STAGE/$f" ]] || { echo "missing $STAGE/$f — run gen-client-cert.sh"; exit 1; }
 done
@@ -97,9 +135,16 @@ fi
 
 echo "── Copying artifacts to $SSHUSER@$PI:/tmp/lexa-deploy/"
 ssh "$SSHUSER@$PI" 'rm -rf /tmp/lexa-deploy && mkdir -p /tmp/lexa-deploy/{bin,configs,systemd,certs}'
+# bin/arm64/lexa-* already sweeps up lexa-cloudlink/lexa-healthcheck/
+# lexa-migrate (built under those exact names by build-arm64); lexactl and
+# scripts/lexa-commission-apply don't match that glob (no "lexa-" prefix /
+# not a build-arm64 artifact) so they're staged explicitly. commission-apply
+# rides into the same "bin" tmp dir since it lands in /usr/local/sbin too.
 scp -q "$HERE"/bin/arm64/lexa-* "$SSHUSER@$PI:/tmp/lexa-deploy/bin/"
+scp -q "$HERE/bin/arm64/lexactl" "$SSHUSER@$PI:/tmp/lexa-deploy/bin/lexactl"
+scp -q "$HERE/scripts/lexa-commission-apply" "$SSHUSER@$PI:/tmp/lexa-deploy/bin/lexa-commission-apply"
 scp -q "$HERE"/configs/*.json "$SSHUSER@$PI:/tmp/lexa-deploy/configs/"
-scp -q "$HERE"/systemd/lexa-*.service "$HERE"/systemd/mosquitto-lexa.conf "$HERE"/systemd/mosquitto-lexa.acl "$HERE"/systemd/journald-lexa.conf "$SSHUSER@$PI:/tmp/lexa-deploy/systemd/"
+scp -q "$HERE"/systemd/lexa-*.service "$HERE"/systemd/lexa-commission.path "$HERE"/systemd/mosquitto-lexa.conf "$HERE"/systemd/mosquitto-lexa.acl "$HERE"/systemd/journald-lexa.conf "$SSHUSER@$PI:/tmp/lexa-deploy/systemd/"
 scp -q "$STAGE/ca-cert.pem"     "$SSHUSER@$PI:/tmp/lexa-deploy/certs/ca.pem"
 scp -q "$STAGE/client-cert.pem" "$SSHUSER@$PI:/tmp/lexa-deploy/certs/client.pem"
 scp -q "$STAGE/client-key.pem"  "$SSHUSER@$PI:/tmp/lexa-deploy/certs/client-key.pem"
@@ -158,7 +203,7 @@ for svc in $SERVICES; do
   fi
 done
 # lexa-cloudlink broker credential (TASK-082, unit 1.3 — pre-provisioning
-# only; the cloudlink service/binary/config ship with unit 2.1+). Mirrors the
+# only; the cloudlink service ships in the standard set as of the 2026-07-10 merge). Mirrors the
 # loop above exactly (idempotent pass-file, 0600 lexa:lexa, mosquitto_passwd
 # upsert) but is deliberately NOT folded into the $SERVICES loop: that loop
 # also drives the mqtt_user/mqtt_pass_file config-patch further below, which
@@ -230,10 +275,34 @@ systemctl reset-failed mosquitto 2>/dev/null || true
 systemctl restart mosquitto
 
 # Binaries, configs, certs.
+# $D/bin/lexa-* already sweeps up lexa-cloudlink/lexa-healthcheck/
+# lexa-migrate/lexa-commission-apply (staged under those names above);
+# lexactl needs its own line, same reason as the scp step.
 install -m 755 $D/bin/lexa-* /usr/local/sbin/
-install -m 644 $D/configs/*.json /etc/lexa/
+install -m 755 $D/bin/lexactl /usr/local/sbin/lexactl
+# The six services' configs are always overwritten from the repo's example
+# (mqtt_user/mqtt_pass_file etc. get patched back in immediately below) —
+# unchanged behavior. cloudlink.json is handled separately further down:
+# no-overwrite, since it can carry operator-set commissioning state this
+# script never re-patches.
+install -m 644 $D/configs/hub.json $D/configs/northbound.json $D/configs/modbus.json $D/configs/ocpp.json $D/configs/telemetry.json $D/configs/api.json /etc/lexa/
 install -m 640 -o lexa -g lexa $D/certs/ca.pem $D/certs/client.pem /etc/lexa/certs/
 install -m 600 -o lexa -g lexa $D/certs/client-key.pem /etc/lexa/certs/
+
+# lexa-cloudlink config (unit 2.1+, now shipping). Install ONLY IF ABSENT —
+# mirrors the Makefile's install-configs no-overwrite discipline, but scoped
+# to just this one file: unlike the six configs above (blindly overwritten
+# every deploy, then immediately re-patched with mqtt creds/listen_addr/etc,
+# so nothing meaningful from a prior deploy survives that anyway),
+# cloudlink.json carries operator-set commissioning state (enabled,
+# endpoint, serial_file, cert paths) this script never re-patches —
+# clobbering it on every redeploy would erase a device's cloud enrollment.
+if [[ ! -f /etc/lexa/cloudlink.json ]]; then
+  install -m 644 $D/configs/cloudlink.json /etc/lexa/cloudlink.json
+  echo "  installed /etc/lexa/cloudlink.json (fresh; configs/cloudlink.json template — enabled:false, no cloud identity yet)"
+else
+  echo "  /etc/lexa/cloudlink.json already present — left untouched (no-overwrite; may carry commissioning state)"
+fi
 
 # Patch each service's mqtt_user/mqtt_pass_file (the config install above just
 # overwrote /etc/lexa/*.json from the repo's example, mqtt_user/
@@ -255,17 +324,16 @@ PY
 done
 echo "  mqtt_user/mqtt_pass_file patched into every /etc/lexa/*.json"
 
-# lexa-cloudlink mqtt_user/mqtt_pass_file (TASK-082, unit 1.3). Guarded on
-# the config existing: the cloudlink service/binary/config ship with unit
-# 2.1+, so on every deploy before then /etc/lexa/cloudlink.json is absent
-# (the configs/*.json install above only copies what's staged, and
-# configs/cloudlink.json isn't shipped in this repo yet) — this must be a
-# no-op, not a failure, or every plain deploy breaks the moment this landed.
-# Once 2.1+ ships configs/cloudlink.json and it starts getting installed
-# above, this block patches it exactly like the loop above patches the six
-# services, just with the cloudlink.pass filename set by the credential
-# block earlier (matches configs/cloudlink.json's shipped mqtt_pass_file
-# value, docs/DEVICE_ROADMAP.md §2.2).
+# lexa-cloudlink mqtt_user/mqtt_pass_file (TASK-082, unit 1.3; cloudlink.json
+# itself now installs, no-overwrite, right above — unit 2.1+). Still guarded
+# on the config existing — belt-and-braces, same reasoning as the
+# PathExists= fallback in systemd/lexa-commission.path — even though the
+# install-if-absent block above now means /etc/lexa/cloudlink.json always
+# exists by this point; costs nothing and protects against a future
+# reordering. Patches exactly like the loop above patches the six services,
+# just with the cloudlink.pass filename set by the credential block earlier
+# (matches configs/cloudlink.json's shipped mqtt_pass_file value,
+# docs/DEVICE_ROADMAP.md §2.2).
 if [[ -f /etc/lexa/cloudlink.json ]]; then
   python3 - <<'PY'
 import json
@@ -280,7 +348,7 @@ with open(path, "w") as f:
 PY
   echo "  mqtt_user/mqtt_pass_file patched into /etc/lexa/cloudlink.json"
 else
-  echo "  /etc/lexa/cloudlink.json not present — skipped cloudlink mqtt cred patch (service ships with unit 2.1+)"
+  echo "  /etc/lexa/cloudlink.json not present — skipped cloudlink mqtt cred patch (unexpected: install-if-absent should have created it)"
 fi
 
 # lexa-api bearer-token auth (TASK-014 / AD-008 / WS-1). The config install
@@ -406,8 +474,12 @@ PY
 fi
 
 # Units: the repo ships its own mosquitto.service for the dev kit; on a Pi we
-# use the distro's, so install only the lexa-* units.
+# use the distro's, so install only the lexa-* units (this glob also picks
+# up lexa-cloudlink.service/lexa-migrate.service/lexa-commission.service,
+# all staged above alongside the original six). lexa-commission.path is a
+# .path unit, not a .service, so it needs its own line.
 install -m 644 $D/systemd/lexa-*.service /etc/systemd/system/
+install -m 644 $D/systemd/lexa-commission.path /etc/systemd/system/
 systemctl daemon-reload
 
 # journald size/retention budget (TASK-009, review §11 flash wear / RSK-14):
@@ -419,15 +491,62 @@ install -d -m 755 /etc/systemd/journald.conf.d
 install -m 644 $D/systemd/journald-lexa.conf /etc/systemd/journald.conf.d/lexa.conf
 systemctl restart systemd-journald
 
-for s in lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-hub; do
+# lexa-migrate + lexa-commission.path: enabled (so they take effect on every
+# future boot) but never started/restarted here. lexa-migrate runs
+# directly, once, right below instead — a `systemctl start` here would just
+# duplicate that (harmless — an already-current schema is a no-op — but
+# redundant). lexa-commission.path is a passive file watcher a reboot picks
+# up on its own; mirrors the Makefile's install-services (enable-only) vs
+# start (restart-now) split for these same two units. lexa-commission.service
+# is deliberately never enabled — it's trigger-activated by the .path unit's
+# PathChanged=/PathExists= only (see its own [Unit] comment).
+systemctl enable lexa-migrate lexa-commission.path >/dev/null
+
+# lexa-migrate (unit 1.6): runs ONCE, directly, BEFORE any service below is
+# restarted — a config a service is about to reload against must already be
+# at the schema version that service's code expects. A refused migration
+# (e.g. a config whose schema_version is newer than this binary's registry
+# understands — cmd/lexa-migrate/main.go) aborts the WHOLE deploy loudly
+# here rather than silently restarting services against a config
+# lexa-migrate itself couldn't bring up to date.
+echo "── Running lexa-migrate (config schema migration)"
+if ! /usr/local/sbin/lexa-migrate -config-dir /etc/lexa; then
+  echo "############################################################"
+  echo "# lexa-migrate FAILED — aborting deploy BEFORE restarting any"
+  echo "# service. See the lexa-migrate output above for which config"
+  echo "# file/step was refused; /etc/lexa/*.json.pre-v<N> backups are"
+  echo "# the recovery path (cmd/lexa-migrate/README.md)."
+  echo "############################################################"
+  exit 1
+fi
+
+for s in lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-hub lexa-cloudlink; do
   systemctl enable "$s" >/dev/null
   systemctl restart "$s"
 done
 sleep 3
 echo "── Service status:"
-for s in mosquitto lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-hub; do
+for s in mosquitto lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-hub lexa-cloudlink; do
   printf '  %-18s %s\n' "$s" "$(systemctl is-active $s)"
 done
+
+# lexa-healthcheck (unit 1.5): advisory-only, run AFTER the restarts above.
+# Deploys via this script are operator-attended — unlike Mender's
+# ArtifactCommit gate on the SOM, there is no A/B slot to fall back to here
+# — so a failure PRINTS LOUDLY but never aborts this (already-finished)
+# deploy or undoes anything already restarted. It's a "look before you
+# trust it" signal for the operator, not a gate.
+echo "── Running lexa-healthcheck -budget 60s (advisory; does not affect deploy result)"
+if /usr/local/sbin/lexa-healthcheck -budget 60s; then
+  echo "  lexa-healthcheck: PASS"
+else
+  echo "  ############################################################"
+  echo "  # lexa-healthcheck FAILED — see the JSON summary above for"
+  echo "  # which check(s) failed. This deploy is NOT rolled back;"
+  echo "  # investigate before trusting this hub."
+  echo "  ############################################################"
+fi
+
 rm -rf $D
 REMOTE
 
@@ -466,3 +585,8 @@ else
   echo "── OCPP: still ws://, no auth (bench-only fallback, staged rollout) — re-run with --enable-ocpp-sp2"
   echo "   once ../csip-tls-test/certs/ev-server-cert.pem is provisioned (gen-ev-cert.sh $PI)."
 fi
+echo
+echo "── lexa-cloudlink / lexa-migrate / lexa-commission:"
+echo "   ssh $SSHUSER@$PI sudo systemctl is-active lexa-cloudlink                    # want: active (enabled:false in cloudlink.json ⇒ idle, no cloud session)"
+echo "   ssh $SSHUSER@$PI sudo journalctl -u lexa-migrate --no-pager | tail -5       # this deploy's migration run"
+echo "   ssh $SSHUSER@$PI sudo systemctl is-enabled lexa-commission.path            # want: enabled (watches /var/lib/lexa/commission/restart.request)"
