@@ -497,3 +497,32 @@ The single most safety-critical OTA property, validated with a GENUINE failure
 Signing note: this dev unit has no /etc/ssl/certs/key.pub → swupdate accepts the
 UNSIGNED .swu. Field units with signature enforcement need the manufacturing key
 (TRUSTFENCE_ENABLED + SRK/CST) — a key-provisioning step, not a recipe defect.
+
+## OTA forward-commit PROVEN + both properties validated (2026-07-10, dev kit)
+
+Rebuilt .swu (dc9e36d3..., firstboot chown fix + bench SSH key baked in), applied
+to the inactive slot:
+- **Forward-commit PROVEN**: new image booted on linux_a, my baked SSH key worked
+  (fix #2 ✓), firstboot chown -R made /etc/lexa lexa:lexa (fix #1 ✓), p7 bound with
+  migrated identity, all 8 services active, /healthz 200, /status plan_heartbeat ok,
+  health-gate COMMITTED (bootcount=0, active_system=linux_a).
+- **Health-gate is CORRECT (not a false-commit)**: it did NOT commit during the
+  early failing window (18:48-18:52); its -budget 120s retry waited until all 8
+  services were genuinely active (lexa-hub journal: connected + Started at 18:53:25),
+  then committed at 18:53:26. Verified against lexa-hub's own journal.
+
+**Config-content lesson (not an OTA-mechanism issue):** the migrated BENCH config
+pointed mqtt_broker at localhost:1882 (the dev-kit's mqttproxy QA fault-injector),
+absent on the clean factory image → services couldn't connect → the gate would have
+rolled back on its own; corrected in-test to 1883 (direct mosquitto). A factory/OTA
+config must use 1883; the bench-only mqttproxy indirection is not baked. (For the new
+image to be a full bench member, mqttproxy would need installing — a bench-tooling
+add, tracked, orthogonal to OTA.)
+
+**BOTH OTA safety properties now proven on hardware:** auto-rollback on failure
+(the first, config-perms-broken image) AND forward-commit on a healthy image.
+Digi-native SWUpdate A/B + lexa-healthcheck gate = complete, validated.
+
+**End state:** controlled slot-switch back to linux_b (the full validated bench:
+mqttproxy + 1882 configs + all Mayhem scenarios) — also demonstrates a non-failure
+rollback. p7 retains the migrated identity (unused by linux_b).
