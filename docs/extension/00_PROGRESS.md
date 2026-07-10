@@ -445,3 +445,23 @@ drop-in removed.
 Follow-up (minor): modbus.json ships no journal block ⇒ scan_run journaling
 is a documented no-op; add a journal block to factory + bench modbus.json
 for the durable scan trail. hub-pi left running empty-fleet-safe.
+
+## OTA architecture decision (2026-07-10, principal + owner) — ADR-0007 pending
+
+ECOSYSTEM_ROADMAP §4.5 recommended Mender. Expert Yocto assessment
+(meta-lexa/MENDER_INTEGRATION_PLAN.md) found Mender's bootloader-A/B path
+NON-VIABLE on the AHAB-secured ConnectCore 93 (would require forking +
+re-signing Digi's secure U-Boot — multi-week, brick risk, no vendor support)
+AND unnecessary: the board already ships Digi's TrustFence-signed dualboot +
+SWUpdate + bootcount auto-rollback + persistent p7 data partition. **DECISION
+(owner-approved): adopt Digi-native SWUpdate, health-gated by lexa-healthcheck
+(bootloader-agnostic, maps 1:1 onto bootcount -r commit / altbootcmd
+rollback). Drop the Mender dependency.** Prove via on-board `swupdate` to the
+inactive slot (active validated slot = safety net), NOT a bare-metal reflash.
+Update ECOSYSTEM_ROADMAP §4.5/§10 + write ADR-0007 to record the pivot.
+
+**LIVE hazard being fixed en route:** /etc/lexa + /var/lib/lexa currently
+resolve to the rootfs slot, not persistent p7 — an A/B update today would wipe
+identity/config/journals/spool. meta-lexa data-partition recipe (bind mounts →
+p7, fail-closed, idempotent seed) closes it; the live hub's current identity
+must be migrated onto p7 BEFORE the first slot switch or it boots factory-blank.
