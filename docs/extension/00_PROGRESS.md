@@ -404,6 +404,6 @@ blinded the HTTP bench toolchain (dashboard/mayhem/lexactl all speak HTTP).
 Fixed: tls:false (the documented bench escape). HTTPS listener SEPARATELY
 proven on hardware first (openssl: CN=lexa-ccimx93-dvk, valid 2026→2036,
 clean handshake) — unit 4.1 TLS path validated on the device, not just in
-unit tests. Watch item: identify what restarted lexa-api with tls:true
+unit tests. Watch item RESOLVED: .pre-v0 backup proves tls:false at deploy & now; lexa-api does NOT rewrite its own config (ensureServerCert writes /var/lib/lexa/api/, not /etc/lexa/api.json) and 0 config_write journal events — no recurring path. The transient tls:true at a 16:24 restart is unreconstructable (disk-full vacuumed pre-14:08 journal); one-off, config stable across restarts now.
 mid-session (config-write path? stray restart?) — the config was tls:false
 through the whole regression campaign.
