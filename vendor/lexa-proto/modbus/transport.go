@@ -54,6 +54,29 @@ func NewTransport(url string, timeout time.Duration) (Transport, error) {
 	return &client{inner: mc}, nil
 }
 
+// NewSerialTransport creates a Modbus RTU (serial) Transport bound to an
+// explicit line speed. It exists because the RTU baud rate is a property of
+// the serial connection, not of the URL: the underlying client library reads
+// the speed from its configuration, never from the URL string, so a Transport
+// built with NewTransport always runs at the library default (19200 bps).
+// Commissioning bus-sweeps that try several bauds need this constructor to
+// reopen the port at each speed. url must be an "rtu://" (or "rtuovertcp://")
+// URL; the returned Transport is not connected — call Open() before use.
+func NewSerialTransport(url string, speedBps int, timeout time.Duration) (Transport, error) {
+	if speedBps <= 0 {
+		return nil, fmt.Errorf("modbus: serial transport %q: invalid speed %d bps", url, speedBps)
+	}
+	mc, err := modbuslib.NewClient(&modbuslib.ClientConfiguration{
+		URL:     url,
+		Speed:   uint(speedBps),
+		Timeout: timeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("modbus: new serial client %q @ %d bps: %w", url, speedBps, err)
+	}
+	return &client{inner: mc}, nil
+}
+
 func (c *client) Open() error {
 	return c.inner.Open()
 }
