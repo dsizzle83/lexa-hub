@@ -118,9 +118,10 @@ func main() {
 		r.Counter("lexa_bus_decode_failures_total").Set(total)
 	})
 	nbm := run.Metrics{
-		WalkDuration: reg.Gauge("lexa_nb_walk_duration_seconds"),
-		WalkFailures: reg.Counter("lexa_nb_walk_failures_total"),
-		ClockOffset:  reg.Gauge("lexa_nb_clock_offset_seconds"),
+		WalkDuration:       reg.Gauge("lexa_nb_walk_duration_seconds"),
+		WalkFailures:       reg.Counter("lexa_nb_walk_failures_total"),
+		ClockOffset:        reg.Gauge("lexa_nb_clock_offset_seconds"),
+		ImplausibleRejects: reg.Counter("lexa_nb_implausible_rejects_total"),
 	}
 	responsesPostedCtr := reg.Counter("lexa_nb_responses_posted_total")
 
