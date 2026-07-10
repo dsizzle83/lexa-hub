@@ -259,7 +259,20 @@ func (m *modeManager) onModeStatus(msg bus.ModeStatus) {
 
 // SealBoot closes the boot re-seed window (called once, immediately after
 // eng.Start()). After it, onModeStatus ignores every lexa/hub/mode message.
-func (m *modeManager) SealBoot() { m.bootSealed.Store(true) }
+//
+// It also publishes the retained ModeStatus for the mode the hub actually
+// booted into (integration-day finding, 2026-07-10): before this, the
+// retained doc only ever appeared after the FIRST mode flip, so a fresh
+// deploy showed `/status` "mode: unknown" (and lexactl "mode: unknown")
+// despite the optimizer author running fine. Publishing here — after the
+// re-seed window closed, so the value is final — makes the retained topic
+// authoritative from boot. Re-publishing the same value a re-seed just
+// adopted is harmless (retained overwrite, identical content); Actor/
+// IntentID are empty for a boot publish (no intent caused it).
+func (m *modeManager) SealBoot() {
+	m.bootSealed.Store(true)
+	m.publishModeStatus(m.Mode(), bus.IntentMeta{})
+}
 
 // setGatewayGauge mirrors the current mode onto lexa_hub_mode_gateway (1 in
 // gateway mode, 0 otherwise). Nil-safe: the gauge is absent in unit tests.
