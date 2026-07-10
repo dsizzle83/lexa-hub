@@ -60,7 +60,7 @@ Status: `todo` · `in-flight(W#)` · `review` · `rework` · `done(<commit>)` ·
 | 4.3 | `POST /intent` + resultWaiter | M | sonnet | **done(w 4.2)** |
 | 4.4 | Commissioning config-write | M | sonnet | **done(047ae2d)** |
 | 5.1 | `lexa-proto` identity + sweep | L | opus | **done(lexa-proto 6922865)** — pin bump deferred (queue item 3) |
-| 5.2 | Modbus scan controller | M | — | todo |
+| 5.2 | Modbus scan controller | M | sonnet | **done(see log)** |
 | 6.1 | OCPP pending + uncommissioned-idle gate | S/M | sonnet | **done(15c62bf)** |
 | 4.5 | Privilege-free commissioning restart trigger (.path unit) | S | sonnet | **done(8d6ba15)** |
 | 6.2 | Reconciler-side Connect execution (solar OpModConnect, EVSE 0A-on-disconnect) | S | sonnet | **done(b815a4f)** |
@@ -385,3 +385,25 @@ logged here at review time.
   evidence matters. Remaining on the queue: proto pin-bump paired session
   (unblocks 5.2), 8.x scenario authoring, OTA/Mender rollback proof
   (needs meta-lexa integration), ev-accept-but-ignore held D in-gate ✓.
+
+## Extension scenarios — HARDWARE VALIDATED (2026-07-10, dev kit)
+
+Four new Mayhem scenarios (csip-tls-test 468b73f) run solo on 69.0.0.2 — ALL PASS:
+- mode-flip-under-active-event (8.3): export cap held across optimizer→gateway
+  →optimizer, heartbeat never stalled, both flips observed. **R10 gate cleared
+  on hardware** — gateway mode under a live utility cap.
+- mode-flip-under-fault (8.3): INV-SOC held through fault + both flips;
+  reassert-on-reconnect evidenced. Mode-invariant Tier-1 safety proven.
+- scan-during-live-control-refused (8.4): refused in 1s, control undisturbed.
+- intent-flood-rate-limit (8.2): 49/50 results (1 tick-coalesced, oracle-pass
+  ≥80%), 72 journald lines vs 300 budget, 0 restarts.
+
+Field-bug caught during validation: api.json flipped to tls:true on the dev
+kit (cert regenerated 15:24 by ensureServerCert on some api restart) —
+blinded the HTTP bench toolchain (dashboard/mayhem/lexactl all speak HTTP).
+Fixed: tls:false (the documented bench escape). HTTPS listener SEPARATELY
+proven on hardware first (openssl: CN=lexa-ccimx93-dvk, valid 2026→2036,
+clean handshake) — unit 4.1 TLS path validated on the device, not just in
+unit tests. Watch item: identify what restarted lexa-api with tls:true
+mid-session (config-write path? stray restart?) — the config was tls:false
+through the whole regression campaign.
