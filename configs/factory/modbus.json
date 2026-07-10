@@ -6,5 +6,10 @@
   "mqtt_pass_file": "",
   "metrics_addr": "",
   "poll_interval_s": 10,
-  "devices": []
+  "devices": [],
+  "journal": {
+    "dir": "/var/lib/lexa/journal/modbus",
+    "max_bytes": 1048576,
+    "max_files": 4
+  }
 }

@@ -32,5 +32,10 @@
       "role": "meter",
       "max_w": 0
     }
-  ]
+  ],
+  "journal": {
+    "dir": "/var/lib/lexa/journal/modbus",
+    "max_bytes": 1048576,
+    "max_files": 4
+  }
 }
