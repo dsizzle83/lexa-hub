@@ -373,3 +373,15 @@ logged here at review time.
   publish after SealBoot (small fix, post-campaign).
 - **IN PROGRESS**: full FAST Mayhem campaign on the merged build (the
   radioactive-merge gate) vs the endgame baseline.
+- **CAMPAIGN GATE PASS (2026-07-10 14:50 EDT)**: full FAST Mayhem on the
+  merged build — 43P/18D/0F/0B/1I, aggregate-identical to the flip-4
+  baseline; 4 swaps all known flappers (accepted signatures); zero crashes/
+  watchdog/unintended restarts; per-axis legacy-override-dropped counters
+  live on all five axes under fault, active_fallback=0, panic latch 0.
+  Report: csip-tls-test/qa-mayhem-20260710-145010.md. Mode boot-publish fix
+  (6a67f9c) deployed post-gate and verified (retained ModeStatus at boot).
+  Operational note: the disk-full scenario vacuums ALL archived journald —
+  pull forensic journals before it runs, or exclude it when journal
+  evidence matters. Remaining on the queue: proto pin-bump paired session
+  (unblocks 5.2), 8.x scenario authoring, OTA/Mender rollback proof
+  (needs meta-lexa integration), ev-accept-but-ignore held D in-gate ✓.
