@@ -526,3 +526,27 @@ Digi-native SWUpdate A/B + lexa-healthcheck gate = complete, validated.
 **End state:** controlled slot-switch back to linux_b (the full validated bench:
 mqttproxy + 1882 configs + all Mayhem scenarios) — also demonstrates a non-failure
 rollback. p7 retains the migrated identity (unused by linux_b).
+
+## Bench restored + session close (2026-07-10)
+
+Controlled slot-switch back to linux_b complete: slot=linux_b, all 8 services
+active, mqttproxy active (fault-injection restored), broker=1882 (bench),
+constraint flips all-active. The full validated bench is operational.
+(p7 retains the migrated identity from the OTA test — unused by linux_b, harmless.)
+
+### Session outcome — everything on the "what remains" list is DONE + hardware-validated
+- Merge (refactor-endgame R4-active × extension), regression GATE PASS, pushed.
+- lexa-proto remote created (github.com/dsizzle83/lexa-proto); pin-bump lockstep.
+- Unit 5.2 scan controller; deploy-script update; modbus empty-fleet watchdog fix (hw-proven).
+- 4 extension Mayhem scenarios PASS on hardware (R10 gateway gate cleared).
+- Hub-pi ACL 13/13 + scan 3/3 PASS.
+- OTA: Mender→Digi-native SWUpdate pivot; BOTH A/B safety properties proven on
+  hardware (auto-rollback on failure + forward-commit on healthy); data-partition
+  identity-persistence, health-gate, and byte-identical firmware bake all validated.
+
+### Follow-ups (tracked, non-blocking)
+- OTA .swu signing = manufacturing-key step (TRUSTFENCE_ENABLED + SRK/CST) for
+  signature-enforcing field units; dev unit accepts unsigned.
+- For the OTA image to be a full bench member, install mqttproxy (bench tooling).
+- lexa-bench-access recipe (baked dev SSH key) is BENCH-ONLY — never ship in product.
+- meta-lexa commits are local (no remote for the Yocto layer).
