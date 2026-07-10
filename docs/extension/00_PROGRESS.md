@@ -436,8 +436,11 @@ empty fleet (factory/uncommissioned/scan-arming state) produces no updates,
 so WatchdogSec=60 SIGABRT-restarted it every ~60s — which also made any
 ~95s scan impossible on its own arming precondition. Fixed with the 1.7/6.1
 idle-path pattern: len(retryDevices)==0 ⇒ 10s MQTT-liveness kick ticker;
-loaded case unchanged (wedge-detection preserved). Deployed to hub-pi,
-stopgap WatchdogSec=0 drop-in removed, verifying on hardware.
+loaded case unchanged (wedge-detection preserved). VERIFIED on hub-pi:
+140s / 0 restarts / 0 watchdog-kills (old bug SIGABRT'd every ~60s), AND a
+full 95s empty-fleet /24 scan ran to completion with 0 restarts (impossible
+pre-fix — the 60s watchdog killed every sweep mid-run). Stopgap WatchdogSec=0
+drop-in removed.
 
 Follow-up (minor): modbus.json ships no journal block ⇒ scan_run journaling
 is a documented no-op; add a journal block to factory + bench modbus.json
