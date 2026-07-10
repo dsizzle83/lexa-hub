@@ -41,6 +41,16 @@ type Metrics struct {
 	WalkDuration *metrics.Gauge   // lexa_nb_walk_duration_seconds
 	WalkFailures *metrics.Counter // lexa_nb_walk_failures_total (monotonic total; contrast Discovery.failures, which is consecutive-and-resets)
 	ClockOffset  *metrics.Gauge   // lexa_nb_clock_offset_seconds
+
+	// ImplausibleRejects counts every discovery cycle where the scheduler held
+	// last-known-good because the freshly-served resource carried a
+	// present-but-garbage control value (ActiveControl.ImplausibleReject —
+	// audit: malform-huge-activepower), as distinct from a hold caused by an
+	// empty/absent program list or the clock-regression guard. A nil-safe
+	// *metrics.Counter (see metrics.Counter's doc), so callers/tests that
+	// build a Metrics{} zero value can still call RunOnce without wiring a
+	// registry.
+	ImplausibleRejects *metrics.Counter // lexa_nb_implausible_rejects_total
 }
 
 // Discovery owns one discovery walk cycle plus the walk-loop goroutine
@@ -290,6 +300,14 @@ func (d *Discovery) RunOnce(ctx context.Context) {
 		// TASK-045: migrated to slog. "holding last-known-good" kept intact.
 		slog.Warn("lexa-northbound: discovery resolved no valid control (empty/malformed resource); holding last-known-good (fail-closed)",
 			"mrid", active.MRID, "valid_until", active.ValidUntil)
+		if active.ImplausibleReject {
+			// Distinct from the WARN above: this counts specifically the
+			// "server served a present-but-garbage control value" case
+			// (audit: malform-huge-activepower), not every fail-closed hold —
+			// an empty program list or a clock-regression hold does not
+			// increment this.
+			d.metrics.ImplausibleRejects.Inc()
+		}
 	}
 
 	msg := publish.ToActiveControl(active, tree.ClockOffset)

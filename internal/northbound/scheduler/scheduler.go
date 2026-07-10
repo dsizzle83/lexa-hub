@@ -69,6 +69,18 @@ type ActiveControl struct {
 	// caller surface the fail-closed hold without changing Source (which the
 	// Response/MRID addressing depends on).
 	Held bool
+
+	// ImplausibleReject is true when this Held control is being re-served
+	// specifically because the FRESHLY-RESOLVED resource this cycle carried a
+	// served-but-garbage value that failed the plausibility gate (audit:
+	// malform-huge-activepower) — as opposed to the OTHER reasons Held can be
+	// true: an empty/absent program list, or the clock-regression guard
+	// holding a still-served control/event. Set only in failClosed's
+	// malformed-control branch. Lets the caller (run.RunOnce) count a
+	// dedicated metric for "the server served a present-but-garbage control"
+	// distinctly from the general fail-closed hold WARN, without conflating
+	// it with a transport/discovery anomaly or a clock hiccup.
+	ImplausibleReject bool
 }
 
 // Scheduler tracks per-event randomization state and evaluates the active
@@ -232,6 +244,7 @@ func (s *Scheduler) failClosed(resolved *ActiveControl, programFound bool, hp *d
 		if s.lastGood != nil && !controlExpired(s.lastGood, serverNow) {
 			held := *s.lastGood
 			held.Held = true
+			held.ImplausibleReject = true
 			return &held
 		}
 		s.lastGood = nil
