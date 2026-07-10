@@ -292,11 +292,43 @@ func main() {
 
 	// sd_notify READY (TASK-008): the poll loop (reg.Start) and its MQTT
 	// fan-out goroutine (publishMeasurements) are both running — the kick
-	// site below covers registry, channel, and publish path in one place.
+	// site in publishMeasurements covers registry, channel, and publish path
+	// in one place while devices are configured (a wedge there starves the
+	// kick directly, the deliberate wedge-detection of CLAUDE.md's watchdog
+	// table).
 	watchdog.Ready()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	if len(retryDevices) == 0 {
+		// EMPTY-FLEET / uncommissioned path (found on the hub-pi validation,
+		// 2026-07-10): with zero devices the registry poll loop produces no
+		// MeasurementUpdate, so publishMeasurements' kick site never fires and
+		// Type=notify/WatchdogSec=60 SIGABRT-restarts the service every ~60s —
+		// which also kills any in-flight commissioning scan (~95s per /24).
+		// There is no poll loop to wedge on here, so — exactly like lexa-ocpp
+		// and lexa-api, which have no tight loop either — kick from a 10s
+		// ticker gated on MQTT liveness (the meaningful readiness signal for an
+		// idle modbus: it exists to receive desired docs / scan requests /
+		// reconciler feeds over the bus). A sustained MQTT outage still
+		// restarts it (accepted crash-only behavior, AD-011).
+		log.Printf("lexa-modbus: no devices configured — idle (scan/commissioning ready); watchdog kicks from the MQTT-liveness ticker")
+		kick := time.NewTicker(10 * time.Second)
+		defer kick.Stop()
+		for {
+			select {
+			case <-quit:
+				log.Println("lexa-modbus: shutting down")
+				return
+			case <-kick.C:
+				if mc.IsConnected() {
+					watchdog.Kick()
+				}
+			}
+		}
+	}
+
 	<-quit
 	log.Println("lexa-modbus: shutting down")
 }
