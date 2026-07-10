@@ -208,6 +208,38 @@ func (o *DefaultOptimizer) scaleTicks(ticks int) int {
 	return n
 }
 
+// scaleRateWPerTick converts a physical ramp rate — expressed as watts moved
+// in one tuned-cadence tick (tunedTickInterval) — into the equivalent
+// watts-per-tick at the configured engine cadence, preserving the WALL-CLOCK
+// rate (W/s) the constant encodes. This is the rate-domain twin of scaleTicks
+// (which preserves a wall-clock DURATION for a tick-COUNT threshold instead):
+// a "W per tick" constant is not cadence-invariant by itself — the same
+// physical ramp expressed as a fixed watts-per-tick allowance describes a 5x
+// faster real-world ramp at the FAST 3 s tick than at the STOCK 15 s tick
+// unless it is rescaled by tick length (audit: STOCK QA malform-huge-
+// activepower/wan-outage-hold — the export ceiling's slew limit took ~5x
+// longer, in wall-clock seconds, to re-tighten after a relax/disturbance at
+// STOCK than at FAST purely from this, not from any northbound/reconciler
+// staleness path).
+//
+// This mirrors internal/orchestrator/constraint/export.go's ceilingSlewW /
+// orchestrator.InverterPlant.MaxRampDownWPerS·MaxRampUpWPerS (TASK-057/064,
+// AD-007), which already made the NEW constraint-stack candidate path
+// cadence-correct; the legacy cascade here (applyExportLimitRule) was left on
+// the raw tuned-tick constants during that migration ("preserve-first ...
+// Until then the constants in optimizer.go remain the single source of
+// truth", plantmodel.go's package doc) and never received the matching fix —
+// the exact gap plantwiring_test.go's "STOCK spot-check at the wave gate"
+// comment flagged as outstanding. Returns wPerTickAtTuned unchanged when no
+// interval is configured (tests) or the cadence matches the tuned one (fast
+// mode) — bit-identical to the pre-fix raw constant in both those cases.
+func (o *DefaultOptimizer) scaleRateWPerTick(wPerTickAtTuned float64) float64 {
+	if o.tickInterval <= 0 || o.tickInterval == tunedTickInterval {
+		return wPerTickAtTuned
+	}
+	return wPerTickAtTuned / tunedTickInterval.Seconds() * o.tickInterval.Seconds()
+}
+
 // tickSeconds returns the wall-clock length of one engine tick for latency
 // telemetry, defaulting to the tuned cadence when unset.
 func (o *DefaultOptimizer) tickSeconds() float64 {
@@ -1079,8 +1111,14 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	// The feed-forward term below is applied AFTER this and deliberately bypasses
 	// the down-slew (see there).
 	if !math.IsNaN(prevCeilingW) {
-		const maxDropW = 1500.0 // tighten ≤1.5 kW/tick
-		const maxRiseW = 500.0  // relax ≤0.5 kW/tick
+		// maxDropW/maxRiseW are a PHYSICAL ramp rate, not a fixed per-tick
+		// allowance: scaleRateWPerTick keeps the wall-clock rate (500 W/s
+		// tighten, ~166.7 W/s relax) constant across engine cadences instead
+		// of silently slowing 5x at STOCK's 15 s tick vs the tuned 3 s tick.
+		// Bit-identical to the historical 1500/500 W/tick constants at the
+		// tuned (FAST) cadence — see scaleRateWPerTick's doc.
+		maxDropW := o.scaleRateWPerTick(benchCeilingDropWPerTick) // tighten ≤1.5 kW/tick @ tunedTickInterval
+		maxRiseW := o.scaleRateWPerTick(benchCeilingRiseWPerTick) // relax ≤0.5 kW/tick @ tunedTickInterval
 		if desiredCeilingW < prevCeilingW-maxDropW {
 			desiredCeilingW = prevCeilingW - maxDropW
 		} else if desiredCeilingW > prevCeilingW+maxRiseW {
