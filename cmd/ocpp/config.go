@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // StationConfig pre-configures a known charging station.
@@ -77,6 +78,19 @@ type Config struct {
 	// makes the reconciler own SetChargingProfile writes with verify-by-readback
 	// and reassert-on-reconnect.
 	Reconciler string `json:"reconciler"`
+
+	// MQTTDeafRestartAfterS bounds how long lexa-ocpp keeps kicking the
+	// systemd watchdog while mc.IsConnected() reports true but the broker
+	// connection has actually been down the whole time (WS-9.1):
+	// mqtt.Client.IsConnected() stays true for paho's entire AutoReconnect
+	// retry loop, not just while actually connected, so a naive kick gated
+	// on it alone never trips during a sustained outage. A watchdog.DeafTracker
+	// tracks continuous-disconnected time from mqttutil's OnConnectionLost/
+	// OnReconnect hooks; once that exceeds this many seconds, the kick gate
+	// stops firing and systemd's WatchdogSec restarts the service — matching
+	// the WatchdogSec comment in systemd/lexa-ocpp.service. Default 300 (5
+	// min) when unset/zero.
+	MQTTDeafRestartAfterS int `json:"mqtt_deaf_restart_after_s"`
 }
 
 // Reconciler mode values.
@@ -93,6 +107,11 @@ func (c *Config) ReconcilerMode() string {
 		return ReconcilerOff
 	}
 	return c.Reconciler
+}
+
+// MQTTDeafRestartAfter is MQTTDeafRestartAfterS as a time.Duration.
+func (c *Config) MQTTDeafRestartAfter() time.Duration {
+	return time.Duration(c.MQTTDeafRestartAfterS) * time.Second
 }
 
 // benchProfile reports whether loadConfig's SP2 fail-closed gate below
@@ -150,6 +169,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
+	}
+	if cfg.MQTTDeafRestartAfterS == 0 {
+		cfg.MQTTDeafRestartAfterS = 300
 	}
 	for i := range cfg.Stations {
 		if cfg.Stations[i].MaxCurrentA == 0 {

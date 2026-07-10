@@ -112,6 +112,18 @@ type Config struct {
 	// field is simply omitted from /site's response, never fabricated.
 	SiteCacheFile string `json:"site_cache"`
 
+	// MQTTDeafRestartAfterS bounds how long lexa-api keeps kicking the
+	// systemd watchdog while mc.IsConnected() reports true but the broker
+	// connection has actually been down the whole time (WS-9.1):
+	// mqtt.Client.IsConnected() stays true for paho's entire AutoReconnect
+	// retry loop, not just while actually connected, so a naive kick gated
+	// on it alone never trips during a sustained outage. A watchdog.DeafTracker
+	// tracks continuous-disconnected time from mqttutil's OnConnectionLost/
+	// OnReconnect hooks; once that exceeds this many seconds, the kick gate
+	// stops firing (alongside the existing probeHealthz gate) and systemd's
+	// WatchdogSec restarts the service. Default 300 (5 min) when unset/zero.
+	MQTTDeafRestartAfterS int `json:"mqtt_deaf_restart_after_s"`
+
 	Devices []DeviceConfig `json:"devices"`
 
 	// Journal is the "journal" block — DEVICE_ROADMAP.md §4.5/TASK-090's
@@ -198,6 +210,9 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.Journal.Dir == "" {
 		cfg.Journal.Dir = defaultJournalDir
 	}
+	if cfg.MQTTDeafRestartAfterS == 0 {
+		cfg.MQTTDeafRestartAfterS = 300
+	}
 	// WS-1 (V1.0 punch list, security fail-closed by default): a wildcard/LAN
 	// bind with no bearer-token auth is an unauthenticated control-adjacent
 	// HTTP surface reachable from the whole LAN. Refuse it unless Bench opts
@@ -253,6 +268,11 @@ func (c *Config) TLSEnabled() bool {
 // ⇒ true — the product default (DEVICE_ROADMAP.md §4.4).
 func (c *Config) MDNSEnabled() bool {
 	return c.MDNS == nil || *c.MDNS
+}
+
+// MQTTDeafRestartAfter is MQTTDeafRestartAfterS as a time.Duration (WS-9.1).
+func (c *Config) MQTTDeafRestartAfter() time.Duration {
+	return time.Duration(c.MQTTDeafRestartAfterS) * time.Second
 }
 
 // LoadAPIToken reads the bearer token from APITokenFile. An unset

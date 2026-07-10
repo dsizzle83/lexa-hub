@@ -169,3 +169,105 @@ func TestResolve_Empty(t *testing.T) {
 		t.Errorf("Resolve(nil)=%v want empty", got)
 	}
 }
+
+// ── FIX-F: axis authorship ──────────────────────────────────────────────────
+
+// A single demand on an axis is trivially its own author.
+func TestResolve_AuthorSingleDemand(t *testing.T) {
+	des := Resolve([]Demand{
+		CeilingDemand("inv1", AxisSolarCeilingW, 3000, TierCompliance, "export"),
+	})["inv1"]
+	if a, ok := des.Author(AxisSolarCeilingW); !ok || a != "export" {
+		t.Fatalf("author=%q ok=%v want export/true", a, ok)
+	}
+}
+
+// The tighter of two same-tier ceilings is the author (mirrors
+// TestResolve_IntersectionLowestCeilingWins's value assertion, authorship
+// side).
+func TestResolve_AuthorSameTierTighterWins(t *testing.T) {
+	des := Resolve([]Demand{
+		CeilingDemand("inv1", AxisSolarCeilingW, 4000, TierCompliance, "export"),
+		CeilingDemand("inv1", AxisSolarCeilingW, 2500, TierCompliance, "generation"),
+	})["inv1"]
+	if a, _ := des.Author(AxisSolarCeilingW); a != "generation" {
+		t.Fatalf("author=%q want generation (the tighter 2500 ceiling)", a)
+	}
+}
+
+// A higher tier that a lower tier's demand does not actually narrow keeps its
+// OWN author — the lower tier's redundant/wider demand never claims
+// authorship it did not earn (mirrors TestResolve_NarrowingOnly).
+func TestResolve_AuthorHigherTierKeepsCreditWhenNotNarrowed(t *testing.T) {
+	des := Resolve([]Demand{
+		CeilingDemand("inv1", AxisSolarCeilingW, 5000, TierEconomics, "cost"),
+		CeilingDemand("inv1", AxisSolarCeilingW, 2000, TierCompliance, "export"),
+		CeilingDemand("inv1", AxisSolarCeilingW, 1500, TierSafety, "protect"),
+	})["inv1"]
+	if a, _ := des.Author(AxisSolarCeilingW); a != "protect" {
+		t.Fatalf("author=%q want protect (safety 1500 is the tightest, real, surviving bound)", a)
+	}
+}
+
+// A lower tier that DOES narrow further than the higher tier's bound becomes
+// the author — narrowing (not merely existing at a lower tier) is what
+// transfers credit.
+func TestResolve_AuthorLowerTierTakesCreditWhenItNarrows(t *testing.T) {
+	des := Resolve([]Demand{
+		CeilingDemand("inv1", AxisSolarCeilingW, 3000, TierCompliance, "export"),
+		CeilingDemand("inv1", AxisSolarCeilingW, 1200, TierEconomics, "cost"),
+	})["inv1"]
+	if a, _ := des.Author(AxisSolarCeilingW); a != "cost" {
+		t.Fatalf("author=%q want cost (1200 narrows inside compliance's 3000)", a)
+	}
+}
+
+// When the higher tier wins outright on a cross-tier conflict (the lower
+// tier's demand is infeasible inside the higher tier's interval and gets
+// clamped away), the higher tier's author must survive unchanged.
+func TestResolve_AuthorHigherTierWinsOutrightKeepsAuthor(t *testing.T) {
+	des := Resolve([]Demand{
+		PointDemand("bat1", AxisBatterySetpointW, 1700, TierCompliance, "import"),
+		PointDemand("bat1", AxisBatterySetpointW, -3000, TierEconomics, "self-use"),
+	})["bat1"]
+	if a, _ := des.Author(AxisBatterySetpointW); a != "import" {
+		t.Fatalf("author=%q want import (compliance wins outright over the contradictory economics point)", a)
+	}
+}
+
+// A point demand strictly INSIDE the higher tier's interval is a real
+// narrowing (Min==Max collapses the interval to a single value), so it takes
+// authorship — the normal "economics proposes a point the caps allow" case.
+func TestResolve_AuthorPointInsideIntervalTakesCredit(t *testing.T) {
+	des := Resolve([]Demand{
+		{Device: "bat1", Axis: AxisBatterySetpointW, Min: -1000, Max: 1000, Tier: TierSafety, Source: "protect"},
+		PointDemand("bat1", AxisBatterySetpointW, 500, TierEconomics, "tou"),
+	})["bat1"]
+	if a, _ := des.Author(AxisBatterySetpointW); a != "tou" {
+		t.Fatalf("author=%q want tou (the in-range point narrows [-1000,1000] to {500})", a)
+	}
+}
+
+// Connect axis: false (disconnect) wins and its source is the author, even
+// when a higher tier merely held true (which false narrows, not conflicts
+// with).
+func TestResolve_AuthorConnectFalseSource(t *testing.T) {
+	tt, ff := true, false
+	des := Resolve([]Demand{
+		{Device: "bat1", Axis: AxisConnect, Connect: &tt, Tier: TierSafety, Source: "hold-connect"},
+		{Device: "bat1", Axis: AxisConnect, Connect: &ff, Tier: TierEconomics, Source: "battery-safety"},
+	})["bat1"]
+	if a, ok := des.Author(AxisConnect); !ok || a != "battery-safety" {
+		t.Fatalf("connect author=%q ok=%v want battery-safety/true", a, ok)
+	}
+}
+
+// An axis no demand touched has no author.
+func TestResolve_AuthorAbsentWhenNoDemand(t *testing.T) {
+	des := Resolve([]Demand{
+		CeilingDemand("inv1", AxisSolarCeilingW, 3000, TierCompliance, "export"),
+	})["inv1"]
+	if _, ok := des.Author(AxisBatterySetpointW); ok {
+		t.Fatalf("battery axis has no demand; Author must report ok=false")
+	}
+}

@@ -80,6 +80,29 @@ type Config struct {
 	// request should be picked up promptly, and an idle stat() of one file
 	// every few seconds costs nothing.
 	CertRotatePollIntervalS int `json:"cert_rotate_poll_interval_s,omitempty"`
+
+	// ResponseStatePath is the WS-4.2 durable persistence path for
+	// responses.Tracker's posted/alerted maps (TASK-041's acknowledged
+	// northbound half — internal/northbound/responses/persist.go): a small
+	// self-compacting NDJSON append-log so a lexa-northbound restart can
+	// neither lose a not-yet-posted CannotComply nor re-POST a duplicate
+	// Response for an event it already acknowledged. Unlike Journal/
+	// Snapshot's opt-in-by-presence rollout shape, this ships ON by
+	// default with NO config change needed on the bench: empty/absent
+	// defaults to defaultResponseStatePath (a sibling of the journal dir,
+	// created independently of whether "journal" is configured); the
+	// literal "off" disables persistence entirely (RAM-only, pre-WS-4.2
+	// behavior) — same convention as MetricsAddr's "off".
+	ResponseStatePath string `json:"response_state_path,omitempty"`
+}
+
+// defaultResponseStatePath is ResponseStatePath's default when empty/absent.
+const defaultResponseStatePath = "/var/lib/lexa/journal/northbound/response-state.ndjson"
+
+// ResponseStateDisabled reports whether the config explicitly opted out of
+// WS-4.2 persistence via the literal "off" value.
+func (c *Config) ResponseStateDisabled() bool {
+	return c.ResponseStatePath == "off"
 }
 
 // JournalConfig is the on-disk "journal" block — a duplicate of cmd/hub's
@@ -134,6 +157,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.PollRateModeStr == "" {
 		cfg.PollRateModeStr = string(run.PollRateHonor)
+	}
+	if cfg.ResponseStatePath == "" {
+		cfg.ResponseStatePath = defaultResponseStatePath
 	}
 	return &cfg, nil
 }

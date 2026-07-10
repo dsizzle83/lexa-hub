@@ -768,6 +768,20 @@ func (e *Engine) LastPlan() Plan {
 	return Plan{}
 }
 
+// CmdDropped reports the total number of engineCmds dropped by enqueue
+// (engine_state.go) because cmdCh was full — a full channel means the
+// control goroutine wasn't keeping up with SetDERConstraints/SetPrices/Wake
+// callers, which today is log-only visibility (WS-9.3). This package stays
+// decoupled from internal/metrics (matching internal/mqttutil's same
+// stance); the caller with visibility into the metrics registry —
+// cmd/hub/main.go — is expected to mirror this into a Counter via
+// metrics.Registry.Collect, the same external-mirroring idiom already used
+// for lexa_hub_tick_overruns_total. Safe for concurrent use from any
+// goroutine.
+func (e *Engine) CmdDropped() uint64 {
+	return e.cmdDropped.Load()
+}
+
 // executePlan fans out the plan's commands to the registered actuators. The
 // actuator maps are fixed before Start (RegisterXActuator panics afterwards —
 // see mustNotBeStarted), so they can be read directly here with no lock and

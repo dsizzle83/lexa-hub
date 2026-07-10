@@ -14,8 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/southbound/device"
+	model "lexa-proto/csipmodel"
 )
 
 // Entry is a named device in the registry.

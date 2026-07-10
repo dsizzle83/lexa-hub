@@ -81,6 +81,47 @@ func TestSeqResetSameTargetNoWrite(t *testing.T) {
 	}
 }
 
+// TestHeartbeatRefreshSameTargetNoWrite is WS-2 fix 1's reconciler-side half:
+// a hub re-stamping IssuedAt/Seq on an UNCHANGED standing intent (the
+// desiredHeartbeatInterval re-publish in cmd/hub/desired.go — normal forward
+// seq progress, not a publisher-restart SeqReset) must advance the staleness
+// baseline (so the doc never ages past StaleAfter) WITHOUT re-issuing a write
+// — i.e. the content-dedupe to hardware holds; no register churn from a
+// heartbeat. This is the "higherSeq" branch of SetDesired, distinct from
+// TestSeqResetSameTargetNoWrite's "newerIssued only" (seq reset) branch.
+func TestHeartbeatRefreshSameTargetNoWrite(t *testing.T) {
+	r := New(bus.DesiredClassBattery, "batt-0", testCfg())
+	a, _ := r.SetDesired(battDoc(0, issuedAt(0), 1000), at(0))
+	mustWrite(t, a, "new-desired") // first doc: unconditional write
+
+	// A heartbeat re-stamp: same content, seq advances normally, issuedAt newer.
+	a, reps := r.SetDesired(battDoc(1, issuedAt(150*time.Second), 1000), at(150*time.Second))
+	mustNone(t, a) // no register write — content unchanged
+	if countKind(reps, ReportSeqReset) != 0 {
+		t.Fatalf("normal forward seq progress must not report SeqReset, got %v", reps)
+	}
+	if r.lastAppliedSeq != 1 || r.lastAppliedIssuedAt != issuedAt(150*time.Second) {
+		t.Fatal("heartbeat refresh must still advance the seq/issuedAt staleness baseline")
+	}
+
+	// Staleness never fires because the heartbeat kept re-arming the timer
+	// (composes with WS-2 fix 1's ≤StaleAfter/2 cadence — see
+	// cmd/hub/desired.go's desiredHeartbeatInterval doc).
+	_, reps = r.Tick(at(300 * time.Second))
+	if countKind(reps, ReportStaleDesired) != 0 {
+		t.Fatalf("a live heartbeat re-stamp must prevent StaleDesired, got %v", reps)
+	}
+
+	// Another heartbeat at +300s (150s after the last one): still no write,
+	// still re-arms.
+	a, _ = r.SetDesired(battDoc(2, issuedAt(300*time.Second), 1000), at(300*time.Second))
+	mustNone(t, a)
+	_, reps = r.Tick(at(450 * time.Second))
+	if countKind(reps, ReportStaleDesired) != 0 {
+		t.Fatalf("second heartbeat must again prevent StaleDesired at the next 300s mark, got %v", reps)
+	}
+}
+
 // -------------------------------------------------------------------------
 // Background bullet: reject stale doc (issuedAt older than the bound)
 // -------------------------------------------------------------------------

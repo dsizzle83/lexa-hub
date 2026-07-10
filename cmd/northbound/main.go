@@ -131,9 +131,10 @@ func main() {
 		r.Counter("lexa_bus_decode_failures_total").Set(total)
 	})
 	nbm := run.Metrics{
-		WalkDuration: reg.Gauge("lexa_nb_walk_duration_seconds"),
-		WalkFailures: reg.Counter("lexa_nb_walk_failures_total"),
-		ClockOffset:  reg.Gauge("lexa_nb_clock_offset_seconds"),
+		WalkDuration:       reg.Gauge("lexa_nb_walk_duration_seconds"),
+		WalkFailures:       reg.Counter("lexa_nb_walk_failures_total"),
+		ClockOffset:        reg.Gauge("lexa_nb_clock_offset_seconds"),
+		ImplausibleRejects: reg.Counter("lexa_nb_implausible_rejects_total"),
 	}
 	responsesPostedCtr := reg.Counter("lexa_nb_responses_posted_total")
 
@@ -158,7 +159,39 @@ func main() {
 	// clk: single-owner accumulated utility-time offset (AD-004, TASK-035),
 	// shared by run.Discovery's walk loop and responses.Tracker.
 	clk := utilitytime.New(utilitytime.Config{})
-	respTracker := responses.New(fetcherResp, lfdi, cfg.ResponseSetPath, clk, responsesPostedCtr, jw)
+
+	// WS-4.2: response-state persistence (TASK-041's northbound half).
+	// Failure to load or open is a WARN, never fatal (AD-011) — this store
+	// is restart-survivability for the dedupe maps, not a source of truth
+	// the service can't run without; a fresh/missing/corrupt file starts
+	// exactly as the pre-WS-4.2 RAM-only tracker always did: empty.
+	var respStore *responses.Store
+	var initialState responses.State
+	if !cfg.ResponseStateDisabled() {
+		var lerr error
+		initialState, lerr = responses.LoadState(cfg.ResponseStatePath)
+		if lerr != nil {
+			if os.IsNotExist(lerr) {
+				log.Printf("lexa-northbound: no persisted response state at %s; starting empty", cfg.ResponseStatePath)
+			} else {
+				log.Printf("lexa-northbound: WARN response-state load failed (%v); starting empty", lerr)
+			}
+			initialState = responses.State{}
+		} else {
+			log.Printf("lexa-northbound: restored response state from %s (posted=%d alerted=%d)",
+				cfg.ResponseStatePath, len(initialState.Posted), len(initialState.Alerted))
+		}
+		var serr error
+		respStore, serr = responses.OpenStore(cfg.ResponseStatePath)
+		if serr != nil {
+			log.Printf("lexa-northbound: WARN could not open response-state store (%v); persistence disabled for this run", serr)
+			respStore = nil
+		} else {
+			defer respStore.Close()
+		}
+	}
+
+	respTracker := responses.New(fetcherResp, lfdi, cfg.ResponseSetPath, clk, responsesPostedCtr, jw, respStore, initialState)
 	frManager := flowres.New(fetcherFR, lfdi)
 	discovery := run.New(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, nbm, run.PollRateConfig{Mode: cfg.PollRateMode()})
 

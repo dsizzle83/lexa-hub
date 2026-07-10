@@ -18,10 +18,22 @@ import (
 // Wrapper runs the legacy authoritative optimizer and the candidate constraint
 // Stack on the SAME SystemState every economic tick, diffs their FINAL
 // per-device outputs under tolerance bands, and hands each divergent tick to an
-// injected sink. It ALWAYS returns the legacy plan unmodified — the candidate's
-// plan is observed and discarded, never actuated. This is the gate that makes a
-// P5 constraint flip validatable: ≥1 week of bench shadow data with ~0 diff
-// rate before any constraint goes active.
+// injected sink. With no constraint configured "active" it ALWAYS returns the
+// legacy plan unmodified — the candidate's plan is observed and discarded,
+// never actuated. This is the gate that makes a P5 constraint flip validatable:
+// ≥1 week of bench shadow data with ~0 diff rate before any constraint goes
+// active.
+//
+// FIX-F active-mode composition (TASK-060 §4 / TASK-061 §4, Options.
+// ActiveConstraints): once cmd/hub's per-constraint config flips one axis to
+// "active", Optimize instead returns a COMPOSED plan — legacy's plan with
+// every device/axis an active constraint's demand won this tick (Stack.
+// AxisAuthors) overwritten by the candidate's value, legacy's own write to
+// that axis dropped and counted (Wrapper.LegacyOverrideDropped) — while every
+// other axis stays legacy-authored and shadow-diffed exactly as before. This
+// file is UNWIRED in the sense that matters operationally until a config flip
+// sets ActiveConstraints non-empty: with it empty, every code path below is
+// byte-identical to the pre-FIX-F shadow-only Wrapper.
 //
 // I/O discipline (05 §1): internal/orchestrator stays I/O-free. Wrapper does no
 // logging, marshalling, or clock reads of its own beyond the INJECTED `now`
@@ -117,6 +129,15 @@ type AxisDivergence struct {
 	Legacy    string   `json:"legacy"`
 	Candidate string   `json:"candidate"`
 	Delta     *float64 `json:"delta,omitempty"`
+	// Author is the candidate constraint (Stack.AxisAuthors) that produced the
+	// candidate's value on this axis this tick (FIX-F). Empty when the
+	// candidate is not a Stack (or exposes no authorship — every pre-FIX-F
+	// test double), or the axis has no attributable single author; omitempty
+	// keeps existing JSON consumers byte-identical when it is unset. The same
+	// lookup also gates active-mode composition (Wrapper.active): an axis
+	// whose author is in the active set is composed, not diffed, so it never
+	// reaches this struct with an Author set to an active constraint's name.
+	Author string `json:"author,omitempty"`
 }
 
 // Divergence is one tick on which the candidate and legacy plans disagreed. It
@@ -190,6 +211,19 @@ type Options struct {
 	// recovered value and stack. Same contract as OnDiverge: must not block,
 	// runs on the control goroutine.
 	OnPanic func(recovered any, stack []byte)
+
+	// ActiveConstraints is the set of candidate constraint Name()s running in
+	// "active" mode (FIX-F: cmd/hub's per-constraint constraint_modes,
+	// TASK-060 §4 / TASK-061 §4). For every tick, the axes an ACTIVE
+	// constraint's demand wins (per the candidate's AxisAuthors, when it
+	// exposes one) are composed from the CANDIDATE plan into the plan
+	// Optimize returns instead of being shadow-diffed; legacy's write to that
+	// same axis is dropped and counted (LegacyOverrideDropped). Every other
+	// axis behaves exactly as pure shadow mode: legacy is authoritative and
+	// diffed against the candidate's opinion. Nil or empty ⇒ no axis is
+	// active ⇒ Optimize is BIT-IDENTICAL to pre-FIX-F shadow-only behaviour
+	// (back-compat, TASK-060 step 4).
+	ActiveConstraints map[string]bool
 }
 
 // Wrapper is the shadow harness. It implements orchestrator.Optimizer (and,
@@ -219,6 +253,21 @@ type Wrapper struct {
 	// metrics scrape reads concurrently with control-goroutine writes.
 	axisCounts sync.Map // string -> *uint64
 	onPanic    func(recovered any, stack []byte)
+
+	// active is the FIX-F ActiveConstraints set (Options), read-only after
+	// Wrap. Empty ⇒ Optimize never composes, matching pre-FIX-F behaviour.
+	active map[string]bool
+	// legacyDropped tallies, per axis (small fixed vocabulary, like
+	// axisCounts), how many device-axis legacy writes composition dropped in
+	// favour of an ACTIVE constraint's candidate value. sync.Map for the same
+	// metrics-scrape-vs-control-goroutine reason as axisCounts.
+	legacyDropped sync.Map // string -> *uint64
+	// activeFallback counts ticks active-mode composition fell back to the
+	// PURE legacy plan on every axis — because the candidate was already
+	// latched, or panicked on this very tick — rather than composing any
+	// active axis (FIX-F's extension of the WS-5.1 fail-safe to composition).
+	// Atomic: read by the metrics scrape.
+	activeFallback uint64
 
 	// ── single-goroutine (control-loop) state ──
 	// breachMismatch counts consecutive ticks the candidate holds a breach
@@ -259,6 +308,7 @@ func Wrap(legacy, candidate orchestrator.Optimizer, opts Options) *Wrapper {
 		onDiverge:  opts.OnDiverge,
 		onPanic:    opts.OnPanic,
 		rateLimit:  rl,
+		active:     opts.ActiveConstraints,
 		lastEmit:   make(map[string]time.Time),
 		suppressed: make(map[string]uint64),
 	}
@@ -293,27 +343,121 @@ func (w *Wrapper) bumpAxis(key string) {
 	atomic.AddUint64(v.(*uint64), 1)
 }
 
+// LegacyOverrideDropped snapshots, per axis, how many device-axis legacy
+// writes active-mode composition has dropped in favour of an ACTIVE
+// constraint's candidate value (FIX-F). Empty when no constraint is active.
+// Safe from any goroutine.
+func (w *Wrapper) LegacyOverrideDropped() map[string]uint64 {
+	out := make(map[string]uint64)
+	w.legacyDropped.Range(func(k, v any) bool {
+		out[k.(string)] = atomic.LoadUint64(v.(*uint64))
+		return true
+	})
+	return out
+}
+
+func (w *Wrapper) bumpDropped(axis string) {
+	v, _ := w.legacyDropped.LoadOrStore(axis, new(uint64))
+	atomic.AddUint64(v.(*uint64), 1)
+}
+
+// ActiveFallbacks returns how many ticks active-mode composition fell back to
+// the pure legacy plan on every axis rather than composing any active one —
+// because the candidate was already latched (a prior panic) or panicked on
+// this very tick (FIX-F's extension of the WS-5.1 fail-safe latch to
+// composition, per the launch brief's deliverable 3). Zero when no
+// constraint is active. Safe from any goroutine; treat any nonzero count as a
+// soak-blocking finding exactly like a tripped Latched().
+func (w *Wrapper) ActiveFallbacks() uint64 { return atomic.LoadUint64(&w.activeFallback) }
+
 // Optimize runs both optimizers on the same state, diffs, and returns the
-// LEGACY plan unmodified. The candidate plan is observed and discarded — it
-// never reaches executePlan. This passthrough is the safety invariant of the
-// whole harness (unit-tested by TestWrapper_ReturnsLegacyPlan).
+// plan to actuate. With no constraint in "active" mode (the common case
+// through TASK-063 and the default even after FIX-F until a config flip) this
+// is UNCHANGED pre-FIX-F behaviour: the LEGACY plan is returned unmodified,
+// the candidate plan is observed and discarded, and this passthrough is the
+// safety invariant the harness always had (unit-tested by
+// TestWrapper_ReturnsLegacyPlanUnmodified).
 //
 // The candidate runs under a recover() latch (WS-5.1): a panic anywhere in
 // the candidate stack must never kill the process controlling hardware. The
 // first panic permanently disables observation (latch) — a tripped latch
 // fails the soak gate, it is never silently tolerated.
+//
+// FIX-F active-mode composition (TASK-060 §4 / TASK-061 §4): when
+// w.active is non-empty, Optimize instead runs candidate.Optimize once,
+// composes its ACTIVE-owned axes into legacy's plan (compose), diffs the
+// two RAW plans exactly as shadow mode does but excluding the axes just
+// composed (compare — "divergence diffing continues for axes still in
+// shadow"), and returns the COMPOSED plan. The panic latch covers
+// composition too: a latched or newly-panicking candidate means Optimize
+// falls back to the pure legacy plan on every axis and ActiveFallbacks
+// counts the tick — fail-safe to the cascade, exactly like shadow mode's
+// existing latch contract.
 func (w *Wrapper) Optimize(state orchestrator.SystemState) orchestrator.Plan {
 	legacy := w.legacy.Optimize(state)
-	if atomic.LoadUint32(&w.latched) == 0 {
-		w.observeCandidate(state, legacy)
+
+	if len(w.active) == 0 {
+		if atomic.LoadUint32(&w.latched) == 0 {
+			w.observeCandidate(state, legacy)
+		}
+		return legacy
 	}
-	return legacy
+
+	if atomic.LoadUint32(&w.latched) == 1 {
+		atomic.AddUint64(&w.activeFallback, 1)
+		return legacy
+	}
+
+	candidate, ok := w.runCandidate(state)
+	if !ok {
+		// The candidate panicked THIS tick — recoverCandidate-equivalent logic
+		// inside runCandidate just latched it. No candidate plan exists to
+		// compose from; fail safe to legacy exactly as the now-permanent latch
+		// will for every subsequent tick.
+		atomic.AddUint64(&w.activeFallback, 1)
+		return legacy
+	}
+
+	authors := candidateAuthors(w.candidate)
+	composed := w.compose(legacy, candidate, authors)
+	w.compare(state, legacy, candidate, "", authors)
+	return composed
 }
 
 func (w *Wrapper) observeCandidate(state orchestrator.SystemState, legacy orchestrator.Plan) {
 	defer w.recoverCandidate()
 	candidate := w.candidate.Optimize(state)
-	w.compare(state, legacy, candidate, "")
+	w.compare(state, legacy, candidate, "", candidateAuthors(w.candidate))
+}
+
+// runCandidate runs the candidate optimizer under the WS-5.1 panic latch and
+// reports whether it produced a usable plan this tick. Factored out of
+// recoverCandidate (which has no return value to signal "this tick failed")
+// so the active-mode composition path in Optimize can tell "no candidate plan
+// this tick" apart from "candidate plan available, diff it" without
+// duplicating the latch-tripping body — see tripLatch.
+func (w *Wrapper) runCandidate(state orchestrator.SystemState) (plan orchestrator.Plan, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.tripLatch(r)
+			ok = false
+		}
+	}()
+	return w.candidate.Optimize(state), true
+}
+
+// candidateAuthors type-asserts the candidate for the Stack's per-tick
+// authorship snapshot (FIX-F, Stack.AxisAuthors). Only a real Stack (or a
+// test double that chooses to implement the interface) exposes one; a plain
+// stub optimizer (shadow_test.go) yields nil, so every axis is then treated
+// as unauthored — composition never claims an axis it cannot attribute
+// (fails toward "stay on legacy"), and AxisDivergence.Author stays empty
+// exactly as it did before FIX-F.
+func candidateAuthors(candidate orchestrator.Optimizer) map[string]string {
+	if a, ok := candidate.(interface{ AxisAuthors() map[string]string }); ok {
+		return a.AxisAuthors()
+	}
+	return nil
 }
 
 // EvaluateSafety returns the LEGACY optimizer's Tier-1 fast protection plan —
@@ -341,18 +485,30 @@ func (w *Wrapper) EvaluateSafety(state orchestrator.SystemState) orchestrator.Pl
 func (w *Wrapper) observeCandidateSafety(state orchestrator.SystemState, legacyPlan orchestrator.Plan, cse orchestrator.SafetyEvaluator) {
 	defer w.recoverCandidate()
 	candidatePlan := cse.EvaluateSafety(state)
-	w.compare(state, legacyPlan, candidatePlan, "safety:")
+	// No authorship/composition on the fast path: FIX-F's active-mode
+	// composition is scoped to Optimize (Stack.EvaluateSafety bypasses the
+	// arbiter's demand pipeline entirely, so there is no per-axis authorship
+	// to attribute here — see stack.go's fastSafetyEvaluator doc).
+	w.compare(state, legacyPlan, candidatePlan, "safety:", nil)
 }
 
 // recoverCandidate is the WS-5.1 latch: record the panic, disable observation
 // for the process lifetime, and let the control loop continue on legacy.
 func (w *Wrapper) recoverCandidate() {
 	if r := recover(); r != nil {
-		atomic.AddUint64(&w.panics, 1)
-		atomic.StoreUint32(&w.latched, 1)
-		if w.onPanic != nil {
-			w.onPanic(r, debug.Stack())
-		}
+		w.tripLatch(r)
+	}
+}
+
+// tripLatch is the shared WS-5.1 body: record the panic, permanently disable
+// candidate observation, and alarm. Factored out so both recoverCandidate
+// (deferred, no return value) and runCandidate (deferred, sets a named `ok`
+// return) trip the SAME latch the SAME way.
+func (w *Wrapper) tripLatch(r any) {
+	atomic.AddUint64(&w.panics, 1)
+	atomic.StoreUint32(&w.latched, 1)
+	if w.onPanic != nil {
+		w.onPanic(r, debug.Stack())
 	}
 }
 
@@ -362,15 +518,28 @@ func (w *Wrapper) recoverCandidate() {
 // slow (Optimize) path; "safety:" is the Tier-1 fast-path diff (WS-5.3),
 // which counts into safetyCount and prefixes its axis keys so the two streams
 // are separable in metrics, signatures, and the soak-gate classification.
-func (w *Wrapper) compare(state orchestrator.SystemState, legacy, candidate orchestrator.Plan, prefix string) {
+//
+// authors is the candidate's per-tick authorship (candidateAuthors), nil on
+// the fast path and on the slow path whenever the candidate exposes none —
+// both cases behave exactly as pre-FIX-F: no Author is filled, no axis is
+// filtered (attributeAndFilter is a no-op on a nil/empty map).
+func (w *Wrapper) compare(state orchestrator.SystemState, legacy, candidate orchestrator.Plan, prefix string, authors map[string]string) {
 	var axes []AxisDivergence
 
 	if bd := w.diffBreach(legacy, candidate); bd != nil {
-		axes = append(axes, *bd)
+		// A candidate breach whose LimitType is ACTIVE-owned is composed
+		// (compose/composeBreach), not shadow-diffed — "divergence diffing
+		// continues for axes still in shadow" (FIX-F). diffBreach still runs
+		// unconditionally above so its onset-debounce state stays correct
+		// even while suppressed here.
+		if candidate.Breach == nil || !w.active[breachOwner(candidate.Breach.LimitType)] {
+			axes = append(axes, *bd)
+		}
 	}
 	axes = append(axes, w.diffSolar(legacy, candidate)...)
 	axes = append(axes, w.diffBattery(legacy, candidate)...)
 	axes = append(axes, w.diffEVSE(legacy, candidate)...)
+	axes = w.attributeAndFilter(axes, authors)
 
 	if len(axes) == 0 {
 		return
@@ -416,6 +585,210 @@ func (w *Wrapper) allow(sig string, now time.Time) bool {
 	}
 	w.lastEmit[sig] = now
 	return true
+}
+
+// ── FIX-F: authorship attribution, divergence filtering, active composition ──
+
+// attributeAndFilter fills each axis divergence's Author from the candidate's
+// per-tick authorship (nil/empty authors ⇒ every lookup misses ⇒ every Author
+// stays "" ⇒ output identical to pre-FIX-F) and, when active-mode composition
+// is configured (w.active non-empty), DROPS any axis whose author is in the
+// active set: that axis is no longer being shadow-validated, it is the
+// composed plan's authoritative source now (legacyOverrideDropped tracks it
+// instead — compose). "Divergence diffing continues for axes still in
+// shadow" (TASK-060 §4) — this is that filter. The breach axis
+// ("grid"/"breach") is unaffected here: it has no per-device authorship key
+// (authors is keyed by axisKey(device, axis), and "grid" is never a real
+// device), so the lookup always misses and it passes through unattributed —
+// its own active-ownership filter runs in compare, keyed off the candidate's
+// actual Breach.LimitType rather than this generic device/axis lookup.
+func (w *Wrapper) attributeAndFilter(axes []AxisDivergence, authors map[string]string) []AxisDivergence {
+	if len(authors) == 0 {
+		return axes
+	}
+	out := axes[:0]
+	for _, a := range axes {
+		if src, ok := authors[a.Device+"/"+a.Axis]; ok && src != "" {
+			if w.active[src] {
+				continue
+			}
+			a.Author = src
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// breachOwner maps a ComplianceBreach.LimitType to the constraint Name() that
+// authors it — the only three compliance constraints that ever set
+// Plan.Breach (export.go, genlimit.go, importlimit.go). Empty for any other
+// (unrecognised) LimitType, which never matches an active constraint name and
+// so is treated as not-active-owned — the conservative, fail-toward-shadow
+// choice.
+func breachOwner(limitType string) string {
+	switch limitType {
+	case "export":
+		return "export"
+	case "generation":
+		return "gen"
+	case "import":
+		return "import"
+	default:
+		return ""
+	}
+}
+
+// compose builds the plan Optimize returns in active mode: legacy's plan with
+// every device/axis an ACTIVE constraint authored this tick (per authors,
+// Stack.AxisAuthors) overwritten by the candidate's value for that axis — the
+// TASK-060 step 4 "per-axis single-author rule". Legacy's own write to a
+// composed axis (when it had one) is counted in legacyOverrideDropped; a
+// legacy axis no active constraint touched this tick passes through
+// unmodified. authors nil/empty (the candidate exposes no authorship, or
+// nothing won an active-owned fold this tick) composes nothing — every axis
+// stays legacy, identical to the pure shadow return.
+func (w *Wrapper) compose(legacy, candidate orchestrator.Plan, authors map[string]string) orchestrator.Plan {
+	composed := legacy
+	composed.SolarCommands = append([]orchestrator.SolarCommand(nil), legacy.SolarCommands...)
+	composed.BatteryCommands = append([]orchestrator.BatteryCommand(nil), legacy.BatteryCommands...)
+	composed.EVSECommands = append([]orchestrator.EVSECommand(nil), legacy.EVSECommands...)
+	composed.Decisions = append([]orchestrator.Decision(nil), legacy.Decisions...)
+
+	if len(authors) > 0 {
+		for _, c := range candidate.SolarCommands {
+			if math.IsNaN(c.CurtailToW) || !w.ownsActive(authors, c.Name, AxisSolarCeilingW) {
+				continue // candidate expresses no restriction, or no active constraint won this axis this tick
+			}
+			composed.SolarCommands = w.composeSolarAxis(composed.SolarCommands, c)
+		}
+		for _, c := range candidate.BatteryCommands {
+			composed.BatteryCommands = w.composeBatteryAxes(composed.BatteryCommands, c, authors)
+		}
+		for _, c := range candidate.EVSECommands {
+			composed.EVSECommands = w.composeEVSEAxis(composed.EVSECommands, c, authors)
+		}
+	}
+
+	composed.Breach = w.composeBreach(legacy.Breach, candidate.Breach)
+	return composed
+}
+
+// ownsActive reports whether the candidate's authorship map attributes
+// device's axis to a constraint that is running in "active" mode this tick.
+func (w *Wrapper) ownsActive(authors map[string]string, device string, axis Axis) bool {
+	src, ok := authors[axisKey(device, axis)]
+	return ok && src != "" && w.active[src]
+}
+
+// composeSolarAxis overwrites (or appends) cmd's solar-ceiling-w value into
+// dst, counting a legacyOverrideDropped hit whenever a legacy command for the
+// device already existed (there was a real write to drop, not an empty slot
+// to fill).
+func (w *Wrapper) composeSolarAxis(dst []orchestrator.SolarCommand, cmd orchestrator.SolarCommand) []orchestrator.SolarCommand {
+	for i := range dst {
+		if dst[i].Name == cmd.Name {
+			w.bumpDropped(AxisSolarCeilingW.String())
+			dst[i].CurtailToW = cmd.CurtailToW
+			return dst
+		}
+	}
+	return append(dst, cmd)
+}
+
+// composeBatteryAxes composes the setpoint and connect axes of one candidate
+// BatteryCommand INDEPENDENTLY — a shared battery can have its setpoint owned
+// by one active constraint (e.g. export's absorb) while its connect axis is
+// owned by a different one (battery safety's disconnect), or by neither, or
+// by both. Only the axes ownsActive attributes to an active constraint are
+// composed; the sibling axis on the SAME legacy command entry is left exactly
+// as legacy wrote it.
+func (w *Wrapper) composeBatteryAxes(dst []orchestrator.BatteryCommand, cmd orchestrator.BatteryCommand, authors map[string]string) []orchestrator.BatteryCommand {
+	setpointOwned := !math.IsNaN(cmd.SetpointW) && w.ownsActive(authors, cmd.Name, AxisBatterySetpointW)
+	connectOwned := cmd.Connect != nil && w.ownsActive(authors, cmd.Name, AxisConnect)
+	if !setpointOwned && !connectOwned {
+		return dst
+	}
+	for i := range dst {
+		if dst[i].Name != cmd.Name {
+			continue
+		}
+		if setpointOwned {
+			w.bumpDropped(AxisBatterySetpointW.String())
+			dst[i].SetpointW = cmd.SetpointW
+		}
+		if connectOwned {
+			w.bumpDropped(AxisConnect.String())
+			dst[i].Connect = cmd.Connect
+		}
+		return dst
+	}
+	// No legacy entry for this device at all: nothing to drop, just compose
+	// in the axes that are actually owned.
+	add := orchestrator.BatteryCommand{Name: cmd.Name, SetpointW: math.NaN()}
+	if setpointOwned {
+		add.SetpointW = cmd.SetpointW
+	}
+	if connectOwned {
+		add.Connect = cmd.Connect
+	}
+	return append(dst, add)
+}
+
+// composeEVSEAxis overwrites (or appends) cmd's evse-current-a value into
+// dst, counting a legacyOverrideDropped hit when a legacy command for the
+// connector already existed.
+func (w *Wrapper) composeEVSEAxis(dst []orchestrator.EVSECommand, cmd orchestrator.EVSECommand, authors map[string]string) []orchestrator.EVSECommand {
+	if !w.ownsActive(authors, evseKey(cmd.StationID, cmd.ConnectorID), AxisEVSECurrentA) {
+		return dst
+	}
+	for i := range dst {
+		if dst[i].StationID == cmd.StationID && dst[i].ConnectorID == cmd.ConnectorID {
+			w.bumpDropped(AxisEVSECurrentA.String())
+			dst[i].MaxCurrentA = cmd.MaxCurrentA
+			return dst
+		}
+	}
+	return append(dst, cmd)
+}
+
+// composeBreach resolves the single reported breach when one or more
+// compliance constraints is active. Plan carries only ONE breach slot (both
+// the legacy cascade's recordBreach and the candidate Stack's already keep
+// only the single worst breach across every rule/constraint that fired that
+// tick), so composition works at that same granularity:
+//
+//   - a legacy breach whose LimitType is now ACTIVE-owned is DROPPED (counted
+//     in legacyOverrideDropped like every other composed axis) — that axis's
+//     compliance reporting belongs to the candidate now, whether or not the
+//     candidate actually raised a breach this tick (no candidate breach ⇒
+//     the active owner says "no breach", which must win);
+//   - a candidate breach whose LimitType is NOT active-owned is not composed
+//     (that axis is still legacy's to report);
+//   - if both a still-eligible candidate breach and a still-eligible legacy
+//     breach remain (an active-owned candidate breach coexisting with a
+//     legacy breach on a DIFFERENT, non-active LimitType), the worse
+//     shortfall wins — mirroring Stack.recordBreach / DefaultOptimizer's own
+//     worst-wins reconciliation.
+func (w *Wrapper) composeBreach(legacy, candidate *orchestrator.ComplianceBreach) *orchestrator.ComplianceBreach {
+	legacyEligible := legacy
+	if legacy != nil && w.active[breachOwner(legacy.LimitType)] {
+		w.bumpDropped("breach")
+		legacyEligible = nil
+	}
+	var candidateEligible *orchestrator.ComplianceBreach
+	if candidate != nil && w.active[breachOwner(candidate.LimitType)] {
+		candidateEligible = candidate
+	}
+	switch {
+	case legacyEligible == nil:
+		return candidateEligible
+	case candidateEligible == nil:
+		return legacyEligible
+	case candidateEligible.ShortfallW >= legacyEligible.ShortfallW:
+		return candidateEligible
+	default:
+		return legacyEligible
+	}
 }
 
 // ── per-axis diffs ────────────────────────────────────────────────────────────

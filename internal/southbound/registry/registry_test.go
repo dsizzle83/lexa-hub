@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/southbound/device"
 	"lexa-hub/internal/southbound/registry"
+	model "lexa-proto/csipmodel"
 )
 
 // ── Mock device ───────────────────────────────────────────────────────────────

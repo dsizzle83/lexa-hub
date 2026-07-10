@@ -6,6 +6,7 @@ package orchestrator
 import (
 	"math"
 	"testing"
+	"time"
 
 	model "lexa-proto/csipmodel"
 )
@@ -324,6 +325,116 @@ func TestExportLimitRule_NoActionWhenUnconstrained(t *testing.T) {
 
 	if len(plan.BatteryCommands) != 0 || len(plan.SolarCommands) != 0 {
 		t.Error("expected no commands with NaN export limit")
+	}
+}
+
+// ── scaleRateWPerTick / ceiling slew cadence-invariance ───────────────────────
+//
+// STOCK QA (malform-huge-activepower, wan-outage-hold, 2026-07-10 campaign)
+// found the export ceiling's slew-limited re-tighten converging right at the
+// edge of (or past) the scenario's fault-recovery window at STOCK cadence
+// while the identical fault converges in seconds at FAST. optimizer.go's
+// maxDropW/maxRiseW were a raw watts-PER-TICK allowance (1500/500), not a
+// wall-clock rate — internal/orchestrator/constraint/export.go's ceilingSlewW
+// (TASK-057/064, AD-007) already migrated the candidate path to a per-second
+// physical rate scaled by the real tick length; the legacy cascade tested
+// here was left on the un-scaled constants ("flagged for the STOCK spot-check
+// at the wave gate", plantwiring_test.go) and never got the matching fix.
+// scaleRateWPerTick (optimizer.go) closes that gap for the legacy path.
+
+func TestScaleRateWPerTick_PreservesWallClockRateAcrossCadence(t *testing.T) {
+	o := NewDefaultOptimizer()
+
+	// No configured interval (unit-test default): unchanged, exactly the
+	// pre-fix constant — every existing whitebox rule test in this file that
+	// never calls SetTickInterval must see byte-identical behaviour.
+	if got := o.scaleRateWPerTick(1500); got != 1500 {
+		t.Errorf("no interval configured: scaleRateWPerTick(1500) = %v, want 1500 unchanged", got)
+	}
+
+	// At the tuned/FAST cadence (3 s), a no-op: reproduces the historical
+	// 1500/500 W/tick exactly.
+	o.SetTickInterval(tunedTickInterval)
+	if got := o.scaleRateWPerTick(1500); got != 1500 {
+		t.Errorf("FAST (tuned) cadence: scaleRateWPerTick(1500) = %v, want 1500", got)
+	}
+	if got := o.scaleRateWPerTick(500); got != 500 {
+		t.Errorf("FAST (tuned) cadence: scaleRateWPerTick(500) = %v, want 500", got)
+	}
+
+	// At STOCK (15 s, 5x the tuned tick): the SAME physical rate (500 W/s /
+	// 166.7 W/s) now moves 5x further per (5x longer) tick — matching
+	// constraint/plantwiring_test.go's already-established STOCK expectation
+	// (7500 W/tick drop, ~2500 W/tick rise) for the candidate path's
+	// equivalent InverterPlant.MaxRampDownWPerS/MaxRampUpWPerS.
+	o.SetTickInterval(15 * time.Second)
+	if got := o.scaleRateWPerTick(1500); got != 7500 {
+		t.Errorf("STOCK cadence: scaleRateWPerTick(1500) = %v, want 7500 (500 W/s x 15s)", got)
+	}
+	if got := o.scaleRateWPerTick(500); math.Abs(got-2500) > 1e-6 {
+		t.Errorf("STOCK cadence: scaleRateWPerTick(500) = %v, want ~2500 (166.7 W/s x 15s)", got)
+	}
+}
+
+// TestExportLimitRule_CeilingSlewHoldsWallClockRateAtStockCadence proves the
+// applyExportLimitRule fix directly: seeded with a relaxed ceiling and a
+// sustained large export (isolating the slew-limited feedback path from the
+// feed-forward override by inflating the feed-forward term's own inputs far
+// past anything the slew could reach in these few ticks — see the huge
+// sol.PowerW below), the ceiling must tighten at the SAME wall-clock rate
+// (watts per real second) regardless of engine cadence. Before the fix, the
+// SAME tick-count budget took 5x longer in wall-clock seconds at STOCK's 15 s
+// tick than at the FAST/tuned 3 s tick.
+func TestExportLimitRule_CeilingSlewHoldsWallClockRateAtStockCadence(t *testing.T) {
+	const startCeilingW = 20000.0 // an artificially large relaxed ceiling (many ticks' worth of tightening at either cadence)
+
+	// ticksAndWallSecondsToZero drives applyExportLimitRule tick-by-tick from a
+	// pre-relaxed ceiling under a sustained, huge export, and returns how many
+	// ticks (and equivalent wall-clock seconds) it takes for the commanded
+	// ceiling to first reach 0 (fully compliant against the 0 W cap).
+	ticksAndWallSecondsToZero := func(tickInterval time.Duration) (ticks int, wallS float64) {
+		o := NewDefaultOptimizer()
+		o.SetTickInterval(tickInterval)
+		// Seed the guard as already engaged mid-episode (not the unclamped
+		// "first tick" one-step correction) with a relaxed ceiling.
+		o.expGuard = exportGuard{
+			evSetpointA: math.NaN(), evCmdW: math.NaN(), batteryAbsorbW: math.NaN(),
+			activeLimitW: 0, filteredExportW: startCeilingW, solarCeilingW: startCeilingW,
+		}
+		limits := gridConstraints{exportLimitW: 0, importLimitW: math.NaN(), maxLimitW: math.NaN()}
+		bats := []BatteryState{ruleBat("bat", 0, 100, 5000)} // full — no absorption lever
+		// PowerW is deliberately far past nameplate so the feed-forward term
+		// (homeSinkW = totalSolarW − actualExportW − ...) computes a value the
+		// slew-limited feedback never catches up to within these ticks — this
+		// isolates the slew mechanism under test from the feed-forward bypass.
+		solar := []SolarState{{Name: "pv", PowerW: 1_000_000, MaxW: startCeilingW, Connected: true, Energized: true}}
+
+		for i := 1; i <= 100; i++ {
+			plan := &Plan{}
+			o.applyExportLimitRule(solar, nil, 0, limits, -20000 /* sustained 20 kW export reading */, 95, 20000, bats, plan)
+			for _, sc := range plan.SolarCommands {
+				if sc.Name == "pv" && sc.CurtailToW <= 0 {
+					return i, float64(i) * o.tickSeconds()
+				}
+			}
+		}
+		t.Fatalf("tickInterval=%v: ceiling never reached 0 within 100 ticks", tickInterval)
+		return 0, 0
+	}
+
+	fastTicks, fastWallS := ticksAndWallSecondsToZero(tunedTickInterval) // 3 s
+	stockTicks, stockWallS := ticksAndWallSecondsToZero(15 * time.Second)
+
+	if stockTicks >= fastTicks {
+		t.Errorf("STOCK ticks-to-zero = %d, want fewer than FAST's %d ticks (the scaled-up per-tick drop should close the SAME gap in fewer, longer ticks)", stockTicks, fastTicks)
+	}
+	// Cadence-invariant wall-clock convergence: within one STOCK tick's slop
+	// (15 s) of each other. Pre-fix this would have been off by ~5x (STOCK
+	// wall-clock time ≈ 5x FAST's, since both took the SAME tick count but
+	// STOCK's ticks are 5x longer).
+	if diff := math.Abs(fastWallS - stockWallS); diff > 15.0 {
+		t.Errorf("wall-clock time to re-converge diverged across cadence: FAST=%.1fs (%d ticks) STOCK=%.1fs (%d ticks) — want within one STOCK tick (15s) of each other",
+			fastWallS, fastTicks, stockWallS, stockTicks)
 	}
 }
 

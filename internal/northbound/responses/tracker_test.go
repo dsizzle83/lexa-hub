@@ -78,7 +78,7 @@ func eq(t *testing.T, got []uint8, want ...uint8) {
 // Received(1) → Started(2) → Completed(3) over three poll cycles.
 func TestResponse_ReceivedStartedCompleted(t *testing.T) {
 	fp := &fakePoster{}
-	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil)
+	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil, nil, State{})
 
 	rt.Update(treeWith(ctrl("E1", 0)), eventActive("E1"), nil) // cycle 1: received+started
 	rt.Update(treeWith(ctrl("E1", 0)), eventActive("E1"), nil) // cycle 2: no change
@@ -92,7 +92,7 @@ func TestResponse_ReceivedStartedCompleted(t *testing.T) {
 // must be acknowledged with status=6 — exactly once.
 func TestResponse_CancelledAfterReceived(t *testing.T) {
 	fp := &fakePoster{}
-	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil)
+	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil, nil, State{})
 
 	rt.Update(treeWith(ctrl("E2", 0)), eventActive("E2"), nil) // received + started
 	rt.Update(treeWith(ctrl("E2", 6)), nil, nil)               // server cancels
@@ -105,7 +105,7 @@ func TestResponse_CancelledAfterReceived(t *testing.T) {
 // An event that arrives already cancelled is dropped — no responses at all.
 func TestResponse_BornCancelledIgnored(t *testing.T) {
 	fp := &fakePoster{}
-	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil)
+	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil, nil, State{})
 
 	rt.Update(treeWith(ctrl("E3", 6)), nil, nil)
 	rt.Update(treeWith(ctrl("E3", 6)), nil, nil)
@@ -119,7 +119,7 @@ func TestResponse_BornCancelledIgnored(t *testing.T) {
 // acknowledged with status=7 (superseded), once.
 func TestResponse_Superseded(t *testing.T) {
 	fp := &fakePoster{}
-	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil)
+	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil, nil, State{})
 
 	rt.Update(treeWith(ctrl("E4", 0)), eventActive("E4"), nil)           // received + started
 	rt.Update(treeWith(ctrl("E4", 0)), nil, map[string]bool{"E4": true}) // now superseded
@@ -134,7 +134,7 @@ func TestResponse_Superseded(t *testing.T) {
 // episode does post.
 func TestResponse_CannotComplyOncePerEpisode(t *testing.T) {
 	fp := &fakePoster{}
-	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil)
+	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil, nil, State{})
 
 	rt.AlertCannotComply("E5", "E5@100#1") // onset → post
 	rt.AlertCannotComply("E5", "E5@100#1") // redelivered same episode → no re-post
@@ -156,7 +156,7 @@ func TestResponse_CannotComplyOncePerEpisode(t *testing.T) {
 // (hub-restart-mid-cap posts exactly once).
 func TestResponse_CannotComplyRestartNoDoublePost(t *testing.T) {
 	fp := &fakePoster{}
-	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil)
+	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil, nil, State{})
 
 	rt.AlertCannotComply("E6", "E6@100#1") // pre-restart onset → post
 	// Hub restarts, re-opens the SAME control's episode with a new counter/time.
@@ -170,7 +170,7 @@ func TestResponse_CannotComplyRestartNoDoublePost(t *testing.T) {
 // hub) dedupes by mRID exactly as before.
 func TestResponse_CannotComplyLegacyNoEpisodeID(t *testing.T) {
 	fp := &fakePoster{}
-	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil)
+	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil, nil, State{})
 
 	rt.AlertCannotComply("E7", "") // legacy publisher, mRID-only
 	rt.AlertCannotComply("E7", "") // redelivered → no re-post
@@ -219,7 +219,7 @@ func TestResponse_CannotComplyJournalsOnSuccess(t *testing.T) {
 	defer jw.Close()
 
 	fp := &fakePoster{}
-	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, jw)
+	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, jw, nil, State{})
 
 	rt.AlertCannotComply("E8", "E8@100#1")
 	rt.AlertCannotComply("E8", "E8@100#1") // redelivered same episode → no re-journal
@@ -253,7 +253,7 @@ func TestResponse_CannotComplyDoesNotJournalOnFailedPOST(t *testing.T) {
 	}
 	defer jw.Close()
 
-	rt := New(failingPoster{}, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, jw)
+	rt := New(failingPoster{}, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, jw, nil, State{})
 	rt.AlertCannotComply("E9", "E9@1#1")
 	if err := jw.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
@@ -270,7 +270,7 @@ func TestResponse_CannotComplyDoesNotJournalOnFailedPOST(t *testing.T) {
 // behavior untouched.
 func TestResponse_NilJournalIsNoop(t *testing.T) {
 	fp := &fakePoster{}
-	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil)
+	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil, nil, State{})
 	rt.AlertCannotComply("E10", "E10@1#1")
 	if got := fp.statusesFor("E10"); len(got) != 1 || got[0] != model.ResponseCannotComply {
 		t.Fatalf("nil journal must not affect the POST itself, got %v", got)

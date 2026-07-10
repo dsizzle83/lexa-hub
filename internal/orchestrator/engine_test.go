@@ -337,6 +337,31 @@ func TestEngine_PreservesReaderClockOffset(t *testing.T) {
 	}
 }
 
+// TestEngine_CmdDropped_ReflectsEnqueueDrops is WS-9.3's test: CmdDropped()
+// must report exactly what enqueue (engine_state.go) already counts
+// internally, so cmd/hub/main.go's Collect hook mirrors a real value. Before
+// Start(), nothing is draining cmdCh (cap 16 — see engine.go's New), so
+// calling SetPrices well past that cap forces enqueue's drop path
+// deterministically, with no reliance on goroutine timing.
+func TestEngine_CmdDropped_ReflectsEnqueueDrops(t *testing.T) {
+	reader := &mockReader{state: state0()}
+	opt := &mockOptimizer{}
+	eng := orchestrator.New(reader, opt, orchestrator.Config{Interval: time.Hour})
+
+	if got := eng.CmdDropped(); got != 0 {
+		t.Fatalf("CmdDropped() before any SetPrices calls = %d, want 0", got)
+	}
+
+	const calls = 32 // well past cmdCh's cap of 16, with nothing draining it yet
+	for i := 0; i < calls; i++ {
+		eng.SetPrices([]float64{1}, []float64{1})
+	}
+
+	if got := eng.CmdDropped(); got == 0 {
+		t.Fatalf("CmdDropped() = 0 after %d SetPrices calls with an undrained cmdCh; want > 0", calls)
+	}
+}
+
 // ── captureStateOptimizer ─────────────────────────────────────────────────────
 
 type captureStateOptimizer struct {

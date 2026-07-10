@@ -159,6 +159,11 @@ func main() {
 			// breach-episode component (active mode only — shadow shells never
 			// drive CannotComply).
 			if mode == modeActive {
+				// WS-4.5: heal a retained NonConvergedBegin left over from a
+				// PREVIOUS process instance of this shell BEFORE this
+				// instance's own reconciler starts publishing (shell.pub,
+				// right below) — see healStaleRetainedReport's doc.
+				healStaleRetainedReport(mc, bus.DesiredClassBattery, dc.Name, time.Now())
 				shell.pub = newReconcileReportPublisher(mc)
 			}
 			battShells[dc.Name] = shell
@@ -202,6 +207,10 @@ func main() {
 			}
 			shell := newSolarShell(dc.Name, reconcile.Config{}, mreg, mode, drv)
 			if mode == modeActive {
+				// WS-4.5: heal a retained NonConvergedBegin left over from a
+				// PREVIOUS process instance of this shell — see
+				// healStaleRetainedReport's doc (battery's call site above).
+				healStaleRetainedReport(mc, bus.DesiredClassSolar, dc.Name, now)
 				shell.pub = newReconcileReportPublisher(mc) // TASK-031
 			}
 			solarShells[dc.Name] = shell

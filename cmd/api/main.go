@@ -96,13 +96,22 @@ func main() {
 	planHB.stalledGauge = reg.Gauge("lexa_api_plan_heartbeat_stalled")
 	planHB.ageGauge = reg.Gauge("lexa_api_plan_heartbeat_age_seconds")
 
+	// WS-9.1: tracks continuous-disconnected time so the watchdog kick below
+	// can tell "genuinely connected" from "IsConnected() still true only
+	// because paho's AutoReconnect is retrying" — see deaf's doc comment.
+	deaf := watchdog.NewDeafTracker()
+	reg.Collect(func(r *metrics.Registry) {
+		r.Gauge("lexa_mqtt_deaf_seconds").Set(deaf.DeafFor(time.Now()).Seconds())
+	})
+
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
 		log.Fatalf("lexa-api: %v", err)
 	}
 	mc, err := mqttutil.ConnectAuthInstrumented(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass, mqttutil.Instrumentation{
-		OnPublishFail: mqttFailCtr.Inc,
-		OnReconnect:   mqttReconnCtr.Inc,
+		OnPublishFail:    mqttFailCtr.Inc,
+		OnReconnect:      func() { mqttReconnCtr.Inc(); deaf.OnReconnect() },
+		OnConnectionLost: deaf.OnConnectionLost,
 	})
 	if err != nil {
 		log.Fatalf("lexa-api: %v", err)
@@ -389,9 +398,15 @@ func main() {
 	// liveness proxy, kicking only when BOTH MQTT is connected AND a fresh
 	// loopback /healthz probe returns 200, so a wedged HTTP server (mux
 	// handlers deadlocked, listener goroutine dead) withholds the kick even
-	// though the process itself is still scheduling goroutines.
+	// though the process itself is still scheduling goroutines. WS-9.1:
+	// mc.IsConnected() alone stays true for the ENTIRE duration of a broker
+	// outage as long as paho's AutoReconnect keeps retrying, so it is paired
+	// with deaf.DeafFor — once a continuous outage exceeds
+	// cfg.MQTTDeafRestartAfter (default 5 min), the kick gate stops firing
+	// and systemd's WatchdogSec restarts this service.
 	kick := time.NewTicker(10 * time.Second)
 	defer kick.Stop()
+	deafRestartAfter := cfg.MQTTDeafRestartAfter()
 
 	// TASK-045: heartbeat evaluation cadence — independent of the watchdog
 	// kick ticker above (different purpose: this one drives the edge-triggered
@@ -410,7 +425,7 @@ func main() {
 			_ = srv.Close()
 			return
 		case <-kick.C:
-			if mc.IsConnected() && probeHealthz(healthzClient, healthzURL) {
+			if mc.IsConnected() && deaf.DeafFor(time.Now()) < deafRestartAfter && probeHealthz(healthzClient, healthzURL) {
 				watchdog.Kick()
 			}
 		case <-hbTicker.C:

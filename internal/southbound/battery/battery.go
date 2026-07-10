@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"time"
 
+	"lexa-hub/internal/southbound/device"
 	model "lexa-proto/csipmodel"
 	"lexa-proto/derbase"
-	"lexa-hub/internal/southbound/device"
 	"lexa-proto/modbus"
 	"lexa-proto/sunspec"
 )

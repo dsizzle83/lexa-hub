@@ -8,6 +8,13 @@
   "engine_interval_s": 15,
   "debug": false,
   "constraint_shadow": false,
+  "constraint_modes": {
+    "export": "off",
+    "gen": "off",
+    "import": "off",
+    "economics": "off",
+    "battery_safety": "off"
+  },
   "mode": "optimizer",
   "gateway": {
     "evse_policy": "scheduled",
@@ -62,7 +69,7 @@
     "max_files": 4
   },
   "snapshot": {
-    "enabled": false,
+    "enabled": true,
     "path": "/var/lib/lexa/snapshot/hub.json",
     "max_age_s": 300
   },

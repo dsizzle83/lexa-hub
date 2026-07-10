@@ -13,11 +13,13 @@ type Interval struct {
 }
 
 // Desired is the arbitrated outcome for one device: the resolved admissible
-// interval per axis, the resolved connect state, and any conflicts recorded
-// while resolving. The Stack converts this into orchestrator commands.
+// interval per axis, the resolved connect state, any conflicts recorded while
+// resolving, and (FIX-F) which constraint AUTHORED each axis's final value.
+// The Stack converts this into orchestrator commands.
 type Desired struct {
 	Device    string
 	Bounds    map[Axis]Interval
+	Authors   map[Axis]string
 	Connect   *bool
 	Conflicts []Conflict
 }
@@ -26,6 +28,22 @@ type Desired struct {
 func (d Desired) Bound(axis Axis) (Interval, bool) {
 	iv, ok := d.Bounds[axis]
 	return iv, ok
+}
+
+// Author returns the Source of the demand that determined this axis's final
+// value this tick, and whether any demand set it (FIX-F, TASK-060 §4 /
+// TASK-061 §4). "Determined" means: whichever demand fixed the surviving Max
+// bound in the cross-tier fold (resolveInterval) — the only bound with real
+// content for every demand shape this package's constraints emit (a
+// CeilingDemand bounds Max only; a PointDemand pins Min==Max, so Max's author
+// IS Min's author). A higher tier that a lower tier's demand does not
+// actually narrow keeps its own author — "ownership is per-tick, whoever's
+// demand won the fold for that axis, not static" (FIX-F launch brief). For
+// AxisConnect the author is the source of the winning (false-dominant) demand
+// (resolveConnect). Empty when no demand touched the axis.
+func (d Desired) Author(axis Axis) (string, bool) {
+	a, ok := d.Authors[axis]
+	return a, ok
 }
 
 // Conflict records a same-tier contention the arbiter resolved by taking the
@@ -71,7 +89,7 @@ func Resolve(demands []Demand) map[string]Desired {
 
 	out := make(map[string]Desired, len(byDevice))
 	for _, dev := range deviceOrder {
-		des := Desired{Device: dev, Bounds: map[Axis]Interval{}}
+		des := Desired{Device: dev, Bounds: map[Axis]Interval{}, Authors: map[Axis]string{}}
 		axes := byDevice[dev]
 		for _, axis := range axisOrder {
 			group := axes[axis]
@@ -79,13 +97,19 @@ func Resolve(demands []Demand) map[string]Desired {
 				continue
 			}
 			if axis == AxisConnect {
-				connect, conflicts := resolveConnect(dev, group)
+				connect, author, conflicts := resolveConnect(dev, group)
 				des.Connect = connect
+				if author != "" {
+					des.Authors[axis] = author
+				}
 				des.Conflicts = append(des.Conflicts, conflicts...)
 				continue
 			}
-			iv, conflicts := resolveInterval(dev, axis, group)
+			iv, author, conflicts := resolveInterval(dev, axis, group)
 			des.Bounds[axis] = iv
+			if author != "" {
+				des.Authors[axis] = author
+			}
 			des.Conflicts = append(des.Conflicts, conflicts...)
 		}
 		out[dev] = des
@@ -125,31 +149,50 @@ func sortDemands(group []Demand) {
 // not resolved by a global min that could let a lower-tier point (e.g. a charge
 // setpoint more negative than a compliance discharge point) silently override the
 // higher tier. See TestResolve_EconomicsPointClampedByCompliance*.
-func resolveInterval(device string, axis Axis, group []Demand) (Interval, []Conflict) {
+//
+// Authorship (FIX-F, return value 2): the fold also tracks, tier by tier,
+// which tier last actually TIGHTENED the surviving Max bound — see intersect-
+// SameTier's tighteningSource and Desired.Author's doc for why tracking only
+// Max is sufficient for every demand shape this package emits. A tier whose
+// own interval is redundant (already contained in the accumulated one) never
+// becomes the author: the higher tier that set the value stays credited,
+// matching "a lower tier may only narrow, never widen or relabel" in spirit.
+func resolveInterval(device string, axis Axis, group []Demand) (Interval, string, []Conflict) {
 	sortDemands(group) // SAFETY first, then by Source — deterministic tier order
 
 	var conflicts []Conflict
 	accLo, accHi := math.Inf(-1), math.Inf(1)
 	accSet := false // whether any higher tier has fixed the interval yet
+	author := ""
 
 	for _, tg := range groupByTier(group) {
-		tierLo, tierHi, tierConflicts := intersectSameTier(device, axis, tg.demands)
+		tierLo, tierHi, tierAuthor, tierConflicts := intersectSameTier(device, axis, tg.demands)
 		conflicts = append(conflicts, tierConflicts...)
 
 		if !accSet {
 			accLo, accHi, accSet = tierLo, tierHi, true
+			author = tierAuthor
 			continue
 		}
 
 		newLo := math.Max(accLo, tierLo)
 		newHi := math.Min(accHi, tierHi)
 		if newLo <= newHi {
+			// This tier is credited as author only if it actually tightened the
+			// surviving bound (Max first — the content-bearing side for every
+			// real demand shape; Min only as a tie-break for a hypothetical
+			// floor-only demand no current constraint emits).
+			if newHi < accHi || (newHi == accHi && newLo > accLo) {
+				author = tierAuthor
+			}
 			accLo, accHi = newLo, newHi
 			continue
 		}
 
 		// Lower tier is infeasible inside the higher-tier interval: the higher
-		// tier wins outright, the lower tier is clamped. Record the seam.
+		// tier wins outright, the lower tier is clamped. Record the seam. The
+		// higher tier's author is unchanged — it is still the one whose bound
+		// survives.
 		conflicts = append(conflicts, Conflict{
 			Device:  device,
 			Axis:    axis,
@@ -160,7 +203,7 @@ func resolveInterval(device string, axis Axis, group []Demand) (Interval, []Conf
 		})
 	}
 
-	return Interval{Min: infToNaN(accLo), Max: infToNaN(accHi)}, conflicts
+	return Interval{Min: infToNaN(accLo), Max: infToNaN(accHi)}, author, conflicts
 }
 
 // tierGroup is one tier's slice of an axis group, in the sorted (ascending-tier)
@@ -189,7 +232,13 @@ func groupByTier(group []Demand) []tierGroup {
 // collapses to the most-restrictive (lowest) ceiling and records a same-tier
 // conflict — the 058 skeleton's within-tier semantics, kept bit-identical so
 // same-tier arbitration does not shift under TASK-063.
-func intersectSameTier(device string, axis Axis, group []Demand) (float64, float64, []Conflict) {
+//
+// The third return value (FIX-F) is tighteningSource: the Source of whichever
+// demand in this tier last set (or, on conflict, collapsed to) the surviving
+// Max. It was already tracked internally pre-FIX-F to label conflict Sources;
+// it is now also handed up to resolveInterval as this tier's authorship
+// candidate for the cross-tier fold.
+func intersectSameTier(device string, axis Axis, group []Demand) (float64, float64, string, []Conflict) {
 	lo, hi := math.Inf(-1), math.Inf(1)
 	tighteningSource := ""
 	var conflicts []Conflict
@@ -228,7 +277,7 @@ func intersectSameTier(device string, axis Axis, group []Demand) (float64, float
 				axis, d.Tier, hi),
 		})
 	}
-	return lo, hi, conflicts
+	return lo, hi, tighteningSource, conflicts
 }
 
 // fmtInterval renders an interval for a conflict reason, mapping ±Inf to "∞".
@@ -244,8 +293,10 @@ func fmtInterval(lo, hi float64) string {
 }
 
 // resolveConnect resolves the connect axis: false wins; a tier holding both a
-// true and a false demand is a recorded conflict.
-func resolveConnect(device string, group []Demand) (*bool, []Conflict) {
+// true and a false demand is a recorded conflict. The second return value
+// (FIX-F) is the Source of the winning demand (falseSrc when any pack
+// requested disconnect, else trueSrc), empty when no demand touched the axis.
+func resolveConnect(device string, group []Demand) (*bool, string, []Conflict) {
 	sortDemands(group)
 
 	anyFalse := false
@@ -301,12 +352,12 @@ func resolveConnect(device string, group []Demand) (*bool, []Conflict) {
 	switch {
 	case anyFalse:
 		v := false
-		return &v, conflicts
+		return &v, falseSrc, conflicts
 	case anyTrue:
 		v := true
-		return &v, conflicts
+		return &v, trueSrc, conflicts
 	default:
-		return nil, conflicts
+		return nil, "", conflicts
 	}
 }
 

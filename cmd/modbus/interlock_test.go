@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"lexa-hub/internal/bus"
-	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/southbound/device"
+	model "lexa-proto/csipmodel"
 )
 
 type fakeApplier struct {

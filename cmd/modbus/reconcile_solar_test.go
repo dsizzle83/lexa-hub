@@ -239,6 +239,143 @@ func TestSolarActive_ReconnectAfterReleaseDeliversRestore(t *testing.T) {
 	}
 }
 
+// -------------------------------------------------------------------------
+// WS-2 fix 2: seedRestoreCeiling fail-closed (reseedFromStaleDoc)
+// -------------------------------------------------------------------------
+
+// TestSolarActive_StaleFirstDocReseedsCapNotRestore is WS-2 fix 2's core
+// acceptance criterion: lexa-modbus restarts (seedRestoreCeiling seeds
+// restore, silently), and the FIRST real hub doc this process ever sees is
+// too stale to adopt (the hub-down-during-consumer-restart scenario) — the
+// standing intent must become the stale doc's CAP, not stay at the seeded
+// restore, and a subsequent reconnect must reassert the CAP.
+func TestSolarActive_StaleFirstDocReseedsCapNotRestore(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingDriver{}
+	s := newSolarShell("inverter-0", reconcile.Config{}, mreg, modeActive, drv)
+	t0 := time.Now()
+
+	s.seedRestoreCeiling(t0)
+	if len(drv.applied) != 0 {
+		t.Fatalf("seed must not write at startup, applied=%d", len(drv.applied))
+	}
+
+	// A stale cap doc arrives (the hub's last real command before it went
+	// down, delivered as the MQTT retained message on subscribe) — 400s old,
+	// past the 300s StaleAfter bound, so the reconciler core rejects it.
+	staleCap := solarCapDoc(1800, 7, t0.Add(-400*time.Second))
+	s.setDesired(staleCap, t0)
+	if len(drv.applied) != 0 {
+		t.Fatalf("a rejected-stale doc must never itself write to hardware, applied=%d", len(drv.applied))
+	}
+	if !s.standingIsSeed {
+		t.Fatal("re-seeding from a stale doc is still a seed, not a genuinely adopted doc")
+	}
+	if !s.haveDesiredCeiling || s.desiredCeilingW != 1800 {
+		t.Fatalf("desiredCeilingW = %v (have=%v), want 1800 (the stale doc's cap, fail-closed over the restore seed)", s.desiredCeilingW, s.haveDesiredCeiling)
+	}
+
+	// Reconnect must reassert the CAP (1800), never the restore ceiling —
+	// this is the WS-2 fail-open this fix closes: without it, the reconnect
+	// reassert below would deliver full output over an inverter the hub last
+	// told to curtail to 1800 W.
+	s.markReconnected()
+	s.observe(solarMeas(0), true, t0.Add(time.Second))
+	if len(drv.applied) != 1 {
+		t.Fatalf("reconnect must reassert the re-seeded cap, applied=%d", len(drv.applied))
+	}
+	if w := lastMaxW(drv.applied[0]); math.Abs(w-1800) > 0.5 {
+		t.Errorf("reconnect reassert = %.0f, want the fail-closed cap 1800 (NOT restore)", w)
+	}
+}
+
+// TestSolarActive_NeverCommandedInverterStillSeedsRestore is WS-2 fix 2's
+// other half, pinned explicitly: an inverter with NO hub doc at all (no
+// stale doc ever arrives — genuinely never-commanded) must still seed and
+// reassert restore, exactly as before this fix. (Also covered end-to-end by
+// TestSolarActive_SeedThenReconnectReassertsRestore; this test isolates the
+// standingIsSeed bookkeeping the WS-2 fix added.)
+func TestSolarActive_NeverCommandedInverterStillSeedsRestore(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingDriver{}
+	s := newSolarShell("inverter-0", reconcile.Config{}, mreg, modeActive, drv)
+	t0 := time.Now()
+
+	s.seedRestoreCeiling(t0)
+	if !s.standingIsSeed || s.desiredCeilingW != restoreCeilingW {
+		t.Fatalf("fresh seed must be restore, got desiredCeilingW=%v standingIsSeed=%v", s.desiredCeilingW, s.standingIsSeed)
+	}
+
+	s.markReconnected()
+	s.observe(solarMeas(3000), true, t0.Add(time.Second))
+	if len(drv.applied) != 1 {
+		t.Fatalf("reconnect must reassert the seeded restore ceiling, applied=%d", len(drv.applied))
+	}
+	if w := lastMaxW(drv.applied[0]); w < 1e8 {
+		t.Errorf("never-commanded inverter's reconnect reassert = %.0f, want restore", w)
+	}
+}
+
+// TestSolarActive_ReseedOnlyAppliesBeforeARealDocIsAccepted verifies the
+// fail-closed re-seed is a ONE-TIME, startup-only correction: once a real
+// doc has been genuinely accepted (standingIsSeed cleared), a LATER
+// stale/replay doc must be ignored exactly as it always was — it must NOT
+// perturb an already-adopted standing intent, even though it carries a
+// CeilingW.
+func TestSolarActive_ReseedOnlyAppliesBeforeARealDocIsAccepted(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingDriver{}
+	s := newSolarShell("inverter-0", reconcile.Config{}, mreg, modeActive, drv)
+	t0 := time.Now()
+
+	// A real, fresh doc is genuinely adopted first (no seed involved).
+	s.setDesired(solarCapDoc(2500, 5, t0), t0)
+	if s.standingIsSeed {
+		t.Fatal("a genuinely accepted doc must clear standingIsSeed")
+	}
+	if len(drv.applied) != 1 {
+		t.Fatalf("expected the real doc to be applied, applied=%d", len(drv.applied))
+	}
+	if w := lastMaxW(drv.applied[0]); math.Abs(w-2500) > 0.5 {
+		t.Fatalf("expected the real doc to be applied as 2500, got %.0f", w)
+	}
+
+	// A stale, older doc later shows up (e.g. a stray retained redelivery) —
+	// must be rejected and must NOT move the already-adopted 2500 standing
+	// intent, exactly as the pre-WS-2 rejected-docs-never-move-desired rule
+	// requires.
+	stale := solarCapDoc(999, 1, t0.Add(-400*time.Second))
+	s.setDesired(stale, t0)
+	if s.desiredCeilingW != 2500 {
+		t.Fatalf("desiredCeilingW = %v, want unchanged 2500 (a stale doc after real adoption must never move it)", s.desiredCeilingW)
+	}
+	if len(drv.applied) != 1 {
+		t.Fatalf("a rejected stale doc must not write, applied=%d", len(drv.applied))
+	}
+}
+
+// TestSolarActive_ReseedIgnoresNonStaleRejections verifies staleRejected
+// only fires the WS-2 re-seed for RejectStale — a NaN doc rejection while
+// still on the startup seed must be ignored exactly as before (no signal
+// worth re-seeding from), not mistaken for a stale-but-informative doc.
+func TestSolarActive_ReseedIgnoresNonStaleRejections(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingDriver{}
+	s := newSolarShell("inverter-0", reconcile.Config{}, mreg, modeActive, drv)
+	t0 := time.Now()
+	s.seedRestoreCeiling(t0)
+
+	nan := math.NaN()
+	nanDoc := bus.DesiredState{
+		DeviceClass: bus.DesiredClassSolar, DeviceID: "inverter-0",
+		CeilingW: &nan, Source: "economic", IssuedAt: t0.Unix(), Seq: 5,
+	}
+	s.setDesired(nanDoc, t0)
+	if !s.standingIsSeed || s.desiredCeilingW != restoreCeilingW {
+		t.Fatalf("a NaN-rejected doc must not perturb the restore seed, got desiredCeilingW=%v standingIsSeed=%v", s.desiredCeilingW, s.standingIsSeed)
+	}
+}
+
 // TestSolarActive_ImplausibleHeld: an implausible reading (solar-bad-scale,
 // ledger L9) is evidence of nothing — no write, no match, no divergence.
 func TestSolarActive_ImplausibleHeld(t *testing.T) {

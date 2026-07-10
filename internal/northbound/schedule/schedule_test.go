@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"lexa-hub/internal/northbound/discovery"
-	model "lexa-proto/csipmodel"
 	"lexa-hub/internal/northbound/schedule"
+	model "lexa-proto/csipmodel"
 )
 
 // baseNow is a fixed reference time so test timestamps are readable.
@@ -39,7 +39,7 @@ func makeProgram(primacy uint8, controls []model.DERControl, hasDefault bool) di
 	if hasDefault {
 		t := true
 		ps.DefaultControl = &model.DefaultDERControl{
-			MRID: "default-ctrl",
+			MRID:           "default-ctrl",
 			DERControlBase: model.DERControlBase{OpModEnergize: &t},
 		}
 	}

@@ -86,13 +86,22 @@ func main() {
 	pendingGauge := reg.Gauge("lexa_ocpp_pending_stations")
 	idleGauge := reg.Gauge("lexa_ocpp_uncommissioned_idle")
 
+	// WS-9.1: tracks continuous-disconnected time so the watchdog kick below
+	// can tell "genuinely connected" from "IsConnected() still true only
+	// because paho's AutoReconnect is retrying" — see deaf's doc comment.
+	deaf := watchdog.NewDeafTracker()
+	reg.Collect(func(r *metrics.Registry) {
+		r.Gauge("lexa_mqtt_deaf_seconds").Set(deaf.DeafFor(time.Now()).Seconds())
+	})
+
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
 		log.Fatalf("lexa-ocpp: %v", err)
 	}
 	mc, err := mqttutil.ConnectAuthInstrumented(cfg.MQTTBroker, cfg.MQTTClientID, cfg.MQTTUser, mqttPass, mqttutil.Instrumentation{
-		OnPublishFail: mqttFailCtr.Inc,
-		OnReconnect:   mqttReconnCtr.Inc,
+		OnPublishFail:    mqttFailCtr.Inc,
+		OnReconnect:      func() { mqttReconnCtr.Inc(); deaf.OnReconnect() },
+		OnConnectionLost: deaf.OnConnectionLost,
 	})
 	if err != nil {
 		log.Fatalf("lexa-ocpp: %v", err)
@@ -162,6 +171,11 @@ func main() {
 				// TASK-031: forward device-level non-convergence to the hub's
 				// breach-episode component (active mode only).
 				if mode == modeActive {
+					// WS-4.5: heal a retained NonConvergedBegin left over from a
+					// PREVIOUS process instance of this shell BEFORE this
+					// instance's own reconciler starts publishing (sh.pub, right
+					// below) — see healStaleRetainedReport's doc.
+					healStaleRetainedReport(mc, bus.DesiredClassEVSE, sc.ID, time.Now())
 					sh.pub = newReconcileReportPublisher(mc)
 				}
 				shells[sc.ID] = sh
@@ -204,11 +218,16 @@ func main() {
 	// dead process (not just a disconnected broker) is what trips the
 	// watchdog. Unaffected by the Unit 6.1 idle gate: an idle instance with
 	// no stations is exactly as alive as one serving chargers from the
-	// watchdog's point of view. A sustained broker outage (> WatchdogSec)
-	// DOES restart this service; that is accepted crash-only behavior
-	// (AD-011), noted in the PR.
+	// watchdog's point of view. WS-9.1: mc.IsConnected() alone stays true for
+	// the ENTIRE duration of a broker outage as long as paho's AutoReconnect
+	// keeps retrying, so it is paired with deaf.DeafFor — once a continuous
+	// outage exceeds cfg.MQTTDeafRestartAfter (default 5 min), the kick gate
+	// stops firing and systemd's WatchdogSec restarts this service; that is
+	// accepted crash-only behavior (AD-011), matching the WatchdogSec comment
+	// in systemd/lexa-ocpp.service.
 	kick := time.NewTicker(10 * time.Second)
 	defer kick.Stop()
+	deafRestartAfter := cfg.MQTTDeafRestartAfter()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -218,7 +237,7 @@ func main() {
 			log.Println("lexa-ocpp: shutting down")
 			return
 		case <-kick.C:
-			if mc.IsConnected() {
+			if mc.IsConnected() && deaf.DeafFor(time.Now()) < deafRestartAfter {
 				watchdog.Kick()
 			}
 		}

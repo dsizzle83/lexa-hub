@@ -71,15 +71,22 @@ RestrictAddressFamilies=AF_INET AF_NETLINK AF_UNIX
 # Type=notify + WatchdogSec (TASK-008, review §11 item 5): lexa-api's main
 # goroutine only ever blocked on signal (ListenAndServe runs in its own
 # goroutine) — no natural liveness point exists. A 10s kick ticker
-# (cmd/api/main.go) fires WATCHDOG=1 only when BOTH mc.IsConnected() AND a
-# fresh loopback GET /healthz (2s timeout) returns 200 — an actual, current
-# HTTP round trip through the mux, not just "the process is scheduled".
-# READY=1 is sent once the HTTP listener goroutine is up, probed once.
+# (cmd/api/main.go) fires WATCHDOG=1 only when mc.IsConnected() AND
+# watchdog.DeafTracker reports less than mqtt_deaf_restart_after_s (WS-9.1,
+# api.json, default 300s) continuous MQTT disconnection AND a fresh loopback
+# GET /healthz (2s timeout) returns 200 — an actual, current HTTP round trip
+# through the mux, not just "the process is scheduled". READY=1 is sent once
+# the HTTP listener goroutine is up, probed once.
 #
-# WatchdogSec=60: a sustained MQTT broker outage or a wedged HTTP server (> a
-# few missed 10s probes) restarts the service — accepted crash-only behavior
-# (AD-011); see PR for the mqtt-broker-restart / mqtt-broker-latency Mayhem
-# reasoning (same as lexa-ocpp).
+# mc.IsConnected() alone is NOT enough to gate a kick: paho's AutoReconnect
+# keeps it true for the client's entire reconnect retry loop, not just while
+# actually connected — the DeafTracker gate above is what makes a sustained
+# broker outage actually withhold kicks. A wedged HTTP server (repeated
+# /healthz probe failures) restarts the service faster, on its own, via the
+# same kick gate. WatchdogSec=60: once kicks stop (either gate), the service
+# restarts within ~60s of the LAST successful kick — accepted crash-only
+# behavior (AD-011); see PR for the mqtt-broker-restart / mqtt-broker-latency
+# Mayhem reasoning (same as lexa-ocpp).
 Type=notify
 NotifyAccess=main
 WatchdogSec=60

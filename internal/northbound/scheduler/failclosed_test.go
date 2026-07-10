@@ -90,9 +90,67 @@ func TestEvaluate_RejectsImplausibleHoldsLastGood(t *testing.T) {
 	if got.MRID != "GOOD" || !got.Held {
 		t.Errorf("expected held GOOD control, got mrid=%q held=%v", got.MRID, got.Held)
 	}
+	if !got.ImplausibleReject {
+		t.Error("expected ImplausibleReject=true on a hold caused by a garbage OpModExpLimW (metric gate for the caller)")
+	}
 	if w := float64(got.Base.OpModExpLimW.Value) * 1; w != 1000 {
 		t.Errorf("held control adopted the garbage limit: value=%d", got.Base.OpModExpLimW.Value)
 	}
+}
+
+// ImplausibleReject must be scoped to the malformed-value hold ONLY — the
+// other fail-closed hold reasons (empty/absent program list, clock
+// regression) are transport/timing anomalies, not "the server served a
+// present-but-garbage control", and must not trip the dedicated
+// lexa_nb_implausible_rejects_total metric the caller (run.RunOnce) gates on
+// this field.
+func TestEvaluate_ImplausibleRejectNotSetOnOtherHoldReasons(t *testing.T) {
+	t.Run("empty program list hold", func(t *testing.T) {
+		s := New()
+		evt := eventWithExpLim("E1", epoch, 3600, 1000, 0)
+		if lkg := s.Evaluate(progs(evt), epoch); lkg == nil {
+			t.Fatal("expected fresh control, got nil")
+		}
+		held := s.Evaluate(nil, epoch+10)
+		if held == nil || !held.Held {
+			t.Fatalf("expected a held control, got %+v", held)
+		}
+		if held.ImplausibleReject {
+			t.Error("empty program list hold must not set ImplausibleReject — it is not a garbage-value reject")
+		}
+	})
+
+	t.Run("clock regression hold (no active event resolved)", func(t *testing.T) {
+		s := New()
+		evt := eventWithExpLim("E1", epoch, 600, 1000, 0)
+		programs := progsNoDefault(evt)
+		if ac := s.Evaluate(programs, epoch+30); ac == nil {
+			t.Fatal("expected fresh control")
+		}
+		held := s.Evaluate(programs, epoch-30) // clock steps back past start
+		if held == nil || !held.Held {
+			t.Fatalf("expected a held control through the clock regression, got %+v", held)
+		}
+		if held.ImplausibleReject {
+			t.Error("clock-regression hold must not set ImplausibleReject — it is not a garbage-value reject")
+		}
+	})
+
+	t.Run("clock regression hold (event over default)", func(t *testing.T) {
+		s := New()
+		evt := eventWithExpLim("E1", epoch, 600, 0, 0)
+		programs := progs(evt) // program carries a 5000 W default
+		if ac := s.Evaluate(programs, epoch+30); ac == nil {
+			t.Fatal("expected fresh control")
+		}
+		held := s.Evaluate(programs, epoch-30)
+		if held == nil || !held.Held {
+			t.Fatalf("expected the event held over the default, got %+v", held)
+		}
+		if held.ImplausibleReject {
+			t.Error("clock-regression event-over-default hold must not set ImplausibleReject")
+		}
+	})
 }
 
 // With no prior good control, a malformed resource resolves to nil — the absurd

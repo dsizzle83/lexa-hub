@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,6 +183,224 @@ func TestLoadConfig_RetainedAdoptionMaxAgeOverride(t *testing.T) {
 	}
 	if cfg.RetainedAdoptionMaxAge() != 60*time.Second {
 		t.Fatalf("RetainedAdoptionMaxAge() = %s, want 60s", cfg.RetainedAdoptionMaxAge())
+	}
+}
+
+// ── FIX-F: ConstraintModes / ResolveConstraintModes ─────────────────────────
+
+// TestResolveConstraintModes_BackCompatAbsentMap pins config.go's absolute
+// back-compat rule (TASK-060 §4): with no "constraint_modes" block,
+// constraint_shadow alone decides — true resolves every key to "shadow"
+// (today's TASK-059 behaviour, bit-identical), false to "off" (moot: cmd/hub
+// never constructs the wrapper in that case, but the map must still be
+// honest).
+func TestResolveConstraintModes_BackCompatAbsentMap(t *testing.T) {
+	allKeys := []string{"export", "gen", "import", "economics", "battery_safety"}
+
+	shadowOn := &Config{ConstraintShadow: true}
+	modes, err := shadowOn.ResolveConstraintModes()
+	if err != nil {
+		t.Fatalf("constraint_shadow=true, no map: %v", err)
+	}
+	for _, k := range allKeys {
+		if modes[k] != ModeShadow {
+			t.Errorf("constraint_shadow=true modes[%q] = %q, want shadow", k, modes[k])
+		}
+	}
+
+	shadowOff := &Config{ConstraintShadow: false}
+	modes, err = shadowOff.ResolveConstraintModes()
+	if err != nil {
+		t.Fatalf("constraint_shadow=false, no map: %v", err)
+	}
+	for _, k := range allKeys {
+		if modes[k] != ModeOff {
+			t.Errorf("constraint_shadow=false modes[%q] = %q, want off", k, modes[k])
+		}
+	}
+}
+
+// TestResolveConstraintModes_PresentMapOmittedKeyDefaultsOff pins the OTHER
+// half of back-compat: once constraint_modes is present, an omitted key
+// defaults to "off" (TASK-060 step 4's per-constraint flip default), NOT
+// "shadow" — a partially-specified map must not silently shadow-enable
+// constraints the author never named.
+func TestResolveConstraintModes_PresentMapOmittedKeyDefaultsOff(t *testing.T) {
+	cfg := &Config{
+		ConstraintShadow: true,
+		ConstraintModes:  map[string]ConstraintMode{"export": ModeShadow},
+	}
+	modes, err := cfg.ResolveConstraintModes()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if modes["export"] != ModeShadow {
+		t.Errorf(`modes["export"] = %q, want shadow (explicit)`, modes["export"])
+	}
+	for _, k := range []string{"gen", "import", "economics", "battery_safety"} {
+		if modes[k] != ModeOff {
+			t.Errorf("modes[%q] = %q, want off (omitted from a present map)", k, modes[k])
+		}
+	}
+}
+
+// TestResolveConstraintModes_ValidationTable is the deliverable-5e table
+// test: every unknown-key/unknown-value/active-without-shadow validation
+// path fails loud, and every valid combination resolves cleanly.
+func TestResolveConstraintModes_ValidationTable(t *testing.T) {
+	cases := []struct {
+		name             string
+		constraintShadow bool
+		modes            map[string]ConstraintMode
+		wantErr          bool
+		wantErrSubstring string
+	}{
+		{
+			name:             "nil map, shadow on",
+			constraintShadow: true,
+			modes:            nil,
+			wantErr:          false,
+		},
+		{
+			name:             "nil map, shadow off",
+			constraintShadow: false,
+			modes:            nil,
+			wantErr:          false,
+		},
+		{
+			name:             "all off, shadow on",
+			constraintShadow: true,
+			modes: map[string]ConstraintMode{
+				"export": ModeOff, "gen": ModeOff, "import": ModeOff,
+				"economics": ModeOff, "battery_safety": ModeOff,
+			},
+			wantErr: false,
+		},
+		{
+			name:             "mixed shadow/active with shadow on",
+			constraintShadow: true,
+			modes: map[string]ConstraintMode{
+				"export": ModeActive, "gen": ModeShadow, "import": ModeOff,
+			},
+			wantErr: false,
+		},
+		{
+			name:             "every key active with shadow on",
+			constraintShadow: true,
+			modes: map[string]ConstraintMode{
+				"export": ModeActive, "gen": ModeActive, "import": ModeActive,
+				"economics": ModeActive, "battery_safety": ModeActive,
+			},
+			wantErr: false,
+		},
+		{
+			name:             "unknown key",
+			constraintShadow: true,
+			modes:            map[string]ConstraintMode{"exprot": ModeShadow},
+			wantErr:          true,
+			wantErrSubstring: "unknown key",
+		},
+		{
+			name:             "unknown value",
+			constraintShadow: true,
+			modes:            map[string]ConstraintMode{"export": "aggressive"},
+			wantErr:          true,
+			wantErrSubstring: "unknown mode",
+		},
+		{
+			name:             "active without constraint_shadow",
+			constraintShadow: false,
+			modes:            map[string]ConstraintMode{"export": ModeActive},
+			wantErr:          true,
+			wantErrSubstring: "requires constraint_shadow=true",
+		},
+		{
+			name:             "one active key legal, sibling active key without shadow still fails (shadow is process-wide)",
+			constraintShadow: false,
+			modes:            map[string]ConstraintMode{"export": ModeShadow, "gen": ModeActive},
+			wantErr:          true,
+			wantErrSubstring: "requires constraint_shadow=true",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{ConstraintShadow: tc.constraintShadow, ConstraintModes: tc.modes}
+			modes, err := cfg.ResolveConstraintModes()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want error, got modes=%v", modes)
+				}
+				if tc.wantErrSubstring != "" && !strings.Contains(err.Error(), tc.wantErrSubstring) {
+					t.Fatalf("error = %q, want substring %q", err.Error(), tc.wantErrSubstring)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(modes) != 5 {
+				t.Fatalf("resolved modes = %v, want all 5 keys present", modes)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_ConstraintModesFailsLoudAtLoad proves the load-time gate: a
+// malformed constraint_modes block never produces a running hub — loadConfig
+// itself returns the error, before any wiring code sees the config.
+func TestLoadConfig_ConstraintModesFailsLoudAtLoad(t *testing.T) {
+	path := writeTempConfig(t, `{
+		"mqtt_broker": "tcp://localhost:1883",
+		"constraint_shadow": true,
+		"constraint_modes": {"typo_key": "shadow"}
+	}`)
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("loadConfig with an unknown constraint_modes key should fail loud, got nil error")
+	}
+}
+
+// TestLoadConfig_ConstraintModesValidBlockParses is the mirror positive case:
+// a well-formed constraint_modes block loads and resolves exactly as written.
+func TestLoadConfig_ConstraintModesValidBlockParses(t *testing.T) {
+	path := writeTempConfig(t, `{
+		"mqtt_broker": "tcp://localhost:1883",
+		"constraint_shadow": true,
+		"constraint_modes": {"export": "active", "gen": "shadow"}
+	}`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	modes, err := cfg.ResolveConstraintModes()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if modes["export"] != ModeActive || modes["gen"] != ModeShadow || modes["import"] != ModeOff {
+		t.Fatalf("modes = %+v, want export=active gen=shadow import=off", modes)
+	}
+}
+
+// TestLoadConfig_ShippedSnapshotEnabled pins WS-4.1 (2026-07-09): the
+// shipped configs/hub.json must ship snapshot.enabled:true (flipped from
+// the write-only-soak default after the 2026-07-08 8-cycle
+// hub-restart-mid-cap campaign passed with restore off — see
+// SnapshotConfig's doc). A regression back to false here would silently
+// resurrect the duplicate-CannotComply-after-restart bug TASK-041 closed —
+// this test exists so that resurrection fails CI instead of a bench.
+func TestLoadConfig_ShippedSnapshotEnabled(t *testing.T) {
+	cfg, err := loadConfig("../../configs/hub.json")
+	if err != nil {
+		t.Fatalf("loadConfig(configs/hub.json): %v", err)
+	}
+	if cfg.Snapshot == nil {
+		t.Fatal("Snapshot = nil, want the shipped snapshot block")
+	}
+	if !cfg.Snapshot.Enabled {
+		t.Fatal("Snapshot.Enabled = false, want true (WS-4.1 shipped default)")
+	}
+	if cfg.Snapshot.Path == "" {
+		t.Fatal("Snapshot.Path = \"\", want the shipped path")
 	}
 }
 

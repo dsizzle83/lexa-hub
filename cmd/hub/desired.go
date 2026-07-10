@@ -13,7 +13,48 @@ import (
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/orchestrator"
+	"lexa-hub/internal/reconcile"
 )
+
+// desiredHeartbeatInterval is the cadence at which every desired-doc actuator
+// re-publishes its retained document even when content is UNCHANGED (WS-2
+// fix 1: "desired-doc restart/staleness fail-open"). It is derived from, and
+// must stay ≤ half of, the reconciler's AD-013 staleness bound
+// (reconcile.DefaultStaleAfter, 300 s) — the bound reconcile.Reconciler.
+// SetDesired uses to hard-reject a doc whose IssuedAt has aged past it
+// (internal/reconcile/reconcile.go:203), and that Reconciler.Tick uses to
+// emit ReportStaleDesired (reconcile.go:337). None of the three call sites
+// that construct a reconcile.Config (cmd/modbus/main.go's battery/solar
+// shells, cmd/ocpp/reconcile_shell.go's EVSE shell) set StaleAfter, so all
+// three reconcilers run on the same DefaultStaleAfter today; if that ever
+// changes to a per-class configured value, this constant must be re-derived
+// from the same config, not hand-tuned separately, or the coupling documented
+// here silently breaks.
+//
+// Without this heartbeat, a hub that is alive but whose standing intent has
+// not changed content in StaleAfter/2+ (a converged optimizer — the
+// STOCK-realistic case; TASK-046's whole point was to stop treating that as
+// a tick stream) lets the retained doc's IssuedAt age past StaleAfter. A
+// consumer that restarts after that point rejects the doc as stale and
+// adopts nothing, which is exactly the hole WS-2 exploits (solar's
+// seedRestoreCeiling then seeds an open ceiling over a still-active cap —
+// see cmd/modbus/reconcile_solar.go). Re-stamping on a live cadence means
+// "stale" only ever means "the hub actually stopped publishing", which is
+// the condition WS-2 fix 2 (seedRestoreCeiling) exists to fail closed on.
+const desiredHeartbeatInterval = reconcile.DefaultStaleAfter / 2
+
+// heartbeatDue reports whether last (the doc this actuator currently
+// believes is retained on the broker) is old enough that it must be
+// re-published verbatim — fresh IssuedAt/Seq, unchanged content — even
+// though nothing new was commanded this call. nil last (nothing published
+// yet) is never due: there is nothing to keep fresh, and the first real
+// command publishes unconditionally anyway (desiredContentEqual's nil case).
+func heartbeatDue(last *bus.DesiredState, now time.Time) bool {
+	if last == nil {
+		return false
+	}
+	return now.Unix()-last.IssuedAt >= int64(desiredHeartbeatInterval/time.Second)
+}
 
 // tickTiming accumulates the wall-clock cost of one engine pass's actuator
 // Apply*Command calls (TASK-046 tick budget). Every desired-doc actuator adds
@@ -68,14 +109,18 @@ func (t *tickTiming) takeReset() time.Duration {
 // an error return anyway so the interface (and engine.go's existing
 // log-on-error call site) needs no change.
 //
-// Source/MRID: BatteryCommand carries neither today (internal/orchestrator's
-// SystemState is where the active CSIP control's mRID lives — optimizer.go's
-// plan.Breach.MRID stamping shows the only place it currently escapes the
-// optimizer). Plumbing it through the actuator interface is a change to
-// internal/orchestrator, which this task does not touch (radioactive zone,
-// 05 §12). Every document below is stamped Source: "economic", MRID: "" —
-// TASK-031 (CannotComply attribution end-to-end) is the follow-up that wires
-// the real mRID through.
+// Source/MRID: WS-4.3 (V1.0 punch list, TASK-031 follow-up) plumbed the real
+// mRID through: optimizer.go's Optimize() stamps orchestrator.BatteryCommand.MRID
+// from state.CSIPControl.MRID — the same source plan.Breach.MRID uses — with
+// a blanket post-hoc pass alongside the existing Breach.MRID stamp, so no
+// individual rule function needed to change. This actuator just copies
+// cmd.MRID straight into the published doc's MRID field below. When no real
+// CSIP control is active (state.CSIPControl == nil), MRID stays "" — that is
+// correct, not a gap: an economic-only device axis has no CSIP event/default
+// to attribute a CannotComply episode to. Source stays the literal
+// "economic" below regardless — bus.DesiredState.Source's four-value
+// taxonomy ("csip-event" | "csip-default" | "economic" | "safety") predates
+// this fix and is not fully implemented; broadening it is out of scope here.
 type desiredPublishingBatteryActuator struct {
 	mc     mqtt.Client
 	device string
@@ -229,6 +274,7 @@ func (a *desiredPublishingBatteryActuator) ApplyBatteryCommand(cmd orchestrator.
 		DeviceClass: bus.DesiredClassBattery,
 		DeviceID:    a.device,
 		Source:      "economic",
+		MRID:        cmd.MRID,
 	}
 	if a.haveSetpoint {
 		w := a.setpointW
@@ -239,11 +285,12 @@ func (a *desiredPublishingBatteryActuator) ApplyBatteryCommand(cmd orchestrator.
 		doc.Connect = &c
 	}
 
-	if desiredContentEqual(a.lastPublished, doc) {
+	now := time.Now()
+	contentChanged := !desiredContentEqual(a.lastPublished, doc)
+	if !contentChanged && !heartbeatDue(a.lastPublished, now) {
 		return nil
 	}
 
-	now := time.Now()
 	doc.IssuedAt = now.Unix()
 	doc.Seq = a.seq
 
@@ -271,17 +318,21 @@ func (a *desiredPublishingBatteryActuator) ApplyBatteryCommand(cmd orchestrator.
 	}
 
 	a.publishes.Inc()
-	// TASK-040: dispatch is journaled post-dedupe (this line only runs on an
-	// actual content-changed publish that the opportunistic check above did
-	// not immediately roll back), so write volume is bounded by real command
-	// changes, not the tick rate. Journaled at (successful-so-far) FIRE time,
-	// not confirmed-delivery time: "dispatch" records that the hub told the
-	// device this, and TASK-032's contract already tolerates a late/dropped
-	// delivery (the reconciler re-asserts); waiting for a later harvest to
-	// journal would silently lose entries for any command whose actuator
-	// instance never gets a "next call" (e.g. process exit before the
-	// following tick).
-	if a.jw != nil {
+	// TASK-040: dispatch is journaled post-dedupe AND only for a genuine
+	// content change (this line only runs on an actual content-changed
+	// publish that the opportunistic check above did not immediately roll
+	// back), so write volume is bounded by real command changes, not the
+	// tick rate — a WS-2 heartbeat re-stamp (contentChanged == false,
+	// heartbeatDue == true) still publishes above, through the same async
+	// path and asyncFailures accounting, but must NOT count as a new
+	// dispatch: nothing was actually commanded, only re-freshened. Journaled
+	// at (successful-so-far) FIRE time, not confirmed-delivery time:
+	// "dispatch" records that the hub told the device this, and TASK-032's
+	// contract already tolerates a late/dropped delivery (the reconciler
+	// re-asserts); waiting for a later harvest to journal would silently
+	// lose entries for any command whose actuator instance never gets a
+	// "next call" (e.g. process exit before the following tick).
+	if contentChanged && a.jw != nil {
 		if ev, err := journal.NewDispatchEvent("hub", journal.NewDispatch(a.device, journal.KindBattery, doc.SetpointW, nil, nil, doc.Connect)); err == nil {
 			_ = a.jw.Append(ev)
 		}
@@ -419,17 +470,19 @@ func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.Sola
 		DeviceID:    a.device,
 		CeilingW:    &ceiling,
 		Source:      "economic",
+		MRID:        cmd.MRID,
 	}
 	if a.connect != nil {
 		c := *a.connect
 		doc.Connect = &c
 	}
 
-	if desiredContentEqual(a.lastPublished, doc) {
+	now := time.Now()
+	contentChanged := !desiredContentEqual(a.lastPublished, doc)
+	if !contentChanged && !heartbeatDue(a.lastPublished, now) {
 		return nil
 	}
 
-	now := time.Now()
 	doc.IssuedAt = now.Unix()
 	doc.Seq = a.seq
 
@@ -451,7 +504,9 @@ func (a *desiredPublishingSolarActuator) ApplySolarCommand(cmd orchestrator.Sola
 	}
 
 	a.publishes.Inc()
-	if a.jw != nil {
+	// See ApplyBatteryCommand's twin comment: journaled only on a genuine
+	// content change, never on a WS-2 heartbeat re-stamp.
+	if contentChanged && a.jw != nil {
 		if ev, err := journal.NewDispatchEvent("hub", journal.NewDispatch(a.device, journal.KindSolar, nil, doc.CeilingW, nil, doc.Connect)); err == nil {
 			_ = a.jw.Append(ev)
 		}
@@ -564,13 +619,15 @@ func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECo
 		ConnectorID: cmd.ConnectorID,
 		Connect:     &connect,
 		Source:      "economic",
-	}
-
-	if desiredContentEqual(a.lastPublished, doc) {
-		return nil
+		MRID:        cmd.MRID,
 	}
 
 	now := time.Now()
+	contentChanged := !desiredContentEqual(a.lastPublished, doc)
+	if !contentChanged && !heartbeatDue(a.lastPublished, now) {
+		return nil
+	}
+
 	doc.IssuedAt = now.Unix()
 	doc.Seq = a.seq
 
@@ -592,7 +649,9 @@ func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECo
 	}
 
 	a.publishes.Inc()
-	if a.jw != nil {
+	// See ApplyBatteryCommand's twin comment: journaled only on a genuine
+	// content change, never on a WS-2 heartbeat re-stamp.
+	if contentChanged && a.jw != nil {
 		if ev, err := journal.NewDispatchEvent("hub", journal.NewDispatch(a.stationID, journal.KindEVSE, nil, nil, doc.MaxCurrentA, doc.Connect)); err == nil {
 			_ = a.jw.Append(ev)
 		}
