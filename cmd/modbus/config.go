@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"lexa-hub/internal/journal"
 )
 
 // DeviceConfig describes one southbound Modbus/SunSpec device.
@@ -46,6 +48,16 @@ type Config struct {
 	// ("shadow" mode plumbing survives in the shells for future non-migrated
 	// classes but is no longer a valid battery/solar config value.)
 	Reconciler map[string]string `json:"reconciler"`
+
+	// Journal is the optional durable event-journal block (TASK-082 unit
+	// 5.2, mirroring cmd/hub/config.go's JournalConfig field verbatim): the
+	// scan controller (scan.go) appends one scan_run event per completed or
+	// refused commissioning scan. A nil/absent "journal" key disables
+	// journaling entirely — scan.go's one call site is `if jw != nil`-guarded
+	// like every cmd/hub journal call site, so this is a true no-op, not a
+	// degraded default. Nothing else in lexa-modbus journals today (TASK-082
+	// review: cmd/modbus had no journal.Writer before this unit).
+	Journal *JournalConfig `json:"journal,omitempty"`
 }
 
 // Reconciler mode values (the "reconciler" config map's values).
@@ -68,6 +80,42 @@ func (c *Config) ReconcilerMode(class string) string {
 		return ReconcilerOff
 	}
 	return mode
+}
+
+// reconcilerClassByRole maps a DeviceConfig.Role to the reconciler class it
+// falls under ("battery" | "solar" — evse has no role in modbus.json at
+// all). Package-level (not a loadConfig-local var) so scan.go's arming rule
+// (§5.2) can ask the exact same question loadConfig's TASK-032 validation
+// does — "which reconciler class does this configured device belong to?" —
+// without duplicating the mapping. "meter" is deliberately absent: meters
+// have no reconciler concept in this codebase (read-only devices, no desired
+// doc, no write path), so a meter-only fleet has no class to check here.
+var reconcilerClassByRole = map[string]string{"battery": "battery", "inverter": "solar"}
+
+// JournalConfig is the on-disk "journal" block. Deliberately its own type
+// (not an embedded internal/journal.Config) for the exact reason cmd/hub's
+// twin type gives: journal.Config carries a Now func and a *Metrics field
+// with no JSON representation, and its field names don't match this repo's
+// snake_case JSON convention without added tags.
+type JournalConfig struct {
+	Dir            string `json:"dir"`              // required; journal.Open MkdirAlls it
+	MaxBytes       int64  `json:"max_bytes"`        // 0 → journal.DefaultMaxBytes
+	MaxFiles       int    `json:"max_files"`        // 0 → journal.DefaultMaxFiles
+	FlushEvery     int    `json:"flush_every"`      // 0 → journal.DefaultFlushEvery
+	FlushIntervalS int    `json:"flush_interval_s"` // 0 → journal.DefaultFlushInterval
+}
+
+// ToLibrary converts jc into a journal.Config for journal.Open. jc == nil is
+// never called — callers gate construction on cfg.Journal != nil first
+// (mirrors cmd/hub/config.go's JournalConfig.ToLibrary).
+func (jc *JournalConfig) ToLibrary() journal.Config {
+	return journal.Config{
+		Dir:           jc.Dir,
+		MaxBytes:      jc.MaxBytes,
+		MaxFiles:      jc.MaxFiles,
+		FlushEvery:    jc.FlushEvery,
+		FlushInterval: time.Duration(jc.FlushIntervalS) * time.Second,
+	}
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -112,10 +160,9 @@ func loadConfig(path string) (*Config, error) {
 	// reconciler MUST be "active": off/shadow (or an absent key) would leave no
 	// write path at all and silently disable actuation — a config restored from
 	// a pre-032 backup must fail loud here rather than run dark.
-	roleClass := map[string]string{"battery": "battery", "inverter": "solar"}
 	haveClass := map[string]bool{}
 	for _, dc := range cfg.Devices {
-		if cls, ok := roleClass[dc.Role]; ok {
+		if cls, ok := reconcilerClassByRole[dc.Role]; ok {
 			haveClass[cls] = true
 		}
 	}

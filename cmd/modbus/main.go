@@ -33,6 +33,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/journal"
 	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
@@ -78,6 +79,27 @@ func main() {
 	writeFailuresCtr := mreg.Counter("lexa_mb_write_failures_total")
 	interlockTripsCtr := mreg.Counter("lexa_mb_interlock_trips_total")
 
+	// TASK-082 unit 5.2: the optional durable event journal. A nil
+	// cfg.Journal (no "journal" block in modbus.json) leaves jw nil — the
+	// scan controller's one call site is `if jw != nil`-guarded, so this is
+	// a true no-op default, matching cmd/hub's journal rollout shape
+	// (cmd/hub/main.go). lexa-modbus journaled nothing before this unit.
+	var jw *journal.Writer
+	if cfg.Journal != nil {
+		jcfg := cfg.Journal.ToLibrary()
+		jcfg.Metrics = &journal.Metrics{
+			Writes:    mreg.Counter("lexa_mb_journal_writes_total"),
+			Rotations: mreg.Counter("lexa_mb_journal_rotations_total"),
+			Errors:    mreg.Counter("lexa_mb_journal_errors_total"),
+			Dropped:   mreg.Counter("lexa_mb_journal_dropped_total"),
+		}
+		jw, err = journal.Open(jcfg)
+		if err != nil {
+			log.Fatalf("lexa-modbus: open journal: %v", err)
+		}
+		defer jw.Close()
+	}
+
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
 		log.Fatalf("lexa-modbus: %v", err)
@@ -90,6 +112,16 @@ func main() {
 		log.Fatalf("lexa-modbus: %v", err)
 	}
 	defer mc.Disconnect(500)
+
+	// TASK-082 unit 5.2: the commissioning-scan controller. Subscribes
+	// bus.TopicScanRequest and owns its own transports (sunspec.SweepTCP/
+	// SweepRTU) entirely independent of the registry/devices built below —
+	// see scan.go's package doc for the arming rule that keeps a scan from
+	// ever running alongside live polling/control on the same segment.
+	scanCtl := newScanController(mc, cfg, jw, mreg)
+	if err := scanCtl.subscribe(); err != nil {
+		log.Printf("lexa-modbus: subscribe scan request: %v", err)
+	}
 
 	reg := registry.New(cfg.PollInterval())
 	log.Printf("lexa-modbus: poll interval=%s (measurement-freshness ceiling; parallel per-device poll)", cfg.PollInterval())
