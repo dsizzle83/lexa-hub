@@ -16,3 +16,5 @@ review.txt
 # live lexa-proto checkout — it must never be committed again.
 go.work
 go.work.sum.claude/worktrees/
+
+/cloudlink
