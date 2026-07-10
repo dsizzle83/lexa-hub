@@ -42,15 +42,22 @@ package orchestrator
 
 // Bench-calibration provenance constants. These name the legacy values so the
 // per-second/per-percent defaults below (and the equivalence test) have a
-// single, documented source. The per-TICK slews come from applyExportLimitRule
-// (optimizer.go maxDropW/maxRiseW); the schema stores per-second, so the
-// defaults divide by tunedTickInterval.
+// single, documented source. Originally these named applyExportLimitRule's
+// own local maxDropW/maxRiseW constants (optimizer.go); as of the STOCK
+// spot-check fix (scaleRateWPerTick, optimizer.go) the relationship is now
+// the other way around — applyExportLimitRule reads these constants directly
+// (via scaleRateWPerTick, cadence-scaled) instead of hard-coding its own copy
+// — so this is the single source both paths share. The schema stores
+// per-second; the defaults below divide by tunedTickInterval to recover the
+// tuned-cadence per-tick value.
 const (
-	// benchCeilingDropWPerTick is optimizer.go's maxDropW (1500 W/tick): how
-	// fast the solar ceiling may be TIGHTENED per tick. Defend the cap quickly.
+	// benchCeilingDropWPerTick is the tuned-cadence per-tick tighten allowance
+	// (1500 W/tick @ tunedTickInterval = 500 W/s): how fast the solar ceiling
+	// may be TIGHTENED. Defend the cap quickly.
 	benchCeilingDropWPerTick = 1500.0
-	// benchCeilingRiseWPerTick is optimizer.go's maxRiseW (500 W/tick): how
-	// fast the ceiling may be RELAXED per tick. Give generation back slowly.
+	// benchCeilingRiseWPerTick is the tuned-cadence per-tick relax allowance
+	// (500 W/tick @ tunedTickInterval ≈ 166.7 W/s): how fast the ceiling may
+	// be RELAXED. Give generation back slowly.
 	benchCeilingRiseWPerTick = 500.0
 
 	// benchBatteryCapacityKWh is the bench pack size named in the
