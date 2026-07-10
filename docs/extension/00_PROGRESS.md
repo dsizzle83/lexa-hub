@@ -407,3 +407,38 @@ clean handshake) — unit 4.1 TLS path validated on the device, not just in
 unit tests. Watch item RESOLVED: .pre-v0 backup proves tls:false at deploy & now; lexa-api does NOT rewrite its own config (ensureServerCert writes /var/lib/lexa/api/, not /etc/lexa/api.json) and 0 config_write journal events — no recurring path. The transient tls:true at a 16:24 restart is unreconstructable (disk-full vacuumed pre-14:08 journal); one-off, config stable across restarts now.
 mid-session (config-write path? stray restart?) — the config was tls:false
 through the whole regression campaign.
+
+## Hub-pi validation session (2026-07-10, 69.0.0.1) — the ACL + scan-happy-path checks the dev kit can't do
+
+Standby Pi, two-hub safety protocol (Modbus/OCPP egress firewalled +
+retained-DB purged pre-start + empty-fleet configs → hub-pi never fought
+the live dev kit for the shared sims). Deploy = first real run of the
+066e5df deploy-script update (migrate pre-restart clean, advisory
+healthcheck).
+
+- **MQTT ACL matrix: 13/13 PASS** on a real WS-1-enforced broker
+  (allow_anonymous false + password_file + acl_file). Confirmed: the
+  reconcile-report hotfix grants (5d9c4d8: modbus/ocpp write, hub read) AND
+  every deliberate asymmetry (api CANNOT write solarforecast; telemetry has
+  zero intent write grants; modbus cannot write hub/mode; nobody but hub
+  writes intent/result+hub/mode). Deny proven subscriber-side (TASK-027
+  lesson: publisher always PUBACKs).
+- **Commissioning scan happy-path: 3/3 PASS** against real sim Pis —
+  .10→inverter, .11→battery(802), .12→meter(201), each with model-1 identity
+  (SunSpec Sim / CSIP-Solar-5000 etc.); sims stayed healthy (read-only
+  sweeps). Note: sims answer all probed unit IDs so each device reports 4×
+  (real HW answers its one ID) — scanner faithfully reports each; no URL
+  dedupe (documented, acceptable).
+
+### REAL BUG found + fixed: empty-fleet modbus watchdog starvation (4a6143a)
+lexa-modbus kicked the watchdog ONLY from the measurement-drain loop; an
+empty fleet (factory/uncommissioned/scan-arming state) produces no updates,
+so WatchdogSec=60 SIGABRT-restarted it every ~60s — which also made any
+~95s scan impossible on its own arming precondition. Fixed with the 1.7/6.1
+idle-path pattern: len(retryDevices)==0 ⇒ 10s MQTT-liveness kick ticker;
+loaded case unchanged (wedge-detection preserved). Deployed to hub-pi,
+stopgap WatchdogSec=0 drop-in removed, verifying on hardware.
+
+Follow-up (minor): modbus.json ships no journal block ⇒ scan_run journaling
+is a documented no-op; add a journal block to factory + bench modbus.json
+for the durable scan trail. hub-pi left running empty-fleet-safe.
