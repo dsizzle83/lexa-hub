@@ -141,5 +141,5 @@ app-side work. mockhub mirrors land here to keep the contract testable.
 | B1 | sec1 crypto + framing | M | opus | **done(see log)** |
 | B2 | BlueZ GATT + advertising | L | opus | **done(see log)** |
 | B3 | NM join + scan + status | M | opus | **done(c1a9a3a)** |
-| B4 | handoff + reprovision + PoP + factory-reset | M | opus | in-flight |
+| B4 | handoff + reprovision + PoP + factory-reset | M | opus | **done(see log)** — CODE COMPLETE |
 | C1–C3 | hardware validation | — | — | blocked on A/B |
