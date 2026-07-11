@@ -160,6 +160,40 @@ func TestSettingsPublisher_TariffChange(t *testing.T) {
 	}
 }
 
+// TestSettingsPublisher_TariffChange_RoundTripsDeliveryAndFixed proves the new
+// PR-C fields (per-period delivery_per_kwh + top-level fixed_daily_charge) round
+// -trip through the published lexa/hub/settings doc for free — settings.go
+// stores the adopted spec as-is (a shallow struct copy) and JSON-marshals it, so
+// /status.tariff echoes exactly what was submitted, including the new fields.
+func TestSettingsPublisher_TariffChange_RoundTripsDeliveryAndFixed(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	sp := newSettingsPublisher(mc, &fakeReserveReader{pct: 20}, 20)
+
+	spec := bus.TariffSpec{
+		Currency:         "USD",
+		FixedDailyCharge: ptr(0.42),
+		Periods: []bus.TariffPeriod{
+			{Label: "peak", Days: []int{0, 1, 2, 3, 4, 5, 6}, StartHH: 16, EndHH: 21, ImportPerKwh: 0.38, DeliveryPerKwh: ptr(0.06)},
+			{Label: "off-peak", Days: []int{0, 1, 2, 3, 4, 5, 6}, StartHH: 0, EndHH: 16, ImportPerKwh: 0.12},
+		},
+	}
+	sp.onTariffChange(spec)
+
+	hs, _ := lastSettingsPublish(t, mc)
+	if hs.Tariff.Spec == nil {
+		t.Fatal("tariff.spec is nil, want the submitted spec echoed")
+	}
+	if hs.Tariff.Spec.FixedDailyCharge == nil || *hs.Tariff.Spec.FixedDailyCharge != 0.42 {
+		t.Errorf("fixed_daily_charge round-trip = %v, want 0.42", hs.Tariff.Spec.FixedDailyCharge)
+	}
+	if hs.Tariff.Spec.Periods[0].DeliveryPerKwh == nil || *hs.Tariff.Spec.Periods[0].DeliveryPerKwh != 0.06 {
+		t.Errorf("period[0].delivery_per_kwh round-trip = %v, want 0.06", hs.Tariff.Spec.Periods[0].DeliveryPerKwh)
+	}
+	if hs.Tariff.Spec.Periods[1].DeliveryPerKwh != nil {
+		t.Errorf("period[1].delivery_per_kwh = %v, want nil (unset)", hs.Tariff.Spec.Periods[1].DeliveryPerKwh)
+	}
+}
+
 // refreshFromPlan republishes ONLY when the effective pct moves.
 func TestSettingsPublisher_RefreshDedupe(t *testing.T) {
 	mc := &fakeHubMQTTClient{}

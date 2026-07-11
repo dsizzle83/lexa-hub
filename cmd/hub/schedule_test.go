@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -124,6 +125,99 @@ func TestSchedulePublisher_PublishesOnPlan(t *testing.T) {
 	ev, ok := hs.EVPlanW["evse1"]
 	if !ok || len(ev) != 288 || ev[0] != -3840 { // 16 A × 240 V, negated (charge = load)
 		t.Errorf("ev_plan_w[evse1][0] = %v, want -3840", ev)
+	}
+}
+
+// TestSchedulePublisher_Economics pins the PR-D plan-economics projection: a
+// snapshot carrying resolved per-slot prices + a plan whose intervals carry
+// ExpectedGridW/MarginalCost produces a HubSchedule with the price arrays copied
+// through, GridW/MarginalCost projected from the intervals, and the horizon
+// scalars (TotalCost/FixedDailyCharge/Currency). Non-finite inputs are forced to
+// 0 so nothing non-finite reaches the wire.
+func TestSchedulePublisher_Economics(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	buildTime := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	snap := makeSnap(buildTime)
+
+	snap.Currency = "USD"
+	snap.FixedDailyCharge = 0.35
+	snap.Plan.TotalCost = 4.20
+	imp := make([]float64, 288)
+	del := make([]float64, 288)
+	exp := make([]float64, 288)
+	for i := range imp {
+		imp[i] = 0.30
+		del[i] = 0.05
+		exp[i] = 0.10
+		snap.Plan.Intervals[i].ExpectedGridW = 1000
+		snap.Plan.Intervals[i].MarginalCost = 0.025
+	}
+	// Non-finite inputs must be scrubbed to 0 on the wire.
+	imp[5] = math.NaN()
+	snap.Plan.Intervals[6].ExpectedGridW = math.Inf(1)
+	snap.ImportPriceKwh = imp
+	snap.DeliveryPriceKwh = del
+	snap.ExportPriceKwh = exp
+
+	r := &fakeSnapReader{}
+	r.set(snap)
+	sp := newSchedulePublisher(mc, r, []string{"evse1"})
+	sp.refresh()
+
+	hs, _ := lastSchedulePublish(t, mc)
+	if hs.Currency != "USD" {
+		t.Errorf("currency = %q, want USD", hs.Currency)
+	}
+	if len(hs.ImportPriceKwh) != 288 || hs.ImportPriceKwh[0] != 0.30 {
+		t.Errorf("import_price_kwh[0] = %v (len %d), want 0.30", hs.ImportPriceKwh[0], len(hs.ImportPriceKwh))
+	}
+	if hs.ImportPriceKwh[5] != 0 {
+		t.Errorf("import_price_kwh[5] = %v, want 0 (NaN scrubbed)", hs.ImportPriceKwh[5])
+	}
+	if len(hs.DeliveryPriceKwh) != 288 || hs.DeliveryPriceKwh[0] != 0.05 {
+		t.Errorf("delivery_price_kwh[0] = %v, want 0.05", hs.DeliveryPriceKwh[0])
+	}
+	if len(hs.ExportPriceKwh) != 288 || hs.ExportPriceKwh[0] != 0.10 {
+		t.Errorf("export_price_kwh[0] = %v, want 0.10", hs.ExportPriceKwh[0])
+	}
+	if len(hs.GridW) != 288 || hs.GridW[0] != 1000 {
+		t.Errorf("grid_w[0] = %v (len %d), want 1000", hs.GridW[0], len(hs.GridW))
+	}
+	if hs.GridW[6] != 0 {
+		t.Errorf("grid_w[6] = %v, want 0 (Inf scrubbed)", hs.GridW[6])
+	}
+	if len(hs.MarginalCost) != 288 || hs.MarginalCost[0] != 0.025 {
+		t.Errorf("marginal_cost[0] = %v, want 0.025", hs.MarginalCost[0])
+	}
+	if hs.TotalCost != 4.20 {
+		t.Errorf("total_cost = %v, want 4.20", hs.TotalCost)
+	}
+	if hs.FixedDailyCharge != 0.35 {
+		t.Errorf("fixed_daily_charge = %v, want 0.35", hs.FixedDailyCharge)
+	}
+	if err := hs.Finite(); err != nil {
+		t.Errorf("HubSchedule.Finite() = %v, want nil", err)
+	}
+}
+
+// TestSchedulePublisher_NoEconomics: a plan with no economics populated (nil
+// price arrays) omits the price arrays (nil) but still emits GridW/MarginalCost
+// projected from the zero-valued intervals — the fields are plan-driven, not
+// economics-driven.
+func TestSchedulePublisher_NoEconomics(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	r := &fakeSnapReader{}
+	r.set(makeSnap(time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC))) // no economics set
+	sp := newSchedulePublisher(mc, r, []string{"evse1"})
+	sp.refresh()
+
+	hs, _ := lastSchedulePublish(t, mc)
+	if hs.ImportPriceKwh != nil || hs.DeliveryPriceKwh != nil || hs.ExportPriceKwh != nil {
+		t.Errorf("price arrays should be nil when the snapshot has none, got imp=%v del=%v exp=%v",
+			hs.ImportPriceKwh, hs.DeliveryPriceKwh, hs.ExportPriceKwh)
+	}
+	if len(hs.GridW) != 288 || len(hs.MarginalCost) != 288 {
+		t.Errorf("grid_w/marginal_cost must still be 288-slot arrays, got %d/%d", len(hs.GridW), len(hs.MarginalCost))
 	}
 }
 

@@ -17,12 +17,20 @@ import (
 // tests (engine_intents_test.go) already verify end-to-end; this package only
 // needs to observe the call.
 type fakeHubEngine struct {
-	mu             sync.Mutex
-	evGoals        []orchestrator.EVGoal
-	reservePcts    []float64
-	solarForecasts []orchestrator.ExternalForecast
-	loadProfiles   [][]float64
-	fallbackTOUs   []*orchestrator.TOUCostModel
+	mu              sync.Mutex
+	evGoals         []orchestrator.EVGoal
+	reservePcts     []float64
+	solarForecasts  []orchestrator.ExternalForecast
+	loadProfiles    [][]float64
+	fallbackTOUs    []*orchestrator.TOUCostModel
+	deliveryTariffs []deliveryTariffCall
+}
+
+// deliveryTariffCall records one SetDeliveryTariff invocation for assertions.
+type deliveryTariffCall struct {
+	delivery   *orchestrator.TOUCostModel
+	fixedDaily float64
+	currency   string
 }
 
 func (f *fakeHubEngine) SetEVGoal(g orchestrator.EVGoal) {
@@ -49,6 +57,11 @@ func (f *fakeHubEngine) SetFallbackTOU(m *orchestrator.TOUCostModel) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.fallbackTOUs = append(f.fallbackTOUs, m)
+}
+func (f *fakeHubEngine) SetDeliveryTariff(delivery *orchestrator.TOUCostModel, fixedDaily float64, currency string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deliveryTariffs = append(f.deliveryTariffs, deliveryTariffCall{delivery: delivery, fixedDaily: fixedDaily, currency: currency})
 }
 
 func (f *fakeHubEngine) lastEVGoal() orchestrator.EVGoal {
@@ -315,6 +328,52 @@ func TestIntentAdopter_Tariff_Applied(t *testing.T) {
 	f.opt.mu.Unlock()
 	if gotOpt != 1 {
 		t.Errorf("SwapCostModel calls = %d, want 1", gotOpt)
+	}
+	// The delivery seam is always fed, even for a supply-only spec: validTOUSpec
+	// has no delivery/fixed, so delivery is nil, fixed 0, currency USD.
+	f.eng.mu.Lock()
+	dts := append([]deliveryTariffCall(nil), f.eng.deliveryTariffs...)
+	f.eng.mu.Unlock()
+	if len(dts) != 1 {
+		t.Fatalf("SetDeliveryTariff calls = %d, want 1", len(dts))
+	}
+	if dts[0].delivery != nil {
+		t.Errorf("delivery model = %v, want nil for a supply-only spec", dts[0].delivery)
+	}
+	if dts[0].fixedDaily != 0 || dts[0].currency != "USD" {
+		t.Errorf("delivery tariff = {fixed:%v cur:%q}, want {0 USD}", dts[0].fixedDaily, dts[0].currency)
+	}
+}
+
+// TestIntentAdopter_Tariff_ForwardsDelivery pins that a spec carrying a delivery
+// charge + fixed daily charge reaches the engine's SetDeliveryTariff seam with a
+// non-nil delivery model priced at the period's delivery rate, the fixed charge,
+// and the currency — the PR-D end-to-end wiring.
+func TestIntentAdopter_Tariff_ForwardsDelivery(t *testing.T) {
+	f := newTestAdopter(t, nil)
+	spec := validTOUSpec()
+	spec.Periods[2].DeliveryPerKwh = fPtr(0.05) // peak 16–21
+	spec.FixedDailyCharge = fPtr(0.40)
+
+	outcome, _ := f.adopter.applyTariff(bus.TariffIntent{Tariff: spec})
+	if outcome != "applied" {
+		t.Fatalf("outcome = %q, want applied", outcome)
+	}
+	f.eng.mu.Lock()
+	dts := append([]deliveryTariffCall(nil), f.eng.deliveryTariffs...)
+	f.eng.mu.Unlock()
+	if len(dts) != 1 {
+		t.Fatalf("SetDeliveryTariff calls = %d, want 1", len(dts))
+	}
+	if dts[0].delivery == nil {
+		t.Fatal("delivery model must be non-nil when the spec carries a delivery charge")
+	}
+	at := time.Date(2026, 6, 15, 17, 0, 0, 0, time.UTC)
+	if got := dts[0].delivery.CurrentRate(at); got != 0.05 {
+		t.Errorf("delivery CurrentRate(17:00) = %v, want 0.05", got)
+	}
+	if dts[0].fixedDaily != 0.40 || dts[0].currency != "USD" {
+		t.Errorf("delivery tariff = {fixed:%v cur:%q}, want {0.40 USD}", dts[0].fixedDaily, dts[0].currency)
 	}
 }
 

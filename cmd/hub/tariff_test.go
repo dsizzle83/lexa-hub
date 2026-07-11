@@ -31,10 +31,11 @@ func validTOUSpec() bus.TariffSpec {
 }
 
 func TestCompileTariff_HappyPath(t *testing.T) {
-	m, err := compileTariff(validTOUSpec())
+	ct, err := compileTariff(validTOUSpec())
 	if err != nil {
 		t.Fatalf("compileTariff: unexpected error: %v", err)
 	}
+	m := ct.Supply
 	// hour-of-day resolution (evaluated in UTC — value is zone-agnostic here).
 	at := func(hh int) time.Time { return time.Date(2026, 6, 15, hh, 0, 0, 0, time.UTC) }
 
@@ -71,10 +72,11 @@ func TestCompileTariff_FlatTariff_NeverPeak(t *testing.T) {
 		Currency: "USD",
 		Periods:  []bus.TariffPeriod{{Label: "flat", Days: allDays, StartHH: 0, EndHH: 24, ImportPerKwh: 0.20}},
 	}
-	m, err := compileTariff(spec)
+	ct, err := compileTariff(spec)
 	if err != nil {
 		t.Fatalf("compileTariff(flat): unexpected error: %v", err)
 	}
+	m := ct.Supply
 	for hh := 0; hh < 24; hh++ {
 		ti := time.Date(2026, 6, 15, hh, 0, 0, 0, time.UTC)
 		if m.CurrentRate(ti) != 0.20 {
@@ -95,6 +97,98 @@ func TestCompileTariff_ExportRate_NilOrZeroAccepted(t *testing.T) {
 	spec.Periods[2].ExportPerKwh = nil // absent — nothing lost
 	if _, err := compileTariff(spec); err != nil {
 		t.Fatalf("nil export should be accepted, got: %v", err)
+	}
+}
+
+// TestCompileTariff_Delivery: a spec carrying per-period delivery charges plus a
+// fixed daily charge compiles a non-nil delivery model that prices each hour at
+// the OWNING period's delivery rate (built the same way as the supply model),
+// the right fixed charge, and "USD". The supply model is unchanged by delivery.
+func TestCompileTariff_Delivery(t *testing.T) {
+	spec := validTOUSpec()
+	// Delivery adder per period: off-peak 0.02, partial-peak 0.03, peak 0.05.
+	spec.Periods[0].DeliveryPerKwh = fPtr(0.02) // off-peak 0–7
+	spec.Periods[1].DeliveryPerKwh = fPtr(0.03) // partial-peak 7–16
+	spec.Periods[2].DeliveryPerKwh = fPtr(0.05) // peak 16–21
+	spec.Periods[3].DeliveryPerKwh = fPtr(0.02) // off-peak 21–24
+	spec.FixedDailyCharge = fPtr(0.35)
+
+	ct, err := compileTariff(spec)
+	if err != nil {
+		t.Fatalf("compileTariff: unexpected error: %v", err)
+	}
+	if ct.Supply == nil {
+		t.Fatal("supply model must be non-nil")
+	}
+	if ct.Delivery == nil {
+		t.Fatal("delivery model must be non-nil when a period carries a delivery charge")
+	}
+	if ct.Currency != "USD" {
+		t.Errorf("currency = %q, want USD", ct.Currency)
+	}
+	if ct.FixedDaily != 0.35 {
+		t.Errorf("fixed daily = %v, want 0.35", ct.FixedDaily)
+	}
+
+	at := func(hh int) time.Time { return time.Date(2026, 6, 15, hh, 0, 0, 0, time.UTC) }
+	checks := []struct {
+		hh                       int
+		wantSupply, wantDelivery float64
+	}{
+		{3, 0.10, 0.02},
+		{9, 0.18, 0.03},
+		{17, 0.38, 0.05},
+		{22, 0.10, 0.02},
+	}
+	for _, c := range checks {
+		if got := ct.Supply.CurrentRate(at(c.hh)); got != c.wantSupply {
+			t.Errorf("supply CurrentRate(%02d:00) = %v, want %v", c.hh, got, c.wantSupply)
+		}
+		if got := ct.Delivery.CurrentRate(at(c.hh)); got != c.wantDelivery {
+			t.Errorf("delivery CurrentRate(%02d:00) = %v, want %v", c.hh, got, c.wantDelivery)
+		}
+	}
+}
+
+// TestCompileTariff_Delivery_PartialCoverage: delivery only on some periods
+// (peak), the rest nil ⇒ those hours price at 0 delivery, but the model is still
+// non-nil since at least one period carries a charge.
+func TestCompileTariff_Delivery_PartialCoverage(t *testing.T) {
+	spec := validTOUSpec()
+	spec.Periods[2].DeliveryPerKwh = fPtr(0.05) // peak only
+
+	ct, err := compileTariff(spec)
+	if err != nil {
+		t.Fatalf("compileTariff: unexpected error: %v", err)
+	}
+	if ct.Delivery == nil {
+		t.Fatal("delivery model must be non-nil when ANY period carries a delivery charge")
+	}
+	at := func(hh int) time.Time { return time.Date(2026, 6, 15, hh, 0, 0, 0, time.UTC) }
+	if got := ct.Delivery.CurrentRate(at(17)); got != 0.05 {
+		t.Errorf("delivery CurrentRate(17:00) = %v, want 0.05 (peak)", got)
+	}
+	if got := ct.Delivery.CurrentRate(at(3)); got != 0 {
+		t.Errorf("delivery CurrentRate(03:00) = %v, want 0 (no delivery on off-peak)", got)
+	}
+}
+
+// TestCompileTariff_NoDelivery: a spec with no delivery charge and no fixed
+// charge (the common case, e.g. validTOUSpec) returns a nil delivery model and
+// 0 fixed — so SetDeliveryTariff gets its nil-means-none sentinel.
+func TestCompileTariff_NoDelivery(t *testing.T) {
+	ct, err := compileTariff(validTOUSpec())
+	if err != nil {
+		t.Fatalf("compileTariff: unexpected error: %v", err)
+	}
+	if ct.Delivery != nil {
+		t.Errorf("delivery model = %v, want nil when no period carries a delivery charge", ct.Delivery)
+	}
+	if ct.FixedDaily != 0 {
+		t.Errorf("fixed daily = %v, want 0 when unspecified", ct.FixedDaily)
+	}
+	if ct.Currency != "USD" {
+		t.Errorf("currency = %q, want USD", ct.Currency)
 	}
 }
 
@@ -143,6 +237,25 @@ func TestCompileTariff_Rejections(t *testing.T) {
 
 	negExport := validTOUSpec()
 	negExport.Periods[2].ExportPerKwh = fPtr(-0.01)
+
+	negDelivery := validTOUSpec()
+	negDelivery.Periods[2].DeliveryPerKwh = fPtr(-0.01)
+
+	nanDelivery := validTOUSpec()
+	nanDelivery.Periods[2].DeliveryPerKwh = fPtr(math.NaN())
+
+	// per-day-of-week DELIVERY divergence: same import rate + label at 16–21, but
+	// the delivery adder differs weekday (0.05) vs weekend (0.08) — the day-blind
+	// delivery model cannot represent that.
+	perDayDelivery := bus.TariffSpec{
+		Currency: "USD",
+		Periods: []bus.TariffPeriod{
+			{Label: "day", Days: allDays, StartHH: 0, EndHH: 16, ImportPerKwh: 0.10, DeliveryPerKwh: fPtr(0.02)},
+			{Label: "eve", Days: allDays, StartHH: 21, EndHH: 24, ImportPerKwh: 0.10, DeliveryPerKwh: fPtr(0.02)},
+			{Label: "peak", Days: []int{1, 2, 3, 4, 5}, StartHH: 16, EndHH: 21, ImportPerKwh: 0.38, DeliveryPerKwh: fPtr(0.05)},
+			{Label: "peak", Days: []int{0, 6}, StartHH: 16, EndHH: 21, ImportPerKwh: 0.38, DeliveryPerKwh: fPtr(0.08)},
+		},
+	}
 
 	// gap: leave hour 16 uncovered (0–16 then 17–24).
 	gap := bus.TariffSpec{
@@ -203,6 +316,9 @@ func TestCompileTariff_Rejections(t *testing.T) {
 		{"inf rate", infRate, "import_per_kwh"},
 		{"non-zero export", nonZeroExport, "export_per_kwh"},
 		{"negative export", negExport, "export_per_kwh"},
+		{"negative delivery", negDelivery, "delivery_per_kwh"},
+		{"nan delivery", nanDelivery, "delivery_per_kwh"},
+		{"per-day delivery", perDayDelivery, "per-day-of-week delivery"},
 		{"gap", gap, "gap"},
 		{"overlap", overlap, "overlap"},
 		{"per-day rate", perDayRate, "per-day-of-week rates"},
@@ -210,15 +326,18 @@ func TestCompileTariff_Rejections(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			m, err := compileTariff(c.spec)
+			ct, err := compileTariff(c.spec)
 			if err == nil {
-				t.Fatalf("expected error containing %q, got nil (model=%v)", c.want, m)
+				t.Fatalf("expected error containing %q, got nil (model=%v)", c.want, ct.Supply)
 			}
 			if !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("error %q does not contain %q", err.Error(), c.want)
 			}
-			if m != nil {
-				t.Errorf("expected nil model on error, got %v", m)
+			if ct.Supply != nil {
+				t.Errorf("expected nil model on error, got %v", ct.Supply)
+			}
+			if ct.Delivery != nil {
+				t.Errorf("expected nil delivery model on error, got %v", ct.Delivery)
 			}
 		})
 	}
@@ -231,10 +350,11 @@ func TestCompileTariff_Rejections(t *testing.T) {
 // process zone must equal the tariff zone, which checkTariffZone asserts).
 func TestCompileTariff_DST_PricesLocalClock(t *testing.T) {
 	loc := mustLoadLocation(t, "America/Los_Angeles")
-	m, err := compileTariff(validTOUSpec())
+	ct, err := compileTariff(validTOUSpec())
 	if err != nil {
 		t.Fatalf("compileTariff: %v", err)
 	}
+	m := ct.Supply
 
 	cases := []struct {
 		name     string
@@ -272,10 +392,11 @@ func TestCompileTariff_DST_PricesLocalClock(t *testing.T) {
 // are correct; see CLAUDE.md "SOM zone must match the tariff zone").
 func TestCompileTariff_ZoneMismatchHazard(t *testing.T) {
 	loc := mustLoadLocation(t, "America/Los_Angeles")
-	m, err := compileTariff(validTOUSpec())
+	ct, err := compileTariff(validTOUSpec())
 	if err != nil {
 		t.Fatalf("compileTariff: %v", err)
 	}
+	m := ct.Supply
 	inLA := time.Date(2026, 6, 15, 17, 0, 0, 0, loc) // 17:00 PDT = peak
 	inUTC := inLA.In(time.UTC)                       // same instant, Hour()==0 in UTC = off-peak
 

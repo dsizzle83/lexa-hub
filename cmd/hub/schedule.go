@@ -141,6 +141,27 @@ func (p *schedulePublisher) build(snap orchestrator.PlanSnapshot) (bus.HubSchedu
 		hs.EVPlanW = map[string][]float64{p.stationID: series}
 	}
 
+	// Plan economics (PR-C wire fields, PR-D population). Emitted whenever a plan
+	// exists — these do NOT depend on a battery/EV being modelled. The per-slot
+	// prices are copied straight from the snapshot's resolved arrays (the DP
+	// costed against these exact values); GridW/MarginalCost are projected from
+	// the plan intervals; TotalCost/FixedDailyCharge are the horizon scalars.
+	// Every value is forced finite (finiteOrZero/finiteSlice) so nothing
+	// non-finite ever reaches the wire — the same guard SolarForecastW uses.
+	hs.Currency = snap.Currency
+	hs.ImportPriceKwh = finiteSlice(snap.ImportPriceKwh)
+	hs.DeliveryPriceKwh = finiteSlice(snap.DeliveryPriceKwh)
+	hs.ExportPriceKwh = finiteSlice(snap.ExportPriceKwh)
+
+	hs.GridW = make([]float64, n)
+	hs.MarginalCost = make([]float64, n)
+	for i := 0; i < n; i++ {
+		hs.GridW[i] = finiteOrZero(plan.Intervals[i].ExpectedGridW)
+		hs.MarginalCost[i] = finiteOrZero(plan.Intervals[i].MarginalCost)
+	}
+	hs.TotalCost = finiteOrZero(plan.TotalCost)
+	hs.FixedDailyCharge = finiteOrZero(snap.FixedDailyCharge)
+
 	return hs, true
 }
 
@@ -150,6 +171,20 @@ func finiteOrZero(v float64) float64 {
 		return 0
 	}
 	return v
+}
+
+// finiteSlice copies src, forcing each element finite (NaN/Inf → 0). A nil src
+// returns nil so an unpopulated economics field stays absent on the wire
+// (omitempty), rather than becoming an empty non-nil slice.
+func finiteSlice(src []float64) []float64 {
+	if src == nil {
+		return nil
+	}
+	out := make([]float64, len(src))
+	for i, v := range src {
+		out[i] = finiteOrZero(v)
+	}
+	return out
 }
 
 // refresh reads the current plan snapshot, builds the schedule, and publishes it

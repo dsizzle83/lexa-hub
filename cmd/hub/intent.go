@@ -68,6 +68,7 @@ type hubEngine interface {
 	SetSolarForecast(orchestrator.ExternalForecast)
 	SetLoadProfile(stepKw []float64)
 	SetFallbackTOU(m *orchestrator.TOUCostModel)
+	SetDeliveryTariff(delivery *orchestrator.TOUCostModel, fixedDaily float64, currency string)
 }
 
 // costModelSwapper is *orchestrator.DefaultOptimizer's SwapCostModel method,
@@ -307,17 +308,20 @@ func (a *intentAdopter) applyReserve(msg bus.BackupReserveIntent) (outcome, deta
 }
 
 // applyTariff validates and applies a tariff intent (lexa/intent/tariff):
-// compiles the spec via compileTariff (cmd/hub/tariff.go, a pure function)
-// and installs the result on BOTH landing spots — the planner's
-// SetFallbackTOU (used only when CSIP SetPrices arrays are nil) and the
-// reactive optimizer's SwapCostModel.
+// compiles the spec via compileTariff (cmd/hub/tariff.go, a pure function) and
+// installs the result on all THREE landing spots — the planner's SetFallbackTOU
+// (the supply model, used only when CSIP SetPrices arrays are nil), the reactive
+// optimizer's SwapCostModel (the supply model), and SetDeliveryTariff (the
+// delivery adder + fixed daily charge + currency, a planner-side concern; the
+// reactive optimizer is supply-only, unchanged — PR-D).
 func (a *intentAdopter) applyTariff(msg bus.TariffIntent) (outcome, detail string) {
-	m, err := compileTariff(msg.Tariff)
+	ct, err := compileTariff(msg.Tariff)
 	if err != nil {
 		return "rejected", err.Error()
 	}
-	a.eng.SetFallbackTOU(m)
-	a.opt.SwapCostModel(m)
+	a.eng.SetFallbackTOU(ct.Supply)
+	a.opt.SwapCostModel(ct.Supply)
+	a.eng.SetDeliveryTariff(ct.Delivery, ct.FixedDaily, ct.Currency)
 	// GAP-8: retain the requested spec (source "manual", updated_at now) on
 	// lexa/hub/settings so the app's tariff viewer reads back what it submitted.
 	if a.settings != nil {
