@@ -142,7 +142,9 @@ app-side work. mockhub mirrors land here to keep the contract testable.
 | B2 | BlueZ GATT + advertising | L | opus | **done(see log)** |
 | B3 | NM join + scan + status | M | opus | **done(c1a9a3a)** |
 | B4 | handoff + reprovision + PoP + factory-reset | M | opus | **done(see log)** — CODE COMPLETE |
-| C1–C3 | hardware validation | — | — | blocked on A/B |
+| C1 | Phase-A endpoints on hardware | — | principal | **done(3fc73ae)** — see below |
+| C2 | BLE OTA validation | — | opus+principal | **done(678a364)** — see below |
+| C3 | GAP-4 hardware re-confirm | — | — | folded into C1 (`/mode`, reserve intent `applied` live) |
 
 ## Phase C1 — Phase-A endpoints validated on hardware (2026-07-11, dev kit)
 
@@ -168,3 +170,80 @@ Deployed gapclose-1a7a82e (api+hub+provision+lexactl) additively to linux_b.
   no cron/timer/config_write writer) — set tls:false, holds.
 Test intents reverted (reserve→floor, retained tariff/reserve cleared) so the
 validated bench economic baseline is restored.
+
+## Phase C2 — BLE commissioning validated over the air (2026-07-11, dev kit)
+
+Harness `tools/provcentral` (committed 678a364) drove the FULL flow from the
+desktop's own hci0 over a real radio, importing the **shipped**
+`internal/provision/sec1` client crypto + `frame` codec verbatim (not a fake) —
+so a green run proves the production client interoperates with the production
+`lexa-provision` peripheral, not an in-process double. No BLE pairing/bonding
+and no elevated perms (BlueZ 5.72 grants the console user Adapter/Device/GATT
+over the system bus). Bench SSH was never at risk (69.0.0.2 link is eth0; only
+wlan0 blipped, and it self-healed).
+
+Results — all against the live dev-kit radio:
+- **Discovery + connect**: `LEXA-000001` @ 00:04:F3:73:3A:9A, ServicesResolved,
+  all 5 chars resolved, negotiated ATT MTU 517. ✓
+- **info (plaintext read)**: `{commissioned:false, fw:"gapclose-1a7a82e",
+  sec:["sec1"], serial:"lexa-devkit-000001", v:1}` — every assertion PASS. ✓
+- **Notify wiring**: session/wifi/status StartNotify OK; **config correctly
+  refuses StartNotify** (write-only). ✓
+- **sec1 handshake (GAP-2 core)**: correct PoP `LEXA-DEVKIT-POP` → **session
+  established** (real X25519 + HKDF-SHA256 + AES-128-GCM over BLE). Wrong PoP
+  ×3 → each **`err pop_mismatch`**, session aborted; no wrong-PoP session ever
+  established. ✓
+- **Encrypted wifi scan**: ScanRequest → decrypted `scan_result` with 12–17
+  real neighborhood APs (ssid/rssi/sec) — proves bidirectional GCM with the
+  implicit nonce counter spanning session→wifi chars. ✓
+- **Join (SAFE, nonexistent SSID)**: streamed `state:joining` → terminal
+  `state:failed reason=timeout`; no network reconfigured, wlan0 self-healed,
+  netmgr auto-deleted the profile. ✓ (harness structurally refuses any SSID
+  not intentionally nonexistent unless `-allow-unsafe-ssid`.)
+- **Throttle (GAP-3)**: after 3 wrong-PoP, `pop_failures_total` 0→3,
+  `advertising` gauge 1→0, journal "advertising stopped", OTA re-discovery →
+  NOT FOUND (off-radio). Service restart cleared the in-memory throttle. ✓
+- **Commissioned gate (GAP-1)**: `touch /etc/lexa/commissioned` → off-radio
+  within one reconcile tick (gauge 0); `rm` → advertising restored (gauge 1).
+  OTA discovery and the metric agreed at every stage. ✓
+
+**Not exercised — needs a controlled session, NOT a defect**: the
+*successful-join handoff* (api_cert_fp + token delivery). The safe join fails
+by design, and `api.json` is `tls:false` on the bench (http), so a delivered
+`api_cert_fp` maps to no live TLS endpoint. Closing it wants a dedicated test
+AP + a `tls:true` api session — a deliberate follow-up, out of safe bench scope.
+
+Two small findings, both benign:
+- Safe join returned `reason=timeout` (45 s) rather than `not_found`: wlan0 is
+  actively connected, so NM leaves the nonexistent-SSID profile "activating"
+  until the overall timeout. On an idle radio you'd see the faster `not_found`.
+  Both are correct FAILED terminals.
+- `api_cert_fp`-file-exists vs `tls:false` is a bench-config inconsistency
+  (the cert file is present but the api serves http) — reconcile before
+  shipping the joined-handoff on a product (tls:true) unit.
+
+Dev kit left clean: `lexa-provision` active, marker absent (uncommissioned),
+advertising=1, pop_failures=0, wlan0 connected, no leftover NM profiles.
+
+## Campaign status: COMPLETE
+
+Every gap in `lexa-app/docs/LEXA_HUB_GAPS.md` that is hub-side and in scope is
+closed in code and validated on hardware:
+- GAP-1/2/3 (BLE commissioning: GATT + advertising, sec1 PoP session, join +
+  status, handoff/PoP/throttle/factory-reset) — B1–B4, OTA-validated C2.
+- GAP-4 (mode manager + intent consumers) — pre-closed by the extension
+  campaign, hardware-reconfirmed C1.
+- GAP-5 (fw stamping) — A1, live.
+- GAP-7 (`GET /plan` series) — A3, live (battery/EV empty pending planner
+  config — see the C1 note; a documented config-completeness follow-up).
+- GAP-8 (reserve + tariff read-back) — A2, live.
+- GAP-6 (remote access) — explicitly out of scope (Phase-3 DRM-vs-cloudlink ADR).
+
+Documented follow-ups (each behavior-changing or needing a controlled session,
+deliberately NOT done on the flipped-active bench):
+1. Populate `hub.json` `planner` block so the daily planner schedules
+   battery+EV and `/plan`'s battery_plan/ev_plan carry data.
+2. Successful-join handoff acceptance: needs a dedicated test AP + `tls:true`
+   api to prove api_cert_fp/token delivery end-to-end.
+3. Reconcile the api_cert_fp-file vs `tls:false` bench inconsistency before a
+   product (tls:true) handoff ships.
