@@ -545,6 +545,12 @@ func main() {
 	// the engine only calls PlanObserver after eng.Start(), well after wiring).
 	settingsRefresh := func() {}
 
+	// scheduleRefresh is the GAP-7 read-back seam (schedule.go): the plan
+	// observer pokes it every pass so the retained lexa/hub/schedule doc tracks
+	// the latest plan (deduped inside on the plan's build time). Same
+	// forward-declaration/no-op-until-wired pattern as settingsRefresh.
+	scheduleRefresh := func() {}
+
 	// tickBudget is this task's Phase 4 exit-criterion threshold: half the
 	// economic engine interval. Exceeding it — measured as this pass's own
 	// synchronous work plus the PRIOR pass's actuator Apply* time, see
@@ -663,6 +669,11 @@ func main() {
 		// doc is refreshed next change/pass).
 		settingsRefresh()
 
+		// GAP-7: refresh the retained lexa/hub/schedule series if the planner has
+		// produced a NEW plan (deduped inside on build time — most passes are a
+		// no-op). Same off-actuator-path, log-only-on-failure discipline.
+		scheduleRefresh()
+
 		// Feed this plan's meter-level breach evidence to the episode component
 		// and publish whatever edge it produces. The component owns the edge
 		// semantics (onset / new-mRID re-alert / clear) and the Safety-plan guard
@@ -741,6 +752,17 @@ func main() {
 	// refresh is the seam the plan observer pokes above.
 	settings := newSettingsPublisher(mc, eng, cfg.Planner.TerminalReservePct)
 	settingsRefresh = settings.refreshFromPlan
+
+	// GAP-7: the retained lexa/hub/schedule publisher. Reads the plan snapshot
+	// (plan + the forecast it used + capacity/voltage) from the engine and keys
+	// the ev_plan series by the first configured station id. Its refresh is the
+	// seam the plan observer pokes above (deduped on the plan's build time).
+	stationIDs := make([]string, 0, len(cfg.Stations))
+	for _, sc := range cfg.Stations {
+		stationIDs = append(stationIDs, sc.ID)
+	}
+	schedule := newSchedulePublisher(mc, eng, stationIDs)
+	scheduleRefresh = schedule.refresh
 
 	// lexa_hub_engine_cmd_dropped_total (WS-9.3): mirrors Engine.CmdDropped()
 	// (internal/orchestrator stays decoupled from internal/metrics — same
@@ -909,6 +931,13 @@ func main() {
 	// window and has already re-seeded modeMgr's mode. After this, onModeStatus
 	// ignores every lexa/hub/mode message — only the intent path flips the mode.
 	modeMgr.SealBoot()
+
+	// GAP-7 seed: publish the retained lexa/hub/schedule once now that the
+	// planner goroutine has been started (its initial replan runs immediately),
+	// so lexa-api has a series soon after subscribing. A no-op if the first plan
+	// hasn't resolved yet — the plan observer's scheduleRefresh() then catches it
+	// on an upcoming tick (deduped on build time so this seed never double-publishes).
+	schedule.refresh()
 
 	// sd_notify READY (TASK-007): tells systemd (Type=notify) the hub has
 	// finished starting and is now ticking, so the watchdog deadline starts

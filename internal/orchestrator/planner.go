@@ -91,6 +91,18 @@ type PlanInterval struct {
 	EVMaxCurrentA float64 // 0 = suspend EV
 	ExpectedGridW float64 // + import, − export
 	MarginalCost  float64 // net cost for this interval (negative = earning)
+	// SocKwh is the planned battery state of charge (kWh) at the START of this
+	// slot — the DP's own tracked source-level SOC for the chosen path, snapped
+	// to the SOC discretisation grid (SOCStepKwh), NOT a re-derived integration.
+	// It is the value backtracking reads off battLevels[srcBattIdx], so it is
+	// exactly the SOC the DP costed this slot's dispatch against. NaN when there
+	// is no battery asset (mirrors BattSetpointW's NaN sentinel) or, defensively,
+	// when a slot has no recorded predecessor. GAP-7: surfaced (via
+	// Engine.DailyPlanSnapshot) so the app's battery-plan chart can render
+	// planned soc_pct per slot. Additive/back-compat: existing PlanInterval
+	// constructions use keyed fields, so this zero-value-safe addition leaves
+	// them unchanged.
+	SocKwh float64
 }
 
 // DailyPlan is the 24-hour cost-optimal plan produced by DailyPlanner.Plan.
@@ -506,9 +518,15 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 		// implied by the snapped SOC change (consistent with the DP cost), not
 		// the raw command, so the setpoint moves only the energy the plan booked.
 		battW := math.NaN()
+		// socKwh is the DP's tracked SOC at the START of this slot: the source
+		// battery level of the chosen transition (battLevels[node.src[0]]),
+		// snapped to the SOC grid. NaN when there is no battery or the slot has
+		// no recorded predecessor (GAP-7 — captured for DailyPlanSnapshot).
+		socKwh := math.NaN()
 		var evA float64
 		if hasBatt && node.src[0] >= 0 {
 			battW = battEffKw[node.src[0]][node.cmd[0]] * 1000
+			socKwh = battLevels[node.src[0]]
 		}
 		if node.src[0] >= 0 {
 			evA = evCurrents[node.cmd[1]]
@@ -539,6 +557,7 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 			EVMaxCurrentA: evA,
 			ExpectedGridW: gridW,
 			MarginalCost:  margCost,
+			SocKwh:        socKwh,
 		}
 
 		if node.src[0] >= 0 {

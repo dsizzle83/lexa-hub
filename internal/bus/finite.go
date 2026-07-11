@@ -277,6 +277,38 @@ func (h HubSettings) Finite() error {
 	return nil
 }
 
+// Finite is HubSchedule's counterpart to Measurement.Finite (GAP-7): it walks
+// the three per-slot series and checks every value. SolarForecastW /
+// BatterySetpointW / each EVPlanW series are plain []float64 (finiteVal per
+// entry); BatterySocPct is []*float64, so a nil (unknown-SOC) entry is skipped
+// via finite's nil wrapper. Defense in depth: the builder already guarantees
+// finite, and the bus decode layer rejects bare/quoted NaN into float64 fields.
+func (h HubSchedule) Finite() error {
+	for i, v := range h.SolarForecastW {
+		if err := finiteVal("solar_forecast_w", v); err != nil {
+			return fmt.Errorf("solar_forecast_w[%d]: %w", i, err)
+		}
+	}
+	for i, v := range h.BatterySetpointW {
+		if err := finiteVal("battery_setpoint_w", v); err != nil {
+			return fmt.Errorf("battery_setpoint_w[%d]: %w", i, err)
+		}
+	}
+	for i := range h.BatterySocPct {
+		if err := finite("battery_soc_pct", h.BatterySocPct[i]); err != nil {
+			return fmt.Errorf("battery_soc_pct[%d]: %w", i, err)
+		}
+	}
+	for station, series := range h.EVPlanW {
+		for i, v := range series {
+			if err := finiteVal("ev_plan_w", v); err != nil {
+				return fmt.Errorf("ev_plan_w[%q][%d]: %w", station, i, err)
+			}
+		}
+	}
+	return nil
+}
+
 // Finite is ScanResult's counterpart to Measurement.Finite (TASK-082): it
 // walks Devices and checks each hit's NameplateW.
 func (s ScanResult) Finite() error {

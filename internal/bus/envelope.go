@@ -65,6 +65,7 @@ const (
 	IntentResultV        = 1 // lexa/intent/result
 	ModeStatusV          = 1 // lexa/hub/mode
 	HubSettingsV         = 1 // lexa/hub/settings (GAP-8 reserve+tariff read-back)
+	HubScheduleV         = 1 // lexa/hub/schedule (GAP-7 plan/forecast 24h series)
 	CloudlinkStatusV     = 1 // lexa/cloudlink/status
 	ScanRequestV         = 1 // lexa/scan/request
 	ScanStatusV          = 1 // lexa/scan/status

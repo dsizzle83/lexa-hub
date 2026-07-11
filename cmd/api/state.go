@@ -85,6 +85,12 @@ type stateStore struct {
 	// broker round trip). Folded into /status's "reserve" + "tariff" objects.
 	hubSettings *bus.HubSettings
 
+	// hubSchedule is the hub's latest 24-hour plan/forecast series
+	// (TopicHubSchedule, retained, GAP-7). nil until the first message arrives —
+	// GET /plan reports 503 in that case rather than fabricating a series (the
+	// hub publishes it on each replan). Projected into GET /plan's app shape.
+	hubSchedule *bus.HubSchedule
+
 	// modeStatus is the hub's latest authoritative plan-author mode
 	// (TopicHubMode, retained, DEVICE_ROADMAP.md §3.5/§4.3). nil until the
 	// first message arrives — GET /mode reports 503 {"error":"unknown"} in
@@ -286,6 +292,14 @@ func (s *stateStore) onHubSettings(_ string, h bus.HubSettings) {
 	s.mu.Unlock()
 }
 
+// onHubSchedule records the hub's latest 24-hour plan/forecast series
+// (TopicHubSchedule, retained, GAP-7).
+func (s *stateStore) onHubSchedule(_ string, h bus.HubSchedule) {
+	s.mu.Lock()
+	s.hubSchedule = &h
+	s.mu.Unlock()
+}
+
 // onCloudlinkStatus records lexa-cloudlink's latest retained status
 // (TopicCloudlinkStatus).
 func (s *stateStore) onCloudlinkStatus(_ string, c bus.CloudlinkStatus) {
@@ -344,6 +358,9 @@ type snapshot struct {
 
 	// GAP-8: nil until the first HubSettings arrives, same discipline as above.
 	hubSettings *bus.HubSettings
+
+	// GAP-7: nil until the first HubSchedule arrives; GET /plan 503s until then.
+	hubSchedule *bus.HubSchedule
 }
 
 func (s *stateStore) snapshot() snapshot {
@@ -389,6 +406,10 @@ func (s *stateStore) snapshot() snapshot {
 	if s.hubSettings != nil {
 		hs := *s.hubSettings
 		out.hubSettings = &hs
+	}
+	if s.hubSchedule != nil {
+		hsc := *s.hubSchedule
+		out.hubSchedule = &hsc
 	}
 	if s.cloudLinkStatus != nil {
 		cl := *s.cloudLinkStatus

@@ -166,6 +166,8 @@ func SupportedV(topic string) int {
 		return ModeStatusV
 	case topic == TopicHubSettings:
 		return HubSettingsV
+	case topic == TopicHubSchedule:
+		return HubScheduleV
 	case topic == TopicCloudlinkStatus:
 		return CloudlinkStatusV
 	case topic == TopicScanRequest:
@@ -292,7 +294,13 @@ const (
 	// active tariff (bus.HubSettings, retained, GAP-8). Published by lexa-hub,
 	// consumed by lexa-api which folds it into /status's "reserve" + "tariff"
 	// so the app reads hub truth, not a locally-cached last-submitted value.
-	TopicHubSettings     = "lexa/hub/settings"
+	TopicHubSettings = "lexa/hub/settings"
+	// TopicHubSchedule carries the hub's most recent 24-hour plan/forecast
+	// series (bus.HubSchedule, retained, GAP-7): the solar forecast the
+	// optimizer used, the planned per-slot battery setpoint + SOC, and the EV
+	// charge plan. Published by lexa-hub on each replan, consumed by lexa-api
+	// which projects it into GET /plan for the app's forecast/plan charts.
+	TopicHubSchedule     = "lexa/hub/schedule"
 	TopicCloudlinkStatus = "lexa/cloudlink/status"
 	TopicScanRequest     = "lexa/scan/request"
 	TopicScanStatus      = "lexa/scan/status"

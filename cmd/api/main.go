@@ -220,6 +220,16 @@ func main() {
 		log.Fatalf("lexa-api: subscribe hub settings: %v", err)
 	}
 
+	// GAP-7: the hub's 24-hour plan/forecast series, projected into GET /plan
+	// (retained — re-served to a restarting lexa-api).
+	if err := mqttutil.Subscribe(mc, bus.TopicHubSchedule, func(topic string, h bus.HubSchedule) {
+		store.onHubSchedule(topic, h)
+		lb.Emit(fmt.Sprintf("[schedule] slots=%d ev_series=%d gen_at=%d",
+			len(h.SolarForecastW), len(h.EVPlanW), h.GeneratedAt))
+	}); err != nil {
+		log.Fatalf("lexa-api: subscribe hub schedule: %v", err)
+	}
+
 	// DEVICE_ROADMAP.md §2/§4.3: lexa-cloudlink's retained status. No such
 	// service exists in this repo yet (TASK-085+) — this subscribe is inert
 	// (never delivers) until it lands, exactly like every other forward-
@@ -308,6 +318,9 @@ func main() {
 	mux.HandleFunc("/devices", requireBearer(apiToken, devicesHandler(store)))
 	mux.HandleFunc("/telemetry/recent", requireBearer(apiToken, telemetryRecentHandler(store.telemetry)))
 	mux.HandleFunc("/mode", requireBearer(apiToken, modeHandler(store)))
+	// GAP-7: the 24-hour plan/forecast series (staged-rollout requireBearer,
+	// same semantics as /status and /mode). 503 until the first HubSchedule.
+	mux.HandleFunc("/plan", requireBearer(apiToken, planHandler(store)))
 	mux.HandleFunc("/intent", requireBearerStrict(apiToken, intentHandler(mc, resWaiter)))
 	// /scan dispatches GET vs POST to their own auth wrapper internally
 	// (scan.go's scanHandler) since both methods share this one path.

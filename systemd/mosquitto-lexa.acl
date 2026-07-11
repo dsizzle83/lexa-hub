@@ -103,6 +103,9 @@ topic write lexa/hub/plan
 # bus.TopicHubSettings (retained, GAP-8) — effective reserve + active tariff
 # read-back for lexa-api (see its matching read grant).
 topic write lexa/hub/settings
+# bus.TopicHubSchedule (retained, GAP-7) — 24h plan/forecast series read-back
+# for lexa-api's GET /plan (see its matching read grant).
+topic write lexa/hub/schedule
 # bus.TopicCSIPComplianceAlert — see lexa-northbound's matching read grant.
 topic write lexa/csip/compliance/alert
 # bus.TopicCSIPFRRequest — see lexa-northbound's matching read grant (RSK-09).
@@ -198,6 +201,9 @@ topic read lexa/hub/plan
 # bus.TopicHubSettings (retained, GAP-8) — GET /status reserve+tariff read-back
 # projection; lexa-hub is the SOLE writer.
 topic read lexa/hub/settings
+# bus.TopicHubSchedule (retained, GAP-7) — GET /plan 24h plan/forecast series
+# projection; lexa-hub is the SOLE writer.
+topic read lexa/hub/schedule
 # bus.TopicIntentMode (retained) (TASK-082) — unit 4.3 POST /intent forwards
 # the app-origin intent (Origin:"app"); unit 3.3 (hub) is the reader.
 topic write lexa/intent/mode

@@ -162,6 +162,30 @@ const (
 	forecastDiurnal  = "diurnal"
 )
 
+// PlanSnapshot is the lock-free view Engine.DailyPlanSnapshot returns: the
+// current 24-hour plan plus the two planner inputs the GET /plan projection
+// (GAP-7) needs but Plan() itself discards. It exists so cmd/hub can build the
+// retained lexa/hub/schedule document — the solar forecast the optimizer
+// actually used, the planned battery setpoint+SOC per slot, and the EV charge
+// plan — without the API having to re-run or re-derive any of it.
+type PlanSnapshot struct {
+	// Plan is the most recent DailyPlan (288 five-minute slots). nil before the
+	// first plan runs (the "no plan yet" sentinel — callers render an empty
+	// schedule).
+	Plan *DailyPlan
+	// ForecastKw is the per-slot solar-generation forecast (kW) the plan was
+	// built against — the resampled external forecast or the diurnal clear-sky
+	// curve, whichever buildPlannerParams selected. May be nil (no solar
+	// information available). len ≤ planSteps; a short/nil slice zero-fills.
+	ForecastKw []float64
+	// BattCapKwh is the battery capacity (kWh) the plan used, so a per-slot
+	// SocKwh can be rendered as soc_pct. 0 when no battery was modelled.
+	BattCapKwh float64
+	// EVVoltageV is the EV nominal voltage (V) the plan used, so a per-slot
+	// EVMaxCurrentA can be rendered as power_W. 0 when no EV was modelled.
+	EVVoltageV float64
+}
+
 // Config groups optional Engine tunables.
 type Config struct {
 	// Interval is how often the optimization loop runs.  Default: 15s.
@@ -350,6 +374,19 @@ func (e *Engine) EffectiveReservePct() float64 {
 	return math.Float64frombits(e.effectiveReservePct.Load())
 }
 
+// DailyPlanSnapshot returns the current 24-hour plan together with the planner
+// inputs the GET /plan projection needs (the solar forecast the plan used, the
+// battery capacity, the EV voltage) — see PlanSnapshot. Before the first plan
+// runs it returns a zero PlanSnapshot (Plan == nil), the "no plan yet"
+// sentinel. Lock-free and safe for concurrent use from any goroutine, the same
+// atomic-snapshot discipline as ForecastSource()/LastPlan(). GAP-7.
+func (e *Engine) DailyPlanSnapshot() PlanSnapshot {
+	if s := e.state.planSnap.Load(); s != nil {
+		return *s
+	}
+	return PlanSnapshot{}
+}
+
 // enqueue, drainCmds, mustNotBeStarted, and Register*Actuator — the Engine
 // methods that mutate or gate engineState — live in engine_state.go
 // alongside the struct they operate on.
@@ -516,6 +553,17 @@ func (e *Engine) replan() {
 	plan := e.planner.Plan(params)
 
 	e.state.dailyPlan.Store(plan)
+	// GAP-7: capture the forecast the plan was built against (Plan() discards
+	// it) plus the capacity/voltage the /plan projection needs to render SOC and
+	// EV power. params.SolarForecastKw is a freshly-built slice per replan
+	// (resampleForecast/diurnalSolarForecast, never aliased), so storing it
+	// directly is race-free. Same single writer (this goroutine) as dailyPlan.
+	e.state.planSnap.Store(&PlanSnapshot{
+		Plan:       plan,
+		ForecastKw: params.SolarForecastKw,
+		BattCapKwh: params.BattCapacityKwh,
+		EVVoltageV: params.EVVoltageV,
+	})
 
 	log.Printf("[orchestrator] replan: window=%s–%s cost=%.3f slots=%d",
 		time.Unix(plan.WindowStart, 0).Format("15:04"),

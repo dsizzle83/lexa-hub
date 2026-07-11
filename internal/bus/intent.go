@@ -179,6 +179,47 @@ type TariffSettings struct {
 	Spec *TariffSpec `json:"spec,omitempty"`
 }
 
+// HubSchedule — lexa/hub/schedule (retained, GAP-7 plan/forecast series). The
+// hub's most recent 24-hour plan projected into three per-slot series the app's
+// forecast/plan charts consume: the solar forecast the optimizer used, the
+// planned battery setpoint + SOC, and the EV charge plan. Published by cmd/hub
+// (schedule.go) on each replan (deduped on the plan's build time), consumed by
+// lexa-api which projects it into GET /plan.
+//
+// All three series share ONE uniform 5-minute grid: slot i starts at
+// WindowStart + i*SlotMinutes*60 (Unix s); lexa-api renders that as the RFC3339
+// "t" of each app-shaped entry. Powers are watts, with the house sign
+// convention (+ discharge/generation, − charge/load): SolarForecastW is +gen,
+// BatterySetpointW is + discharge / − charge, and EVPlanW is − (charging is a
+// load). Never NaN on the wire (the builder guarantees finite; HubSchedule.
+// Finite() is decode-side defense in depth) — an unknown per-slot SOC is a nil
+// *float64 (JSON null), and an absent series is an empty/nil slice.
+type HubSchedule struct {
+	Envelope
+	// GeneratedAt is the plan's build time (Unix s) — the dedupe key cmd/hub
+	// uses so an unchanged plan is not republished, and the app's "as of".
+	GeneratedAt int64 `json:"generated_at"`
+	// WindowStart is the Unix second of slot 0; SlotMinutes/HorizonH describe
+	// the grid (5 / 24 today). t of slot i = WindowStart + i*SlotMinutes*60.
+	WindowStart int64 `json:"window_start"`
+	SlotMinutes int   `json:"slot_minutes"`
+	HorizonH    int   `json:"horizon_h"`
+	// SolarForecastW is the per-slot solar-generation forecast (W, + gen) the
+	// optimizer actually planned against. Empty when no forecast was available.
+	SolarForecastW []float64 `json:"solar_forecast_w"`
+	// BatterySetpointW / BatterySocPct are the planned per-slot battery dispatch
+	// (W, + discharge − charge) and the planned SOC (percent of capacity) at the
+	// START of each slot. Parallel slices (same length); a nil SOC entry means
+	// the slot's SOC is unknown. Both empty when no battery was modelled.
+	BatterySetpointW []float64  `json:"battery_setpoint_w"`
+	BatterySocPct    []*float64 `json:"battery_soc_pct"`
+	// EVPlanW maps station id → per-slot EV power (W, − charge/load). The daily
+	// planner models a single logical EV today, so this normally holds one
+	// series keyed by the configured station id. Empty when no EV was modelled.
+	EVPlanW map[string][]float64 `json:"ev_plan_w"`
+	Ts      int64                `json:"ts"` // publish wall-clock (Unix s)
+}
+
 // CloudlinkStatus — lexa/cloudlink/status (retained). Folded into lexa-api's
 // /status as "cloud_link" and uplinked as part of the health stream.
 type CloudlinkStatus struct {

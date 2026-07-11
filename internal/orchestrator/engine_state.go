@@ -42,6 +42,16 @@ type engineState struct {
 	// via an atomic load — no lock.
 	dailyPlan atomic.Pointer[DailyPlan]
 
+	// planSnap bundles the most recent DailyPlan with the planner inputs the
+	// GET /plan projection needs but Plan() otherwise discards — the solar
+	// forecast the plan was built against and the battery capacity / EV
+	// voltage used to render per-slot SOC and EV power (GAP-7). Written
+	// alongside dailyPlan by the SAME single writer (the planner goroutine,
+	// replan()); read lock-free by any caller via Engine.DailyPlanSnapshot().
+	// A parallel atomic (not a field on the public DailyPlan) so DailyPlan's
+	// wire/consumer shape is untouched. nil until the first plan.
+	planSnap atomic.Pointer[PlanSnapshot]
+
 	// lastPlan is the most recently computed economic Plan, exposed via
 	// Engine.LastPlan(). Single writer: the control goroutine (tick()).
 	// Read by any external caller (e.g. cmd/hub's /status handler) via an
