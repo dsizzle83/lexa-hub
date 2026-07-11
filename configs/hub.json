@@ -21,6 +21,21 @@
     "evse_window": { "start_hh": 23, "end_hh": 7 },
     "evse_full_a": 32.0
   },
+  "planner": {
+    "batt_capacity_kwh": 10.0,
+    "batt_max_charge_kw": 5.0,
+    "batt_max_discharge_kw": 5.0,
+    "batt_efficiency": 0.96,
+    "terminal_reserve_pct": 20.0,
+    "ev_capacity_kwh": 60.0,
+    "ev_max_charge_kw": 7.68,
+    "ev_voltage_v": 240.0,
+    "ev_target_soc_pct": 80.0,
+    "ev_departure_hh": 7,
+    "solar_peak_kw": 8.0,
+    "soc_step_kwh": 0.5,
+    "replan_interval_s": 900
+  },
   "devices": [
     {
       "name": "inverter-0",
