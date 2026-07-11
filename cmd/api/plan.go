@@ -17,16 +17,31 @@ import (
 // planResp is GET /plan's JSON shape on success — the app-map target:
 //
 //	{ generated_at, horizon_h, slot_minutes,
+//	  currency, total_cost, fixed_daily_charge,
 //	  solar_forecast:[{t, solar_W}],
 //	  battery_plan:[{t, setpoint_W, soc_pct}],
-//	  ev_plan:{<station_id>:[{t, power_W}]} }
+//	  ev_plan:{<station_id>:[{t, power_W}]},
+//	  price_forecast:[{t, import_per_kwh, delivery_per_kwh, export_per_kwh}],
+//	  cost_plan:[{t, grid_W, marginal_cost}] }
+//
+// The economics fields (currency/total_cost/fixed_daily_charge and the
+// price_forecast/cost_plan series) are ADDITIVE (PR-E): they surface the $
+// economics HubSchedule now carries. They are emitted only when the source
+// HubSchedule fields are populated — an unpopulated schedule yields the same
+// wire shape as before this PR (empty Currency/zero totals omit, the two new
+// series stay nil).
 type planResp struct {
-	GeneratedAt   string                    `json:"generated_at"` // RFC3339
-	HorizonH      int                       `json:"horizon_h"`
-	SlotMinutes   int                       `json:"slot_minutes"`
-	SolarForecast []solarPoint              `json:"solar_forecast"`
-	BatteryPlan   []batteryPoint            `json:"battery_plan"`
-	EVPlan        map[string][]evPowerPoint `json:"ev_plan"`
+	GeneratedAt      string                    `json:"generated_at"` // RFC3339
+	HorizonH         int                       `json:"horizon_h"`
+	SlotMinutes      int                       `json:"slot_minutes"`
+	Currency         string                    `json:"currency,omitempty"`
+	TotalCost        float64                   `json:"total_cost,omitempty"`
+	FixedDailyCharge float64                   `json:"fixed_daily_charge,omitempty"`
+	SolarForecast    []solarPoint              `json:"solar_forecast"`
+	BatteryPlan      []batteryPoint            `json:"battery_plan"`
+	EVPlan           map[string][]evPowerPoint `json:"ev_plan"`
+	PriceForecast    []pricePoint              `json:"price_forecast"`
+	CostPlan         []costPoint               `json:"cost_plan"`
 }
 
 type solarPoint struct {
@@ -43,6 +58,26 @@ type batteryPoint struct {
 type evPowerPoint struct {
 	T      string  `json:"t"`       // RFC3339 slot start
 	PowerW float64 `json:"power_W"` // − charge/load
+}
+
+// pricePoint is one slot of the price_forecast series: the all-in import price
+// (supply + delivery), the delivery component alone (so the app can annotate
+// how much of the import price is delivery vs. supply), and the export/feed-in
+// credit — all $/kWh at that slot.
+type pricePoint struct {
+	T              string  `json:"t"`                // RFC3339 slot start
+	ImportPerKwh   float64 `json:"import_per_kwh"`   // all-in supply + delivery
+	DeliveryPerKwh float64 `json:"delivery_per_kwh"` // delivery component alone
+	ExportPerKwh   float64 `json:"export_per_kwh"`   // feed-in credit
+}
+
+// costPoint is one slot of the cost_plan series: the planned grid flow (house
+// sign convention, + import / − export) and the net $ cost that flow implies at
+// the slot's price (negative = earning, e.g. net export at a positive credit).
+type costPoint struct {
+	T            string  `json:"t"`             // RFC3339 slot start
+	GridW        float64 `json:"grid_W"`        // + import, − export
+	MarginalCost float64 `json:"marginal_cost"` // net $ at this slot
 }
 
 // planHandler serves GET /plan: 503 {"error":"unknown"} until the first
@@ -79,9 +114,12 @@ func buildPlan(s bus.HubSchedule) planResp {
 	}
 
 	resp := planResp{
-		GeneratedAt: time.Unix(s.GeneratedAt, 0).UTC().Format(time.RFC3339),
-		HorizonH:    s.HorizonH,
-		SlotMinutes: s.SlotMinutes,
+		GeneratedAt:      time.Unix(s.GeneratedAt, 0).UTC().Format(time.RFC3339),
+		HorizonH:         s.HorizonH,
+		SlotMinutes:      s.SlotMinutes,
+		Currency:         s.Currency,
+		TotalCost:        s.TotalCost,
+		FixedDailyCharge: s.FixedDailyCharge,
 		// Non-nil empty slices so the JSON always carries the arrays (the app's
 		// chart code iterates them without a null check).
 		SolarForecast: []solarPoint{},
@@ -109,6 +147,37 @@ func buildPlan(s bus.HubSchedule) planResp {
 			pts = append(pts, evPowerPoint{T: tAt(i), PowerW: v})
 		}
 		resp.EVPlan[station] = pts
+	}
+
+	// price_forecast is driven by ImportPriceKwh; the delivery/export components
+	// are index-guarded against a shorter/absent slice (same rule as the
+	// battery setpoint/SOC pairing above). Emitted only when the economics are
+	// populated — an unpopulated schedule leaves the series nil (JSON null),
+	// signalling "not planned" rather than an empty forecast.
+	if len(s.ImportPriceKwh) > 0 {
+		resp.PriceForecast = []pricePoint{}
+		for i, imp := range s.ImportPriceKwh {
+			pp := pricePoint{T: tAt(i), ImportPerKwh: imp}
+			if i < len(s.DeliveryPriceKwh) {
+				pp.DeliveryPerKwh = s.DeliveryPriceKwh[i]
+			}
+			if i < len(s.ExportPriceKwh) {
+				pp.ExportPerKwh = s.ExportPriceKwh[i]
+			}
+			resp.PriceForecast = append(resp.PriceForecast, pp)
+		}
+	}
+
+	// cost_plan is driven by GridW; marginal_cost is index-guarded the same way.
+	if len(s.GridW) > 0 {
+		resp.CostPlan = []costPoint{}
+		for i, g := range s.GridW {
+			cp := costPoint{T: tAt(i), GridW: g}
+			if i < len(s.MarginalCost) {
+				cp.MarginalCost = s.MarginalCost[i]
+			}
+			resp.CostPlan = append(resp.CostPlan, cp)
+		}
 	}
 
 	return resp

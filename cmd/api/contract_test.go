@@ -238,7 +238,14 @@ func TestContract_Plan(t *testing.T) {
 	store.onHubSchedule(bus.TopicHubSchedule, bus.HubSchedule{
 		Envelope: bus.Envelope{V: bus.HubScheduleV}, GeneratedAt: ws, WindowStart: ws, SlotMinutes: 5, HorizonH: 24,
 		SolarForecastW: []float64{1500}, BatterySetpointW: []float64{-1000}, BatterySocPct: []*float64{&soc0},
-		EVPlanW: map[string][]float64{"evse-001": {-7200}}, Ts: ws + 10,
+		EVPlanW: map[string][]float64{"evse-001": {-7200}},
+		// Plan economics (PR-E) — seed so the live handler emits the new keys
+		// (currency/total_cost/fixed_daily_charge + price_forecast/cost_plan).
+		Currency:       "USD",
+		ImportPriceKwh: []float64{0.38}, DeliveryPriceKwh: []float64{0.05}, ExportPriceKwh: []float64{0.10},
+		GridW: []float64{1200}, MarginalCost: []float64{0.0076},
+		TotalCost: 4.25, FixedDailyCharge: 0.35,
+		Ts: ws + 10,
 	})
 	h := planHandler(store)
 	rec := httptest.NewRecorder()

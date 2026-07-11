@@ -2,6 +2,9 @@
   "generated_at": "2026-07-11T00:00:00Z",
   "horizon_h": 24,
   "slot_minutes": 5,
+  "currency": "USD",
+  "total_cost": 4.25,
+  "fixed_daily_charge": 0.35,
   "solar_forecast": [
     {
       "t": "2026-07-11T00:00:00Z",
@@ -22,5 +25,20 @@
         "power_W": -7200
       }
     ]
-  }
+  },
+  "price_forecast": [
+    {
+      "t": "2026-07-11T00:00:00Z",
+      "import_per_kwh": 0.38,
+      "delivery_per_kwh": 0.05,
+      "export_per_kwh": 0.1
+    }
+  ],
+  "cost_plan": [
+    {
+      "t": "2026-07-11T00:00:00Z",
+      "grid_W": 1200,
+      "marginal_cost": 0.0076
+    }
+  ]
 }

@@ -111,8 +111,14 @@ Each is pinned by a golden fixture and the CI gate. Fields are grouped by route;
 - **`GET /mode`** (`mode.json`): `mode`, `since`, `actor`, `intent_id`. (The app
   tolerates `503`→null before the first mode arrives.)
 - **`GET /plan`** (`plan.json`): `generated_at`, `horizon_h`, `slot_minutes`,
+  `currency?`, `total_cost?`, `fixed_daily_charge?`,
   `solar_forecast[{t, solar_W}]`, `battery_plan[{t, setpoint_W, soc_pct?}]`,
-  `ev_plan{<station>:[{t, power_W}]}`. (`503` before the first schedule.)
+  `ev_plan{<station>:[{t, power_W}]}`,
+  `price_forecast[{t, import_per_kwh, delivery_per_kwh, export_per_kwh}]`,
+  `cost_plan[{t, grid_W, marginal_cost}]`. (`503` before the first schedule.
+  The economics fields — `currency`/`total_cost`/`fixed_daily_charge` and the
+  `price_forecast`/`cost_plan` series — are additive and emitted only once the
+  schedule carries them.)
 - **`GET /scan`** (`scan_get.json`): `status[{id, phase, probed, found, detail, ts}]`,
   `result{id, ts, devices[…]}`.
 - **`POST /scan`** (`scan_post.json`): `202 {id}`.
