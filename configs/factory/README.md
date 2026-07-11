@@ -68,7 +68,16 @@ treat as "plan heartbeat `never` is fine" rather than a fault.
   "/etc/lexa/api-secret"` (satisfies the WS-1 gate for a non-loopback bind
   — see "Known gaps" for what has to be true about that file for this to
   actually work), `bench: false`, `tls: true`, `mdns: true`, `serial_file:
-  "/etc/lexa/identity/serial"`, `cert_dir: "/var/lib/lexa/api"`.
+  "/etc/lexa/identity/serial"`, `cert_dir: "/var/lib/lexa/api"`. `tls: true`
+  is no longer distinctive to this factory profile — the repo's dev/bench
+  example `configs/api.json` also ships `tls: true` now (bring-up fix,
+  2026-07-11: the companion app is HTTPS-only/cert-pinned and cannot reach a
+  plain-http hub, and `scripts/deploy-hub-pi.sh` was re-flipping every bench
+  deploy back to plain HTTP via the old `tls: false` example). Both profiles
+  agree on-value now; only `listen_addr`/`api_token_file`/`bench` still
+  differ between them (LAN-reachable + pre-provisioned token here vs.
+  loopback + no token in the bench example, per the bullets above and in
+  `cmd/api/config.go`'s field docs).
 
 - **cloudlink.json** — `enabled: false`, `endpoint: ""`. **Speculative**:
   `cmd/cloudlink` does not exist in this repo yet (it's TASK-085 in

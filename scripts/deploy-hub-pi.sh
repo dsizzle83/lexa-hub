@@ -15,6 +15,16 @@
 # lexa-ocpp's new fail-closed startup gate (cmd/ocpp/config.go) doesn't
 # block a plain bench deploy.
 #
+# TLS-on-by-default (bring-up fix, 2026-07-11): the repo's dev/bench example
+# configs/api.json now ships "tls": true, matching configs/factory/api.json —
+# the companion app is HTTPS-only (cert-pinned) and simply cannot reach a
+# plain-http hub at all. lexa-api auto-generates its own self-signed cert on
+# first boot (cmd/api/tlscert.go), so flipping this needed no cert staging.
+# This script also asserts, right after installing /etc/lexa/api.json below,
+# that its "tls" key isn't explicitly false — a LOUD (non-fatal) warning if
+# it is, so a hand-edited or stale config can't silently re-introduce the
+# app-breaking plain-http hub.
+#
 # Extension campaign catch-up (units 4.5/2.1/1.5/1.6, 2026-07-10): lexa-hub's
 # canonical install set grew to 6 services + lexa-healthcheck + lexa-migrate
 # + lexa-cloudlink + lexactl (see the Makefile's `install`/`install-services`
@@ -56,6 +66,11 @@
 #     --bench-insecure leaves api_token_file unset (today's pre-WS-1
 #     behavior) and sets api.json's "bench": true so lexa-api's fail-closed
 #     startup gate on its LAN-reachable listen_addr doesn't block it.
+#   - asserts, right after installing /etc/lexa/api.json, that its "tls" key
+#     isn't explicitly false — printing a LOUD non-fatal warning if it is,
+#     since the companion app is HTTPS-only and cannot reach a plain-http
+#     hub at all (TLS-on is the default in both configs/api.json and
+#     configs/factory/api.json now).
 #   - generates per-service MQTT broker passwords (idempotent) under
 #     /etc/lexa/mqtt/<svc>.pass and always patches them into each service's
 #     mqtt_user/mqtt_pass_file (TASK-013 / W7 / AD-008) — independent of
@@ -288,6 +303,33 @@ install -m 755 $D/bin/lexactl /usr/local/sbin/lexactl
 install -m 644 $D/configs/hub.json $D/configs/northbound.json $D/configs/modbus.json $D/configs/ocpp.json $D/configs/telemetry.json $D/configs/api.json /etc/lexa/
 install -m 640 -o lexa -g lexa $D/certs/ca.pem $D/certs/client.pem /etc/lexa/certs/
 install -m 600 -o lexa -g lexa $D/certs/client-key.pem /etc/lexa/certs/
+
+# TLS-on-by-default guardrail (bring-up fix, 2026-07-11): configs/api.json now
+# ships "tls": true (matching configs/factory/api.json) so a plain deploy
+# serves HTTPS — the companion app is HTTPS-only (cert-pinned TLS) and cannot
+# reach a plain-http hub at all. This does NOT fail the deploy (an operator
+# may deliberately want a one-off plain-http local debug session) — it just
+# makes a plain-http deploy impossible to miss in the log. Checked right after
+# the config install above so this reflects exactly what just landed on disk,
+# before any later step in this script touches api.json again.
+if python3 - <<'PY'
+import json, sys
+with open("/etc/lexa/api.json") as f:
+    cfg = json.load(f)
+sys.exit(0 if cfg.get("tls") is False else 1)
+PY
+then
+  echo "############################################################"
+  echo "# WARNING: /etc/lexa/api.json has \"tls\": false"
+  echo "# lexa-api will serve PLAIN HTTP, not HTTPS, once restarted."
+  echo "# The companion app is HTTPS-only (TLS cert pinning) and CANNOT"
+  echo "# connect to a plain-http hub — this deploy will be unreachable"
+  echo "# from the app until tls is set back to true."
+  echo "# Fix: set \"tls\": true in configs/api.json and redeploy, or"
+  echo "# hand-edit /etc/lexa/api.json's \"tls\" key on this Pi and"
+  echo "# restart lexa-api."
+  echo "############################################################"
+fi
 
 # lexa-cloudlink config (unit 2.1+, now shipping). Install ONLY IF ABSENT —
 # mirrors the Makefile's install-configs no-overwrite discipline, but scoped
@@ -551,17 +593,27 @@ rm -rf $D
 REMOTE
 
 echo
-echo "── Done. Verify from the desktop:"
+echo "── Done. Verify from the desktop (TLS is ON by default now — lexa-api"
+echo "   serves HTTPS via its self-signed cert; curl needs -k to skip local"
+echo "   verification, same as any client until it does real TOFU pinning):"
 if [[ "$BENCH_INSECURE" == "1" ]]; then
-  echo "   curl http://$PI:9100/status | python3 -m json.tool | head              # auth off (--bench-insecure)"
-  echo "   Then restart the dashboard with -hub http://$PI:9100"
+  echo "   curl -k https://$PI:9100/status | python3 -m json.tool | head          # auth off (--bench-insecure)"
   echo "   Re-run WITHOUT --bench-insecure once the dashboard/metersim carry the token (scripts/update-sim-pis.sh, bench-up.sh)."
 else
-  echo "   curl -s http://$PI:9100/status                                        # → 401 (auth on, WS-1 default)"
-  echo "   curl -s -H \"Authorization: Bearer \$(ssh $SSHUSER@$PI sudo cat /etc/lexa/api.token)\" http://$PI:9100/status | python3 -m json.tool | head"
-  echo "   curl -s http://$PI:9100/healthz                                        # → 200 (never authenticated)"
+  echo "   curl -k -s https://$PI:9100/status                                    # → 401 (auth on, WS-1 default)"
+  echo "   curl -k -s -H \"Authorization: Bearer \$(ssh $SSHUSER@$PI sudo cat /etc/lexa/api.token)\" https://$PI:9100/status | python3 -m json.tool | head"
+  echo "   curl -k -s https://$PI:9100/healthz                                   # → 200 (never authenticated)"
   echo "   Then restart the dashboard/metersim with -hub-token-file pointing at a copy of that token (see docs/BENCH.md)."
 fi
+echo "── The companion app REQUIRES this: it is HTTPS-only (cert-pinned) and"
+echo "   cannot reach a plain-http hub at all — that's why tls:true is now the"
+echo "   default in both configs/api.json and configs/factory/api.json."
+echo "   The bench tooling in csip-tls-test was migrated in tandem (WS-B):"
+echo "   the dashboard reverse-proxy/drivers/log follower, metersim's -hub-api,"
+echo "   prometheus-bench.yml's :9100 scrape, and update-sim-pis.sh all now dial"
+echo "   https with skip-verify (self-signed leaf) — so a normal paired"
+echo "   hub+sims deploy keeps working. A hand-set \"tls\": false on this Pi is"
+echo "   the only path that still needs plain http (the WARNING above flags it)."
 echo
 if [[ "$BENCH_INSECURE" == "1" ]]; then
   echo "── MQTT broker: allow_anonymous true (--bench-insecure) — every service already carries"

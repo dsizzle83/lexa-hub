@@ -8,7 +8,7 @@
   "log_buffer_size": 256,
   "api_token_file": "",
   "bench": false,
-  "tls": false,
+  "tls": true,
   "mdns": true,
   "serial_file": "/etc/lexa/identity/serial",
   "cert_dir": "/var/lib/lexa/api",
