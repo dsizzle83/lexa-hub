@@ -89,6 +89,11 @@ type TariffIntent struct {
 type TariffSpec struct {
 	Currency string         `json:"currency"` // "USD"
 	Periods  []TariffPeriod `json:"periods"`
+	// FixedDailyCharge is a flat daily connection/service charge ($/day),
+	// separate from any per-kWh rate above (PR-C, additive). nil = not
+	// specified — the compiling caller (cmd/hub, later PR) treats absence as
+	// zero rather than "unknown", same convention as ExportPerKwh below.
+	FixedDailyCharge *float64 `json:"fixed_daily_charge,omitempty"`
 }
 
 // TariffPeriod is one recurring rate window within a TariffSpec.
@@ -99,6 +104,12 @@ type TariffPeriod struct {
 	EndHH        int      `json:"end_hh"`   // exclusive
 	ImportPerKwh float64  `json:"import_per_kwh"`
 	ExportPerKwh *float64 `json:"export_per_kwh,omitempty"`
+	// DeliveryPerKwh is the per-period volumetric delivery/distribution
+	// charge ($/kWh), added on top of ImportPerKwh's supply rate to form the
+	// all-in import price (PR-C, additive). nil = not specified (no delivery
+	// component modeled for this period), matching ExportPerKwh's optional
+	// convention.
+	DeliveryPerKwh *float64 `json:"delivery_per_kwh,omitempty"`
 }
 
 // ChargeNowIntent — lexa/intent/chargenow (NOT retained; TTLS mandatory).
@@ -217,7 +228,45 @@ type HubSchedule struct {
 	// planner models a single logical EV today, so this normally holds one
 	// series keyed by the configured station id. Empty when no EV was modelled.
 	EVPlanW map[string][]float64 `json:"ev_plan_w"`
-	Ts      int64                `json:"ts"` // publish wall-clock (Unix s)
+
+	// --- Plan economics (PR-C, additive) ---
+	// The fields below surface the $ economics the DP already computes
+	// internally so GET /plan can render them; populated by a later PR
+	// (cmd/hub/schedule.go). All default to nil/zero, which is harmless: an
+	// empty Currency/slice or zero TotalCost/FixedDailyCharge simply means
+	// "not yet populated," identical to today's wire shape before this PR.
+	// Same uniform 5-minute grid as SolarForecastW/BatterySetpointW above —
+	// index-aligned, one entry per slot.
+
+	// Currency is the ISO-ish code the $ fields below are denominated in,
+	// e.g. "USD". Empty = not populated.
+	Currency string `json:"currency,omitempty"`
+	// ImportPriceKwh is the per-slot ALL-IN import price (supply + delivery),
+	// $/kWh — what the household actually pays per kWh imported in that
+	// slot.
+	ImportPriceKwh []float64 `json:"import_price_kwh,omitempty"`
+	// DeliveryPriceKwh is the per-slot delivery/distribution component alone,
+	// $/kWh, so the app can annotate how much of ImportPriceKwh is delivery
+	// vs. supply.
+	DeliveryPriceKwh []float64 `json:"delivery_price_kwh,omitempty"`
+	// ExportPriceKwh is the per-slot export/feed-in credit, $/kWh.
+	ExportPriceKwh []float64 `json:"export_price_kwh,omitempty"`
+	// GridW is the per-slot planned grid flow, watts, house sign convention:
+	// + import, − export.
+	GridW []float64 `json:"grid_w,omitempty"`
+	// MarginalCost is the per-slot net $ cost implied by GridW at that slot's
+	// price (negative = earning, e.g. net export at a positive export
+	// credit).
+	MarginalCost []float64 `json:"marginal_cost,omitempty"`
+	// TotalCost is the 24h total $ for the plan, INCLUDING FixedDailyCharge
+	// below (not just the sum of MarginalCost).
+	TotalCost float64 `json:"total_cost,omitempty"`
+	// FixedDailyCharge is the flat daily connection/service charge ($/day)
+	// this plan's TotalCost included — the plan-side echo of TariffSpec's
+	// field of the same name above.
+	FixedDailyCharge float64 `json:"fixed_daily_charge,omitempty"`
+
+	Ts int64 `json:"ts"` // publish wall-clock (Unix s)
 }
 
 // CloudlinkStatus — lexa/cloudlink/status (retained). Folded into lexa-api's

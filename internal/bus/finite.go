@@ -238,25 +238,53 @@ func (l LoadProfileIntent) Finite() error {
 	return nil
 }
 
-// Finite is TariffIntent's counterpart to Measurement.Finite (TASK-082): it
-// walks Tariff.Periods and checks each period's rates — ImportPerKwh (always
-// present, via finiteVal) and ExportPerKwh (optional, via finite's nil-skip
-// wrapper).
+// Finite is TariffPeriod's counterpart to Measurement.Finite (TASK-082;
+// extended PR-C for DeliveryPerKwh): ImportPerKwh is always present (checked
+// via finiteVal); ExportPerKwh/DeliveryPerKwh are optional (finite's nil-skip
+// wrapper). Factored out of TariffIntent.Finite/HubSettings.Finite (which
+// both walk a []TariffPeriod) so the two callers below share one check.
+func (p TariffPeriod) Finite() error {
+	if err := finiteVal("import_per_kwh", p.ImportPerKwh); err != nil {
+		return err
+	}
+	if err := finite("export_per_kwh", p.ExportPerKwh); err != nil {
+		return err
+	}
+	if err := finite("delivery_per_kwh", p.DeliveryPerKwh); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is TariffSpec's counterpart to Measurement.Finite (PR-C): walks
+// Periods (delegating to TariffPeriod.Finite) and checks the optional
+// FixedDailyCharge.
+func (t TariffSpec) Finite() error {
+	for i, p := range t.Periods {
+		if err := p.Finite(); err != nil {
+			return fmt.Errorf("periods[%d]: %w", i, err)
+		}
+	}
+	if err := finite("fixed_daily_charge", t.FixedDailyCharge); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is TariffIntent's counterpart to Measurement.Finite (TASK-082):
+// delegates to Tariff.Finite (TariffSpec.Finite above), which walks Periods
+// and checks FixedDailyCharge.
 func (t TariffIntent) Finite() error {
-	for i, p := range t.Tariff.Periods {
-		if err := finiteVal("import_per_kwh", p.ImportPerKwh); err != nil {
-			return fmt.Errorf("tariff.periods[%d]: %w", i, err)
-		}
-		if err := finite("export_per_kwh", p.ExportPerKwh); err != nil {
-			return fmt.Errorf("tariff.periods[%d]: %w", i, err)
-		}
+	if err := t.Tariff.Finite(); err != nil {
+		return fmt.Errorf("tariff: %w", err)
 	}
 	return nil
 }
 
 // Finite is HubSettings' counterpart to Measurement.Finite (GAP-8): it checks
 // the reserve percents (both optional/*float64) and, when a tariff spec is
-// present, each period's rates — the same walk TariffIntent.Finite does.
+// present, delegates to TariffSpec.Finite (the same check TariffIntent.Finite
+// uses).
 func (h HubSettings) Finite() error {
 	if err := finite("reserve.effective_pct", h.Reserve.EffectivePct); err != nil {
 		return err
@@ -265,13 +293,23 @@ func (h HubSettings) Finite() error {
 		return err
 	}
 	if h.Tariff.Spec != nil {
-		for i, p := range h.Tariff.Spec.Periods {
-			if err := finiteVal("import_per_kwh", p.ImportPerKwh); err != nil {
-				return fmt.Errorf("tariff.spec.periods[%d]: %w", i, err)
-			}
-			if err := finite("export_per_kwh", p.ExportPerKwh); err != nil {
-				return fmt.Errorf("tariff.spec.periods[%d]: %w", i, err)
-			}
+		if err := h.Tariff.Spec.Finite(); err != nil {
+			return fmt.Errorf("tariff.spec.%w", err)
+		}
+	}
+	return nil
+}
+
+// finiteSlice walks a plain []float64 series and returns the first non-finite
+// entry's error, wrapped with the series name and index — the shared helper
+// HubSchedule.Finite uses for each of its several parallel per-slot series
+// (PR-C), replacing what would otherwise be five copies of the same
+// for/finiteVal/wrap loop already visible in the SolarForecastW/
+// BatterySetpointW/EVPlanW walks below.
+func finiteSlice(name string, s []float64) error {
+	for i, v := range s {
+		if err := finiteVal(name, v); err != nil {
+			return fmt.Errorf("%s[%d]: %w", name, i, err)
 		}
 	}
 	return nil
@@ -283,16 +321,18 @@ func (h HubSettings) Finite() error {
 // entry); BatterySocPct is []*float64, so a nil (unknown-SOC) entry is skipped
 // via finite's nil wrapper. Defense in depth: the builder already guarantees
 // finite, and the bus decode layer rejects bare/quoted NaN into float64 fields.
+//
+// PR-C additive fields: ImportPriceKwh/DeliveryPriceKwh/ExportPriceKwh/GridW/
+// MarginalCost are plain []float64 series on the same grid, checked via the
+// same finiteSlice helper now used for the original series too; TotalCost/
+// FixedDailyCharge are always-present plain float64 (no absent-value
+// convention, like ComplianceAlert's fields), checked via finiteVal directly.
 func (h HubSchedule) Finite() error {
-	for i, v := range h.SolarForecastW {
-		if err := finiteVal("solar_forecast_w", v); err != nil {
-			return fmt.Errorf("solar_forecast_w[%d]: %w", i, err)
-		}
+	if err := finiteSlice("solar_forecast_w", h.SolarForecastW); err != nil {
+		return err
 	}
-	for i, v := range h.BatterySetpointW {
-		if err := finiteVal("battery_setpoint_w", v); err != nil {
-			return fmt.Errorf("battery_setpoint_w[%d]: %w", i, err)
-		}
+	if err := finiteSlice("battery_setpoint_w", h.BatterySetpointW); err != nil {
+		return err
 	}
 	for i := range h.BatterySocPct {
 		if err := finite("battery_soc_pct", h.BatterySocPct[i]); err != nil {
@@ -305,6 +345,27 @@ func (h HubSchedule) Finite() error {
 				return fmt.Errorf("ev_plan_w[%q][%d]: %w", station, i, err)
 			}
 		}
+	}
+	if err := finiteSlice("import_price_kwh", h.ImportPriceKwh); err != nil {
+		return err
+	}
+	if err := finiteSlice("delivery_price_kwh", h.DeliveryPriceKwh); err != nil {
+		return err
+	}
+	if err := finiteSlice("export_price_kwh", h.ExportPriceKwh); err != nil {
+		return err
+	}
+	if err := finiteSlice("grid_w", h.GridW); err != nil {
+		return err
+	}
+	if err := finiteSlice("marginal_cost", h.MarginalCost); err != nil {
+		return err
+	}
+	if err := finiteVal("total_cost", h.TotalCost); err != nil {
+		return err
+	}
+	if err := finiteVal("fixed_daily_charge", h.FixedDailyCharge); err != nil {
+		return err
 	}
 	return nil
 }

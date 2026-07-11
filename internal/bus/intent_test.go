@@ -190,6 +190,8 @@ func TestFiniteRejectsNonFiniteIntentFields(t *testing.T) {
 	posInf := math.Inf(1)
 	negInf := math.Inf(-1)
 	exportNaN := math.NaN()
+	deliveryInf := math.Inf(1)
+	fixedDailyNaN := math.NaN()
 
 	cases := []struct {
 		name      string
@@ -211,6 +213,16 @@ func TestFiniteRejectsNonFiniteIntentFields(t *testing.T) {
 			"TariffIntent/ExportPerKwh=NaN",
 			TariffIntent{Tariff: TariffSpec{Periods: []TariffPeriod{{ImportPerKwh: 0.1, ExportPerKwh: &exportNaN}}}},
 			"export_per_kwh",
+		},
+		{
+			"TariffIntent/DeliveryPerKwh=+Inf",
+			TariffIntent{Tariff: TariffSpec{Periods: []TariffPeriod{{ImportPerKwh: 0.1, DeliveryPerKwh: &deliveryInf}}}},
+			"delivery_per_kwh",
+		},
+		{
+			"TariffIntent/FixedDailyCharge=NaN",
+			TariffIntent{Tariff: TariffSpec{FixedDailyCharge: &fixedDailyNaN, Periods: []TariffPeriod{{ImportPerKwh: 0.1}}}},
+			"fixed_daily_charge",
 		},
 	}
 	for _, tc := range cases {
@@ -248,12 +260,56 @@ func TestFiniteAcceptsValidIntentFields(t *testing.T) {
 		t.Errorf("LoadProfileIntent.Finite() = %v, want nil", err)
 	}
 	exportRate := 0.05
-	valid := TariffIntent{Tariff: TariffSpec{Periods: []TariffPeriod{
-		{ImportPerKwh: 0.3, ExportPerKwh: &exportRate},
-		{ImportPerKwh: 0.1},
-	}}}
+	deliveryRate := 0.11
+	fixedDaily := 0.75
+	valid := TariffIntent{Tariff: TariffSpec{
+		FixedDailyCharge: &fixedDaily,
+		Periods: []TariffPeriod{
+			{ImportPerKwh: 0.3, ExportPerKwh: &exportRate, DeliveryPerKwh: &deliveryRate},
+			{ImportPerKwh: 0.1},
+		},
+	}}
 	if err := valid.Finite(); err != nil {
 		t.Errorf("TariffIntent.Finite() = %v, want nil", err)
+	}
+}
+
+// TestTariffSpecDeliveryAndFixedDailyChargeOmitted verifies the *float64
+// absent-value convention for the two PR-C additions: DeliveryPerKwh/
+// FixedDailyCharge nil must vanish from the wire (omitempty), and a non-nil
+// value (including an explicit 0) must round-trip.
+func TestTariffSpecDeliveryAndFixedDailyChargeOmitted(t *testing.T) {
+	nilSpec := TariffSpec{Currency: "USD", Periods: []TariffPeriod{{ImportPerKwh: 0.2}}}
+	b, err := json.Marshal(nilSpec)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{"delivery_per_kwh", "fixed_daily_charge"} {
+		if strings.Contains(string(b), key) {
+			t.Errorf("nil %q must be omitted, got %s", key, b)
+		}
+	}
+
+	delivery := 0.09
+	fixedDaily := 0.5
+	populated := TariffSpec{
+		Currency:         "USD",
+		FixedDailyCharge: &fixedDaily,
+		Periods:          []TariffPeriod{{ImportPerKwh: 0.2, DeliveryPerKwh: &delivery}},
+	}
+	b, err = json.Marshal(populated)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out TariffSpec
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.FixedDailyCharge == nil || *out.FixedDailyCharge != 0.5 {
+		t.Errorf("fixed_daily_charge round-trip = %v, want 0.5", out.FixedDailyCharge)
+	}
+	if len(out.Periods) != 1 || out.Periods[0].DeliveryPerKwh == nil || *out.Periods[0].DeliveryPerKwh != 0.09 {
+		t.Errorf("delivery_per_kwh round-trip = %v", out.Periods[0].DeliveryPerKwh)
 	}
 }
 
