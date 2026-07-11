@@ -1,0 +1,76 @@
+[Unit]
+# StartLimit* MUST live in [Unit] (systemd >=v230 ignores them in
+# [Service]); the default 5-in-10s otherwise applies and a crash burst
+# permanently disables the service. (V1RC FINDING A, 2026-07-06.)
+StartLimitIntervalSec=120
+StartLimitBurst=5
+Description=LEXA BLE Commissioning (GATT peripheral + advertising)
+Documentation=https://github.com/lexa/lexa-hub
+# BlueZ (bluetoothd) owns the adapter and mediates every GATT/advertising
+# D-Bus call; dbus.service carries the system bus this service connects to.
+# Ordering + Wants (not Requires): a bluetoothd restart must not stop-propagate
+# to this unit — it reconnects/re-registers on the next reconcile, same
+# crash-only/reconnect posture as the MQTT services.
+After=dbus.service bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+# --- Privilege (User) ---
+# Runs as root, deliberately. RegisterApplication / RegisterAdvertisement on
+# org.bluez (and unit B3's NetworkManager AddAndActivateConnection) are
+# privileged D-Bus methods: the stock BlueZ policy (/usr/share/dbus-1/
+# system.d/bluetooth.conf) grants them to root, not to an unprivileged service
+# user — and the dev kit has no `lexa` user at all (the rest of the fleet's
+# User=lexa). Product-hardening follow-up (tracked for B4/ops): install a
+# scoped org.bluez D-Bus policy + a NetworkManager polkit rule and drop to
+# User=lexa with SupplementaryGroups=bluetooth. Until then the sandbox below
+# bounds the blast radius instead.
+#
+# --- Sandbox ---
+# NoNewPrivileges still matters under root (blocks setuid escalation).
+# ProtectSystem=strict makes the whole tree read-only: B2 only READS
+# /etc/lexa (provision.json, provision-pop, identity/serial) and stats the
+# commissioned marker — no ReadWritePaths needed. (B4's factory-reset / marker
+# write will add one then.)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# AF_UNIX: the system D-Bus socket (all BlueZ/NetworkManager traffic).
+# AF_INET: the loopback Prometheus /metrics listener (127.0.0.1:9107).
+# No AF_BLUETOOTH / raw HCI socket is opened here — bluetoothd owns the radio;
+# this service only talks to it over D-Bus.
+RestrictAddressFamilies=AF_UNIX AF_INET
+ReadOnlyPaths=/etc/lexa
+# Type=notify + WatchdogSec (TASK-008 pattern): like lexa-ocpp/lexa-api/
+# lexa-cloudlink, lexa-provision has no tight control loop, so a 10s kick
+# ticker gated on the D-Bus connection being alive (cmd/provision/main.go) is
+# the liveness proxy — a dead system bus withholds the kick and systemd
+# restarts the service (accepted crash-only behavior, AD-011). READY=1 is sent
+# once the GATT application is registered and advertising is reconciled.
+# WatchdogSec=60 matches the other no-tight-loop services.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
+ExecStart=/usr/local/sbin/lexa-provision -config /etc/lexa/provision.json
+# SIGHUP forces an immediate advertising re-check (marker committed → go
+# silent) without a restart.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+
+# journald rate cap (TASK-009, review §11 flash wear / RSK-14): steady state is
+# near-silent (registration lines + advertising start/stop edges + occasional
+# session lines). Burst=150 matches the other low-volume services' headroom.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=150
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lexa-provision
+
+# NOTE: intentionally NOT auto-enabled by `make install-services`. Advertising
+# a commissioning radio is only appropriate on a provisioning-capable image;
+# enablement is gated on that image (ADR-0002), not on every hub.
+[Install]
+WantedBy=multi-user.target

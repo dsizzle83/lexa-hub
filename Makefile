@@ -26,7 +26,7 @@ LDFLAGS := -X lexa-hub/internal/buildinfo.Version=$(VERSION)
 # healthcheck is not a service (no unit file, no daemon) but builds/installs
 # through the same pattern rule: bin/lexa-healthcheck → /usr/local/sbin, the
 # path scripts/mender/ArtifactCommit_Enter_00_lexa-health expects (unit 1.5).
-SERVICES := hub northbound modbus ocpp telemetry api healthcheck cloudlink
+SERVICES := hub northbound modbus ocpp telemetry api healthcheck cloudlink provision
 BINS     := $(addprefix $(BINDIR)/lexa-, $(SERVICES))
 
 .PHONY: all build install install-configs install-services clean tidy test test-nocgo fuzz sweep-sunspec
@@ -88,6 +88,7 @@ build-arm64:
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-healthcheck ./cmd/healthcheck
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-migrate     ./cmd/lexa-migrate
 	$(GOARM64)     -o $(BINDIR)/arm64/lexa-cloudlink   ./cmd/cloudlink
+	$(GOARM64)     -o $(BINDIR)/arm64/lexa-provision   ./cmd/provision
 	$(GOARM64)     -o $(BINDIR)/arm64/lexactl          ./cmd/lexactl
 	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-northbound ./cmd/northbound
 	$(GOARM64_CGO) -o $(BINDIR)/arm64/lexa-telemetry  ./cmd/telemetry

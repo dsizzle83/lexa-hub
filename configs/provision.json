@@ -1,0 +1,10 @@
+{
+  "adapter": "hci0",
+  "pop_file": "/etc/lexa/provision-pop",
+  "serial_file": "/etc/lexa/identity/serial",
+  "marker_file": "/etc/lexa/commissioned",
+  "handoff_port": 9100,
+  "reconcile_interval_s": 10,
+  "metrics_addr": "127.0.0.1:9107",
+  "log_level": "info"
+}

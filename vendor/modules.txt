@@ -15,6 +15,10 @@ github.com/go-playground/universal-translator
 # github.com/goburrow/serial v0.1.0
 ## explicit
 github.com/goburrow/serial
+# github.com/godbus/dbus/v5 v5.2.2
+## explicit; go 1.20
+github.com/godbus/dbus/v5
+github.com/godbus/dbus/v5/introspect
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux

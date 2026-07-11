@@ -56,6 +56,16 @@ type PeripheralConfig struct {
 	// Serial is the device serial, used to fill an empty handoff serial and to
 	// build the info document.
 	Serial string
+	// Fw is the firmware/build version reported in the info document's "fw"
+	// field. Empty preserves the original B1 placeholder ("sec1-go") — unit B2
+	// wires the real internal/buildinfo.Version here so a plaintext info read
+	// reports build truth instead of the placeholder.
+	Fw string
+	// Commissioned is the info document's "commissioned" flag. A hub that is
+	// already commissioned still answers info reads (e.g. during a re-provision
+	// window) but reports true; the default zero value (false) matches a
+	// factory-fresh, uncommissioned unit.
+	Commissioned bool
 	// ScanResults answers a scan request. Nil yields an empty list.
 	ScanResults []WifiAp
 	// JoinBehavior scripts join outcomes. Nil defaults to JoinHangs{}.
@@ -81,6 +91,8 @@ type PeripheralConfig struct {
 type Peripheral struct {
 	pop            string
 	serial         string
+	fw             string
+	commissioned   bool
 	scanResults    []WifiAp
 	attPayloadSize int
 	rand           io.Reader
@@ -126,9 +138,15 @@ func NewPeripheral(cfg PeripheralConfig) *Peripheral {
 	if jb == nil {
 		jb = JoinHangs{}
 	}
+	fw := cfg.Fw
+	if fw == "" {
+		fw = "sec1-go"
+	}
 	return &Peripheral{
 		pop:            cfg.Pop,
 		serial:         cfg.Serial,
+		fw:             fw,
+		commissioned:   cfg.Commissioned,
 		scanResults:    cfg.ScanResults,
 		attPayloadSize: att,
 		rand:           rnd,
@@ -145,8 +163,8 @@ func (p *Peripheral) InfoDoc() map[string]any {
 	return map[string]any{
 		"v":            1,
 		"serial":       p.serial,
-		"fw":           "sec1-go",
-		"commissioned": false,
+		"fw":           p.fw,
+		"commissioned": p.commissioned,
 		"sec":          []string{"sec1"},
 	}
 }
