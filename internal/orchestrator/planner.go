@@ -66,6 +66,28 @@ type PlannerParams struct {
 	ExportPricePerKwh []float64
 	FallbackTOU       *TOUCostModel // used when price slices are nil
 
+	// DeliveryTOU is an optional volumetric delivery/distribution charge
+	// ($/kWh) modelled as an orthogonal adder on the IMPORT price only: you
+	// pay delivery on every imported kWh, never on export. nil ⇒ no delivery
+	// charge (the shipped default; withDefaults needs nothing for it). It is
+	// evaluated at the SAME wall-clock hour as the supply import price
+	// (planStepDeliveryPrice reuses planStepImportPrice's local-time
+	// derivation), so a delivery tariff written in the SOM's zone lines up
+	// slot-for-slot with the supply tariff. Folded into the all-in import
+	// price (planStepImportAllIn) at both the forward DP objective and the
+	// backtrack MarginalCost mirror, so the DP optimises against — and reports
+	// MarginalCost at — the true all-in import cost. The export branch is
+	// untouched.
+	DeliveryTOU *TOUCostModel
+
+	// FixedDailyCharge is a flat $/day charge (e.g. a fixed distribution or
+	// service fee) added ONCE to DailyPlan.TotalCost — the horizon is exactly
+	// 24 h = 1 day. 0 ⇒ none (the correct no-op default). Being a constant that
+	// does not vary with dispatch, it deliberately does NOT enter any per-slot
+	// MarginalCost and never shifts a setpoint; it only raises the reported
+	// daily total.
+	FixedDailyCharge float64
+
 	// DERConstraints holds per-step DER operating constraints from the northbound
 	// schedule. nil or short → unconstrained.
 	DERConstraints []StepConstraint
@@ -373,7 +395,7 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 		solarKw := planStepSolar(p, t)
 		loadKw := planStepLoad(p, t)
 		stepT := ws + int64(t)*planStepSec
-		impPrice := planStepImportPrice(p, t, stepT)
+		impPrice := planStepImportAllIn(p, t, stepT)
 		expPrice := planStepExportPrice(p, t, stepT)
 		evGone := evDeptStep >= 0 && t > evDeptStep
 		fixedBI := fixedPwrIdx[t]
@@ -541,7 +563,7 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 		}
 		gridW := (planStepLoad(p, t) + evKw - solarKw - bKw) * 1000
 		stepT := ws + int64(t)*planStepSec
-		impP := planStepImportPrice(p, t, stepT)
+		impP := planStepImportAllIn(p, t, stepT)
 		expP := planStepExportPrice(p, t, stepT)
 		gKw := gridW / 1000
 		var margCost float64
@@ -565,6 +587,13 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 			ej = int(node.src[1])
 		}
 	}
+
+	// Fixed daily charge: a flat, dispatch-independent cost added ONCE to the
+	// reported daily total. The horizon is exactly 24 h = 1 day
+	// (planStepHours*planSteps == 24), so the whole charge applies. It stays out
+	// of every per-slot MarginalCost — a constant cannot change marginal
+	// dispatch — and therefore never moves a setpoint.
+	out.TotalCost += p.FixedDailyCharge
 
 	return out
 }
@@ -674,6 +703,31 @@ func planStepImportPrice(p PlannerParams, t int, unixT int64) float64 {
 		return p.FallbackTOU.CurrentRate(time.Unix(unixT, 0).Local())
 	}
 	return 0.20
+}
+
+// planStepDeliveryPrice returns the volumetric delivery/distribution charge
+// ($/kWh) for step t: p.DeliveryTOU.CurrentRate at the slot's local time when a
+// DeliveryTOU is set, else 0 (no delivery charge). It renders the local time
+// exactly as planStepImportPrice does for its FallbackTOU lookup
+// (time.Unix(unixT, 0).Local()), so supply and delivery are always evaluated at
+// the same wall-clock hour. Delivery has no per-slot override array — it is a
+// pure TOU adder — so t is accepted only to mirror planStepImportPrice's
+// signature and keep the call sites uniform.
+func planStepDeliveryPrice(p PlannerParams, t int, unixT int64) float64 {
+	if p.DeliveryTOU != nil {
+		return p.DeliveryTOU.CurrentRate(time.Unix(unixT, 0).Local())
+	}
+	return 0
+}
+
+// planStepImportAllIn is the all-in import price ($/kWh) for step t: the supply
+// import price plus the orthogonal delivery adder. This is what the DP costs an
+// imported kWh at — used by BOTH the forward objective and the backtrack
+// MarginalCost mirror so the two stay consistent. The export price has no such
+// adder (you do not pay delivery on export), so the export branch keeps using
+// planStepExportPrice directly.
+func planStepImportAllIn(p PlannerParams, t int, unixT int64) float64 {
+	return planStepImportPrice(p, t, unixT) + planStepDeliveryPrice(p, t, unixT)
 }
 
 func planStepExportPrice(p PlannerParams, t int, unixT int64) float64 {
