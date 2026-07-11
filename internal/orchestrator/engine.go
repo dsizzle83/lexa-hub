@@ -29,6 +29,17 @@ type plannerInput struct {
 	solarForecast *ExternalForecast // external solar forecast; wins over the diurnal curve when fresh
 	loadProfileKw []float64         // per-step site load (kW) on the 288 grid; empty = scalar load
 	fallbackTOU   *TOUCostModel     // tariff-intent TOU model; used when CSIP price slices are nil
+
+	// Delivery-tariff intent (PR-B). Fed as one unit by SetDeliveryTariff and
+	// overlaid onto PlannerParams in buildPlannerParams the same way fallbackTOU
+	// is. deliveryTOU is the volumetric delivery/distribution TOU adder on the
+	// import price (nil ⇒ no delivery charge); fixedDailyCharge is the flat
+	// $/day service fee added once to DailyPlan.TotalCost (0 ⇒ none); currency is
+	// the ISO code the plan is priced in, surfaced on PlanSnapshot ("" ⇒ "USD",
+	// which compileTariff enforces upstream).
+	deliveryTOU      *TOUCostModel
+	fixedDailyCharge float64
+	currency         string
 }
 
 // EVGoal is an externally-supplied EV charging goal (app or cloud), overlaid
@@ -184,6 +195,28 @@ type PlanSnapshot struct {
 	// EVVoltageV is the EV nominal voltage (V) the plan used, so a per-slot
 	// EVMaxCurrentA can be rendered as power_W. 0 when no EV was modelled.
 	EVVoltageV float64
+
+	// Currency is the ISO currency code the plan (TotalCost, MarginalCost, and
+	// the price arrays below) is priced in — "USD" by default (compileTariff
+	// enforces USD upstream). Never empty in a captured snapshot.
+	Currency string
+	// ImportPriceKwh is the resolved all-in import price ($/kWh) per 288-slot
+	// window — supply plus the delivery adder — evaluated with the SAME helper
+	// (planStepImportAllIn) the DP costed against. This is what an imported kWh
+	// actually costs at each slot. Always len planSteps in a captured snapshot.
+	ImportPriceKwh []float64
+	// DeliveryPriceKwh is the delivery/distribution component ($/kWh) of the
+	// all-in import price, per slot (planStepDeliveryPrice) — 0 in every slot
+	// when no delivery tariff is set. Always len planSteps in a captured
+	// snapshot.
+	DeliveryPriceKwh []float64
+	// ExportPriceKwh is the resolved export price ($/kWh) per slot
+	// (planStepExportPrice) — you earn this per exported kWh (no delivery adder).
+	// Always len planSteps in a captured snapshot.
+	ExportPriceKwh []float64
+	// FixedDailyCharge is the flat $/day service charge folded once into
+	// Plan.TotalCost (params.FixedDailyCharge). 0 when none.
+	FixedDailyCharge float64
 }
 
 // Config groups optional Engine tunables.
@@ -339,6 +372,29 @@ func (e *Engine) SetLoadProfile(stepKw []float64) {
 func (e *Engine) SetFallbackTOU(m *TOUCostModel) {
 	e.enqueue(func(s *engineState) {
 		s.setPlanIn(func(in *plannerInput) { in.fallbackTOU = m })
+	})
+	e.signalReplan()
+}
+
+// SetDeliveryTariff supplies the volumetric delivery/distribution TOU adder
+// (delivery, nil ⇒ none), the flat daily service charge (fixedDaily $/day,
+// 0 ⇒ none), and the ISO currency ("" ⇒ "USD") the plan is priced in. It is the
+// single seam cmd/hub's tariff adoption calls to fold a delivery tariff into the
+// optimizer's cost model. All three travel together as one plannerInput update.
+//
+// Same async command contract as SetFallbackTOU/SetPrices: the mutation is
+// enqueued on cmdCh (cap 16, drop-and-count on overflow) and applied by the
+// control goroutine, so it takes effect no later than the next replan — never
+// synchronously. The *TOUCostModel is compiled fresh per tariff intent, so the
+// pointer is stored as-is (no copy needed). Triggers an immediate re-plan. Safe
+// for concurrent use from any goroutine.
+func (e *Engine) SetDeliveryTariff(delivery *TOUCostModel, fixedDaily float64, currency string) {
+	e.enqueue(func(s *engineState) {
+		s.setPlanIn(func(in *plannerInput) {
+			in.deliveryTOU = delivery
+			in.fixedDailyCharge = fixedDaily
+			in.currency = currency
+		})
 	})
 	e.signalReplan()
 }
@@ -552,17 +608,46 @@ func (e *Engine) replan() {
 	params := e.buildPlannerParams(state, inp)
 	plan := e.planner.Plan(params)
 
+	// Resolve the per-slot price series the DP actually costed against, over the
+	// same 288-slot window, by re-evaluating the SAME helpers the DP used
+	// (planStepImportAllIn/planStepDeliveryPrice/planStepExportPrice). This gives
+	// the GET /plan projection the all-in import, delivery, and export prices in
+	// force per slot without re-deriving any tariff logic — a delivery-adder or
+	// tariff-zone change shows up identically here and in the DP. Freshly built
+	// each replan, so storing them in the snapshot is race-free (same single
+	// writer, this goroutine, as dailyPlan).
+	ws := params.WindowStart
+	imp := make([]float64, planSteps)
+	del := make([]float64, planSteps)
+	exp := make([]float64, planSteps)
+	for t := range imp {
+		stepT := ws + int64(t)*planStepSec
+		imp[t] = planStepImportAllIn(params, t, stepT)   // supply + delivery
+		del[t] = planStepDeliveryPrice(params, t, stepT) // delivery component
+		exp[t] = planStepExportPrice(params, t, stepT)
+	}
+	currency := inp.currency
+	if currency == "" {
+		currency = "USD" // compileTariff enforces USD upstream; never surface ""
+	}
+
 	e.state.dailyPlan.Store(plan)
 	// GAP-7: capture the forecast the plan was built against (Plan() discards
 	// it) plus the capacity/voltage the /plan projection needs to render SOC and
 	// EV power. params.SolarForecastKw is a freshly-built slice per replan
 	// (resampleForecast/diurnalSolarForecast, never aliased), so storing it
 	// directly is race-free. Same single writer (this goroutine) as dailyPlan.
+	// PR-B adds the resolved price series + currency + fixed daily charge.
 	e.state.planSnap.Store(&PlanSnapshot{
-		Plan:       plan,
-		ForecastKw: params.SolarForecastKw,
-		BattCapKwh: params.BattCapacityKwh,
-		EVVoltageV: params.EVVoltageV,
+		Plan:             plan,
+		ForecastKw:       params.SolarForecastKw,
+		BattCapKwh:       params.BattCapacityKwh,
+		EVVoltageV:       params.EVVoltageV,
+		Currency:         currency,
+		ImportPriceKwh:   imp,
+		DeliveryPriceKwh: del,
+		ExportPriceKwh:   exp,
+		FixedDailyCharge: params.FixedDailyCharge,
 	})
 
 	log.Printf("[orchestrator] replan: window=%s–%s cost=%.3f slots=%d",
@@ -752,6 +837,12 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 	if inp.fallbackTOU != nil {
 		p.FallbackTOU = inp.fallbackTOU
 	}
+	// Delivery tariff overlay (PR-B), alongside the fallback-TOU overlay: an
+	// unset deliveryTOU (nil) leaves the import price with no delivery adder, and
+	// a zero fixedDailyCharge adds nothing to TotalCost — the correct no-op
+	// defaults, so a hub with no delivery tariff configured is unchanged.
+	p.DeliveryTOU = inp.deliveryTOU
+	p.FixedDailyCharge = inp.fixedDailyCharge
 
 	return p
 }
