@@ -1,0 +1,55 @@
+{
+  "description": "sec1 test vectors for LEXA Provision v1 (docs/adr/ADR-0002). Shared contract between the Dart app (packages/lexa_core, unit 1.5) and the Go hub (lexa-hub, unit H.2). Regenerated and verified by test/ble/session_test.dart.",
+  "key_derivation": {
+    "curve": "X25519; seeds are the raw 32-byte private scalars, clamped per RFC 7748 during scalar multiplication",
+    "kdf": "K = HKDF-SHA256(ikm = X25519 shared secret, salt = UTF8(pop), info = UTF8(\"lexa-prov-v1\"), length = 16)",
+    "app_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "hub_seed_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "app_public_hex": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+    "hub_public_hex": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254",
+    "shared_secret_hex": "9663aa1da97e848a914a436d04163dfbb89178f107f1b5b77ed3854203382854",
+    "pop": "8F3K2M9Q",
+    "hkdf_info": "lexa-prov-v1",
+    "derived_key_hex": "a32acbd7c2ee6d09b841e652358169f5"
+  },
+  "aead": {
+    "algorithm": "AES-128-GCM; wire message = ciphertext || 16-byte tag; the nonce is never transmitted",
+    "nonce": "direction(1B) || 0x000000 || counter(8B big-endian); independent counter per direction starting at 0, incremented per message; the receiver decrypts under the exact next expected counter and aborts the session on any authentication failure",
+    "direction_bytes": {
+      "app_to_hub": 1,
+      "hub_to_app": 2
+    }
+  },
+  "messages": [
+    {
+      "direction": "app_to_hub",
+      "counter": 0,
+      "nonce_hex": "010000000000000000000000",
+      "plaintext": "{\"op\":\"scan\"}",
+      "ciphertext_hex": "a0ec9ab36cbdcafea613eda461801fd77028bbf41c291a93aa2b065d46"
+    },
+    {
+      "direction": "app_to_hub",
+      "counter": 1,
+      "nonce_hex": "010000000000000000000001",
+      "plaintext": "{\"op\":\"scan\"}",
+      "ciphertext_hex": "35402a2c4d10aac2f050f19bad3157b8a5c0f212ccc443c39898bf844a"
+    },
+    {
+      "direction": "hub_to_app",
+      "counter": 0,
+      "nonce_hex": "020000000000000000000000",
+      "plaintext": "{\"op\":\"ok\"}",
+      "ciphertext_hex": "892fe3543c53ac916a864145a28bee52d477c57382173721e74d42"
+    }
+  ],
+  "chunking": {
+    "description": "messages[0].ciphertext_hex framed by chunkMessage (byte0 flags: bit0 FIN, bit1 ENC; byte1 seq; then payload) at an ATT payload size of 23 bytes",
+    "att_payload_size": 23,
+    "message_hex": "a0ec9ab36cbdcafea613eda461801fd77028bbf41c291a93aa2b065d46",
+    "chunks_hex": [
+      "0200a0ec9ab36cbdcafea613eda461801fd77028bbf41c",
+      "0301291a93aa2b065d46"
+    ]
+  }
+}
