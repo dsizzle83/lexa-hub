@@ -20,20 +20,12 @@ import (
 	"time"
 
 	"github.com/grandcat/zeroconf"
+
+	"lexa-hub/internal/buildinfo"
 )
 
 // mdnsServiceType is the DNS-SD service type this unit advertises under.
 const mdnsServiceType = "_lexa-hub._tcp"
-
-// apiVersion is the value reported in the mDNS TXT record's "fw=" field.
-//
-// Coordination note: no build-injected version variable exists anywhere in
-// this repo today — grepped Makefile and every cmd/*/main.go for
-// -ldflags/-X/BuildVersion and found nothing (confirmed against the
-// Makefile's build/build-arm64 targets, which pass no -ldflags at all).
-// "dev" is a placeholder until a real version stamp lands; see this task's
-// report for the follow-up recommendation.
-const apiVersion = "dev"
 
 // commissionedMarkerPath is the presence-checked marker file
 // (DEVICE_ROADMAP.md §9): its existence means the unit has been claimed by
@@ -100,7 +92,7 @@ func (a *mdnsAdvertiser) txt() []string {
 	}
 	return []string{
 		"serial=" + a.serial,
-		"fw=" + apiVersion,
+		"fw=" + buildinfo.Version,
 		"claimed=" + claimed,
 		"api=" + a.apiScheme(),
 	}

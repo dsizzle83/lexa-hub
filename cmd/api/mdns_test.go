@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"lexa-hub/internal/buildinfo"
 )
 
 func equalStringSlices(a, b []string) bool {
@@ -53,6 +55,23 @@ func TestMDNSAdvertiser_TXT_APISchemeFollowsTLS(t *testing.T) {
 		if !equalStringSlices(got, want) {
 			t.Errorf("tlsOn=%v: TXT = %v, want %v", c.tlsOn, got, want)
 		}
+	}
+}
+
+// TestMDNSAdvertiser_TXT_FWReflectsBuildinfoVersion pins that the TXT
+// record's "fw=" value is a live read of internal/buildinfo.Version
+// (GAP-5), not the old hardcoded placeholder — so a real -ldflags -X build
+// stamp reaches mDNS discovery too.
+func TestMDNSAdvertiser_TXT_FWReflectsBuildinfoVersion(t *testing.T) {
+	orig := buildinfo.Version
+	defer func() { buildinfo.Version = orig }()
+	buildinfo.Version = "1.2.3-test"
+
+	a := &mdnsAdvertiser{serial: "SN123", port: 9100, tlsOn: true}
+	got := a.txt()
+	want := []string{"serial=SN123", "fw=1.2.3-test", "claimed=0", "api=https"}
+	if !equalStringSlices(got, want) {
+		t.Fatalf("TXT = %v, want %v", got, want)
 	}
 }
 

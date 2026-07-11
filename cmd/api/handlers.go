@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"lexa-hub/internal/buildinfo"
 	"lexa-hub/internal/utilitytime"
 )
 
@@ -42,6 +43,14 @@ type statusResp struct {
 	// logged at startup and advertised for TOFU comparison. Empty/omitted
 	// when TLS is disabled (Config.TLS false). Additive field.
 	APICertFP string `json:"api_cert_fp,omitempty"`
+	// FW is the build-injected version string (internal/buildinfo.Version,
+	// GAP-5) — the same value reported in mDNS TXT "fw=" and GET
+	// /site.fw, so all three surfaces agree. Process-static, so it's
+	// stamped directly onto the response next to APICertFP rather than
+	// threaded through buildStatus's pure reduction. omitempty is
+	// defensive symmetry with APICertFP; in practice this is never empty
+	// (buildinfo.Version defaults to "dev", never "").
+	FW string `json:"fw,omitempty"`
 	// Mode is the hub's current plan-author mode (bus.ModeStatus.Mode,
 	// TopicHubMode, DEVICE_ROADMAP.md §3.5/§4.3) — "optimizer" or "gateway".
 	// Additive: omitted until the first ModeStatus arrives (no mode manager
@@ -354,7 +363,8 @@ func buildStatus(snap snapshot, hb heartbeatStatus) statusResp {
 // periodic ticker) so /status always reflects the live state. certFP is
 // this process's TLS cert fingerprint (empty when TLS is disabled) —
 // static for the process lifetime, so it's stamped directly onto the
-// response rather than threaded through buildStatus's pure reduction.
+// response rather than threaded through buildStatus's pure reduction. FW
+// (buildinfo.Version, GAP-5) is stamped the same way, for the same reason.
 func statusHandler(store *stateStore, hb *planHeartbeat, certFP string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -365,6 +375,7 @@ func statusHandler(store *stateStore, hb *planHeartbeat, certFP string) http.Han
 		}
 		resp := buildStatus(store.snapshot(), hb.evaluate(time.Now()))
 		resp.APICertFP = certFP
+		resp.FW = buildinfo.Version
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			log.Printf("lexa-api: /status encode: %v", err)

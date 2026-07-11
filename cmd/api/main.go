@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"time"
 
+	"lexa-hub/internal/buildinfo"
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/journal"
 	"lexa-hub/internal/logutil"
@@ -37,7 +38,17 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", "/etc/lexa/api.json", "path to JSON config")
+	showVersion := flag.Bool("version", false, "print the build version (internal/buildinfo.Version) and exit")
 	flag.Parse()
+
+	// Handled before config load: -version is a build-verification/ops
+	// utility (GAP-5), not a service start — it must work even with no
+	// /etc/lexa/api.json present (e.g. right after `make build-arm64
+	// VERSION=...`, before the binary is ever installed).
+	if *showVersion {
+		fmt.Println(buildinfo.Version)
+		return
+	}
 
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {

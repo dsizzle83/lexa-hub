@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"lexa-hub/internal/buildinfo"
 )
 
 // defaultSiteCacheFile is Config.SiteCacheFile's default (DEVICE_ROADMAP.md
@@ -52,7 +54,7 @@ func siteHandler(serial, siteCacheFile string) http.HandlerFunc {
 
 		resp := siteResp{
 			Serial:       serial,
-			FW:           apiVersion, // mdns.go's placeholder version const — see its doc
+			FW:           buildinfo.Version,
 			Commissioned: isCommissioned(),
 			TZ:           time.Local.String(),
 		}

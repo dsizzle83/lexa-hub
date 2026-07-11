@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"lexa-hub/internal/buildinfo"
 )
 
 // TestSiteHandler_BasicFields pins GET /site's always-present fields and the
@@ -40,6 +42,28 @@ func TestSiteHandler_BasicFields(t *testing.T) {
 	}
 	if got.SiteCache != nil {
 		t.Errorf("SiteCache = %s, want nil (no cache file present)", got.SiteCache)
+	}
+}
+
+// TestSiteHandler_FWReflectsBuildinfoVersion pins that /site.fw is a live
+// read of internal/buildinfo.Version (GAP-5) — not a hardcoded placeholder
+// — so a real -ldflags -X stamp actually reaches this response.
+func TestSiteHandler_FWReflectsBuildinfoVersion(t *testing.T) {
+	orig := buildinfo.Version
+	defer func() { buildinfo.Version = orig }()
+	buildinfo.Version = "1.2.3-test"
+
+	h := siteHandler("SN-TEST-FW", filepath.Join(t.TempDir(), "absent.json"))
+	req := httptest.NewRequest(http.MethodGet, "/site", nil)
+	rec := httptest.NewRecorder()
+	h(rec, req)
+
+	var got siteResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.FW != "1.2.3-test" {
+		t.Errorf("FW = %q, want %q", got.FW, "1.2.3-test")
 	}
 }
 

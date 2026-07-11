@@ -3,6 +3,26 @@ SBINDIR := /usr/local/sbin
 CFGDIR  := /etc/lexa
 SVCDIR  := /etc/systemd/system
 
+# VERSION (GAP-5, internal/buildinfo): the build-version string stamped into
+# internal/buildinfo.Version via -ldflags -X, surfaced today by lexa-api's
+# mDNS TXT "fw=", GET /site.fw, and GET /status.fw. Override on the command
+# line for a real build, e.g. `make build-arm64 VERSION=1.2.3`; the "dev"
+# default matches buildinfo.Version's own unstamped default, so a plain
+# `make build`/`go build` and a `VERSION=dev` build are indistinguishable.
+#
+# LDFLAGS is applied to EVERY service build below, not just lexa-api's,
+# even though internal/buildinfo.Version is (today) only read by lexa-api.
+# This was a deliberate simplicity choice over scoping the flag to a single
+# $(BINDIR)/lexa-api rule carved out of the generic pattern rule: `-X` on a
+# symbol path a given binary doesn't happen to import is a silent no-op
+# (verified — no warning, no error, `go build -ldflags "-X
+# lexa-hub/internal/buildinfo.Version=x" ./cmd/healthcheck` links clean), so
+# there is no cost to the five services that don't read it today, and any
+# future service that starts reading buildinfo.Version gets the stamp for
+# free with no Makefile change.
+VERSION ?= dev
+LDFLAGS := -X lexa-hub/internal/buildinfo.Version=$(VERSION)
+
 # healthcheck is not a service (no unit file, no daemon) but builds/installs
 # through the same pattern rule: bin/lexa-healthcheck → /usr/local/sbin, the
 # path scripts/mender/ArtifactCommit_Enter_00_lexa-health expects (unit 1.5).
@@ -17,7 +37,7 @@ build: $(BINS) $(BINDIR)/lexa-migrate $(BINDIR)/lexactl
 
 $(BINDIR)/lexa-%: cmd/%/*.go internal/**/*.go go.mod
 	@mkdir -p $(BINDIR)
-	go build -o $@ ./cmd/$*
+	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/$*
 
 # lexa-migrate's source dir (cmd/lexa-migrate) doesn't fit the lexa-% pattern
 # rule above (% would resolve to cmd/migrate), so it gets an explicit rule.
@@ -40,7 +60,7 @@ $(BINDIR)/lexactl: cmd/lexactl/*.go go.mod
 #   make wolfssl-arm64          # builds + installs wolfSSL into WOLFSSL_SYSROOT
 #
 # Pure-Go services (no CGo):
-GOARM64 := GOARCH=arm64 GOOS=linux CGO_ENABLED=0 go build
+GOARM64 := GOARCH=arm64 GOOS=linux CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)"
 
 # CGo services (wolfSSL mTLS):
 WOLFSSL_SYSROOT ?= /tmp/wolfssl-arm64-sysroot
@@ -57,7 +77,7 @@ GOARM64_CGO := CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
 	CC=aarch64-linux-gnu-gcc \
 	CGO_CFLAGS="-I$(WOLFSSL_SYSROOT)/include" \
 	CGO_LDFLAGS="-L$(WOLFSSL_SYSROOT)/lib -lwolfssl -lm" \
-	go build
+	go build -ldflags "$(LDFLAGS)"
 
 build-arm64:
 	@mkdir -p $(BINDIR)/arm64
