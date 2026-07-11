@@ -254,6 +254,29 @@ func (t TariffIntent) Finite() error {
 	return nil
 }
 
+// Finite is HubSettings' counterpart to Measurement.Finite (GAP-8): it checks
+// the reserve percents (both optional/*float64) and, when a tariff spec is
+// present, each period's rates — the same walk TariffIntent.Finite does.
+func (h HubSettings) Finite() error {
+	if err := finite("reserve.effective_pct", h.Reserve.EffectivePct); err != nil {
+		return err
+	}
+	if err := finite("reserve.floor_pct", h.Reserve.FloorPct); err != nil {
+		return err
+	}
+	if h.Tariff.Spec != nil {
+		for i, p := range h.Tariff.Spec.Periods {
+			if err := finiteVal("import_per_kwh", p.ImportPerKwh); err != nil {
+				return fmt.Errorf("tariff.spec.periods[%d]: %w", i, err)
+			}
+			if err := finite("export_per_kwh", p.ExportPerKwh); err != nil {
+				return fmt.Errorf("tariff.spec.periods[%d]: %w", i, err)
+			}
+		}
+	}
+	return nil
+}
+
 // Finite is ScanResult's counterpart to Measurement.Finite (TASK-082): it
 // walks Devices and checks each hit's NameplateW.
 func (s ScanResult) Finite() error {

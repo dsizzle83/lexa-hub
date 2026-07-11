@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"lexa-hub/internal/buildinfo"
+	"lexa-hub/internal/bus"
 	"lexa-hub/internal/utilitytime"
 )
 
@@ -62,6 +63,35 @@ type statusResp struct {
 	// until the first message arrives (no cloudlink service exists in this
 	// repo yet, TASK-085+, so today this stays omitted on every deployment).
 	CloudLink *cloudLinkJSON `json:"cloud_link,omitempty"`
+	// Reserve is the hub's effective backup-reserve floor (bus.HubSettings,
+	// TopicHubSettings, GAP-8) — effective_pct/floor_pct/source. Additive:
+	// nil/omitted until the first HubSettings arrives (the hub seeds one at
+	// startup, so normally present). The app's reserve slider reads
+	// effective_pct as authoritative instead of its own last-submitted value.
+	Reserve *reserveJSON `json:"reserve,omitempty"`
+	// Tariff is the hub's active tariff (bus.HubSettings, GAP-8) —
+	// source/updated_at/spec, where spec parses with the app's
+	// TariffSpec.fromJson. Additive, same nil-until-first-message discipline.
+	Tariff *tariffJSON `json:"tariff,omitempty"`
+}
+
+// reserveJSON is /status's stable shape for bus.ReserveSettings (GAP-8).
+// effective_pct/floor_pct stay nullable (*float64) — effective_pct is null
+// before the hub's first plan.
+type reserveJSON struct {
+	EffectivePct *float64 `json:"effective_pct"`
+	FloorPct     *float64 `json:"floor_pct"`
+	Source       string   `json:"source"`
+}
+
+// tariffJSON is /status's stable shape for bus.TariffSettings (GAP-8). Spec
+// reuses bus.TariffSpec directly: its JSON tags (currency, periods[{label,
+// days,start_hh,end_hh,import_per_kwh,export_per_kwh}]) are exactly the wire
+// shape the app's TariffSpec.fromJson consumes.
+type tariffJSON struct {
+	Source    string          `json:"source"`
+	UpdatedAt int64           `json:"updated_at"`
+	Spec      *bus.TariffSpec `json:"spec,omitempty"`
 }
 
 // cloudLinkJSON is /status's stable, hand-rolled shape for bus.CloudlinkStatus
@@ -212,6 +242,28 @@ func buildStatus(snap snapshot, hb heartbeatStatus) statusResp {
 			clj.LastUplinkTs = time.Unix(cl.LastUplinkTs, 0).UTC().Format(time.RFC3339)
 		}
 		resp.CloudLink = clj
+	}
+
+	// GAP-8: project the hub's effective reserve + active tariff into /status's
+	// "reserve"/"tariff" objects. Nullable pcts pass through verbatim
+	// (effective_pct is null before the hub's first plan); the tariff spec
+	// reuses bus.TariffSpec, whose wire shape is exactly the app's
+	// TariffSpec.fromJson input.
+	if hs := snap.hubSettings; hs != nil {
+		resp.Reserve = &reserveJSON{
+			EffectivePct: hs.Reserve.EffectivePct,
+			FloorPct:     hs.Reserve.FloorPct,
+			Source:       hs.Reserve.Source,
+		}
+		tj := &tariffJSON{
+			Source:    hs.Tariff.Source,
+			UpdatedAt: hs.Tariff.UpdatedAt,
+		}
+		if hs.Tariff.Spec != nil {
+			spec := *hs.Tariff.Spec
+			tj.Spec = &spec
+		}
+		resp.Tariff = tj
 	}
 
 	// Relay the hub's actual plan trace (TopicHubPlan). The timestamp is the

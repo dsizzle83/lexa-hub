@@ -129,6 +129,56 @@ type ModeStatus struct {
 	Ts       int64  `json:"ts"`
 }
 
+// HubSettings — lexa/hub/settings (retained, GAP-8 read-back). The hub's
+// EFFECTIVE reserve floor and ACTIVE tariff, published so the app's reserve
+// slider and tariff viewer render hub truth instead of a locally-persisted
+// last-submitted value (which is all they had while the hub exposed neither).
+// Published by cmd/hub (settings.go) on every reserve/tariff change, once at
+// startup as a seed, and whenever the effective reserve pct moves after a
+// re-plan; folded into lexa-api's /status as "reserve" + "tariff".
+type HubSettings struct {
+	Envelope
+	Reserve ReserveSettings `json:"reserve"`
+	Tariff  TariffSettings  `json:"tariff"`
+	Ts      int64           `json:"ts"`
+}
+
+// ReserveSettings is HubSettings' backup-reserve read-back block.
+type ReserveSettings struct {
+	// EffectivePct is the reserve floor (percent of battery capacity) the most
+	// recent plan actually resolved to — the config floor RAISED by any reserve
+	// intent (Engine.EffectiveReservePct). nil before the hub's first plan (the
+	// engine's -1 sentinel), which is exactly why applyReserve could not report
+	// "clamped" before this existed.
+	EffectivePct *float64 `json:"effective_pct"`
+	// FloorPct is the configured safety floor (percent) a reserve intent may
+	// only raise above, never below — the value EffectivePct clamps against.
+	FloorPct *float64 `json:"floor_pct"`
+	// Source is where the standing reserve came from: "default" (no intent yet —
+	// the config floor governs), or a reserve intent's origin ("app" | "cloud" |
+	// "lexactl").
+	Source string `json:"source"`
+}
+
+// TariffSettings is HubSettings' active-tariff read-back block.
+type TariffSettings struct {
+	// Source is "manual" once a tariff intent has set Spec, else "csip" (no
+	// manual override — utility CSIP pricing or the built-in default TOU
+	// governs). NOTE: "csip" here means only "not manually overridden"; the hub
+	// does not yet distinguish an ACTIVE CSIP price feed from the default TOU,
+	// nor detect a CSIP feed overriding a manual tariff — that live-CSIP-override
+	// detection is a documented follow-up (needs a pricing-source signal the
+	// engine does not expose today).
+	Source string `json:"source"`
+	// UpdatedAt is when the tariff last changed on the hub (Unix seconds); 0
+	// before any tariff intent.
+	UpdatedAt int64 `json:"updated_at"`
+	// Spec is the last tariff intent's TariffSpec, echoed verbatim so the app's
+	// tariff viewer renders exactly what it submitted. nil before any tariff
+	// intent (the app then shows no manual tariff).
+	Spec *TariffSpec `json:"spec,omitempty"`
+}
+
 // CloudlinkStatus — lexa/cloudlink/status (retained). Folded into lexa-api's
 // /status as "cloud_link" and uplinked as part of the health stream.
 type CloudlinkStatus struct {

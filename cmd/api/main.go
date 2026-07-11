@@ -206,6 +206,20 @@ func main() {
 		log.Fatalf("lexa-api: subscribe hub mode: %v", err)
 	}
 
+	// GAP-8: the hub's effective reserve + active tariff, folded into /status's
+	// "reserve"/"tariff" so the app reads hub truth (retained — re-served to a
+	// restarting lexa-api).
+	if err := mqttutil.Subscribe(mc, bus.TopicHubSettings, func(topic string, h bus.HubSettings) {
+		store.onHubSettings(topic, h)
+		src := "-"
+		if h.Reserve.EffectivePct != nil {
+			src = fmt.Sprintf("%.0f%%", *h.Reserve.EffectivePct)
+		}
+		lb.Emit(fmt.Sprintf("[settings] reserve=%s src=%s tariff=%s", src, h.Reserve.Source, h.Tariff.Source))
+	}); err != nil {
+		log.Fatalf("lexa-api: subscribe hub settings: %v", err)
+	}
+
 	// DEVICE_ROADMAP.md §2/§4.3: lexa-cloudlink's retained status. No such
 	// service exists in this repo yet (TASK-085+) — this subscribe is inert
 	// (never delivers) until it lands, exactly like every other forward-

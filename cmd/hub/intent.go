@@ -90,6 +90,13 @@ type intentAdopter struct {
 	mc  mqtt.Client
 	cfg *Config
 
+	// settings, when non-nil, is the retained lexa/hub/settings publisher (GAP-8,
+	// settings.go): applyReserve/applyTariff call it so the app can read back the
+	// effective reserve + active tariff. Set by main.go after both the adopter
+	// and the publisher exist; nil in the Unit 3.3 tests that don't wire it (the
+	// calls below are nil-guarded).
+	settings *settingsPublisher
+
 	// modes routes "mode" intents (Unit 3.4): applyMode validates the value and
 	// delegates the transition to modeManager.request (mode.go). Set by main.go
 	// after both the adopter and the modeManager exist (the modeManager is
@@ -286,12 +293,16 @@ func (a *intentAdopter) applyReserve(msg bus.BackupReserveIntent) (outcome, deta
 		return "rejected", "reserve_pct must be within [0,100]"
 	}
 	a.eng.SetBackupReserve(pct)
-	// The engine clamps UP to the configured safety floor internally
-	// (buildPlannerParams — intents may only RAISE the reserve, never lower
-	// it). This adopter has no way to observe whether that clamp fired (no
-	// getter exposes the effective floor), so a raised-but-clamped reserve
-	// still reports "applied" in v1 — an honest, documented limitation
-	// rather than a guess at "clamped".
+	// GAP-8: publish the new reserve source on lexa/hub/settings so the app can
+	// read it back. The effective pct this carries may be one plan stale
+	// (SetBackupReserve is async); the plan-observer refresh settles it. The
+	// engine still clamps UP to the configured floor internally
+	// (buildPlannerParams) — this adopter reports "applied" (not "clamped")
+	// because the clamp outcome is now observable via /status.reserve.
+	// effective_pct rather than guessed at here.
+	if a.settings != nil {
+		a.settings.onReserveChange(msg.Origin)
+	}
 	return "applied", ""
 }
 
@@ -307,6 +318,11 @@ func (a *intentAdopter) applyTariff(msg bus.TariffIntent) (outcome, detail strin
 	}
 	a.eng.SetFallbackTOU(m)
 	a.opt.SwapCostModel(m)
+	// GAP-8: retain the requested spec (source "manual", updated_at now) on
+	// lexa/hub/settings so the app's tariff viewer reads back what it submitted.
+	if a.settings != nil {
+		a.settings.onTariffChange(msg.Tariff)
+	}
 	return "applied", ""
 }
 

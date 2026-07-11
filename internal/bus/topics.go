@@ -164,6 +164,8 @@ func SupportedV(topic string) int {
 		}
 	case topic == TopicHubMode:
 		return ModeStatusV
+	case topic == TopicHubSettings:
+		return HubSettingsV
 	case topic == TopicCloudlinkStatus:
 		return CloudlinkStatusV
 	case topic == TopicScanRequest:
@@ -286,11 +288,16 @@ const (
 	TopicIntentChargeNow     = "lexa/intent/chargenow"
 	TopicIntentResult        = "lexa/intent/result"
 	TopicHubMode             = "lexa/hub/mode"
-	TopicCloudlinkStatus     = "lexa/cloudlink/status"
-	TopicScanRequest         = "lexa/scan/request"
-	TopicScanStatus          = "lexa/scan/status"
-	TopicScanResult          = "lexa/scan/result"
-	TopicOCPPPending         = "lexa/ocpp/pending"
+	// TopicHubSettings carries the hub's effective backup-reserve floor and
+	// active tariff (bus.HubSettings, retained, GAP-8). Published by lexa-hub,
+	// consumed by lexa-api which folds it into /status's "reserve" + "tariff"
+	// so the app reads hub truth, not a locally-cached last-submitted value.
+	TopicHubSettings     = "lexa/hub/settings"
+	TopicCloudlinkStatus = "lexa/cloudlink/status"
+	TopicScanRequest     = "lexa/scan/request"
+	TopicScanStatus      = "lexa/scan/status"
+	TopicScanResult      = "lexa/scan/result"
+	TopicOCPPPending     = "lexa/ocpp/pending"
 )
 
 // IntentTopic returns lexa/intent/{kind} for a request-kind string ("mode",

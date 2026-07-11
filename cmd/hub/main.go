@@ -538,6 +538,13 @@ func main() {
 	forecastSourceOf := func() string { return "" }
 	forecastAgeOf := func() int64 { return -1 }
 
+	// settingsRefresh is the GAP-8 read-back seam (settings.go): the plan
+	// observer pokes it every pass so the retained lexa/hub/settings doc's
+	// effective reserve pct tracks the plan. No-op until wired to the real
+	// publisher below (same forward-declaration pattern as modeOf/forecast* —
+	// the engine only calls PlanObserver after eng.Start(), well after wiring).
+	settingsRefresh := func() {}
+
 	// tickBudget is this task's Phase 4 exit-criterion threshold: half the
 	// economic engine interval. Exceeding it — measured as this pass's own
 	// synchronous work plus the PRIOR pass's actuator Apply* time, see
@@ -650,6 +657,12 @@ func main() {
 			planLogPending = pp
 		}
 
+		// GAP-8: refresh the retained lexa/hub/settings effective reserve pct if
+		// this plan moved it (deduped inside — most passes are a no-op). Cheap
+		// and off the actuator path; a failed publish only logs (the retained
+		// doc is refreshed next change/pass).
+		settingsRefresh()
+
 		// Feed this plan's meter-level breach evidence to the episode component
 		// and publish whatever edge it produces. The component owns the edge
 		// semantics (onset / new-mRID re-alert / clear) and the Safety-plan guard
@@ -722,6 +735,13 @@ func main() {
 	forecastSourceOf = eng.ForecastSource
 	forecastAgeOf = eng.ForecastAgeSeconds
 
+	// GAP-8: the retained lexa/hub/settings publisher. Reads the effective
+	// reserve pct from the engine and the configured floor from cfg; the intent
+	// adopter (wired below) feeds it the reserve source + tariff spec. Its
+	// refresh is the seam the plan observer pokes above.
+	settings := newSettingsPublisher(mc, eng, cfg.Planner.TerminalReservePct)
+	settingsRefresh = settings.refreshFromPlan
+
 	// lexa_hub_engine_cmd_dropped_total (WS-9.3): mirrors Engine.CmdDropped()
 	// (internal/orchestrator stays decoupled from internal/metrics — same
 	// stance as internal/mqttutil) — the same external-mirroring idiom
@@ -786,6 +806,12 @@ func main() {
 	// modeMgr.request; wire adopter.modes here so applyMode can reach the manager.
 	adopter := newIntentAdopter(eng, opt, jw, mc, cfg, intentsAppliedCtr, intentsRejectedCtr)
 	adopter.modes = modeMgr
+	adopter.settings = settings
+	// GAP-8 seed: publish an initial retained lexa/hub/settings so lexa-api has a
+	// value the moment it subscribes (effective pct is nil until the first plan;
+	// source "default"/"csip"). A retained reserve/tariff intent redelivered
+	// during the subscribe→Start window republishes it with the real source.
+	settings.publish()
 	if err := mqttutil.Subscribe(mc, bus.TopicIntentEVGoal, func(_ string, msg bus.EVGoalIntent) {
 		adopter.adopt("evgoal", msg.IntentMeta, func() (string, string) { return adopter.applyEVGoal(msg) })
 	}); err != nil {

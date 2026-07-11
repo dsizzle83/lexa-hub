@@ -139,6 +139,20 @@ type Engine struct {
 	// forecast was present (fresh OR stale), else -1. Same writer/reader split
 	// as forecastSource; initialised to -1 in New.
 	forecastAgeSecs atomic.Int64
+
+	// effectiveReservePct is the backup-reserve floor (percent of battery
+	// capacity) the most recent plan resolved to — the config floor
+	// (cfg.TerminalReservePct, 20% default) RAISED by any reserve intent
+	// (SetBackupReserve). It closes GAP-8's read-back: the post-clamp reserve
+	// was previously unobservable, so applyReserve could never report "clamped"
+	// and the app's reserve slider could only echo its own last-submitted value.
+	//
+	// Same writer/reader split as forecastSource above: WRITTEN by the planner
+	// goroutine inside buildPlannerParams (which replan() calls single-threaded),
+	// READ lock-free by any caller via EffectiveReservePct(). Stored as float64
+	// BITS in a Uint64 (math.Float64bits); initialised to bits(-1) in New so the
+	// accessor returns the -1 "no plan yet" sentinel until the first plan runs.
+	effectiveReservePct atomic.Uint64
 }
 
 // Solar-forecast source labels stored in Engine.forecastSource and reported by
@@ -194,6 +208,9 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 	// No external forecast has been evaluated yet: report age -1 until the first
 	// plan that sees one (ForecastSource() stays "" until the first plan runs).
 	e.forecastAgeSecs.Store(-1)
+	// No plan has resolved a reserve floor yet: report -1 (the "no plan yet"
+	// sentinel) until the first buildPlannerParams stores the effective pct.
+	e.effectiveReservePct.Store(math.Float64bits(-1))
 	// Wire the fast protection loop only if BOTH the optimizer and reader support
 	// it; otherwise safety runs on the economic tick (inside Optimize) as before.
 	if se, ok := optimizer.(SafetyEvaluator); ok {
@@ -320,6 +337,17 @@ func (e *Engine) ForecastSource() string {
 // the fallback. Safe for concurrent use from any goroutine.
 func (e *Engine) ForecastAgeSeconds() int64 {
 	return e.forecastAgeSecs.Load()
+}
+
+// EffectiveReservePct reports the backup-reserve floor (percent of battery
+// capacity) the most recent plan resolved to: the configured floor
+// (cfg.TerminalReservePct, 20% default) RAISED by any reserve intent
+// (SetBackupReserve, RAISE-only). Returns -1 before the first plan. This is the
+// read-back GAP-8 needs — a reserve intent clamped UP to the safety floor was
+// otherwise unobservable (see cmd/hub/intent.go applyReserve). Safe for
+// concurrent use from any goroutine.
+func (e *Engine) EffectiveReservePct() float64 {
+	return math.Float64frombits(e.effectiveReservePct.Load())
 }
 
 // enqueue, drainCmds, mustNotBeStarted, and Register*Actuator — the Engine
@@ -643,6 +671,18 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 	// Reserve + load profile + fallback TOU overlays (Unit 3.1 §3.3), next to
 	// the TerminalReservePct derivation above. p.BattCapacityKwh was set by the
 	// battery loop (0 when no connected battery, making the reserve a no-op).
+	//
+	// effReservePct is the reserve floor (%) this plan resolves to — the
+	// cfg-derived floor (20% default), RAISED by a reserve intent when one is
+	// set. It is computed the SAME way the battery loop above and the override
+	// below derive it, and stored UNCONDITIONALLY (below) so
+	// EffectiveReservePct() reflects the % in force even with no intent or no
+	// connected battery — the GAP-8 read-back the app's reserve slider reads.
+	floorPct := cfg.TerminalReservePct
+	if floorPct <= 0 {
+		floorPct = 20
+	}
+	effReservePct := floorPct
 	if r := inp.reservePct; r != nil {
 		// Intents may only RAISE the reserve floor, never lower it — a safety
 		// invariant. We clamp against the CFG-DERIVED floor (the same 20%
@@ -650,14 +690,14 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 		// intent can never drop TerminalSocKwh below the floor the loop set.
 		// Planner economics only: the optimizer's SOCReserve safety checks and
 		// the Tier-0 interlock floor are untouched.
-		floorPct := cfg.TerminalReservePct
-		if floorPct <= 0 {
-			floorPct = 20
-		}
-		pct := math.Max(*r, floorPct)
-		p.TerminalSocKwh = p.BattCapacityKwh * pct / 100
-		p.MinBattSocKwh = math.Max(p.MinBattSocKwh, p.BattCapacityKwh*pct/100)
+		effReservePct = math.Max(*r, floorPct)
+		p.TerminalSocKwh = p.BattCapacityKwh * effReservePct / 100
+		p.MinBattSocKwh = math.Max(p.MinBattSocKwh, p.BattCapacityKwh*effReservePct/100)
 	}
+	// GAP-8: publish the resolved floor for EffectiveReservePct() (see the field
+	// doc in Engine for the writer/reader split — this is the single write site,
+	// mirroring the forecastSource stores above).
+	e.effectiveReservePct.Store(math.Float64bits(effReservePct))
 	if lp := inp.loadProfileKw; len(lp) > 0 {
 		p.LoadProfileKw = lp
 	}
