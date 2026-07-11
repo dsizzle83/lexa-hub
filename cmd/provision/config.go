@@ -43,6 +43,14 @@ type Config struct {
 	// mid-run commit stops advertising. Default 10.
 	ReconcileIntervalS int `json:"reconcile_interval_s"`
 
+	// JoinTimeoutS bounds a single WiFi join (unit B3): no NetworkManager
+	// ACTIVATED within this window ⇒ state:failed reason=timeout. Default 45.
+	JoinTimeoutS int `json:"join_timeout_s"`
+
+	// ScanTimeoutS bounds a single WiFi scan (RequestScan + settle + read) via
+	// the ScanFunc context deadline (unit B3). Default 8.
+	ScanTimeoutS int `json:"scan_timeout_s"`
+
 	// MetricsAddr is the Prometheus /metrics listen address (TASK-044 pattern).
 	// Empty ⇒ default "127.0.0.1:9107" (loopback-only product default); the
 	// literal "off" disables the listener.
@@ -85,6 +93,12 @@ func (c *Config) applyDefaults() {
 	if c.ReconcileIntervalS == 0 {
 		c.ReconcileIntervalS = 10
 	}
+	if c.JoinTimeoutS == 0 {
+		c.JoinTimeoutS = 45
+	}
+	if c.ScanTimeoutS == 0 {
+		c.ScanTimeoutS = 8
+	}
 	if c.MetricsAddr == "" {
 		c.MetricsAddr = "127.0.0.1:9107"
 	}
@@ -96,6 +110,16 @@ func (c *Config) applyDefaults() {
 // ReconcileInterval is the advertising re-check cadence.
 func (c *Config) ReconcileInterval() time.Duration {
 	return time.Duration(c.ReconcileIntervalS) * time.Second
+}
+
+// JoinTimeout bounds a single WiFi join (unit B3).
+func (c *Config) JoinTimeout() time.Duration {
+	return time.Duration(c.JoinTimeoutS) * time.Second
+}
+
+// ScanTimeout bounds a single WiFi scan (unit B3).
+func (c *Config) ScanTimeout() time.Duration {
+	return time.Duration(c.ScanTimeoutS) * time.Second
 }
 
 // loadPoP reads the proof-of-possession from PopFile, falling back to the

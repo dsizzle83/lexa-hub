@@ -5,6 +5,8 @@
   "marker_file": "/etc/lexa/commissioned",
   "handoff_port": 9100,
   "reconcile_interval_s": 10,
+  "join_timeout_s": 45,
+  "scan_timeout_s": 8,
   "metrics_addr": "127.0.0.1:9107",
   "log_level": "info"
 }

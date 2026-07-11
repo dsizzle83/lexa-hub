@@ -335,6 +335,16 @@ func (s *Server) push(uuid string, chunk []byte) {
 	}
 }
 
+// Notify pushes a framed chunk out on the characteristic that owns uuid as an
+// indication — the ASYNCHRONOUS path for indications produced OUTSIDE a
+// WriteValue call. A live join (unit B3) streams its encrypted StateMessages
+// here after the join write has already been answered; cmd/provision wires this
+// as the sec1 peripheral's AsyncSend transport. It reuses the same push the
+// WriteValue reply path uses; an unknown uuid is dropped.
+func (s *Server) Notify(uuid string, chunk []byte) {
+	s.push(uuid, chunk)
+}
+
 // Register registers the application with the adapter's GattManager1. Idempotent.
 func (s *Server) Register() error {
 	s.mu.Lock()

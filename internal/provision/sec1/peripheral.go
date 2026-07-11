@@ -1,11 +1,13 @@
 package sec1
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"lexa-hub/internal/provision/frame"
 )
@@ -68,8 +70,19 @@ type PeripheralConfig struct {
 	Commissioned bool
 	// ScanResults answers a scan request. Nil yields an empty list.
 	ScanResults []WifiAp
+	// ScanFunc answers a scan request with a LIVE result (unit B3's
+	// NetworkManager scan). When non-nil it takes precedence over ScanResults;
+	// if it returns an error the peripheral falls back to ScanResults (possibly
+	// empty) and records the error in LastError. Nil ⇒ the static ScanResults.
+	ScanFunc func() ([]WifiAp, error)
 	// JoinBehavior scripts join outcomes. Nil defaults to JoinHangs{}.
 	JoinBehavior JoinBehavior
+	// AsyncSend delivers a framed indication produced OUTSIDE the HandleChunk
+	// return path — the streaming transport a JoinLive runner uses for its
+	// status updates (unit B2's gatt.Server pushes each Outbound as an
+	// indication via Server.Notify). Nil ⇒ live async emit is disabled; the
+	// scripted behaviors never use it, so all B1/B2 tests leave it nil.
+	AsyncSend func(Outbound)
 	// AttPayloadSize frames outgoing indications. Zero uses
 	// DefaultAttPayloadSize.
 	AttPayloadSize int
@@ -94,8 +107,19 @@ type Peripheral struct {
 	fw             string
 	commissioned   bool
 	scanResults    []WifiAp
+	scanFunc       func() ([]WifiAp, error)
+	asyncSend      func(Outbound)
 	attPayloadSize int
 	rand           io.Reader
+
+	// mu serializes session use (encryption counters + the abort flag) across
+	// the serialized HandleChunk path and the asynchronous JoinLive emit
+	// goroutine. Before B3 the peripheral was single-goroutine; a live join now
+	// streams status indications from its own goroutine, so both paths take mu.
+	mu sync.Mutex
+	// joinCancel cancels the in-flight JoinLive runner when a new join (retry)
+	// or a fresh handshake supersedes it.
+	joinCancel context.CancelFunc
 
 	// JoinBehavior may be reassigned between join retries within a session,
 	// mirroring the mutable Dart field.
@@ -148,6 +172,8 @@ func NewPeripheral(cfg PeripheralConfig) *Peripheral {
 		fw:             fw,
 		commissioned:   cfg.Commissioned,
 		scanResults:    cfg.ScanResults,
+		scanFunc:       cfg.ScanFunc,
+		asyncSend:      cfg.AsyncSend,
 		attPayloadSize: att,
 		rand:           rnd,
 		JoinBehavior:   jb,
@@ -174,6 +200,8 @@ func (p *Peripheral) InfoDoc() map[string]any {
 // is also recorded in LastError; framing/decoding faults are non-fatal to the
 // process, matching the Dart pump that catches into lastError.
 func (p *Peripheral) HandleChunk(uuid string, chunk []byte) ([]Outbound, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.out = nil
 	err := p.process(uuid, chunk)
 	if err != nil {
@@ -221,7 +249,9 @@ func (p *Peripheral) handleSession(message []byte, encrypted bool) error {
 		if !ok {
 			return p.sendErr(UUIDSession, "bad_request")
 		}
-		// Fresh handshake (also allows a client retry after pop_mismatch).
+		// Fresh handshake (also allows a client retry after pop_mismatch). A new
+		// handshake supersedes any in-flight live join from a prior session.
+		p.cancelJoin()
 		session, err := Generate(RoleHub)
 		if err != nil {
 			return err
@@ -284,9 +314,23 @@ func (p *Peripheral) handleWifi(message []byte, encrypted bool) error {
 		return err
 	}
 	if _, ok := msg.(*ScanRequest); ok {
-		return p.send(UUIDWifi, &WifiScanResult{APs: p.scanResults}, true)
+		return p.send(UUIDWifi, &WifiScanResult{APs: p.scanAPs()}, true)
 	}
 	return p.send(UUIDWifi, &Err{Code: "bad_request"}, true)
+}
+
+// scanAPs answers a scan request: the live ScanFunc when wired (falling back to
+// the static ScanResults on error), else the static ScanResults.
+func (p *Peripheral) scanAPs() []WifiAp {
+	if p.scanFunc == nil {
+		return p.scanResults
+	}
+	aps, err := p.scanFunc()
+	if err != nil {
+		p.LastError = err
+		return p.scanResults
+	}
+	return aps
 }
 
 func (p *Peripheral) handleConfig(message []byte, encrypted bool) error {
@@ -345,6 +389,25 @@ func (p *Peripheral) runJoin() error {
 	case JoinHangs:
 		return emitJoining(b.JoiningEvents)
 		// …and never conclude: the client's join timeout must fire.
+	case JoinLive:
+		// A real join streams over time. Answer the config write immediately
+		// (no synchronous status) and run the driver in its own goroutine; each
+		// state is encrypted, framed, and pushed on the status characteristic
+		// via emitStatusAsync. godbus dispatches each GATT write on its own
+		// goroutine, so this never blocks the transport.
+		p.cancelJoin()
+		if b.Run == nil || len(p.JoinRequests) == 0 {
+			return nil
+		}
+		req := *p.JoinRequests[len(p.JoinRequests)-1]
+		ctx, cancel := context.WithCancel(context.Background())
+		p.joinCancel = cancel
+		run := b.Run
+		go func() {
+			defer cancel()
+			run(ctx, req, p.emitStatusAsync)
+		}()
+		return nil
 	default:
 		return nil
 	}

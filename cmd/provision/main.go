@@ -35,6 +35,7 @@ import (
 	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/provision/gatt"
+	"lexa-hub/internal/provision/netmgr"
 	"lexa-hub/internal/provision/sec1"
 	"lexa-hub/internal/watchdog"
 )
@@ -70,18 +71,37 @@ func main() {
 	sessionsCtr := reg.Counter("lexa_provision_sessions_total")
 	popFailuresCtr := reg.Counter("lexa_provision_pop_failures_total")
 
-	// Peripheral factory: a fresh sec1 peripheral per connection (Reset).
-	// Info reports build truth (buildinfo.Version + resolved serial +
-	// live commissioned marker). ScanResults/JoinBehavior are B2 stubs — the
-	// B3 seam wires NetworkManager scan + join here.
+	// System bus, shared by the GATT server and the NetworkManager client.
+	conn, err := dbus.SystemBus()
+	if err != nil {
+		log.Fatalf("lexa-provision: connect system bus: %v", err)
+	}
+	defer conn.Close()
+
+	// NetworkManager client (unit B3): backs the live WiFi scan + streaming join.
+	nm := netmgr.New(conn, netmgr.Options{JoinTimeout: cfg.JoinTimeout()})
+
+	// Peripheral factory: a fresh sec1 peripheral per connection (Reset). Info
+	// reports build truth (buildinfo.Version + resolved serial + live
+	// commissioned marker). ScanFunc + JoinBehavior are the real B3 seams: a
+	// NetworkManager scan and a streaming NetworkManager join whose status
+	// indications are pushed ASYNCHRONOUSLY via the GATT server (AsyncSend →
+	// server.Notify — server is assigned just below and read lazily by the
+	// closure, only once a central drives a join, long after registration).
+	var server *gatt.Server
 	newPeripheral := func() *sec1.Peripheral {
 		return sec1.NewPeripheral(sec1.PeripheralConfig{
 			Pop:          pop,
 			Serial:       serial,
 			Fw:           buildinfo.Version,
 			Commissioned: markerPresent(cfg.MarkerFile),
-			ScanResults:  nil,        // B3: real NetworkManager scan
-			JoinBehavior: stubJoin(), // B3: real NetworkManager join
+			ScanFunc:     scanCallback(nm, cfg.ScanTimeout()),
+			JoinBehavior: sec1.JoinLive{Run: liveJoin(nm, cfg.HandoffPort)},
+			AsyncSend: func(o sec1.Outbound) {
+				if server != nil {
+					server.Notify(o.UUID, o.Chunk)
+				}
+			},
 		})
 	}
 	disp := gatt.NewDispatcher(newPeripheral, gatt.Observer{
@@ -89,15 +109,8 @@ func main() {
 		OnPopFailure:         popFailuresCtr.Inc,
 	})
 
-	// System bus + GATT application.
-	conn, err := dbus.SystemBus()
-	if err != nil {
-		log.Fatalf("lexa-provision: connect system bus: %v", err)
-	}
-	defer conn.Close()
-
 	adapter := gatt.AdapterPath(cfg.Adapter)
-	server, err := gatt.NewServer(conn, adapter, disp, sec1.UUIDService, gatt.ADRCharDefs())
+	server, err = gatt.NewServer(conn, adapter, disp, sec1.UUIDService, gatt.ADRCharDefs())
 	if err != nil {
 		log.Fatalf("lexa-provision: build GATT server: %v", err)
 	}
@@ -190,11 +203,11 @@ func main() {
 	}
 }
 
-// stubJoin is the B2 placeholder JoinBehavior: it emits one "joining" then a
-// "failed: internal" so a central driving the full flow gets a defined,
-// end-to-end response (exercising the encrypted status-indication path) rather
-// than hanging. Unit B3 replaces this with a real NetworkManager
-// AddAndActivateConnection that emits joining → joined{handoff} / failed{reason}.
+// stubJoin was the B2 placeholder JoinBehavior. Unit B3 replaced main()'s use of
+// it with a real streaming NetworkManager join (sec1.JoinLive{Run: liveJoin});
+// it is retained only because info_test.go builds a peripheral factory with it
+// to assert the plaintext info read reports build truth. It emits one "joining"
+// then a "failed: internal" — a defined, non-hanging end-to-end response.
 func stubJoin() sec1.JoinBehavior {
 	return sec1.JoinFails{Reason: sec1.ReasonInternal, JoiningEvents: 1}
 }
