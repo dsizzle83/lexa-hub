@@ -50,10 +50,11 @@ func liveJoin(nm *netmgr.Client, port int) sec1.JoinRunner {
 
 // updateToState translates one netmgr.JoinUpdate into the sec1 StateMessage the
 // hub streams on the status characteristic. The joined handoff carries {ip,
-// port}; the serial is filled by the peripheral (withSerial). api_cert_fp +
-// token are the B4 seam (the API leaf-cert SHA-256 fingerprint per
-// cmd/api/tlscert.go, plus the bearer token in /etc/lexa/api-secret) and are
-// intentionally left empty in B3.
+// port}; the serial is filled by the peripheral (withSerial) and api_cert_fp +
+// token are filled by B4's handoffRunner (handoff.go), which decorates this
+// runner's emit. updateToState itself leaves that pair empty — the secret fill
+// is deliberately a separate layer, so this netmgr→state translation stays
+// pure and independently testable.
 func updateToState(u netmgr.JoinUpdate, port int) sec1.StateMessage {
 	switch u.State {
 	case sec1.StateJoined:

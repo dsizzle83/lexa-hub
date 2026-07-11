@@ -28,10 +28,15 @@ Wants=bluetooth.service
 #
 # --- Sandbox ---
 # NoNewPrivileges still matters under root (blocks setuid escalation).
-# ProtectSystem=strict makes the whole tree read-only: B2 only READS
-# /etc/lexa (provision.json, provision-pop, identity/serial) and stats the
-# commissioned marker — no ReadWritePaths needed. (B4's factory-reset / marker
-# write will add one then.)
+# ProtectSystem=strict makes the whole tree read-only. B4 keeps it that way:
+# this service still only READS — /etc/lexa (provision.json, provision-pop,
+# identity/serial, the API cert + token it hands off), stats the commissioned
+# marker, and reads /run/lexa/provision-window (read-only access is enough to
+# read a file). It never writes the marker (ADR-0002: `done` does NOT commission
+# — the API commissioning path does) nor the window file (`lexactl provision
+# --window` writes that), so NO ReadWritePaths is needed. The /run/lexa dir is
+# created at boot by systemd/tmpfiles.d/lexa-provision.conf (install it to
+# /etc/tmpfiles.d/ on a provisioning-capable image).
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

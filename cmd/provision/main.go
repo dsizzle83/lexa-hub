@@ -81,13 +81,23 @@ func main() {
 	// NetworkManager client (unit B3): backs the live WiFi scan + streaming join.
 	nm := netmgr.New(conn, netmgr.Options{JoinTimeout: cfg.JoinTimeout()})
 
+	// Advertising brute-force throttle (B4/GAP-3): 3 wrong-PoP confirms → 5 min
+	// off-radio. Fed by the Observer edge below, read by the advertising gate.
+	throttle := newPopThrottle(nil)
+
+	// Handoff secret source (B4/GAP-2): the API cert fingerprint + bearer token
+	// handed back on state:joined, read FRESH at handoff time.
+	handoffSrc := handoffSource{certFile: cfg.APICertFile, tokenFile: cfg.APITokenFile}
+
 	// Peripheral factory: a fresh sec1 peripheral per connection (Reset). Info
 	// reports build truth (buildinfo.Version + resolved serial + live
 	// commissioned marker). ScanFunc + JoinBehavior are the real B3 seams: a
 	// NetworkManager scan and a streaming NetworkManager join whose status
 	// indications are pushed ASYNCHRONOUSLY via the GATT server (AsyncSend →
 	// server.Notify — server is assigned just below and read lazily by the
-	// closure, only once a central drives a join, long after registration).
+	// closure, only once a central drives a join, long after registration). B4
+	// wraps the live join in handoffRunner so each joined state carries the API
+	// cert fingerprint + token (GAP-2).
 	var server *gatt.Server
 	newPeripheral := func() *sec1.Peripheral {
 		return sec1.NewPeripheral(sec1.PeripheralConfig{
@@ -96,7 +106,7 @@ func main() {
 			Fw:           buildinfo.Version,
 			Commissioned: markerPresent(cfg.MarkerFile),
 			ScanFunc:     scanCallback(nm, cfg.ScanTimeout()),
-			JoinBehavior: sec1.JoinLive{Run: liveJoin(nm, cfg.HandoffPort)},
+			JoinBehavior: sec1.JoinLive{Run: handoffRunner(liveJoin(nm, cfg.HandoffPort), handoffSrc)},
 			AsyncSend: func(o sec1.Outbound) {
 				if server != nil {
 					server.Notify(o.UUID, o.Chunk)
@@ -106,7 +116,10 @@ func main() {
 	}
 	disp := gatt.NewDispatcher(newPeripheral, gatt.Observer{
 		OnSessionEstablished: sessionsCtr.Inc,
-		OnPopFailure:         popFailuresCtr.Inc,
+		OnPopFailure: func() {
+			popFailuresCtr.Inc()
+			throttle.OnPopFailure()
+		},
 	})
 
 	adapter := gatt.AdapterPath(cfg.Adapter)
@@ -121,10 +134,16 @@ func main() {
 	log.Printf("lexa-provision: GATT application registered on %s (serial=%s fw=%s)",
 		adapter, serial, buildinfo.Version)
 
-	// Advertising: real BlueZ AdManager, gated on the commissioned marker.
-	// MarkerGate.Window is the B4 re-provision-window seam (nil for B2).
+	// Advertising: real BlueZ AdManager. The gate is uncommissioned OR an open
+	// re-provision window (B4/GAP-3 MarkerGate.Window seam → windowOpen),
+	// ANDed with the brute-force throttle: an open backoff window suppresses
+	// advertising even while uncommissioned/in-window.
 	adMgr := gatt.NewBluezAdManager(conn, adapter, gatt.LocalName(serial), sec1.UUIDService)
-	gate := gatt.MarkerGate{MarkerPath: cfg.MarkerFile}
+	marker := gatt.MarkerGate{
+		MarkerPath: cfg.MarkerFile,
+		Window:     func() bool { return windowOpen(cfg.WindowFile, time.Now()) },
+	}
+	gate := gatt.GateFunc(func() bool { return throttle.Allow() && marker.ShouldAdvertise() })
 	adv := gatt.NewAdvertiser(adMgr, gate, func(on bool) {
 		if on {
 			advertisingGauge.Set(1)

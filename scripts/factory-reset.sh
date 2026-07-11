@@ -23,13 +23,21 @@
 #   4. wipe /etc/lexa/certs/* (contents; the directory itself survives, so
 #      systemd ReadOnlyPaths=/etc/lexa/certs on lexa-northbound/telemetry
 #      keeps pointing at something that exists)
-#   5. remove /etc/lexa/commissioned (the uncommissioned-mode marker)
+#   5. remove /etc/lexa/commissioned (the uncommissioned-mode marker) AND
+#      clear /run/lexa/provision-window (any open BLE re-provision window),
+#      returning the unit to provisioning-ready state — lexa-provision will
+#      advertise again (ADR-0002 unit B4)
 #   6. restart the seven services against the now-factory config
 #
-# /etc/lexa/identity/ is never touched by ANY step above — it is preserved
-# by omission, not by a special-cased "restore" step. See the certs step
-# below for why identity survives a reset but the CSIP cert does not: they
-# are not the same kind of thing.
+# /etc/lexa/identity/ AND /etc/lexa/provision-pop are never touched by ANY
+# step above — both are preserved by omission, not by a special-cased
+# "restore" step (step 5 makes the provision-pop preservation explicit with a
+# log line, the way the identity note below does). See the certs step for why
+# identity survives a reset but the CSIP cert does not, and step 5 for why the
+# per-unit manufacturing PoP is treated like identity: it is label-bound (the
+# LEXA:v1 QR printed on the device carries this exact code), so a reset that
+# invalidated it would brick the printed label and make the unit
+# un-recommissionable from its own sticker.
 #
 # Refuses to run without --yes (this is destructive and irreversible for
 # everything except identity/). Every action is logged via `logger` (to the
@@ -60,9 +68,16 @@
 
 set -eu
 
-FACTORY_DIR="/usr/share/lexa/factory"
-ETC_LEXA="/etc/lexa"
-VAR_LEXA="/var/lib/lexa"
+# Paths are env-overridable (defaults are the real device paths, so a normal
+# invocation is unchanged). This lets the B4 test-suite point the whole reset at
+# a temp sandbox and assert on its effects WITHOUT wiping the real /etc/lexa.
+# LEXA_SKIP_SERVICES=1 skips the systemctl stop/start steps for the same reason
+# (a test box must not stop live units); it is never set on a real device.
+FACTORY_DIR="${LEXA_FACTORY_DIR:-/usr/share/lexa/factory}"
+ETC_LEXA="${LEXA_ETC:-/etc/lexa}"
+VAR_LEXA="${LEXA_VAR:-/var/lib/lexa}"
+RUN_LEXA="${LEXA_RUN:-/run/lexa}"
+SKIP_SERVICES="${LEXA_SKIP_SERVICES:-}"
 SERVICES="lexa-hub lexa-northbound lexa-modbus lexa-ocpp lexa-telemetry lexa-api lexa-cloudlink"
 
 log() {
@@ -83,21 +98,25 @@ done
 if [ -z "$YES" ]; then
   echo "factory-reset.sh: refusing to run without --yes" >&2
   echo "  this wipes /etc/lexa/*.json, /etc/lexa/certs/*, and all of /var/lib/lexa" >&2
-  echo "  (journal, spool, snapshot, api cert, site.json) -- ONLY /etc/lexa/identity/" >&2
-  echo "  survives. Re-run as: $0 --yes" >&2
+  echo "  (journal, spool, snapshot, api cert, site.json). Only /etc/lexa/identity/" >&2
+  echo "  and /etc/lexa/provision-pop survive. Re-run as: $0 --yes" >&2
   exit 1
 fi
 
 log "factory reset starting (--yes acknowledged)"
 
-log "step 1/6: stopping services: $SERVICES"
-for svc in $SERVICES; do
-  if timeout 15 systemctl stop "$svc" >/dev/null 2>&1; then
-    log "stopped $svc"
-  else
-    log "WARN: could not stop $svc (not installed, already stopped, or systemctl unresponsive) -- continuing"
-  fi
-done
+if [ -n "$SKIP_SERVICES" ]; then
+  log "step 1/6: skipping service stop (LEXA_SKIP_SERVICES set)"
+else
+  log "step 1/6: stopping services: $SERVICES"
+  for svc in $SERVICES; do
+    if timeout 15 systemctl stop "$svc" >/dev/null 2>&1; then
+      log "stopped $svc"
+    else
+      log "WARN: could not stop $svc (not installed, already stopped, or systemctl unresponsive) -- continuing"
+    fi
+  done
+fi
 
 log "step 2/6: removing existing /etc/lexa/*.json"
 for f in "$ETC_LEXA"/*.json; do
@@ -146,8 +165,14 @@ if [ -d "$ETC_LEXA/certs" ]; then
   log "cleared $ETC_LEXA/certs"
 fi
 
-log "step 5/6: removing $ETC_LEXA/commissioned marker"
+log "step 5/6: restoring provisioning-ready state (remove commissioned marker + clear re-provision window)"
 rm -f -- "$ETC_LEXA/commissioned"
+log "removed $ETC_LEXA/commissioned marker"
+# Clear any open BLE re-provision window so advertising state is governed
+# purely by the (now absent) commissioned marker, not a stale window file left
+# over from before the reset (ADR-0002 unit B4). Missing file is fine.
+rm -f -- "$RUN_LEXA/provision-window"
+log "cleared $RUN_LEXA/provision-window (re-provision window, if any)"
 
 if [ -d "$ETC_LEXA/identity" ]; then
   log "preserved $ETC_LEXA/identity/ untouched (device identity survives every reset)"
@@ -155,13 +180,30 @@ else
   log "note: $ETC_LEXA/identity did not exist -- nothing to preserve"
 fi
 
-log "step 6/6: restarting services: $SERVICES"
-for svc in $SERVICES; do
-  if timeout 15 systemctl start "$svc" >/dev/null 2>&1; then
-    log "started $svc"
-  else
-    log "WARN: could not start $svc (not installed, failed to start, or systemctl unresponsive -- check: systemctl status $svc)"
-  fi
-done
+# Preserve the per-unit manufacturing PoP (ADR-0002 unit B4). It is treated
+# EXACTLY like identity: it is provisioned once at manufacturing and printed
+# into the device's LEXA:v1 label QR (LEXA:v1;serial=...;pop=<this value>), so
+# it must survive a factory reset or the printed label would no longer
+# commission the unit. Like identity/, it is preserved by OMISSION (no step
+# above touches /etc/lexa/provision-pop — step 2 wipes only *.json), and this
+# log line makes that preservation explicit + auditable.
+if [ -f "$ETC_LEXA/provision-pop" ]; then
+  log "preserved $ETC_LEXA/provision-pop untouched (per-unit manufacturing PoP, label-bound -- survives every reset like identity)"
+else
+  log "note: $ETC_LEXA/provision-pop did not exist -- nothing to preserve (dev-kit default PoP in effect)"
+fi
+
+if [ -n "$SKIP_SERVICES" ]; then
+  log "step 6/6: skipping service restart (LEXA_SKIP_SERVICES set)"
+else
+  log "step 6/6: restarting services: $SERVICES"
+  for svc in $SERVICES; do
+    if timeout 15 systemctl start "$svc" >/dev/null 2>&1; then
+      log "started $svc"
+    else
+      log "WARN: could not start $svc (not installed, failed to start, or systemctl unresponsive -- check: systemctl status $svc)"
+    fi
+  done
+fi
 
 log "factory reset complete"

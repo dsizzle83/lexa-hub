@@ -51,6 +51,7 @@
 //	lexactl scan run [--cidr X] [--watch] [-json]
 //	lexactl scan show [-json]
 //	lexactl fingerprint
+//	lexactl provision --window 10m | --close | status
 //	lexactl telemetry [--minutes N] [-json]
 //
 // Global flags: -addr (default https://127.0.0.1:9100), -token-file
@@ -99,7 +100,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// typo'd subcommand on a box with no cert file yet must not be
 	// misreported as an API/trust error.
 	switch cmdName {
-	case "fingerprint", "status", "mode", "intent", "ev", "reserve", "scan", "telemetry":
+	case "fingerprint", "provision", "status", "mode", "intent", "ev", "reserve", "scan", "telemetry":
 		// recognized; falls through to token/trust resolution below
 	default:
 		fmt.Fprintf(stderr, "lexactl: unknown command %q\n", cmdName)
@@ -111,6 +112,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// and no token — resolve it before anything network- or trust-related.
 	if cmdName == "fingerprint" {
 		return cmdFingerprint(&client{certFile: defaultCertFile}, cmdArgs, stdout)
+	}
+
+	// `provision` is a LOCAL filesystem control (the BLE re-provision window),
+	// not an API call — dispatch it before token/trust resolution too, so it
+	// works with lexa-api down and needs no bearer token. See cmd_provision.go.
+	if cmdName == "provision" {
+		return dispatchProvision(cmdArgs, stdout, stderr)
 	}
 
 	token, err := loadToken(*tokenFile)
@@ -205,6 +213,7 @@ Commands:
   scan run [--cidr X] [--watch]              POST /scan
   scan show                                  GET /scan
   fingerprint                                print the local cert's sha256
+  provision --window 10m|--close|status      BLE re-provision window (local, no API)
   telemetry [--minutes N]                    GET /telemetry/recent
 
 Every command accepts -json to print the raw API response body verbatim

@@ -35,9 +35,28 @@ type Config struct {
 	// Default "/etc/lexa/commissioned".
 	MarkerFile string `json:"marker_file"`
 
-	// HandoffPort is the API port reported in the join handoff (B3/B4 seam;
-	// unused by B2's stub join). Default 9100.
+	// HandoffPort is the API port reported in the join handoff. Default 9100.
 	HandoffPort int `json:"handoff_port"`
+
+	// APICertFile is the lexa-api HTTPS leaf-cert PEM whose SHA-256 fingerprint
+	// is delivered in the join handoff (GAP-2). It must be the SAME file
+	// lexa-api serves (its CertDir/cert.pem), so the handed-off fingerprint
+	// equals /status.api_cert_fp on this box. Default matches cmd/api's CertDir
+	// default: "/var/lib/lexa/api/cert.pem".
+	APICertFile string `json:"api_cert_file"`
+
+	// APITokenFile is the lexa-api bearer-token file whose content is delivered
+	// in the join handoff (GAP-2) so the homeowner never types it. It must be
+	// the SAME file lexa-api reads (its api_token_file). Default
+	// "/etc/lexa/api.token" matches the devkit deploy (deploy-hub-pi.sh);
+	// override to "/etc/lexa/api-secret" on a factory image whose api.json
+	// points there.
+	APITokenFile string `json:"api_token_file"`
+
+	// WindowFile is the re-provision window file (a Unix-seconds expiry on
+	// tmpfs) whose presence+freshness forces advertising on even when
+	// commissioned (GAP-3). Default "/run/lexa/provision-window".
+	WindowFile string `json:"window_file"`
 
 	// ReconcileIntervalS is how often the advertising gate is re-evaluated so a
 	// mid-run commit stops advertising. Default 10.
@@ -89,6 +108,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.HandoffPort == 0 {
 		c.HandoffPort = 9100
+	}
+	if c.APICertFile == "" {
+		c.APICertFile = "/var/lib/lexa/api/cert.pem"
+	}
+	if c.APITokenFile == "" {
+		c.APITokenFile = "/etc/lexa/api.token"
+	}
+	if c.WindowFile == "" {
+		c.WindowFile = defaultWindowFile
 	}
 	if c.ReconcileIntervalS == 0 {
 		c.ReconcileIntervalS = 10
