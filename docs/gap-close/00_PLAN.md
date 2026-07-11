@@ -143,3 +143,28 @@ app-side work. mockhub mirrors land here to keep the contract testable.
 | B3 | NM join + scan + status | M | opus | **done(c1a9a3a)** |
 | B4 | handoff + reprovision + PoP + factory-reset | M | opus | **done(see log)** — CODE COMPLETE |
 | C1–C3 | hardware validation | — | — | blocked on A/B |
+
+## Phase C1 — Phase-A endpoints validated on hardware (2026-07-11, dev kit)
+
+Deployed gapclose-1a7a82e (api+hub+provision+lexactl) additively to linux_b.
+- **GAP-5 (fw)**: /site.fw AND /status.fw = "gapclose-1a7a82e" ✓ (ldflags stamp live).
+- **GAP-8 reserve**: /status.reserve {effective_pct,floor_pct,source} tracks
+  intents after a replan (submitted 45 → effective_pct 45, source app) ✓.
+- **GAP-8 tariff**: a valid import-only tariff intent → /status.tariff
+  {source:"manual", spec:{currency,periods[3]}} round-trips EXACTLY ✓; the
+  compiler's validation (non-zero export rejected, midnight-wrap rejected,
+  full-coverage) all enforced on hardware ✓.
+- **GAP-7 /plan**: endpoint live, exact app shape (RFC3339 t, capital-W,
+  slot_minutes 5, horizon 24), solar_forecast series flows ✓. **battery_plan
+  and ev_plan are EMPTY** — root cause: the shipped `planner` config block is
+  {} (repo configs/hub.json AND the dev kit), so the 288-slot daily planner
+  models neither battery nor EV (only the solar forecast passes through). A3
+  faithfully exposes what the DP produces; this is a PRE-EXISTING planner-
+  config-completeness gap A3 SURFACED, not an A3 defect. **Follow-up (outside
+  gap-close scope, behavior-changing so NOT done on the flipped-active bench):
+  populate hub.json's planner block (batt_capacity_kwh/ev_capacity_kwh/…) so
+  the daily planner schedules battery+EV and the app's plan charts get data.**
+- Config note: api.json tls-flip was stale state (mtime shows my fix owns it;
+  no cron/timer/config_write writer) — set tls:false, holds.
+Test intents reverted (reserve→floor, retained tariff/reserve cleared) so the
+validated bench economic baseline is restored.
