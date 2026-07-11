@@ -136,10 +136,10 @@ app-side work. mockhub mirrors land here to keep the contract testable.
 | Unit | Name | Size | Model | Status |
 |---|---|---|---|---|
 | A1 | build-version stamping | S | sonnet | **done(defc924)** |
-| A2 | reserve + tariff readback | M | opus | todo |
-| A3 | GET /plan series | L | opus | todo |
-| B1 | sec1 crypto + framing | M | opus | todo |
-| B2 | BlueZ GATT + advertising | L | opus | todo |
+| A2 | reserve + tariff readback | M | opus | **done(see log)** |
+| A3 | GET /plan series | L | opus | in-flight |
+| B1 | sec1 crypto + framing | M | opus | **done(see log)** |
+| B2 | BlueZ GATT + advertising | L | opus | in-flight |
 | B3 | NM join + scan + status | M | opus | todo |
 | B4 | handoff + reprovision + PoP + factory-reset | M | opus | todo |
 | C1–C3 | hardware validation | — | — | blocked on A/B |
