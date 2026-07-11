@@ -135,7 +135,7 @@ app-side work. mockhub mirrors land here to keep the contract testable.
 
 | Unit | Name | Size | Model | Status |
 |---|---|---|---|---|
-| A1 | build-version stamping | S | sonnet | todo |
+| A1 | build-version stamping | S | sonnet | **done(defc924)** |
 | A2 | reserve + tariff readback | M | opus | todo |
 | A3 | GET /plan series | L | opus | todo |
 | B1 | sec1 crypto + framing | M | opus | todo |
