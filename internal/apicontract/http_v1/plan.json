@@ -1,0 +1,26 @@
+{
+  "generated_at": "2026-07-11T00:00:00Z",
+  "horizon_h": 24,
+  "slot_minutes": 5,
+  "solar_forecast": [
+    {
+      "t": "2026-07-11T00:00:00Z",
+      "solar_W": 1500
+    }
+  ],
+  "battery_plan": [
+    {
+      "t": "2026-07-11T00:00:00Z",
+      "setpoint_W": -1000,
+      "soc_pct": 50
+    }
+  ],
+  "ev_plan": {
+    "evse-001": [
+      {
+        "t": "2026-07-11T00:00:00Z",
+        "power_W": -7200
+      }
+    ]
+  }
+}

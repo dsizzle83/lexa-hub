@@ -1,0 +1,28 @@
+{
+  "status": [
+    {
+      "id": "s1",
+      "phase": "tcp",
+      "probed": 5,
+      "found": 1,
+      "detail": "probing 192.168.1.0/24",
+      "ts": "2026-07-11T00:00:00Z"
+    }
+  ],
+  "result": {
+    "id": "s1",
+    "ts": "2026-07-11T00:00:00Z",
+    "devices": [
+      {
+        "url": "tcp://192.168.1.40:502",
+        "unit_id": 1,
+        "manufacturer": "Acme",
+        "model": "INV-5000",
+        "serial": "INV-SN-1",
+        "fw_version": "1.0.0",
+        "class": "inverter",
+        "nameplate_w": 5000
+      }
+    ]
+  }
+}

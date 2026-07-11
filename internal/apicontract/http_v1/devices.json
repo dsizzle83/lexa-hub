@@ -1,0 +1,54 @@
+{
+  "devices": {
+    "batt-0": {
+      "role": "battery",
+      "connected": true,
+      "W_W": 1000,
+      "V_V": 240,
+      "Hz_Hz": 60,
+      "soc_pct": 55,
+      "max_W": 10000
+    }
+  },
+  "evse_stations": [
+    {
+      "station_id": "evse-001",
+      "connector_id": 1,
+      "connected": true,
+      "session_active": true,
+      "status": "Charging",
+      "current_A": 16,
+      "max_current_A": 32,
+      "current_a": 16,
+      "max_current_a": 32,
+      "voltage_V": 240,
+      "power_W": 3840,
+      "soc_pct": 60
+    }
+  ],
+  "scan_result": {
+    "id": "scan-1",
+    "ts": "2026-07-11T00:00:00Z",
+    "devices": [
+      {
+        "url": "tcp://192.168.1.41:502",
+        "unit_id": 2,
+        "manufacturer": "Acme",
+        "model": "INV-5000",
+        "serial": "INV-SN-1",
+        "fw_version": "1.0.0",
+        "class": "inverter",
+        "nameplate_w": 5000
+      }
+    ]
+  },
+  "ocpp_pending": [
+    {
+      "station_id": "ev-unknown",
+      "vendor": "AcmeEV",
+      "model": "Wallbox-1",
+      "first_seen_ts": "2026-07-11T00:00:00Z",
+      "remote_addr": "10.0.0.9:5000"
+    }
+  ]
+}

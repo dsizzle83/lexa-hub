@@ -1,0 +1,6 @@
+{
+  "mode": "gateway",
+  "since": 1000,
+  "actor": "installer@example.com",
+  "intent_id": "abc123"
+}

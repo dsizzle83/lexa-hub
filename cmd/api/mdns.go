@@ -21,6 +21,7 @@ import (
 
 	"github.com/grandcat/zeroconf"
 
+	"lexa-hub/internal/apicontract"
 	"lexa-hub/internal/buildinfo"
 )
 
@@ -95,6 +96,11 @@ func (a *mdnsAdvertiser) txt() []string {
 		"fw=" + buildinfo.Version,
 		"claimed=" + claimed,
 		"api=" + a.apiScheme(),
+		// contract= advertises the hub⇄app HTTP contract version
+		// (apicontract.Version, Workstream C) so a discovering app can warn on a
+		// major mismatch before it even opens the API — the mDNS mirror of the
+		// X-Lexa-Contract-Version header and /status's contract_version field.
+		"contract=" + strconv.Itoa(apicontract.Version),
 	}
 }
 

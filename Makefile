@@ -29,7 +29,7 @@ LDFLAGS := -X lexa-hub/internal/buildinfo.Version=$(VERSION)
 SERVICES := hub northbound modbus ocpp telemetry api healthcheck cloudlink provision
 BINS     := $(addprefix $(BINDIR)/lexa-, $(SERVICES))
 
-.PHONY: all build install install-configs install-services clean tidy test test-nocgo fuzz sweep-sunspec
+.PHONY: all build install install-configs install-services clean tidy test test-nocgo contract fuzz sweep-sunspec
 
 all: build
 
@@ -167,6 +167,17 @@ test:
 test-nocgo:
 	go test -race $(shell go list ./internal/... | grep -v -e internal/wolfssl -e internal/tlsclient)
 	go test -race $(shell go list ./cmd/... | grep -v -e cmd/northbound -e cmd/telemetry)
+
+# Workstream C: the hub⇄app HTTP contract drift gate. cmd/api/contract_test.go
+# drives the REAL /status, /site, /devices, /telemetry, /mode, /plan, /scan,
+# /intent handlers and asserts each still conforms to the pinned golden
+# fixtures in internal/apicontract/http_v1/ (checker + policy:
+# internal/apicontract, docs/API_CONTRACT.md). cmd/api is pure-Go, so this is
+# already covered transitively by test-nocgo above; this named target exists so
+# the gate can be invoked (and required in CI) on its own. See
+# .github/workflows/ci.yml's contract step.
+contract:
+	go test ./cmd/api/...
 
 # TASK-053 (GAP-07): quick local re-run of just the int16/scale-factor
 # boundary sweep — the shared lexa-proto/sunspec codec contract (against

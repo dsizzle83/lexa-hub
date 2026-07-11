@@ -1,0 +1,10 @@
+{
+  "kind": "evgoal",
+  "body": {
+    "station_id": "evse-001",
+    "target_soc_kwh": 40,
+    "departure_unix": 1893456000,
+    "initial_soc_kwh": 10,
+    "capacity_kwh": 60
+  }
+}

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"lexa-hub/internal/apicontract"
 	"lexa-hub/internal/buildinfo"
 	"lexa-hub/internal/bus"
 	"lexa-hub/internal/utilitytime"
@@ -15,14 +16,19 @@ import (
 // statusResp mirrors the JSON shape served by the legacy csip-tls-test hub on
 // /status, so the existing demo dashboard works unmodified.
 type statusResp struct {
-	Timestamp    string                `json:"timestamp"`
-	ClockOffsetS int64                 `json:"clock_offset_s"`
-	CSIPPrograms int                   `json:"csip_programs"`
-	CSIPControl  *csipControlInfo      `json:"csip_control,omitempty"`
-	Devices      map[string]deviceInfo `json:"devices"`
-	Power        powerSummary          `json:"power"`
-	LastPlan     planJSON              `json:"last_plan"`
-	EVSEs        []evseJSON            `json:"evse_stations,omitempty"`
+	Timestamp    string `json:"timestamp"`
+	ClockOffsetS int64  `json:"clock_offset_s"`
+	// ContractVersion is the hub⇄app HTTP contract version (apicontract.Version,
+	// Workstream C) — additive, so the app can detect a major mismatch from the
+	// /status body as well as the X-Lexa-Contract-Version header and the mDNS
+	// "contract=" TXT record. All three read the same constant.
+	ContractVersion int                   `json:"contract_version"`
+	CSIPPrograms    int                   `json:"csip_programs"`
+	CSIPControl     *csipControlInfo      `json:"csip_control,omitempty"`
+	Devices         map[string]deviceInfo `json:"devices"`
+	Power           powerSummary          `json:"power"`
+	LastPlan        planJSON              `json:"last_plan"`
+	EVSEs           []evseJSON            `json:"evse_stations,omitempty"`
 	// StaleSources names measurement sources the hub has detected as frozen/silent
 	// (a hung meter serving a cached value, or a silent charger) — surfaced so the
 	// fault is visible, not silently trusted (INV-STALE / INV-EVBLIND).
@@ -185,6 +191,25 @@ type evseJSON struct {
 	Stale bool `json:"stale,omitempty"`
 }
 
+// MarshalJSON emits the EVSE current/max-current under BOTH the capital-suffix
+// key the bench convention uses (current_A/max_current_A — read by
+// csip-tls-test's dashboard.html and mayhem driver, matching evsim's output and
+// the V_V/W_W device-field style) AND the lowercase key the companion app reads
+// (current_a/max_current_a — the same form /telemetry/recent already uses,
+// telemetry.go). The two are pure aliases of the same value, so they can never
+// disagree; both are part of the v1 contract (docs/API_CONTRACT.md). This is
+// the additive resolution of the current_A vs current_a drift the contract work
+// surfaced — the app's EVSE-current display was blank because /status only
+// carried the capital form. Value receiver so slice elements marshal correctly.
+func (e evseJSON) MarshalJSON() ([]byte, error) {
+	type alias evseJSON // shed the method to avoid infinite recursion
+	return json.Marshal(struct {
+		alias
+		CurrentALower    float64 `json:"current_a"`
+		MaxCurrentALower float64 `json:"max_current_a"`
+	}{alias(e), e.CurrentA, e.MaxCurrentA})
+}
+
 // csipReportGraceS is how many seconds past a control's ValidUntil (in server
 // time) /status keeps reporting it. Covers the orchestrator's own
 // expiry-confirm debounce plus a clock-jitter margin, so the API never reports
@@ -198,10 +223,11 @@ const csipReportGraceS = 15
 // was before this field existed.
 func buildStatus(snap snapshot, hb heartbeatStatus) statusResp {
 	resp := statusResp{
-		Timestamp:    snap.now.UTC().Format(time.RFC3339),
-		ClockOffsetS: snap.clockOffsetS,
-		CSIPPrograms: snap.csipPrograms,
-		Devices:      make(map[string]deviceInfo, len(snap.devices)),
+		Timestamp:       snap.now.UTC().Format(time.RFC3339),
+		ClockOffsetS:    snap.clockOffsetS,
+		ContractVersion: apicontract.Version,
+		CSIPPrograms:    snap.csipPrograms,
+		Devices:         make(map[string]deviceInfo, len(snap.devices)),
 		LastPlan: planJSON{
 			Timestamp: snap.now.UTC().Format(time.RFC3339),
 			Decisions: []decisionJSON{},

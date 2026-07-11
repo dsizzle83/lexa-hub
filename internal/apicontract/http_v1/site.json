@@ -1,0 +1,8 @@
+{
+  "serial": "SN-TEST-1",
+  "fw": "dev",
+  "commissioned": false,
+  "tz": "UTC",
+  "site_cache": null,
+  "contract_version": 1
+}

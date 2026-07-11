@@ -344,7 +344,11 @@ func main() {
 	// listener, new route" per the task: no new auth surface, no new port.
 	mux.Handle("/metrics", reg.Handler())
 
-	srv := &http.Server{Addr: cfg.ListenAddr, Handler: mux, TLSConfig: tlsConfig}
+	// withContractVersion stamps the X-Lexa-Contract-Version header
+	// (apicontract.Version) on every response — see version.go. Wrapping the
+	// whole mux (rather than each route) keeps the header on /healthz and
+	// /metrics too, so the app can read the contract version off any route.
+	srv := &http.Server{Addr: cfg.ListenAddr, Handler: withContractVersion(mux), TLSConfig: tlsConfig}
 	scheme := "http"
 	if cfg.TLSEnabled() {
 		scheme = "https"

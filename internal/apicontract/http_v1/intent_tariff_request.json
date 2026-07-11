@@ -1,0 +1,18 @@
+{
+  "kind": "tariff",
+  "body": {
+    "tariff": {
+      "currency": "USD",
+      "periods": [
+        {
+          "label": "peak",
+          "days": [1, 2, 3, 4, 5],
+          "start_hh": 16,
+          "end_hh": 21,
+          "import_per_kwh": 0.38,
+          "export_per_kwh": 0.05
+        }
+      ]
+    }
+  }
+}

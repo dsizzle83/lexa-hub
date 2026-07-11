@@ -1,0 +1,103 @@
+{
+  "timestamp": "2026-07-11T00:00:00Z",
+  "clock_offset_s": 0,
+  "csip_programs": 0,
+  "contract_version": 1,
+  "fw": "dev",
+  "mode": "gateway",
+  "api_cert_fp": "0000000000000000000000000000000000000000000000000000000000000000",
+  "power": {
+    "solar_W": 0,
+    "battery_W": 0,
+    "grid_W": 0,
+    "load_W": 0
+  },
+  "devices": {
+    "batt-0": {
+      "role": "battery",
+      "connected": true,
+      "W_W": 1000,
+      "V_V": 240,
+      "Hz_Hz": 60,
+      "soc_pct": 55,
+      "max_W": 10000
+    }
+  },
+  "evse_stations": [
+    {
+      "station_id": "evse-001",
+      "connector_id": 1,
+      "connected": true,
+      "session_active": true,
+      "status": "Charging",
+      "current_A": 16,
+      "max_current_A": 32,
+      "current_a": 16,
+      "max_current_a": 32,
+      "voltage_V": 240,
+      "power_W": 3840,
+      "soc_pct": 60
+    }
+  ],
+  "stale_sources": ["evse:evse-001"],
+  "last_plan": {
+    "timestamp": "2026-07-11T00:00:00Z",
+    "decisions": [
+      {
+        "rule": "csip/export-limit",
+        "reason": "export over cap",
+        "impact": "curtail pv"
+      }
+    ]
+  },
+  "plan_heartbeat": {
+    "state": "ok",
+    "age_s": 0
+  },
+  "csip_control": {
+    "source": "event",
+    "mrid": "abc123",
+    "valid_until": 4102444800,
+    "base": {
+      "exp_lim_W": 5000,
+      "max_lim_W": 8000,
+      "imp_lim_W": 6000,
+      "fixed_W": 0,
+      "connect": true
+    }
+  },
+  "cert_status": {
+    "client_days_left": 90,
+    "ca_days_left": 3650,
+    "days_left": 90,
+    "checked_at": "2026-07-11T00:00:00Z"
+  },
+  "cloud_link": {
+    "connected": true,
+    "endpoint": "ssl://cloud.example:8883",
+    "spool_bytes": 0,
+    "cert_days_left": 45
+  },
+  "reserve": {
+    "effective_pct": 30,
+    "floor_pct": 20,
+    "source": "app"
+  },
+  "tariff": {
+    "source": "manual",
+    "updated_at": 1752000000,
+    "spec": {
+      "currency": "USD",
+      "periods": [
+        {
+          "label": "peak",
+          "days": [1, 2, 3, 4, 5],
+          "start_hh": 16,
+          "end_hh": 21,
+          "import_per_kwh": 0.38,
+          "export_per_kwh": 0.05
+        }
+      ]
+    }
+  }
+}

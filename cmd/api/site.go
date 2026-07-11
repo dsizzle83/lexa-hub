@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"lexa-hub/internal/apicontract"
 	"lexa-hub/internal/buildinfo"
 )
 
@@ -35,6 +36,10 @@ type siteResp struct {
 	Commissioned bool            `json:"commissioned"`
 	TZ           string          `json:"tz"`
 	SiteCache    json.RawMessage `json:"site_cache,omitempty"`
+	// ContractVersion is the hub⇄app HTTP contract version (apicontract.Version,
+	// Workstream C) — additive, same value as /status's field, the
+	// X-Lexa-Contract-Version header, and the mDNS "contract=" TXT record.
+	ContractVersion int `json:"contract_version"`
 }
 
 // siteHandler serves GET /site. serial is the same value main.go resolves
@@ -53,10 +58,11 @@ func siteHandler(serial, siteCacheFile string) http.HandlerFunc {
 		}
 
 		resp := siteResp{
-			Serial:       serial,
-			FW:           buildinfo.Version,
-			Commissioned: isCommissioned(),
-			TZ:           time.Local.String(),
+			Serial:          serial,
+			FW:              buildinfo.Version,
+			Commissioned:    isCommissioned(),
+			TZ:              time.Local.String(),
+			ContractVersion: apicontract.Version,
 		}
 		if data, err := os.ReadFile(siteCacheFile); err == nil {
 			if json.Valid(data) {

@@ -1,0 +1,7 @@
+{
+  "kind": "chargenow",
+  "body": {
+    "station_id": "evse-001",
+    "ttl_s": 900
+  }
+}

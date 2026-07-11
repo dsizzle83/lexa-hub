@@ -1,0 +1,25 @@
+{
+  "minutes": 15,
+  "devices": {
+    "inv-0": [
+      {
+        "arrived_at": "2026-07-11T00:00:00Z",
+        "kind": "measurement",
+        "w": 1000,
+        "voltage_v": 240,
+        "hz": 60
+      }
+    ],
+    "batt-0": [
+      {
+        "arrived_at": "2026-07-11T00:00:00Z",
+        "kind": "batt_metrics",
+        "soc_pct": 55,
+        "soh_pct": 98,
+        "capacity_wh": 13500,
+        "max_charge_w": 5000,
+        "max_discharge_w": 5000
+      }
+    ]
+  }
+}

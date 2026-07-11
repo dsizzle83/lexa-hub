@@ -1,0 +1,6 @@
+{
+  "kind": "reserve",
+  "body": {
+    "reserve_pct": 30
+  }
+}

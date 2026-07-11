@@ -27,14 +27,14 @@ func TestMDNSAdvertiser_TXT_ClaimedFlip(t *testing.T) {
 
 	a.claimed.Store(false)
 	got := a.txt()
-	want := []string{"serial=SN123", "fw=dev", "claimed=0", "api=https"}
+	want := []string{"serial=SN123", "fw=dev", "claimed=0", "api=https", "contract=1"}
 	if !equalStringSlices(got, want) {
 		t.Fatalf("unclaimed TXT = %v, want %v", got, want)
 	}
 
 	a.claimed.Store(true)
 	got = a.txt()
-	want = []string{"serial=SN123", "fw=dev", "claimed=1", "api=https"}
+	want = []string{"serial=SN123", "fw=dev", "claimed=1", "api=https", "contract=1"}
 	if !equalStringSlices(got, want) {
 		t.Fatalf("claimed TXT = %v, want %v", got, want)
 	}
@@ -51,7 +51,7 @@ func TestMDNSAdvertiser_TXT_APISchemeFollowsTLS(t *testing.T) {
 	for _, c := range cases {
 		a := &mdnsAdvertiser{serial: "SN1", port: 9100, tlsOn: c.tlsOn}
 		got := a.txt()
-		want := []string{"serial=SN1", "fw=dev", "claimed=0", "api=" + c.want}
+		want := []string{"serial=SN1", "fw=dev", "claimed=0", "api=" + c.want, "contract=1"}
 		if !equalStringSlices(got, want) {
 			t.Errorf("tlsOn=%v: TXT = %v, want %v", c.tlsOn, got, want)
 		}
@@ -69,7 +69,7 @@ func TestMDNSAdvertiser_TXT_FWReflectsBuildinfoVersion(t *testing.T) {
 
 	a := &mdnsAdvertiser{serial: "SN123", port: 9100, tlsOn: true}
 	got := a.txt()
-	want := []string{"serial=SN123", "fw=1.2.3-test", "claimed=0", "api=https"}
+	want := []string{"serial=SN123", "fw=1.2.3-test", "claimed=0", "api=https", "contract=1"}
 	if !equalStringSlices(got, want) {
 		t.Fatalf("TXT = %v, want %v", got, want)
 	}
