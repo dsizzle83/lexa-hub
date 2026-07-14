@@ -33,11 +33,14 @@ Each concern runs as its own process and communicates only via Mosquitto MQTT:
     ├─ lexa-telemetry— subscribes to measurements; POSTs MUP readings to northbound server
     ├─ lexa-ocpp     — OCPP 2.0.1 CSMS for EV chargers
     ├─ lexa-hub      — energy optimizer engine (the "brain")
-    └─ lexa-api      — HTTP /status + /logs, default listen_addr 127.0.0.1:9100
-                        (WS-1, V1.0 punch list: loopback-only product default);
-                        bearer-token auth (`api_token_file`) — a non-loopback
-                        bind with no token is refused at startup unless
-                        `bench:true` (TASK-014, AD-008, WS-1); /healthz always open
+    ├─ lexa-api      — HTTP /status + /logs, default listen_addr 127.0.0.1:9100
+    │                   (WS-1, V1.0 punch list: loopback-only product default);
+    │                   bearer-token auth (`api_token_file`) — a non-loopback
+    │                   bind with no token is refused at startup unless
+    │                   `bench:true` (TASK-014, AD-008, WS-1); /healthz always open
+    └─ lexa-openadr  — OpenADR 3.1 CP-profile VEN (WP-15; opt-in — idle until
+                        `vtn_url` set); prices/limits → hub, status → api; pure
+                        Go, no wolfSSL; metrics :9108
 ```
 
 Every service also exposes Prometheus `/metrics` (TASK-044) — see "Metrics" below.
@@ -57,6 +60,15 @@ Every service also exposes Prometheus `/metrics` (TASK-044) — see "Metrics" be
 | `lexa/reconcile/{class}/{device}/report` *(retained)* | lexa-modbus, lexa-ocpp | lexa-hub | 1 |
 | `lexa/csip/rewalk` *(TASK-042)* | lexa-hub | lexa-northbound | 1 |
 | `lexa/northbound/certstatus` *(retained, TASK-072)* | lexa-northbound | lexa-api | 1 |
+| `lexa/csip/curves` *(retained, WP-8)* | lexa-northbound | lexa-hub | 1 |
+| `lexa/desired/adv/{device}` *(retained, WP-9)* | lexa-hub | lexa-modbus | 1 |
+| `lexa/reconcile/adv/{device}/report` *(retained, WP-10)* | lexa-modbus | lexa-hub | 1 |
+| `lexa/hub/dersite` *(retained, WP-4)* | lexa-hub | lexa-northbound | 1 |
+| `lexa/hub/logevent` *(edge, WP-6)* | lexa-hub | lexa-northbound | 1 |
+| `lexa/ocpp/pairing` *(edge, WP-13)* | lexa-api | lexa-ocpp | 1 |
+| `lexa/openadr/prices` *(retained, WP-15)* | lexa-openadr | lexa-hub | 1 |
+| `lexa/openadr/limits` *(retained, WP-15)* | lexa-openadr | lexa-hub | 1 |
+| `lexa/openadr/status` *(retained, WP-15)* | lexa-openadr | lexa-api | 1 |
 
 The three struck-through `lexa/control/*` / `lexa/evse/+/command` legacy command
 topics were **removed in TASK-032**: the retained `lexa/desired/{class}/{device}`
@@ -472,6 +484,43 @@ Editing the Pi's copy without updating `configs/modbus.json` in-repo is undone
 by a full `deploy-hub-pi.sh` (it overwrites `/etc/lexa/*.json`); the in-repo
 default stays conservative (`battery: off`) and the flip is a deliberate,
 binary-only deploy + hand-set Pi config (05 §6 discipline).
+
+## Standards build-out (2026-07)
+
+A 17-work-package campaign (`docs/standards-buildout/`: `work-packages.md` plan,
+`architecture.md` design, `00_PROGRESS.md` board, `VERIFICATION_SWEEP.md` +
+`CSIP_AUS_CHECKLIST.md` bench queue) closed the SunSpec CSIP DER-client conformance
+gaps and added CSIP-AUS/OpenADR/OCPP-1.6 reach. Everything landed **additive +
+feature-flagged**; every campaign flag ships **fail-closed** so the product default
+is byte-identical to pre-campaign behavior. New service `lexa-openadr` (WP-15) + new
+bus topics `lexa/csip/curves`, `lexa/desired/adv/+`, `lexa/reconcile/adv/+/report`,
+`lexa/hub/dersite`, `lexa/hub/logevent`, `lexa/ocpp/pairing`, `lexa/openadr/{prices,
+limits,status}` (topic map above; ACL stanzas in `systemd/mosquitto-lexa.acl`).
+
+Flag inventory + shipped defaults (all in `configs/*.json`):
+
+| File | Key | Default | Effect |
+|---|---|---|---|
+| northbound.json | `registration_pin` | `0` | 0 = PIN check disabled + WARN (WS-8 pattern) |
+| northbound.json | `der_report` | `true` | DER* PUT reporting (404/405-skip per resource) |
+| northbound.json | `legacy_cannotcomply_code` | `false`* | false = IEEE Table 27 codes; true = legacy 0xF0 (*bench config ships `true` until gridsim flips — MTR-4 paired change) |
+| northbound.json | `redirect_max` | `3` | 301/302 same-host follow bound (0 disables) |
+| hub.json | `advanced_der` | `"off"` | "off"\|"on" — adv desired-doc author (curve/PF/energize) |
+| hub.json | `enforce_aus_limits` | `false` | GenLimW/LoadLimW cascade (shadow always runs under `constraint_shadow`) |
+| hub.json | `ev_storage` | `false` | planner EV discharge term (off ⇒ byte-identical plans) |
+| hub.json | `logevent_min_interval_s` | `10` | LogEvent edge rate floor (flash budget) |
+| hub.json | `der_type` | `0` | 0 = derive DERCapability type from device mix; else 2030.5 code |
+| hub.json | `openadr_adopt` / `openadr_price_max_age_s` | `true` / `3600` | adopt VEN prices/limits (D9 precedence, staleness-checked) |
+| modbus.json | `reconciler.adv` | `"off"` | "off"\|"shadow"\|"active" — adv reconciler shell (staged like battery) |
+| ocpp.json | `port_16` | `0` | 0 = OCPP 1.6J listener disabled (fail-closed dual-stack) |
+| ocpp.json | `pairing_mode` | `""` ⇒ gated | empty resolves to "gated" (product) / "open" (bench profile) |
+| ocpp.json | `allowlist_path` | `/var/lib/lexa/ocpp-allowlist.json` | persisted pairing approvals (B2) |
+| telemetry.json | `post_var` / `post_wh` | `true` / `true` | VAr + cumulative-Wh MirrorMeterReadings |
+| openadr.json | *(new file)* | `vtn_url:""` | "" = uncommissioned idle (telemetry pattern); metrics :9108 |
+
+Bench-deferred (hardware/paired-sim work, tracked in `VERIFICATION_SWEEP.md`): adv-shell
+shadow soak · AUS shadow week · 1.6 evsim · PIN mismatch drill · COMM-004 pcaps ·
+dersite/PUT + LogEvent vs gridsim (needs gridsim endpoints) · lexa-openadr deploy wiring.
 
 ## Critical invariants
 

@@ -16,14 +16,14 @@ Status legend: ⬜ pending · 🔵 in progress · ✅ done (tests green) · 🟠
 | WP-7 | PIN verify + Table 27 codes | S | 1 | ✅ ea8b228 | 252 + 13/14 are documented seams; bench config keeps legacy 0xF0 until gridsim flips |
 | WP-8 | Advanced-control carriage northbound | M | 2 | ✅ 619494c | BUS LANE; retires extended→simple silent drop |
 | WP-9 | Adv desired doc + hub authoring | M | 8 | ✅ eae6b4d | BUS LANE; `advanced_der` flag |
-| WP-10 | Advanced reconciler execution | L | 9 | 🔵 | `reconciler.adv` off/shadow/active; closes BASIC-004..012 exec half |
+| WP-10 | Advanced reconciler execution | L | 9 | ✅ bd6190e | `reconciler.adv` off/shadow/active; closes BASIC-004..012 exec half |
 | WP-11 | GenLimW/LoadLimW enforcement (AUS) | M | 8 | ✅ 593620a | cascade+shadow pair; `enforce_aus_limits` |
 | WP-12 | OCPP 1.6J dual-stack | M/L | 1 | ✅ fcdd98e | 2.0.1 path byte-identical |
-| WP-13 | Pairing gate + ClearChargingProfile | M | 12 (+bus slot after 9) | 🔵 | closes R8 |
-| WP-14 | V2G type enablers | M | 9,13 (bus lane tail) | ⬜ | `ev_storage`; flag-off byte-identical plans |
-| WP-15 | lexa-openadr service | L | 2 (+bus slot last) | 🟡 c9c2984 svc half | metrics :9108; pure Go |
+| WP-13 | Pairing gate + ClearChargingProfile | M | 12 (+bus slot after 9) | ✅ 205e90c | closes R8; `pairing_mode`; apicontract /devices pinned |
+| WP-14 | V2G type enablers | M | 9,13 (bus lane tail) | ✅ 776845c | `ev_storage`; flag-off byte-identical plans |
+| WP-15 | lexa-openadr service | L | 2 (+bus slot last) | ✅ c9c2984+6adb74f | svc half + hub-adoption slice (D9); metrics :9108; pure Go |
 | WP-16 | CSIP-AUS checklist + verify-sweep docs | S | 11 | ✅ | AUS spec-gap disclosure; `CSIP_AUS_CHECKLIST.md` + `VERIFICATION_SWEEP.md` |
-| WP-17 | Integration & verification gate | M | all | ⬜ | ACL re-derive (incl. pre-existing lexa-api certstatus gap), envelope audit, -race+arm64, apicontract, CLAUDE.md updates |
+| WP-17 | Integration & verification gate | M | all | ✅ | ACL re-derive (8 rows added), envelope/Finite audit clean, -race+cmd+vet+arm64 green, apicontract green, CLAUDE.md updated |
 
 Bus-lane serialization (internal/bus/{messages,desired,topics,envelope}.go): WP-2 → WP-8 → WP-9 →
 WP-13(slice) → WP-14 → WP-15(slice). One owner at a time.
@@ -40,3 +40,59 @@ must still provision /etc/lexa/mqtt/openadr.pass + patch openadr.json creds + in
 unit + a client_secret_file, per architecture §2.3's deploy note — tracked separately).
 
 Vendor quirks for next proto bump: (WP-4) csipmodel DERList lacks pollRate; DERCapability/Settings lack rtg/setMaxWh; DERStatus lacks alarmStatus; derreport parses putResult error strings for 404/405 — switch to typed error when tlsclient gains one. (WP-5) csipmodel KindVoltage=12 collides with 2030.5 KindType energy(12); KindFreq=38 is not a KindType member. Telemetry uses local spec-correct constants meanwhile.
+
+## Campaign status (WP-17 gate, 2026-07-14)
+
+**Code-complete: all 17 WPs landed and verified.** Tree is releasable; every WP is
+additive + feature-flagged, product defaults fail-closed (byte-identical to
+pre-campaign behavior). Verification (branch `standards-buildout`, `GOWORK=off`):
+
+- `make test` (-race, ./internal/...): **PASS, 0 FAIL**.
+- `go test ./cmd/...`: **PASS** (12 packages, incl. cgo northbound/telemetry with host wolfSSL).
+- `go vet ./...`: **clean**. `gofmt -l`: **empty**.
+- Cross-compile: 5 pure-Go arm64 binaries (hub/modbus/ocpp/api/openadr) + host-CGo
+  northbound/telemetry — **all build** (arm64 wolfSSL sysroot is a bench step, deferred).
+- apicontract drift gate (`make contract`): **green** (13 contract tests incl. `Pairing`).
+- ACL re-derived from every Subscribe/Publish call site: **8 gap rows added** to
+  `systemd/mosquitto-lexa.acl` (northbound `write certstatus`; api `read certstatus`
+  §0.3; modbus `write reconcile/adv` + `read reconcile/{battery,solar,adv}`; ocpp `read
+  reconcile/evse`; hub `read hub/mode`). Envelope/SupportedV/Finite audit: **no gaps**
+  (every family has a const + arm; DesiredAdvanced arm precedes `lexa/desired/`; all
+  `*float64` types wired through mqttutil.Subscribe have comprehensive Finite()).
+  FLASH_BUDGET: **no per-tick Info logging** at product defaults (verbose reconcile-adv/
+  adv logs are behind opt-in bench flags, edge/transition-gated).
+
+**Flag inventory + shipped defaults** (mirrors architecture §3; also in CLAUDE.md
+"Standards build-out" section):
+
+| File | Key | Default |
+|---|---|---|
+| northbound.json | `registration_pin` | `0` (disabled+WARN) |
+| northbound.json | `der_report` | `true` |
+| northbound.json | `legacy_cannotcomply_code` | loader `false`; **bench config ships `true`** until gridsim flips |
+| northbound.json | `redirect_max` | `3` |
+| hub.json | `advanced_der` | `"off"` |
+| hub.json | `enforce_aus_limits` | `false` |
+| hub.json | `ev_storage` | `false` |
+| hub.json | `logevent_min_interval_s` | `10` |
+| hub.json | `der_type` | `0` (derive) |
+| hub.json | `openadr_adopt` / `openadr_price_max_age_s` | `true` / `3600` |
+| modbus.json | `reconciler.adv` | `"off"` |
+| ocpp.json | `port_16` | `0` (1.6J off) |
+| ocpp.json | `pairing_mode` | `""` ⇒ gated (product) / open (bench) |
+| ocpp.json | `allowlist_path` | `/var/lib/lexa/ocpp-allowlist.json` |
+| telemetry.json | `post_var` / `post_wh` | `true` / `true` |
+| openadr.json | `vtn_url` | `""` (uncommissioned idle) |
+
+**Ordered bench-deferred queue** (from `VERIFICATION_SWEEP.md`; earlier = cheaper/
+prerequisite):
+
+1. **PIN mismatch drill** — arm `registration_pin` vs a mismatching Test Server; confirm D4 fail-closed (held control, suspended egress, `pin_ok`/gauge).
+2. **COMM-004 D–G pcaps** — blocked on 7 cert-chain fixtures + a `UseCertificateChainFile` wrapper in csip-tls-test (paired work item).
+3. **ERR-001 redirect bench check** — blocked on a redirect-injection `/admin/malform` kind in gridsim (paired work item).
+4. **dersite/PUT + LogEvent vs gridsim** — gridsim needs PUT + LogEventList endpoints (paired work item; blocks WP-4/WP-6 bench validation).
+5. **CannotComply code-flip pairing** — flip `legacy_cannotcomply_code` → false with gridsim's expectation updated same session (currently bench ships `true`).
+6. **AUS shadow week** — ≥1-week `constraint_shadow` zero-diff before any `enforce_aus_limits` default-flip proposal.
+7. **adv-shell shadow soak** — `reconciler.adv` shadow→active against real inverter hardware (unvalidatable in sim alone, RSK-08).
+8. **1.6 evsim** — OCPP 1.6J evsim vs `port_16` dual-stack; 2.0.1 byte-identical preserved.
+9. **lexa-openadr deploy wiring** — `deploy-hub-pi.sh` must provision `/etc/lexa/mqtt/openadr.pass`, patch `openadr.json` creds, install/enable the unit + `client_secret_file` (service half shipped without script changes).

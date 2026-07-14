@@ -9,6 +9,9 @@
   "debug": false,
   "enforce_aus_limits": false,
   "ev_storage": false,
+  "advanced_der": "off",
+  "logevent_min_interval_s": 10,
+  "der_type": 0,
   "constraint_shadow": false,
   "constraint_modes": {
     "export": "off",

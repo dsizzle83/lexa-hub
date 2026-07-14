@@ -62,6 +62,18 @@ topic write lexa/scan/result
 # the device-level breach evidence feeding breachEpisodes/CannotComply.
 topic write lexa/reconcile/battery/+/report
 topic write lexa/reconcile/solar/+/report
+# bus.ReconcileReportTopic(advClass, dev) (WP-10) — the advanced-DER reconciler
+# shell (cmd/modbus/reconcile_adv.go:1817) publishes per-device axis/adopt_state/
+# curve_hash verdicts here; the hub's SubReconcileReport wildcard matches it.
+topic write lexa/reconcile/adv/+/report
+# The reconciler shells READ their own report topic once at active-mode startup
+# (healStaleRetainedReport, cmd/modbus/main.go:198/245/297) to heal a retained
+# NonConvergedBegin orphaned by a crash between Begin and End. Surfaced by the
+# WP-17 re-derivation: only the write grants above existed, so under enforcement
+# the heal probe's one-shot subscribe was silently denied.
+topic read lexa/reconcile/battery/+/report
+topic read lexa/reconcile/solar/+/report
+topic read lexa/reconcile/adv/+/report
 
 user lexa-northbound
 # bus.TopicCSIPControl (retained) — resolved CSIP DERControl limits.
@@ -78,6 +90,13 @@ topic write lexa/csip/flowreservation/status
 topic write lexa/csip/curves
 # bus.TopicNorthboundSchedule (retained) — resolved 24h DER schedule.
 topic write lexa/northbound/schedule
+# bus.TopicNorthboundCertStatus (retained, TASK-072) — northbound's cert-expiry
+# monitor (cmd/northbound/certmon.go:276) publishes the client/CA PEM leaf
+# status here; lexa-api and lexa-cloudlink read it. Surfaced by the WP-17
+# re-derivation: the WRITER grant was never present, so under enforcement the
+# certstatus doc (and /status's cert_status projection) would silently never
+# publish (RSK-09 pattern).
+topic write lexa/northbound/certstatus
 # bus.TopicCSIPComplianceAlert — hub → northbound CannotComply trigger.
 topic read lexa/csip/compliance/alert
 # bus.TopicCSIPFRRequest — hub → northbound (RSK-09: the other easy-to-miss
@@ -197,6 +216,12 @@ topic write lexa/intent/result
 # writer (authoritative mode state; lexa-api and lexa-cloudlink only read it,
 # see their stanzas).
 topic write lexa/hub/mode
+# bus.TopicHubMode (retained) — the hub ALSO subscribes its own mode topic to
+# re-seed authoritative mode after a restart (cmd/hub/main.go:1058, modeMgr
+# onModeStatus; sole writer, in-code echo-guarded). Surfaced by the WP-17 ACL
+# re-derivation: only the write grant above existed, so under enforcement
+# (WS-1 default) the retained re-seed was silently dropped (RSK-09 pattern).
+topic read lexa/hub/mode
 
 # bus.SubReconcileReport (TASK-031) — hub re-seeds breach-episode state
 # from the retained reconciler verdicts (HOTFIX 2026-07-09, see modbus
@@ -225,6 +250,12 @@ topic read lexa/ocpp/pairing
 # bus.ReconcileReportTopic("evse", station) (TASK-030/031) — EVSE
 # reconciler verdicts (HOTFIX 2026-07-09, see modbus stanza note).
 topic write lexa/reconcile/evse/+/report
+# The EVSE reconciler shell READS its own report topic once at active-mode
+# startup (healStaleRetainedReport, cmd/ocpp/main.go:214) to heal a retained
+# NonConvergedBegin orphaned by a crash. Surfaced by the WP-17 re-derivation:
+# only the write grant above existed, so under enforcement the heal probe's
+# one-shot subscribe was silently denied.
+topic read lexa/reconcile/evse/+/report
 
 user lexa-telemetry
 # bus.SubMeasurements — telemetry posts MUP measurements upstream over CSIP.
@@ -243,6 +274,11 @@ topic read lexa/csip/control
 topic read lexa/evse/+/state
 # bus.TopicNorthboundSchedule (retained).
 topic read lexa/northbound/schedule
+# bus.TopicNorthboundCertStatus (retained, TASK-072) — GET /status cert_status
+# projection (cmd/api/main.go:180 onCertStatus). The documented pre-existing
+# gap (architecture §0.3): the only certstatus read grant lived in the
+# lexa-cloudlink stanza; lexa-api subscribes it but had none. Fixed in WP-17.
+topic read lexa/northbound/certstatus
 # bus.TopicHubPlan (retained).
 topic read lexa/hub/plan
 # bus.TopicHubSettings (retained, GAP-8) — GET /status reserve+tariff read-back
