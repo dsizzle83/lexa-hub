@@ -129,7 +129,9 @@ func Init(r *sunspec.Reader, tag string) (Base, error) {
 //	W > 0  power flowing from grid into site (import)
 //	W < 0  power flowing from site into grid (export)
 //
-// Fields set to math.NaN() are not available from this device.
+// Fields set to math.NaN() are not available from this device; pointer
+// fields are nil when not available (the legacy 103 path, or a 701 device
+// that leaves the point unimplemented).
 type Measurements struct {
 	// AC-side
 	W   float64 // net AC real power (watts)
@@ -148,6 +150,21 @@ type Measurements struct {
 
 	// Storage (batteries only; NaN if not applicable)
 	SOC float64 // state of charge (0–100 %)
+
+	// DER operational state (model 701 only; nil on the legacy 10x path and
+	// for 701 points the device leaves unimplemented — sentinel-checked, so a
+	// nil here is "not reported", never a mistaken 0).
+	OpSt   *uint16 // 701 St: operating state (0=off, 1=on)
+	InvSt  *uint16 // 701 InvSt: inverter state (0..7)
+	ConnSt *uint16 // 701 ConnSt: 0=disconnected, 1=connected
+	Alrm   *uint32 // 701 Alrm: alarm bitfield (raw; mapping happens hub-side)
+
+	// Lifetime energy accumulators (Wh); NaN when the device doesn't report
+	// them. Import/export follow the DEVICE's own perspective (matching W's
+	// sign convention above): import = energy absorbed (battery charging),
+	// export = energy injected (generating/discharging).
+	WhImpTotal float64 // total energy absorbed (701 TotWhAbs)
+	WhExpTotal float64 // total energy injected (701 TotWhInj)
 }
 
 // ReadMeasurementsM701 parses model 701 into Measurements.
@@ -157,7 +174,27 @@ func ReadMeasurementsM701(regs []uint16) Measurements {
 	if math.IsNaN(v) {
 		v = m.VL1
 	}
-	return Measurements{W: m.W, V: v, Hz: m.Hz, VA: m.VA, Var: m.Var, PF: m.PF, TmpCab: m.TmpCab, SOC: math.NaN()}
+	out := Measurements{
+		W: m.W, V: v, Hz: m.Hz, VA: m.VA, Var: m.Var, PF: m.PF, TmpCab: m.TmpCab, SOC: math.NaN(),
+		WhImpTotal: m.TotWhAbs, WhExpTotal: m.TotWhInj,
+	}
+	// St/InvSt/ConnSt/Alrm ride Parse701 as plain integers, which cannot
+	// distinguish 0 from "not implemented" — re-check presence through the
+	// layout view (ok=false on absent or sentinel) before adopting them.
+	lv := sunspec.L701.View(regs)
+	if st, ok := lv.Enum("St"); ok {
+		out.OpSt = &st
+	}
+	if ist, ok := lv.Enum("InvSt"); ok {
+		out.InvSt = &ist
+	}
+	if cst, ok := lv.Enum("ConnSt"); ok {
+		out.ConnSt = &cst
+	}
+	if alrm, ok := lv.U32("Alrm"); ok {
+		out.Alrm = &alrm
+	}
+	return out
 }
 
 // ReadMeasurementsACModel parses legacy Model 10x (101/102/103).
@@ -169,7 +206,10 @@ func ReadMeasurementsACModel(regs []uint16) Measurements {
 		return 0
 	}
 	sf := func(off int) int16 { return int16(get(off)) }
-	m := Measurements{TmpCab: math.NaN(), SOC: math.NaN()}
+	// Model 10x has no St/InvSt/ConnSt/Alrm or lifetime-Wh points that map
+	// onto the 701 semantics — the state pointers stay nil and the energy
+	// accumulators stay NaN (absent, per the struct doc).
+	m := Measurements{TmpCab: math.NaN(), SOC: math.NaN(), WhImpTotal: math.NaN(), WhExpTotal: math.NaN()}
 	if len(regs) > sunspec.M103_W_SF {
 		m.W = sunspec.ApplyScaleSigned(get(sunspec.M103_W), sf(sunspec.M103_W_SF))
 	}

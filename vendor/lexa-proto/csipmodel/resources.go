@@ -459,6 +459,17 @@ const (
 	ResponseEventCancelled  uint8 = 6 // event cancelled by the server (CORE-022)
 	ResponseEventSuperseded uint8 = 7 // event superseded by an overlapping event (CORE-023)
 
+	// Remaining Table 27 lifecycle / rejection statuses (CORE-022/023 code
+	// discipline — the standard vocabulary the LEXA 0xF0 extension below is
+	// being migrated onto; see the responses tracker's D5 mapping).
+	ResponsePartialOptOut   uint8 = 8   // event partially completed (user/DER opt-out during the interval)
+	ResponseNoParticipation uint8 = 10  // event interval elapsed with no participation
+	ResponseAbortedServer   uint8 = 13  // event aborted — server cancelled/deleted it
+	ResponseAbortedProgram  uint8 = 14  // event aborted — superseding program change
+	ResponseRejectedParam   uint8 = 252 // rejected — parameter not applicable to this DER
+	ResponseRejectedInvalid uint8 = 253 // rejected — invalid/out-of-range event content
+	ResponseRejectedExpired uint8 = 254 // rejected — event already expired at receipt
+
 	// ResponseCannotComply is a LEXA profile extension (NOT an IEEE 2030.5
 	// Table 27 status). It alerts the server that the DER physically cannot meet
 	// an active control limit — e.g. an import cap that would require battery
