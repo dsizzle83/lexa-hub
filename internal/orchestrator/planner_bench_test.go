@@ -41,7 +41,7 @@ func constrainedBenchParams() PlannerParams {
 	p := benchParams()
 	cons := make([]StepConstraint, planSteps)
 	for i := range cons {
-		cons[i] = StepConstraint{ExpLimW: math.NaN(), ImpLimW: math.NaN(), MaxLimW: math.NaN(), FixedW: math.NaN()}
+		cons[i] = StepConstraint{ExpLimW: math.NaN(), ImpLimW: math.NaN(), MaxLimW: math.NaN(), FixedW: math.NaN(), GenLimW: math.NaN(), LoadLimW: math.NaN()}
 	}
 	for i := 24; i < 48; i++ { // 2h export limit
 		cons[i].ExpLimW = 2000

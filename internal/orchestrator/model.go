@@ -169,6 +169,24 @@ type GridState struct {
 	ImportLimitW float64 // max watts we may draw from grid
 	ExportLimitW float64 // max watts we may push to grid
 	MaxLimitW    float64 // absolute generation cap (OpModMaxLimW)
+
+	// CSIP-AUS dynamic-envelope axes (WP-11). NaN = no limit imposed.
+	// Unlike the three limits above these have no DERControlBase leg:
+	// opModGenLimW/opModLoadLimW are EXTENDED controls, carried on
+	// bus.ActiveControl (gen_lim_w/load_lim_w, WP-8) and adopted here
+	// UNCONDITIONALLY by cmd/hub's reader — adoption is never gated;
+	// ENFORCEMENT is what hub.json's `enforce_aus_limits` flag gates
+	// (DefaultOptimizer.EnforceAusLimits).
+	//
+	// GenLimitW caps GROSS site generation — solar output PLUS battery
+	// discharge — which is deliberately distinct from MaxLimitW
+	// (opModMaxLimW), an inverter-OUTPUT-only ceiling. LoadLimitW caps GROSS
+	// site load — home consumption + EV charging + battery charging — which
+	// is deliberately distinct from ImportLimitW (opModImpLimW), a net cap at
+	// the meter that battery discharge can satisfy (discharge cannot satisfy
+	// a load cap: it reduces import, not consumption).
+	GenLimitW  float64 // max gross generation (W) — opModGenLimW (CSIP-AUS)
+	LoadLimitW float64 // max gross load (W) — opModLoadLimW (CSIP-AUS)
 }
 
 // CSIPControlState summarises the currently-active CSIP control signal.
@@ -329,7 +347,7 @@ type Decision struct {
 // Response so the grid server knows the DER is resource-limited, not faulty.
 type ComplianceBreach struct {
 	MRID       string  // active DERControl that cannot be met
-	LimitType  string  // "import" | "export" | "generation"
+	LimitType  string  // "import" | "export" | "generation" | "generation-aus" | "load-aus"
 	LimitW     float64 // commanded limit (W)
 	MeasuredW  float64 // actual net/generation at the meter (W)
 	ShortfallW float64 // how far over the limit, after all levers (W)
@@ -386,5 +404,7 @@ func NewGridState() GridState {
 		ImportLimitW: math.NaN(),
 		ExportLimitW: math.NaN(),
 		MaxLimitW:    math.NaN(),
+		GenLimitW:    math.NaN(),
+		LoadLimitW:   math.NaN(),
 	}
 }

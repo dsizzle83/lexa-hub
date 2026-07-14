@@ -7,13 +7,16 @@
   "metrics_addr": "",
   "engine_interval_s": 15,
   "debug": false,
+  "enforce_aus_limits": false,
   "constraint_shadow": false,
   "constraint_modes": {
     "export": "off",
     "gen": "off",
     "import": "off",
     "economics": "off",
-    "battery_safety": "off"
+    "battery_safety": "off",
+    "gen_aus": "off",
+    "load_aus": "off"
   },
   "mode": "optimizer",
   "gateway": {

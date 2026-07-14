@@ -104,6 +104,14 @@ type StepConstraint struct {
 	ImpLimW    float64 // max net import from grid (W)
 	MaxLimW    float64 // total generation cap (W)
 	FixedW     float64 // fixed battery dispatch (W); NaN → DP chooses freely
+
+	// CSIP-AUS dynamic-envelope axes (WP-11), carried on DERScheduleSlot
+	// since WP-8. GenLimW caps gross generation (solar + battery discharge);
+	// LoadLimW caps gross load (home + EV + battery charge). NaN =
+	// unconstrained — construction sites MUST set NaN explicitly (a zero
+	// value is a real 0 W cap, not absence), same as every field above.
+	GenLimW  float64 // max gross generation (W) — opModGenLimW
+	LoadLimW float64 // max gross load (W) — opModLoadLimW
 }
 
 // PlanInterval is the cost-optimised dispatch target for one 5-min slot.
@@ -460,6 +468,31 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 								continue
 							}
 						}
+						// CSIP-AUS gross-generation cap (WP-11): solar plus
+						// battery discharge — here the "gen includes battery
+						// discharge" formula is the cap's actual definition
+						// (for MaxLimW above it is a conservative planning
+						// approximation of an inverter-output cap).
+						if !math.IsNaN(c.GenLimW) {
+							gen := solarKw
+							if battKwEff > 0 {
+								gen += battKwEff
+							}
+							if gen > c.GenLimW/1000+1e-6 {
+								continue
+							}
+						}
+						// CSIP-AUS gross-load cap (WP-11): home load plus EV
+						// draw plus battery charge.
+						if !math.IsNaN(c.LoadLimW) {
+							load := loadKw + evKw
+							if battKwEff < 0 {
+								load += -battKwEff
+							}
+							if load > c.LoadLimW/1000+1e-6 {
+								continue
+							}
+						}
 
 						// Step cost.
 						var stepCost float64
@@ -631,7 +664,7 @@ func planStepConstraint(p PlannerParams, t int) StepConstraint {
 		c := p.DERConstraints[t]
 		return c
 	}
-	return StepConstraint{ExpLimW: math.NaN(), ImpLimW: math.NaN(), MaxLimW: math.NaN(), FixedW: math.NaN()}
+	return StepConstraint{ExpLimW: math.NaN(), ImpLimW: math.NaN(), MaxLimW: math.NaN(), FixedW: math.NaN(), GenLimW: math.NaN(), LoadLimW: math.NaN()}
 }
 
 func planStepSolar(p PlannerParams, t int) float64 {

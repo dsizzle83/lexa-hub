@@ -126,6 +126,18 @@ type Config struct {
 	SafetyIntervalS int  `json:"safety_interval_s"` // fast protection loop; default 1, 0 disables
 	Debug           bool `json:"debug"`
 
+	// EnforceAusLimits gates the WP-11 CSIP-AUS dynamic-envelope cascade
+	// rules (opModGenLimW gross-generation / opModLoadLimW gross-load caps)
+	// in the legacy DefaultOptimizer, plus the planner-side StepConstraint
+	// mapping of the schedule's gen_lim_w/load_lim_w slots. Default false:
+	// the limits are still ADOPTED into GridState by the reader (state.go —
+	// adoption is unconditional) and OBSERVED by the "gen_aus"/"load_aus"
+	// shadow constraints whenever constraint_shadow is on, but never
+	// enforced/actuated — flag-off plans are byte-identical to pre-WP-11.
+	// Shadow-first discipline (docs/standards-buildout/architecture.md §6):
+	// ≥1 week bench shadow before any default-flip proposal.
+	EnforceAusLimits bool `json:"enforce_aus_limits"`
+
 	// ConstraintShadow enables the observe-only constraint-stack shadow harness
 	// (TASK-059): every economic tick runs the candidate constraint Stack
 	// ALONGSIDE the authoritative DefaultOptimizer, diffs their final per-device
@@ -292,6 +304,8 @@ var constraintKeys = map[string]string{
 	"import":         "import",
 	"economics":      "economics",
 	"battery_safety": "battery-safety",
+	"gen_aus":        "gen-aus",  // WP-11 CSIP-AUS gross-generation cap mirror
+	"load_aus":       "load-aus", // WP-11 CSIP-AUS gross-load cap mirror
 }
 
 // ResolveConstraintModes validates cfg.ConstraintModes against constraintKeys
@@ -323,7 +337,7 @@ func (c *Config) ResolveConstraintModes() (map[string]ConstraintMode, error) {
 	}
 	for key, mode := range c.ConstraintModes {
 		if _, known := constraintKeys[key]; !known {
-			return nil, fmt.Errorf("constraint_modes: unknown key %q (want one of export|gen|import|economics|battery_safety)", key)
+			return nil, fmt.Errorf("constraint_modes: unknown key %q (want one of export|gen|import|economics|battery_safety|gen_aus|load_aus)", key)
 		}
 		switch mode {
 		case ModeOff, ModeShadow, ModeActive:

@@ -620,11 +620,11 @@ func (w *Wrapper) attributeAndFilter(axes []AxisDivergence, authors map[string]s
 }
 
 // breachOwner maps a ComplianceBreach.LimitType to the constraint Name() that
-// authors it — the only three compliance constraints that ever set
-// Plan.Breach (export.go, genlimit.go, importlimit.go). Empty for any other
-// (unrecognised) LimitType, which never matches an active constraint name and
-// so is treated as not-active-owned — the conservative, fail-toward-shadow
-// choice.
+// authors it — the compliance constraints that ever set Plan.Breach
+// (export.go, genlimit.go, importlimit.go, plus WP-11's genlimaus.go and
+// loadlimaus.go). Empty for any other (unrecognised) LimitType, which never
+// matches an active constraint name and so is treated as not-active-owned —
+// the conservative, fail-toward-shadow choice.
 func breachOwner(limitType string) string {
 	switch limitType {
 	case "export":
@@ -633,6 +633,10 @@ func breachOwner(limitType string) string {
 		return "gen"
 	case "import":
 		return "import"
+	case "generation-aus":
+		return "gen-aus"
+	case "load-aus":
+		return "load-aus"
 	default:
 		return ""
 	}

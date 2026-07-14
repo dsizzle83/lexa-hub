@@ -195,10 +195,12 @@ func TestPlan_ExportLimit_Respected(t *testing.T) {
 	p.DERConstraints = make([]StepConstraint, planSteps)
 	for i := range p.DERConstraints {
 		p.DERConstraints[i] = StepConstraint{
-			ExpLimW: 1000,
-			ImpLimW: math.NaN(),
-			MaxLimW: math.NaN(),
-			FixedW:  math.NaN(),
+			ExpLimW:  1000,
+			ImpLimW:  math.NaN(),
+			MaxLimW:  math.NaN(),
+			FixedW:   math.NaN(),
+			GenLimW:  math.NaN(),
+			LoadLimW: math.NaN(),
 		}
 	}
 
@@ -217,6 +219,92 @@ func TestPlan_ExportLimit_Respected(t *testing.T) {
 	}
 	if !charged {
 		t.Error("battery never charged — plan is infeasible/degenerate, not actually holding the cap")
+	}
+}
+
+// ── Plan: CSIP-AUS gross-generation / gross-load envelope (WP-11) ─────────────
+
+// A GenLimW envelope caps gross generation — solar PLUS battery discharge — so
+// the DP must never schedule a discharge that pushes solar+discharge over it,
+// even during peak hours when discharging is maximally profitable.
+func TestPlan_AusGenLim_CapsDischargePlusSolar(t *testing.T) {
+	p := plannerTestBase()
+	p.BattCapacityKwh = 10
+	p.BattMaxChargeKw = 5
+	p.BattMaxDischargeKw = 5
+	p.InitialBattSocKwh = 9 // nearly full — peak discharge is attractive
+	p.TerminalSocKwh = 2    // allowed to run down
+	p.LoadForecastKw = 1.0
+
+	// Constant 1 kW solar all day (simplest gross-gen contribution).
+	p.SolarForecastKw = make([]float64, planSteps)
+	for i := range p.SolarForecastKw {
+		p.SolarForecastKw[i] = 1.0
+	}
+
+	// Gross-generation cap 2 kW on every step: with 1 kW solar the battery may
+	// discharge at most 1 kW.
+	p.DERConstraints = make([]StepConstraint, planSteps)
+	for i := range p.DERConstraints {
+		p.DERConstraints[i] = StepConstraint{
+			ExpLimW: math.NaN(), ImpLimW: math.NaN(), MaxLimW: math.NaN(),
+			FixedW: math.NaN(), GenLimW: 2000, LoadLimW: math.NaN(),
+		}
+	}
+
+	plan := NewDailyPlanner().Plan(p)
+	for i, iv := range plan.Intervals {
+		if math.IsNaN(iv.BattSetpointW) {
+			continue
+		}
+		gross := 1000.0 + math.Max(0, iv.BattSetpointW)
+		if gross > 2000+50 {
+			t.Errorf("step %d: gross generation %.0fW exceeds the 2000W GenLimW envelope (batt=%.0f)", i, gross, iv.BattSetpointW)
+		}
+	}
+}
+
+// A LoadLimW envelope caps gross load — site load plus battery charge — so the
+// DP must never schedule a grid charge that pushes load+charge over it, even
+// when overnight prices make charging maximally attractive.
+func TestPlan_AusLoadLim_CapsChargePlusLoad(t *testing.T) {
+	p := plannerTestBase()
+	// Fine SOC step (the TestPlan_ExportLimit_Respected precedent): at a
+	// coarse step the snapped effective charge power quantises above the
+	// envelope's 2 kW headroom and the DP can only ever sit idle.
+	p.SOCStepKwh = 0.1
+	p.BattCapacityKwh = 10
+	p.BattMaxChargeKw = 5
+	p.BattMaxDischargeKw = 5
+	p.InitialBattSocKwh = 1 // nearly empty — overnight charging is attractive
+	p.LoadForecastKw = 1.0
+
+	// Gross-load cap 3 kW on every step: with 1 kW site load the battery may
+	// charge at most 2 kW.
+	p.DERConstraints = make([]StepConstraint, planSteps)
+	for i := range p.DERConstraints {
+		p.DERConstraints[i] = StepConstraint{
+			ExpLimW: math.NaN(), ImpLimW: math.NaN(), MaxLimW: math.NaN(),
+			FixedW: math.NaN(), GenLimW: math.NaN(), LoadLimW: 3000,
+		}
+	}
+
+	plan := NewDailyPlanner().Plan(p)
+	charged := false
+	for i, iv := range plan.Intervals {
+		if math.IsNaN(iv.BattSetpointW) {
+			continue
+		}
+		load := 1000.0 + math.Max(0, -iv.BattSetpointW)
+		if load > 3000+50 {
+			t.Errorf("step %d: gross load %.0fW exceeds the 3000W LoadLimW envelope (batt=%.0f)", i, load, iv.BattSetpointW)
+		}
+		if iv.BattSetpointW < -100 {
+			charged = true
+		}
+	}
+	if !charged {
+		t.Error("battery never charged — the plan is degenerate, not actually honoring the envelope while dispatching")
 	}
 }
 
@@ -353,6 +441,8 @@ func TestPlan_Disconnect_ForcesZero(t *testing.T) {
 			ImpLimW:    math.NaN(),
 			MaxLimW:    math.NaN(),
 			FixedW:     math.NaN(),
+			GenLimW:    math.NaN(),
+			LoadLimW:   math.NaN(),
 		}
 	}
 

@@ -143,7 +143,7 @@ type RewalkRequest struct {
 type ComplianceAlert struct {
 	Envelope
 	MRID       string  `json:"mrid"`        // active DERControl that cannot be met
-	LimitType  string  `json:"limit_type"`  // "import" | "export" | "generation"
+	LimitType  string  `json:"limit_type"`  // "import" | "export" | "generation" | "generation-aus" | "load-aus" (WP-11)
 	LimitW     float64 `json:"limit_w"`     // commanded limit (W)
 	MeasuredW  float64 `json:"measured_w"`  // actual net/generation at the meter (W)
 	ShortfallW float64 `json:"shortfall_w"` // how far over the limit (W)

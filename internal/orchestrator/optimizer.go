@@ -51,6 +51,29 @@ type genGuard struct {
 	overCount    int     // consecutive ticks measured generation stayed over the cap
 }
 
+// ausGenGuard carries per-cap-session state for the CSIP-AUS gross-generation
+// rule's closed-loop convergence check (WP-11). Mirrors genGuard field-for-field
+// — same tolerance-band session tracking, same leaky counter — but over GROSS
+// generation (solar + battery discharge), the quantity opModGenLimW caps.
+type ausGenGuard struct {
+	activeLimitW float64 // cap value when guard was reset; NaN = no active cap
+	overCount    int     // consecutive ticks measured GROSS generation stayed over the cap
+}
+
+// ausLoadGuard carries per-cap-session state for the CSIP-AUS gross-load rule
+// (WP-11). Mirrors importGuard's shape: without sticky state the EV lever would
+// fire only when gross load strictly exceeds the cap, the EV-charging rule
+// would restore full current the next tick, and the system would oscillate at
+// the tick period (the exact failure importGuard's doc describes). The whole
+// guard — including breachTicks — resets together on a MEANINGFUL cap-value
+// change, the same single reset domain applyImportLimitRule uses.
+type ausLoadGuard struct {
+	activeLimitW float64 // limit value when guard was reset; NaN = no active limit
+	evLimitA     float64 // sticky EV current ceiling (A); NaN = EV lever not engaged
+	safeCount    int     // consecutive ticks gross load ≤ hard cap (EV relax gate)
+	breachTicks  int     // leaky convergence counter with NaN-hold semantics
+}
+
 // genBreachTicks is how many ticks measured generation may stay over the cap
 // (after curtailment is commanded) before the hub reports a CannotComply. Long
 // enough to ride out a normal inverter ramp-down (1–2 ticks, further softened by
@@ -72,6 +95,19 @@ const genBreachTicks = 3
 const (
 	battConvergeFrac = 0.5
 	battBreachTicks  = 3
+)
+
+// ausGenBreachTicks / ausLoadBreachTicks are how many ticks measured GROSS
+// generation / GROSS load may stay over the CSIP-AUS cap (WP-11) before the
+// hub reports a CannotComply. Same value and leaky accumulation as their
+// direct templates (genBreachTicks / importBreachTicks): long enough to ride
+// out a normal inverter ramp-down or EV soft-stop, short enough that the
+// detect→alert→northbound CannotComply chain completes inside a tight
+// compliance window. Scaled by scaleTicks like every other tick-denominated
+// threshold so the wall-clock latency is cadence-invariant.
+const (
+	ausGenBreachTicks  = 3
+	ausLoadBreachTicks = 3
 )
 
 // DefaultOptimizer is a rule-based + heuristic optimizer.
@@ -149,6 +185,21 @@ type DefaultOptimizer struct {
 	// genGuard holds per-cap-session state for the generation-limit rule's
 	// measured-effect convergence check.
 	genGuard genGuard
+
+	// EnforceAusLimits gates the WP-11 CSIP-AUS dynamic-envelope cascade rules
+	// (applyAusGenerationLimitRule / applyAusLoadLimitRule + their convergence
+	// backstops) — hub.json's `enforce_aus_limits`, default false. The limits
+	// themselves are ALWAYS adopted into GridState (see GridState.GenLimitW);
+	// with the flag off, Optimize's output is byte-identical to pre-WP-11
+	// regardless of what limits are present. Set once at construction from
+	// cmd/hub; never mutated while the engine runs.
+	EnforceAusLimits bool
+
+	// ausGenGuard / ausLoadGuard hold per-cap-session state for the CSIP-AUS
+	// gross-generation / gross-load rules (WP-11). Untouched while
+	// EnforceAusLimits is false.
+	ausGenGuard  ausGenGuard
+	ausLoadGuard ausLoadGuard
 
 	// battDrainTicks counts, per battery, consecutive ticks the pack was measured
 	// discharging at/below its SOC reserve — a state no rule commands, so a
@@ -307,6 +358,8 @@ func NewDefaultOptimizer() *DefaultOptimizer {
 			activeLimitW: math.NaN(),
 		},
 		genGuard:          genGuard{activeLimitW: math.NaN()},
+		ausGenGuard:       ausGenGuard{activeLimitW: math.NaN()},
+		ausLoadGuard:      ausLoadGuard{activeLimitW: math.NaN(), evLimitA: math.NaN()},
 		battDrainTicks:    make(map[string]int),
 		battWrongDirTicks: make(map[string]int),
 		lastBattCmd:       make(map[string]float64),
@@ -319,6 +372,15 @@ type gridConstraints struct {
 	exportLimitW float64
 	importLimitW float64
 	maxLimitW    float64
+
+	// CSIP-AUS dynamic-envelope axes (WP-11). Unlike the three above they
+	// have no DERControlBase override leg: opModGenLimW/opModLoadLimW are
+	// EXTENDED controls that reach the optimizer pre-distilled on GridState
+	// (cmd/hub adopts bus.ActiveControl.gen_lim_w/load_lim_w into
+	// Grid.GenLimitW/LoadLimitW), so deriveGridConstraints copies them
+	// through unchanged. Enforcement is gated by EnforceAusLimits.
+	genLimitW  float64
+	loadLimitW float64
 }
 
 // Optimize evaluates all rules against state and returns a Plan.
@@ -381,6 +443,25 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// Closed-loop check: verify measured import actually converged to the cap.
 	o.checkImportConvergence(limits.importLimitW, state.Grid.NetW, &plan)
 
+	// Rule 3.6 (WP-11, gated on `enforce_aus_limits`): CSIP-AUS gross-
+	// GENERATION cap (opModGenLimW — NOT opModMaxLimW; see the rule's doc for
+	// the disambiguation). PLACEMENT: with the other CSIP compliance rules
+	// (AD-007: compliance > economics), and deliberately LAST of them —
+	// after the export (3), opModMaxLimW (3.1), and import (3.5) rules — so
+	// that (a) its keep-the-tighter solar-ceiling merge sees the ceilings
+	// those rules already issued, and (b) its battery-discharge participation
+	// cap sees the discharge they already committed. It runs BEFORE the
+	// economics rules (4/5/6) and bounds their autonomous TOU discharge via
+	// ausGenTOUCapW (threaded into Rule 5's maxDischargeW exactly the way the
+	// export limit threads dischargeCapW). Flag off ⇒ nothing here runs and
+	// ausGenTOUCapW stays NaN ⇒ plans byte-identical to pre-WP-11.
+	ausGenTOUCapW := math.NaN()
+	if o.EnforceAusLimits {
+		batteries, ausGenTOUCapW = o.applyAusGenerationLimitRule(state.Solar, batteries, limits.genLimitW, &plan)
+		// Closed-loop check: verify measured GROSS generation converged.
+		o.checkAusGenerationConvergence(state.Solar, state.Batteries, state.Grid.NetW, limits.genLimitW, &plan)
+	}
+
 	if !planFollowed {
 		// Rule 4: Self-consumption — route solar surplus to battery.
 		batteries, surplusW = applySelfConsumptionRule(batteries, surplusW, o.ExcessSolarThreshold, o.SOCFullThreshold, &plan)
@@ -416,6 +497,10 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 			}
 			dischargeCapW = math.Max(0, limits.exportLimitW*(1-margin)-exportNowW)
 		}
+		// WP-11: the CSIP-AUS gross-generation cap bounds autonomous TOU
+		// discharge too — battery discharge is INSIDE the capped quantity.
+		// NaN when the flag is off or no gen cap is active (nanMin no-op).
+		dischargeCapW = nanMin(dischargeCapW, ausGenTOUCapW)
 		batteries, surplusW = applyDemandResponseRule(batteries, surplusW, o.SOCReserve, false, isPeak, peakReason, dischargeCapW, &plan)
 
 		// Rule 6: EV charging allocation.
@@ -427,12 +512,37 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 		applyEVChargingRule(state.EVSEs, limits, state.Grid.NetW, solarW, surplusW, evImportSuppressed, &plan)
 	}
 
+	// Rule 3.7 (WP-11, gated on `enforce_aus_limits`): CSIP-AUS gross-LOAD cap
+	// (opModLoadLimW) + its convergence backstop. PLACEMENT: this compliance
+	// rule deliberately runs AFTER the economics rules (4/5/6) — the one
+	// deviation from the pre-economics slot the other compliance rules occupy
+	// — because a load cap must NARROW whatever charge/EV draw economics just
+	// proposed, and this cascade's rules coordinate by command OWNERSHIP
+	// (hasBatteryCommand/hasEVSECommand skips), which lets a rule own an axis
+	// but not narrow a later rule's write. Pre-economics placement would leave
+	// self-consumption (4) and EV charging (6) free to re-add the very load
+	// this rule shed — a tick-period oscillation, the exact failure
+	// importGuard's stickiness exists to kill. Running after economics and
+	// before applyRestoreRule/checkBatterySafety, it clamps the FINAL
+	// commanded charge/EV draw the same way checkBatterySafety (the other
+	// post-pass) overrides final commands: a higher tier narrowing a lower
+	// tier's output, which is AD-007's priority order expressed in cascade
+	// form. See applyAusLoadLimitRule's doc for the lever details.
+	if o.EnforceAusLimits {
+		o.applyAusLoadLimitRule(state.Solar, state.Batteries, state.EVSEs, limits.loadLimitW, state.Grid.NetW, &plan)
+		// Closed-loop check: verify measured GROSS load converged to the cap.
+		o.checkAusLoadConvergence(state.Solar, state.Batteries, state.Grid.NetW, limits.loadLimitW, &plan)
+	}
+
 	// Final: restore unconstrained devices so prior setpoints don't persist.
 	// While an export or generation cap is active the cap rules own the solar
 	// setpoints, so a dark inverter must keep its held curtailment; once both
 	// clear, the restore is queued even for dark inverters so the southbound
-	// delivers it on reconnect (see applyRestoreRule).
-	solarCapActive := !math.IsNaN(limits.exportLimitW) || !math.IsNaN(limits.maxLimitW)
+	// delivers it on reconnect (see applyRestoreRule). The WP-11 AUS gross-
+	// generation cap is a solar cap too (its ceiling must survive a dark
+	// inverter the same way), so it joins the guard when enforcement is on.
+	solarCapActive := !math.IsNaN(limits.exportLimitW) || !math.IsNaN(limits.maxLimitW) ||
+		(o.EnforceAusLimits && !math.IsNaN(limits.genLimitW))
 	applyRestoreRule(state.Solar, batteries, o.SOCReserve, solarCapActive, &plan)
 
 	// Safety backstop: force-disconnect any pack that is draining itself below the
@@ -541,6 +651,8 @@ func deriveGridConstraints(grid GridState, cc *CSIPControlState) gridConstraints
 		exportLimitW: grid.ExportLimitW,
 		importLimitW: grid.ImportLimitW,
 		maxLimitW:    grid.MaxLimitW,
+		genLimitW:    grid.GenLimitW,
+		loadLimitW:   grid.LoadLimitW,
 	}
 	if cc != nil {
 		if lim := cc.Base.OpModExpLimW; lim != nil {
@@ -1330,6 +1442,12 @@ func (o *DefaultOptimizer) checkExportLimitConvergence(exportLimitW, netW float6
 
 // applyGenLimitRule enforces an absolute generation cap (CSIP OpModMaxLimW) by
 // curtailing the inverters so total solar output stays at or below the limit.
+//
+// DISAMBIGUATION (WP-11): this rule enforces opModMaxLimW — a cap on inverter
+// OUTPUT alone, which is why its only lever is the solar ceiling and battery
+// discharge never enters its arithmetic. The CSIP-AUS opModGenLimW GROSS
+// generation cap (solar output PLUS battery discharge) is a different axis
+// with a different rule: applyAusGenerationLimitRule (auslimits.go).
 //
 // A generation cap limits inverter OUTPUT; only curtailing the inverter can
 // satisfy it (battery absorption merely hides the over-generation behind a

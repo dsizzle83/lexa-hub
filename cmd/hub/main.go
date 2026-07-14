@@ -237,6 +237,18 @@ func main() {
 	} else {
 		opt.EVImportCooldownCycles = 4
 	}
+	// WP-11: CSIP-AUS dynamic-envelope enforcement (opModGenLimW/opModLoadLimW
+	// cascade rules). Default false — the limits are adopted into GridState
+	// and shadow-observed regardless; only enforcement is flagged. The gauge
+	// makes the flag state scrapeable (the WS-8 lexa_tariff_zone_mismatch
+	// flag-visibility pattern).
+	opt.EnforceAusLimits = cfg.EnforceAusLimits
+	if cfg.EnforceAusLimits {
+		reg.Gauge("lexa_hub_aus_limits_enforced").Set(1)
+		log.Printf("lexa-hub: CSIP-AUS envelope enforcement ENABLED (enforce_aus_limits=true): opModGenLimW/opModLoadLimW cascade rules live")
+	} else {
+		reg.Gauge("lexa_hub_aus_limits_enforced").Set(0)
+	}
 
 	// TASK-059/FIX-F: the constraint-stack shadow harness + per-constraint
 	// off|shadow|active modes (TASK-060 §4 / TASK-061 §4). When
@@ -313,6 +325,23 @@ func main() {
 				active["import"] = true
 			}
 		}
+		// WP-11: the CSIP-AUS envelope mirrors. Shadow-observed whenever
+		// constraint_shadow is on (an absent constraint_modes block resolves
+		// every key to "shadow"), REGARDLESS of enforce_aus_limits — the
+		// shadow watches the axis even while the cascade does not enforce it,
+		// exactly how the export shadow ran before its flip (architecture §6).
+		if m := modes["gen_aus"]; m != ModeOff {
+			constraints = append(constraints, constraint.NewAusGenLimitConstraint())
+			if m == ModeActive {
+				active["gen-aus"] = true
+			}
+		}
+		if m := modes["load_aus"]; m != ModeOff {
+			constraints = append(constraints, constraint.NewAusLoadLimitConstraint())
+			if m == ModeActive {
+				active["load-aus"] = true
+			}
+		}
 		if m := modes["economics"]; m != ModeOff {
 			constraints = append(constraints, constraint.NewEconomicsConstraint(
 				opt.CostModel,
@@ -384,8 +413,8 @@ func main() {
 			}
 			r.Counter("lexa_constraint_active_fallback_total").Set(wrapper.ActiveFallbacks())
 		})
-		log.Printf("lexa-hub: constraint shadow ENABLED — modes: export=%s gen=%s import=%s economics=%s battery_safety=%s (panic-latch + per-axis + Tier-1 safety diff armed)",
-			modes["export"], modes["gen"], modes["import"], modes["economics"], modes["battery_safety"])
+		log.Printf("lexa-hub: constraint shadow ENABLED — modes: export=%s gen=%s import=%s economics=%s battery_safety=%s gen_aus=%s load_aus=%s (panic-latch + per-axis + Tier-1 safety diff armed)",
+			modes["export"], modes["gen"], modes["import"], modes["economics"], modes["battery_safety"], modes["gen_aus"], modes["load_aus"])
 		if len(active) > 0 {
 			names := make([]string, 0, len(active))
 			for n := range active {
@@ -876,7 +905,7 @@ func main() {
 
 	// Subscribe to northbound DER schedule → extract DER constraints for planner.
 	if err := mqttutil.Subscribe(mc, bus.TopicNorthboundSchedule, func(_ string, sched bus.DERScheduleMsg) {
-		eng.SetDERConstraints(derConstraintsFromSchedule(sched))
+		eng.SetDERConstraints(derConstraintsFromSchedule(sched, cfg.EnforceAusLimits))
 		// WP-9: the schedule is the ONLY bus carriage for opModFreqDroop
 		// parameters (WP-8's carriage seam — see droopFromSchedule in adv.go);
 		// the adv author correlates them to the active control by MRID.
@@ -1152,7 +1181,13 @@ func buildConstraintPlant(cfg *Config) constraint.Plant {
 
 // derConstraintsFromSchedule converts a DERScheduleMsg into per-step
 // StepConstraints for the daily planner.  Missing steps are left unconstrained.
-func derConstraintsFromSchedule(sched bus.DERScheduleMsg) []orchestrator.StepConstraint {
+//
+// ausLimits (WP-11, hub.json `enforce_aus_limits`) gates whether the slots'
+// CSIP-AUS gen_lim_w/load_lim_w fields (carried since WP-8) are mapped into
+// the planner envelope: with the flag off, daily plans stay byte-identical to
+// pre-WP-11 even against a schedule that carries AUS limits, matching the
+// optimizer cascade's own flag-off contract.
+func derConstraintsFromSchedule(sched bus.DERScheduleMsg, ausLimits bool) []orchestrator.StepConstraint {
 	const planStepSec = 5 * 60
 	const planSteps = 288
 
@@ -1163,10 +1198,12 @@ func derConstraintsFromSchedule(sched bus.DERScheduleMsg) []orchestrator.StepCon
 	out := make([]orchestrator.StepConstraint, planSteps)
 	for i := range out {
 		out[i] = orchestrator.StepConstraint{
-			ExpLimW: math.NaN(),
-			ImpLimW: math.NaN(),
-			MaxLimW: math.NaN(),
-			FixedW:  math.NaN(),
+			ExpLimW:  math.NaN(),
+			ImpLimW:  math.NaN(),
+			MaxLimW:  math.NaN(),
+			FixedW:   math.NaN(),
+			GenLimW:  math.NaN(),
+			LoadLimW: math.NaN(),
 		}
 	}
 
@@ -1200,6 +1237,16 @@ func derConstraintsFromSchedule(sched bus.DERScheduleMsg) []orchestrator.StepCon
 		if slot.FixedW != nil {
 			fixedW = *slot.FixedW
 		}
+		genLimW := math.NaN()
+		loadLimW := math.NaN()
+		if ausLimits {
+			if slot.GenLimW != nil {
+				genLimW = *slot.GenLimW
+			}
+			if slot.LoadLimW != nil {
+				loadLimW = *slot.LoadLimW
+			}
+		}
 
 		for i := startIdx; i < endIdx; i++ {
 			out[i] = orchestrator.StepConstraint{
@@ -1208,6 +1255,8 @@ func derConstraintsFromSchedule(sched bus.DERScheduleMsg) []orchestrator.StepCon
 				ImpLimW:    impLimW,
 				MaxLimW:    maxLimW,
 				FixedW:     fixedW,
+				GenLimW:    genLimW,
+				LoadLimW:   loadLimW,
 			}
 		}
 	}

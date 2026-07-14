@@ -339,8 +339,8 @@ func TestResolveConstraintModes_ValidationTable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if len(modes) != 5 {
-				t.Fatalf("resolved modes = %v, want all 5 keys present", modes)
+			if len(modes) != 7 {
+				t.Fatalf("resolved modes = %v, want all 7 keys present (5 originals + WP-11 gen_aus/load_aus)", modes)
 			}
 		})
 	}

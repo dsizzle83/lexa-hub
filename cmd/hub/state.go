@@ -741,6 +741,21 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 	}
 	if r.lastCSIP != nil {
 		state.CSIPControl = busToCSIPControl(r.lastCSIP)
+		// WP-11: CSIP-AUS dynamic-envelope axes. opModGenLimW/opModLoadLimW
+		// are EXTENDED controls with no DERControlBase field, so they ride
+		// GridState instead of CSIPControl.Base — adopted UNCONDITIONALLY
+		// whenever a real control carries them (enforcement is what hub.json's
+		// `enforce_aus_limits` gates, never adoption), and dropped with the
+		// control on expiry exactly like the Base limits (state.CSIPControl
+		// nil ⇒ these stay NewGridState's NaN).
+		if state.CSIPControl != nil {
+			if r.lastCSIP.GenLimW != nil {
+				state.Grid.GenLimitW = *r.lastCSIP.GenLimW
+			}
+			if r.lastCSIP.LoadLimW != nil {
+				state.Grid.LoadLimitW = *r.lastCSIP.LoadLimW
+			}
+		}
 	}
 
 	// TASK-037: edge-triggered local (wall-clock) step detection/logging, like
