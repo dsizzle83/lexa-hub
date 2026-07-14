@@ -98,6 +98,15 @@ func (inv *Inverter) ApplyControl(ctrl model.DERControlBase) error {
 	return inv.Base.ApplyControl(ctrl, tag)
 }
 
+// DERBase exposes the embedded derbase.Base for the WP-10 advanced-DER
+// reconciler shell (cmd/modbus/reconcile_adv.go): model-presence flags
+// (Has703..Has712), the DefaultRvrtTms reversion plumb (C3), and the typed
+// curve/PF/var/enter-service writers with their §3.1.2 adopt handshake.
+// Callers MUST hold the per-device transport serialization (cmd/modbus's
+// retryDevice.mu) around every use — the underlying Modbus session is not
+// safe for concurrent access, and the poll loop shares it.
+func (inv *Inverter) DERBase() *derbase.Base { return &inv.Base }
+
 // ── Delegated IEEE 1547-2018 methods ─────────────────────────────────────────
 
 func (inv *Inverter) SetEnterService(s sunspec.EnterService) error {

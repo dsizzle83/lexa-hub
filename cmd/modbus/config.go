@@ -19,6 +19,19 @@ type DeviceConfig struct {
 	// SOCReservePct is the battery SOC reserve floor (%) used by the Tier-0 edge
 	// safety interlock. 0 ⇒ default (20%). Only meaningful for battery devices.
 	SOCReservePct float64 `json:"soc_reserve_pct"`
+
+	// DERGen names the device's advanced-DER model generation for the WP-10
+	// adv reconciler shell — the modbus-side mirror of hub.json's per-device
+	// der_gen (WP-9's authoring capability table; this one is EXECUTION
+	// truth): "7xx" (SunSpec IEEE-1547 models 701–712 — curve/PF/var/energize
+	// axes, gated per-model on what the live device actually reports) or
+	// "12x" (legacy 12x-series — fixed PF/var via model 123 with the
+	// enable-rewrite rule only; curve axes and energize report
+	// adopt_state=unsupported). Empty (the default) means UNKNOWN capability:
+	// every commanded advanced axis reports unsupported — never write what a
+	// device may lack the model for. Any other value is a fatal config error
+	// (loadConfig). Read only when reconciler.adv is shadow/active.
+	DERGen string `json:"der_gen,omitempty"`
 }
 
 // Config is the JSON configuration for lexa-modbus.
@@ -47,6 +60,14 @@ type Config struct {
 	// present role, because there is no legacy path left to fall back to.
 	// ("shadow" mode plumbing survives in the shells for future non-migrated
 	// classes but is no longer a valid battery/solar config value.)
+	//
+	// The "adv" class (WP-10) is the advanced-DER reconciler — curve/PF/var/
+	// energize provisioning from the retained lexa/desired/adv/{device} docs.
+	// Unlike battery/solar it follows the FULL TASK-027 staged rollout:
+	// "off" (default — shells not even constructed, byte-zero behavior),
+	// "shadow" (read docs + verdict logs + lexa_mb_adv_* metrics, ZERO
+	// hardware writes), "active" (write authority over 703/705–712 and the
+	// 704 PF/var groups; bench-gated flip).
 	Reconciler map[string]string `json:"reconciler"`
 
 	// Journal is the optional durable event-journal block (TASK-082 unit
@@ -151,8 +172,20 @@ func loadConfig(path string) (*Config, error) {
 		}
 		// EVSE stays fatal in THIS process regardless of mode — its reconciler
 		// lives in lexa-ocpp (ocpp.json's own "reconciler" key), never in modbus.
-		if class != "battery" && class != "solar" && mode == ReconcilerActive {
-			return nil, fmt.Errorf("reconciler active mode is battery/solar-only in lexa-modbus (class %q; evse belongs to lexa-ocpp)", class)
+		// "adv" (WP-10) is legal in every mode: it lives here, alongside the
+		// scalar shells, and follows the off→shadow→active staged rollout.
+		if class != "battery" && class != "solar" && class != "adv" && mode == ReconcilerActive {
+			return nil, fmt.Errorf("reconciler active mode is battery/solar/adv-only in lexa-modbus (class %q; evse belongs to lexa-ocpp)", class)
+		}
+	}
+	// WP-10: per-device der_gen validation (mirrors cmd/hub/config.go's rule:
+	// "7xx", "12x", or omitted; anything else is a typo that would silently
+	// disable advanced execution — fail loud instead).
+	for _, dc := range cfg.Devices {
+		switch dc.DERGen {
+		case "", "7xx", "12x":
+		default:
+			return nil, fmt.Errorf("device %q: invalid der_gen %q: want \"7xx\", \"12x\", or omitted (unknown)", dc.Name, dc.DERGen)
 		}
 	}
 	// TASK-032: the legacy lexa/control/* command path was deleted, so battery

@@ -8,7 +8,8 @@
   "poll_interval_s": 10,
   "reconciler": {
     "battery": "active",
-    "solar": "active"
+    "solar": "active",
+    "adv": "off"
   },
   "devices": [
     {
@@ -16,14 +17,16 @@
       "url": "tcp://69.0.0.10:5020",
       "unit_id": 1,
       "role": "inverter",
-      "max_w": 4800
+      "max_w": 4800,
+      "der_gen": "7xx"
     },
     {
       "name": "battery-0",
       "url": "tcp://69.0.0.11:5021",
       "unit_id": 1,
       "role": "battery",
-      "max_w": 5000
+      "max_w": 5000,
+      "der_gen": "7xx"
     },
     {
       "name": "meter-0",

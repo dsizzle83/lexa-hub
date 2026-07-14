@@ -134,6 +134,11 @@ func (b *Battery) ApplyControl(ctrl model.DERControlBase) error {
 	return b.Base.ApplyControl(ctrl, tag)
 }
 
+// DERBase exposes the embedded derbase.Base for the WP-10 advanced-DER
+// reconciler shell — see inverter.Inverter.DERBase for the contract (callers
+// must hold the per-device transport serialization around every use).
+func (b *Battery) DERBase() *derbase.Base { return &b.Base }
+
 // ReadStorageCapacity reads battery storage state from M713.
 func (b *Battery) ReadStorageCapacity() (sunspec.StorageCapacity, error) {
 	return b.Base.ReadStorageCapacity(tag)

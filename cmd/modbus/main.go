@@ -260,6 +260,63 @@ func main() {
 		log.Printf("lexa-modbus: solar reconciler %s mode active for %d device(s)", solarMode, len(solarShells))
 	}
 
+	// WP-10: one advanced-DER shell per inverter/battery device when the adv
+	// reconciler is in shadow or active mode. SHADOW is a recorder (doc +
+	// verdict logs + lexa_mb_adv_* metrics, ZERO hardware writes — the
+	// TASK-027 pattern; the shell holds no driver at all). ACTIVE gives the
+	// shell exclusive write authority over models 703/705–712 and the 704
+	// PF/var sync groups, through the SAME per-device transport mutex the
+	// poll loop and scalar shells serialize on (retryDevice.advanced), with
+	// Tier-0 interlock seniority on energize restores and the reconciler-
+	// standard reassert-on-reconnect. Off (the default) ⇒ shells not even
+	// constructed — byte-zero behavior.
+	var advShells map[string]*advShell
+	advMode := cfg.ReconcilerMode("adv")
+	if advMode == ReconcilerShadow || advMode == ReconcilerActive {
+		mode := modeShadow
+		if advMode == ReconcilerActive {
+			mode = modeActive
+		}
+		advShells = make(map[string]*advShell)
+		advCfg := advReconcileConfig(cfg.PollInterval())
+		for _, dc := range cfg.Devices {
+			if dc.Role != "inverter" && dc.Role != "battery" {
+				continue
+			}
+			var drv advDriver
+			var gate interlockGate
+			if mode == modeActive {
+				drv = &advDeviceDriver{rd: retryDevices[dc.Name]}
+				gate = interlock // isTripped is false for non-battery devices
+			}
+			shell := newAdvShell(dc.Name, dc.DERGen, advCfg, mreg, mode, drv, gate)
+			if mode == modeActive {
+				// WS-4.5: heal a retained NonConvergedBegin left over from a
+				// PREVIOUS process instance (same discipline as the scalar
+				// shells) BEFORE this instance's own publisher is attached.
+				healStaleRetainedReport(mc, advClass, dc.Name, time.Now())
+				shell.pub = newAdvReportPublisher(mc)
+				// Reassert-on-reconnect: CHAIN onto the scalar shell's hook —
+				// battery/solar shells already own rd.onReconnect for their
+				// devices, and both shells must see the reopen (each is the
+				// single reasserter for its OWN register surface; the fan-out
+				// only sets two atomic flags, preserving the no-lock rule).
+				if rd := retryDevices[dc.Name]; rd != nil {
+					prev := rd.onReconnect
+					mark := shell.markReconnected
+					if prev != nil {
+						rd.onReconnect = func() { prev(); mark() }
+					} else {
+						rd.onReconnect = mark
+					}
+				}
+			}
+			advShells[dc.Name] = shell
+		}
+		go runAdvShellTicker(advShells, 60*time.Second)
+		log.Printf("lexa-modbus: adv reconciler %s mode active for %d device(s)", advMode, len(advShells))
+	}
+
 	// Single retained-desired subscription routes each class to its shell map.
 	if battShells != nil || solarShells != nil {
 		if err := mqttutil.Subscribe(mc, bus.SubDesired, func(topic string, doc bus.DesiredState) {
@@ -279,6 +336,20 @@ func main() {
 		}
 	}
 
+	// WP-10: the advanced desired docs ride their own topic family
+	// (lexa/desired/adv/{device} — D6; the SubDesired wildcard above also
+	// matches them but its DesiredState handler ignores class "adv", so the
+	// two subscriptions never double-dispatch).
+	if advShells != nil {
+		if err := mqttutil.Subscribe(mc, bus.SubDesiredAdv, func(topic string, doc bus.DesiredAdvanced) {
+			if s, ok := advShells[bus.DeviceFromDesiredTopic(topic)]; ok {
+				s.setDesired(doc, time.Now())
+			}
+		}); err != nil {
+			log.Printf("lexa-modbus: subscribe desired adv (WP-10): %v", err)
+		}
+	}
+
 	// Subscribe to the registry and fan out to MQTT.
 	updates, unsub := reg.Subscribe()
 	defer unsub()
@@ -286,7 +357,7 @@ func main() {
 	reg.Start()
 	defer reg.Stop()
 
-	go publishMeasurements(mc, cfg, updates, interlock, battShells, solarShells)
+	go publishMeasurements(mc, cfg, updates, interlock, battShells, solarShells, advShells)
 
 	metrics.Serve(cfg.MetricsAddr, mreg)
 
@@ -354,7 +425,7 @@ func openDevice(dc DeviceConfig) (device.Device, error) {
 
 // publishMeasurements drains the registry subscription channel and publishes
 // measurements (and battery metrics) to MQTT.
-func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.MeasurementUpdate, interlock *batterySafetyInterlock, battShells map[string]*batteryShell, solarShells map[string]*solarShell) {
+func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.MeasurementUpdate, interlock *batterySafetyInterlock, battShells map[string]*batteryShell, solarShells map[string]*solarShell, advShells map[string]*advShell) {
 	deviceRole := map[string]string{}
 	nameplate := map[string]float64{}
 	for _, dc := range cfg.Devices {
@@ -417,6 +488,12 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 		// the shell). In active mode this is where an over-ceiling inverter
 		// triggers a corrective write and a just-reconnected inverter reasserts.
 		if s, ok := solarShells[upd.Name]; ok {
+			s.observe(m, wPlausible, nowT)
+		}
+		// WP-10: feed the advanced shell — measured PF/Var convergence for the
+		// fixed PF/var axes, measured cessation for energize, and the
+		// active-mode reconnect reassert, all off the same poll sample.
+		if s, ok := advShells[upd.Name]; ok {
 			s.observe(m, wPlausible, nowT)
 		}
 		if !math.IsNaN(m.V) {

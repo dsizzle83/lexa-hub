@@ -86,6 +86,12 @@ const (
 	// defaultConnectTolerance keeps the boolean Connect surface exact: 0 and 1
 	// differ by 1, so any tolerance below 1 (here 0.5) forbids aliasing.
 	defaultConnectTolerance = 0.5
+	// defaultPFTolerance is the readback tolerance for the FixedPF surface
+	// (power factor, [0,1] signed): the W/A default of 1.0 spans the whole
+	// range and would call any PF converged. The WP-10 shell feeds the DESIRED
+	// value on a converged one-sided assessment and a genuinely-measured value
+	// on divergence, so this only needs to be small enough to separate those.
+	defaultPFTolerance = 0.005
 )
 
 // DefaultRetryBackoff is the escalating re-write schedule when a device will
@@ -188,6 +194,18 @@ func New(class, deviceID string, cfg Config) *Reconciler {
 	return &Reconciler{cfg: cfg.withDefaults(), class: class, deviceID: deviceID}
 }
 
+// DocMeta is the AD-013 identity/staleness surface of a desired document —
+// the fields the acceptance gate and report attribution need, independent of
+// which document TYPE carried them. WP-10's advanced shell extracts it from
+// bus.DesiredAdvanced (whose curve payloads the scalar-fields core has no
+// business decoding) and feeds SetDesiredFields; SetDesired derives it from
+// bus.DesiredState internally.
+type DocMeta struct {
+	MRID     string
+	Seq      uint64
+	IssuedAt int64
+}
+
 // SetDesired applies the AD-013 seq/issuedAt/staleness/NaN gate and, on accept,
 // adopts the document as the standing intent. It returns the resulting Action
 // (an unconditional Write on a new target; None on a same-target refresh or a
@@ -198,6 +216,29 @@ func (r *Reconciler) SetDesired(doc bus.DesiredState, now time.Time) (Action, []
 	if docHasNaN(doc) {
 		return none(), []Report{r.rejectReport(doc, RejectNaN, now)}
 	}
+	return r.setDesiredCore(doc, fieldsOf(doc), now)
+}
+
+// SetDesiredFields is SetDesired for callers whose document type is not
+// bus.DesiredState (WP-10: bus.DesiredAdvanced, decomposed per axis by the adv
+// shell). It applies the IDENTICAL AD-013 gate — NaN defense over the opinion
+// values, staleness, seq/issuedAt regression — and on accept adopts the given
+// opinion set as the standing intent, with meta carried for report
+// attribution. Additive: SetDesired's behavior is byte-identical (both route
+// through setDesiredCore).
+func (r *Reconciler) SetDesiredFields(meta DocMeta, fields map[Field]float64, now time.Time) (Action, []Report) {
+	doc := bus.DesiredState{MRID: meta.MRID, Seq: meta.Seq, IssuedAt: meta.IssuedAt}
+	for _, v := range fields {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return none(), []Report{r.rejectReport(doc, RejectNaN, now)}
+		}
+	}
+	return r.setDesiredCore(doc, copyFields(fields), now)
+}
+
+// setDesiredCore is the shared gate+adopt body of SetDesired/SetDesiredFields.
+// fields is owned by the callee after the call (both callers pass a fresh map).
+func (r *Reconciler) setDesiredCore(doc bus.DesiredState, fields map[Field]float64, now time.Time) (Action, []Report) {
 	// AD-013 rule 3: reject stale regardless of seq (an old retained doc must
 	// not win over reality). issuedAt older than the staleness bound.
 	if now.Unix()-doc.IssuedAt > int64(r.cfg.StaleAfter/time.Second) {
@@ -225,7 +266,7 @@ func (r *Reconciler) SetDesired(doc bus.DesiredState, now time.Time) (Action, []
 	prevFields := r.desiredFields
 	stored := doc
 	r.desired = &stored
-	r.desiredFields = fieldsOf(doc)
+	r.desiredFields = fields
 	r.lastAppliedSeq = doc.Seq
 	r.lastAppliedIssuedAt = doc.IssuedAt
 	r.haveApplied = true
@@ -305,6 +346,12 @@ func (r *Reconciler) Observe(o Observed, now time.Time) (Action, []Report) {
 	}
 	return none(), reports
 }
+
+// Episode returns the current non-convergence episode counter. The WP-10 adv
+// shell stamps it on shell-authored (AdoptState) reports so they correlate
+// with the same episode's NonConvergedBegin/End on the wire. Read-only,
+// single-writer like every other method.
+func (r *Reconciler) Episode() uint64 { return r.episodeCounter }
 
 // Reconnected forces the next action to be an unconditional Write of the
 // standing desired (ledger L4). A reconnected device may have rebooted to
@@ -420,17 +467,25 @@ func (r *Reconciler) matches(read map[Field]float64) (ok, complete bool) {
 }
 
 // tolerance returns the readback tolerance for a Field: the configured value,
-// else the boolean-exact default for Connect, else the W/A default.
+// else the boolean-exact default for the boolean-like surfaces (Connect,
+// Energize, AdvContent — 0/1 or exact-fingerprint semantics, where the W/A
+// default of 1.0 would alias distinct values), else the unit-PF default for
+// FixedPF (a [0,1]-ranged surface where 1.0 would call everything converged),
+// else the W/A default.
 func (r *Reconciler) tolerance(f Field) float64 {
 	if r.cfg.ReadbackTolerance != nil {
 		if v, ok := r.cfg.ReadbackTolerance[f]; ok {
 			return v
 		}
 	}
-	if f == Connect {
+	switch f {
+	case Connect, Energize, AdvContent:
 		return defaultConnectTolerance
+	case FixedPF:
+		return defaultPFTolerance
+	default:
+		return defaultPowerTolerance
 	}
-	return defaultPowerTolerance
 }
 
 // report builds a Report attributed to the current standing desired.

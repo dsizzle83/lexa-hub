@@ -24,6 +24,34 @@ const (
 	Connect
 	// MaxCurrentA is the EVSE charging-current ceiling (A); explicit 0 = suspend.
 	MaxCurrentA
+
+	// ── WP-10 advanced-DER fields (appended additively; existing iota values
+	// unchanged). These are fed via SetDesiredFields by the cmd/modbus adv
+	// shell — one Reconciler per (device, axis) — never by fieldsOf/SetDesired.
+
+	// FixedPF is the constant-power-factor surface: |value| is the commanded
+	// power factor [0,1]; the SIGN carries excitation (+ over-excited,
+	// − under-excited), since excitation is not independently measurable and
+	// must still participate in target-change detection.
+	FixedPF
+	// FixedVarPct is the constant-reactive-power surface: signed percent of
+	// the device's reactive rating (+ inject), straight from
+	// bus.AdvReactiveMode.FixedVarPct.
+	FixedVarPct
+	// Energize is the 703 enter-service / cease-to-energize surface, carried
+	// as 1 (energize) / 0 (cease) — boolean-exact like Connect.
+	Energize
+	// AdvContent is the opaque numeric fingerprint of an advanced axis's
+	// desired provisioned content: 0 = the axis is RELEASED (function must be
+	// disabled), non-zero = a fingerprint the WP-10 shell derives from the
+	// axis's canonical content hash (bus.AdvCurve.Hash / AdvTripSet.Hash /
+	// the droop-parameter digest). The shell feeds readback-VERIFIED
+	// fingerprints: equal to desired iff the full content hash matched on
+	// re-read, a deliberately-different value otherwise — so the core's
+	// generic diverge/retry/episode machinery drives re-adoption without
+	// knowing what a curve is. Boolean-exact tolerance (fingerprints either
+	// match or don't).
+	AdvContent
 )
 
 // String renders a Field for logs and test failures.
@@ -37,6 +65,14 @@ func (f Field) String() string {
 		return "Connect"
 	case MaxCurrentA:
 		return "MaxCurrentA"
+	case FixedPF:
+		return "FixedPF"
+	case FixedVarPct:
+		return "FixedVarPct"
+	case Energize:
+		return "Energize"
+	case AdvContent:
+		return "AdvContent"
 	default:
 		return "Field(?)"
 	}
@@ -119,6 +155,15 @@ const (
 	// iota (the append-only journal, TASK-039, is String-keyed but the numeric
 	// stability costs nothing).
 	ReportInterlockHold
+	// ReportAdoptState is emitted by the WP-10 advanced-DER shell (never by
+	// the core itself) when an axis's adoption state transitions
+	// (""|pending|adopted|diverged|unsupported|failed — bus.AdoptState*
+	// vocabulary). It rides the retained per-device ReconcileReport so the
+	// hub re-seeds provisioning state after a restart (architecture D6);
+	// consumers that only understand convergence kinds (breachEpisodes'
+	// OnReport default arm) ignore it safely. Appended at the end of the
+	// enum, same append-only discipline as ReportInterlockHold.
+	ReportAdoptState
 )
 
 // String renders a ReportKind.
@@ -138,6 +183,8 @@ func (k ReportKind) String() string {
 		return "SeqReset"
 	case ReportInterlockHold:
 		return "InterlockHold"
+	case ReportAdoptState:
+		return "AdoptState"
 	default:
 		return "ReportKind(?)"
 	}

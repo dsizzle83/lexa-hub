@@ -176,15 +176,66 @@ type ComplianceAlert struct {
 // now (TASK-031 scope).
 type ReconcileReport struct {
 	Envelope
-	Kind        string `json:"kind"`                // reconcile.ReportKind.String() (NonConvergedBegin|NonConvergedEnd)
-	DeviceClass string `json:"device_class"`        // battery | solar | evse
+	Kind        string `json:"kind"`                // reconcile.ReportKind.String() (NonConvergedBegin|NonConvergedEnd|AdoptState)
+	DeviceClass string `json:"device_class"`        // battery | solar | evse | adv
 	DeviceID    string `json:"device_id"`           // device / EVSE station ID
 	MRID        string `json:"mrid,omitempty"`      // active CSIP control the held intent derives from
 	Seq         uint64 `json:"seq,omitempty"`       // seq of the held desired document
 	IssuedAt    int64  `json:"issued_at,omitempty"` // held document's publisher wall clock (Unix s)
 	Episode     uint64 `json:"episode"`             // per-reconciler monotonic episode counter
 	Ts          int64  `json:"ts"`                  // report wall-clock time (Unix s)
+
+	// ── WP-10 advanced-DER extension (architecture §2.2, additive — same V).
+	// Populated only by the cmd/modbus adv shell (class "adv",
+	// lexa/reconcile/adv/{device}/report); empty on every legacy scalar
+	// report. Adoption state rides THIS retained report — never the desired
+	// doc (D6: readback state on publisher-owned intent would be a second
+	// writer) — so the hub re-seeds provisioning state after restart exactly
+	// like NonConverged state.
+
+	// Axis names the advanced axis the report is about: "" (legacy scalar
+	// report) | AdvAxis* below.
+	Axis string `json:"axis,omitempty"`
+	// AdoptState is the axis's provisioning state: "" (axis released / no adv
+	// provisioning in force) | AdoptState* below.
+	AdoptState string `json:"adopt_state,omitempty"`
+	// CurveHash is the canonical content hash of the ADOPTED curve/set
+	// (bus.AdvCurve.Hash / AdvTripSet.Hash vocabulary), readback-verified:
+	// populated only when AdoptState is "adopted", i.e. the shell re-read the
+	// live curve after the adopt handshake and recomputed the same hash.
+	CurveHash string `json:"curve_hash,omitempty"`
 }
+
+// ReconcileReport.Axis vocabulary (WP-10, architecture §2.2). "freq_watt" is
+// an additive extension beyond the §2.2 list: the D6 desired doc carries a
+// freq-watt overlay axis, but no SunSpec 1547 model executes it (705/706/711/
+// 712 cover volt-var/volt-watt/droop/watt-var only), so the execution shell
+// must be able to NAME the axis to report it unsupported.
+const (
+	AdvAxisVoltVar   = "volt_var"
+	AdvAxisVoltWatt  = "volt_watt"
+	AdvAxisWattVar   = "watt_var"
+	AdvAxisFreqWatt  = "freq_watt"
+	AdvAxisFreqDroop = "freq_droop"
+	AdvAxisTripLV    = "trip_lv"
+	AdvAxisTripHV    = "trip_hv"
+	AdvAxisTripLF    = "trip_lf"
+	AdvAxisTripHF    = "trip_hf"
+	AdvAxisFixedPF   = "fixed_pf"
+	AdvAxisFixedVar  = "fixed_var"
+	AdvAxisEnergize  = "energize"
+)
+
+// ReconcileReport.AdoptState vocabulary (WP-10, architecture §2.2). The empty
+// string is deliberate vocabulary, not absence: "" = the axis is released /
+// nothing in force.
+const (
+	AdoptStatePending     = "pending"     // commanded; execution not yet verified
+	AdoptStateAdopted     = "adopted"     // readback-verified (curve hash match / measured convergence)
+	AdoptStateDiverged    = "diverged"    // executed but readback/measurement disagrees with desired
+	AdoptStateUnsupported = "unsupported" // device (der_gen/model set) cannot execute this axis
+	AdoptStateFailed      = "failed"      // write or adopt handshake failed (incl. AdptCrvRslt FAILED)
+)
 
 // BattCommand is published by the hub (orchestrator) to the modbus service.
 // Nil SetpointW means "leave unchanged".
