@@ -22,7 +22,7 @@ Status legend: ⬜ pending · 🔵 in progress · ✅ done (tests green) · 🟠
 | WP-13 | Pairing gate + ClearChargingProfile | M | 12 (+bus slot after 9) | 🔵 | closes R8 |
 | WP-14 | V2G type enablers | M | 9,13 (bus lane tail) | ⬜ | `ev_storage`; flag-off byte-identical plans |
 | WP-15 | lexa-openadr service | L | 2 (+bus slot last) | 🟡 c9c2984 svc half | metrics :9108; pure Go |
-| WP-16 | CSIP-AUS checklist + verify-sweep docs | S | 11 | ⬜ | AUS spec-gap disclosure |
+| WP-16 | CSIP-AUS checklist + verify-sweep docs | S | 11 | ✅ | AUS spec-gap disclosure; `CSIP_AUS_CHECKLIST.md` + `VERIFICATION_SWEEP.md` |
 | WP-17 | Integration & verification gate | M | all | ⬜ | ACL re-derive (incl. pre-existing lexa-api certstatus gap), envelope audit, -race+arm64, apicontract, CLAUDE.md updates |
 
 Bus-lane serialization (internal/bus/{messages,desired,topics,envelope}.go): WP-2 → WP-8 → WP-9 →
