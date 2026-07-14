@@ -41,6 +41,7 @@ import (
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/northbound/derreport"
+	"lexa-hub/internal/northbound/discovery"
 	"lexa-hub/internal/northbound/egress"
 	"lexa-hub/internal/northbound/flowres"
 	"lexa-hub/internal/northbound/identity"
@@ -153,6 +154,12 @@ func main() {
 	// the registered-but-zero convention, TASK-044).
 	derreportPutsCtr := reg.Counter("lexa_nb_derreport_puts_total")
 	derreportErrsCtr := reg.Counter("lexa_nb_derreport_errors_total")
+	// WP-8: control content the carriage could not represent (unknown
+	// opModes, unresolvable curve hrefs, ...) — scrape-time snapshot of the
+	// walker's process-global recorder.
+	reg.Collect(func(r *metrics.Registry) {
+		r.Counter("lexa_nb_ignored_control_content_total").Set(discovery.IgnoredContentTotal())
+	})
 
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {

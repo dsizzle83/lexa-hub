@@ -66,6 +66,10 @@ topic write lexa/csip/pricing
 topic write lexa/csip/billing
 # bus.TopicCSIPFRStatus (retained).
 topic write lexa/csip/flowreservation/status
+# bus.TopicCSIPCurves (retained) — resolved curve content for the active
+# control's curve-linked modes (WP-8, content-hashed CurveSet; the small
+# lexa/csip/control doc carries only the matching curve_set_id).
+topic write lexa/csip/curves
 # bus.TopicNorthboundSchedule (retained) — resolved 24h DER schedule.
 topic write lexa/northbound/schedule
 # bus.TopicCSIPComplianceAlert — hub → northbound CannotComply trigger.
@@ -134,6 +138,9 @@ topic read lexa/measurements/+
 topic read lexa/battery/+/metrics
 # bus.TopicCSIPControl (retained).
 topic read lexa/csip/control
+# bus.TopicCSIPCurves (retained) — the CurveSet doc matching the active
+# control's curve_set_id (WP-8; consumed by the WP-9 adv-doc author).
+topic read lexa/csip/curves
 # bus.SubEVSEState.
 topic read lexa/evse/+/state
 # bus.TopicNorthboundSchedule (retained).

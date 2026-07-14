@@ -79,6 +79,9 @@ const (
 	// DERSiteReport schema (WP-4, standards-buildout A2). Born at 1, same
 	// convention as every family above.
 	DERSiteReportV = 1 // lexa/hub/dersite (DERSiteReport)
+	// CurveSet schema (WP-8, standards-buildout C1/D6). Born at 1, same
+	// convention as every family above.
+	CurveSetV = 1 // lexa/csip/curves (CurveSet)
 )
 
 // LegacyV0Accepted is the transition switch for AD-006's compatibility

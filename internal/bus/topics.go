@@ -182,6 +182,8 @@ func SupportedV(topic string) int {
 		return LogEventV
 	case topic == TopicHubDERSite:
 		return DERSiteReportV
+	case topic == TopicCSIPCurves:
+		return CurveSetV
 	default:
 		return 1
 	}
@@ -229,6 +231,19 @@ const (
 // rate-limited independently on both ends — see cmd/hub/state.go's
 // rewalkRateLimit and cmd/northbound/main.go's rewalkGate).
 const TopicCSIPRewalk = "lexa/csip/rewalk"
+
+// TopicCSIPCurves carries the resolved curve content (bus.CurveSet) for the
+// active DER control's curve-linked modes (WP-8, standards-buildout C1/D6):
+// northbound → hub, RETAINED, QoS 1 (PubQoS's non-measurement default).
+// Curve content deliberately rides its OWN retained doc rather than
+// ActiveControl (architecture §2.3/D6): curves are provisioning state that
+// changes rarely, keeping the small, staleness-checked lexa/csip/control doc
+// (TASK-042 — untouched by WP-8) small. The doc is content-hashed
+// (CurveSet.SetID = CurveSetContentHash over the entries), republished only
+// on hash change; ActiveControl.CurveSetID names the matching set ("" = the
+// active control links no resolvable curves). Retained-doc redelivery on
+// rewalk/reconnect covers late subscribers.
+const TopicCSIPCurves = "lexa/csip/curves"
 
 // TopicNorthboundSchedule is published by lexa-northbound after each discovery
 // walk. It carries the resolved 24-hour DER control schedule (retained, QoS 1).

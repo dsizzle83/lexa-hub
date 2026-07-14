@@ -75,6 +75,13 @@ type Discovery struct {
 	// SetPinVerifier before Loop starts; read only from the walk goroutine.
 	pin *PinVerifier
 
+	// curves publishes the resolved curve-linked content (bus.CurveSet,
+	// retained lexa/csip/curves) alongside every ActiveControl publish —
+	// including the PIN-freeze held republish, so the retained curve doc and
+	// the retained control doc can never drift apart across a freeze (WP-8).
+	// Hash-change deduped internally; touched only from the walk goroutine.
+	curves publish.Curves
+
 	// lastPub/rewalkChan/rewalkGate: the TASK-042 (GAP-01/02 re-request path)
 	// rewalk single-flight mechanism. See lastPublishedStore and
 	// handleRewalkRequest's doc comments below.
@@ -385,6 +392,7 @@ func (d *Discovery) RunOnce(ctx context.Context) {
 		} else {
 			d.lastPub.set(msg)
 		}
+		d.curves.Publish(d.mc, held)
 		return
 	}
 
@@ -414,6 +422,7 @@ func (d *Discovery) RunOnce(ctx context.Context) {
 		// lastPublishedStore's doc and handleRewalkRequest.
 		d.lastPub.set(msg)
 	}
+	d.curves.Publish(d.mc, active)
 	// 24-hour DER schedule — built from all discovered programs, curves, and
 	// DER resource data. Published retained so lexa-hub always has the full plan.
 	der24h := schedule.Build(tree, serverNow)

@@ -81,6 +81,65 @@ type ActiveControl struct {
 	// distinctly from the general fail-closed hold WARN, without conflating
 	// it with a transport/discovery anomaly or a clock hiccup.
 	ImplausibleReject bool
+
+	// ── WP-8 carriage (standards-buildout C1, architecture §5(b)) ─────────
+	// The fields below CARRY the winning control's advanced content through
+	// to publish.ToActiveControl/publish.Curves. The scheduler's decision
+	// logic never reads them — it stays keyed on the scalar Base exactly as
+	// before; the only evaluation they participate in is the plausibility
+	// gate (implausibleReason), which REJECTS garbage content the same
+	// fail-closed way the scalar limits always have.
+
+	// Extended is the winning control's full ExtendedDERControlBase (curve
+	// links, target W/Var, freq droop, plus copies of the scalar modes) —
+	// nil when the program had no extended fetch (e.g. tests that build only
+	// the simple Controls list).
+	Extended *model.ExtendedDERControlBase
+
+	// Curves is the winning PROGRAM's resolved curve map (href → DERCurve,
+	// ProgramState.Curves), carried so consumers can resolve Extended's
+	// curve links without re-walking. Shared, never mutated.
+	Curves map[string]model.DERCurve
+
+	// ProgramHref is the winning DERProgram's href — CurveSet.Program on the
+	// published curve doc.
+	ProgramHref string
+
+	// SetGradW/SetSoftGradW are the DefaultDERControl-only ramp-rate
+	// defaults (raw 2030.5 PerCent: hundredths of a percent of setMaxW per
+	// second), populated ONLY when Source=="default" per the CSIP ramp-rate
+	// rule (events ramp via Base.RampTms).
+	SetGradW     *uint16
+	SetSoftGradW *uint16
+}
+
+// ModeCurve pairs a curve-linked mode name (the bus.CurveMode* vocabulary)
+// with its resolved DERCurve.
+type ModeCurve struct {
+	Mode  string
+	Curve model.DERCurve
+}
+
+// ResolvedModeCurves resolves the carried Extended base's curve links
+// against the carried program curve map, returning one entry per RESOLVED
+// mode in CurveModeLinks' fixed order. Unresolvable links are skipped here —
+// they are alarmed at walk time by the walker's ignored-content sweep, never
+// silently — so the result is exactly the content publish.Curves emits and
+// the plausibility gate vets.
+func (ac *ActiveControl) ResolvedModeCurves() []ModeCurve {
+	if ac == nil || ac.Extended == nil || len(ac.Curves) == 0 {
+		return nil
+	}
+	var out []ModeCurve
+	for _, ml := range discovery.CurveModeLinks(ac.Extended) {
+		if ml.Link == nil || ml.Link.Href == "" {
+			continue
+		}
+		if c, ok := ac.Curves[ml.Link.Href]; ok {
+			out = append(out, ModeCurve{Mode: ml.Mode, Curve: c})
+		}
+	}
+	return out
 }
 
 // Scheduler tracks per-event randomization state and evaluates the active
@@ -103,17 +162,19 @@ type Scheduler struct {
 
 	// RejectHook (WP-7, D5), when non-nil, is invoked by failClosed each
 	// Evaluate cycle that REJECTS a freshly-served control at receipt —
-	// today only the plausibility gate (plausibleControl, audit:
+	// the plausibility gate (implausibleReason, audit:
 	// malform-huge-activepower) — with the REJECTED control's mRID and a
-	// short reason ("implausible-limit"), so the response tracker can post
-	// the Table 27 rejection Response (253 invalid/out-of-range; the
-	// tracker dedupes per mRID, since a persistently-served malformed
-	// control re-fires this every walk). Purely observational: the hook
-	// cannot veto or alter any fail-closed decision, and nil (the default)
-	// preserves pre-WP-7 behavior exactly. Called with s.mu held; safe
-	// because the tracker never calls back into the scheduler (responses
-	// imports scheduler only for the ActiveControl type). Wire it before
-	// the first Evaluate (main.go wiring, single walk goroutine).
+	// short reason ("implausible-limit" for a garbage watt limit;
+	// "implausible-pf"/"implausible-var"/"implausible-curve" for the WP-8
+	// advanced-numeric gates), so the response tracker can post the Table 27
+	// rejection Response (253 invalid/out-of-range; the tracker dedupes per
+	// mRID, since a persistently-served malformed control re-fires this
+	// every walk). Purely observational: the hook cannot veto or alter any
+	// fail-closed decision, and nil (the default) preserves pre-WP-7
+	// behavior exactly. Called with s.mu held; safe because the tracker
+	// never calls back into the scheduler (responses imports scheduler only
+	// for the ActiveControl type). Wire it before the first Evaluate
+	// (main.go wiring, single walk goroutine).
 	RejectHook func(mrid, reason string)
 }
 
@@ -198,11 +259,20 @@ func (s *Scheduler) resolve(programs []discovery.ProgramState, serverNow int64) 
 
 	// No active event — apply DefaultDERControl fallback.
 	if hp.DefaultControl != nil {
-		return &ActiveControl{
+		ac := &ActiveControl{
 			Base:   hp.DefaultControl.DERControlBase,
 			Source: "default",
 			MRID:   hp.DefaultControl.MRID,
-		}, true
+			// WP-8 carriage (never evaluated — see the field docs).
+			Curves:       hp.Curves,
+			ProgramHref:  hp.Program.Href,
+			SetGradW:     hp.DefaultSetGradW,
+			SetSoftGradW: hp.DefaultSetSoftGradW,
+		}
+		if hp.ExtendedDefault != nil {
+			ac.Extended = &hp.ExtendedDefault.DERControlBase
+		}
+		return ac, true
 	}
 
 	return nil, true // program exists but no active control — explicit clear
@@ -225,7 +295,12 @@ func (s *Scheduler) failClosed(resolved *ActiveControl, programFound bool, hp *d
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if resolved != nil && plausibleControl(resolved) {
+	rejectReason := ""
+	if resolved != nil {
+		rejectReason = implausibleReason(resolved)
+	}
+
+	if resolved != nil && rejectReason == "" {
 		// Clock-regression guard, default-fallback half (QA 2026-07-03 v6:
 		// clock-jitter). The 2026-07-02 guard below covers a regression that
 		// resolves to NOTHING — but a program that carries a DefaultDERControl
@@ -258,9 +333,12 @@ func (s *Scheduler) failClosed(resolved *ActiveControl, programFound bool, hp *d
 	if resolved != nil {
 		// WP-7 (D5): surface the receipt-reject to the response tracker
 		// (Table 27 status 253) — observation only, before and independent
-		// of the unchanged hold-vs-release decision below.
+		// of the unchanged hold-vs-release decision below. The reason names
+		// which gate fired ("implausible-limit" as before WP-8;
+		// "implausible-pf"/"implausible-var"/"implausible-curve" for the
+		// advanced-numeric gates).
 		if s.RejectHook != nil {
-			s.RejectHook(resolved.MRID, "implausible-limit")
+			s.RejectHook(resolved.MRID, rejectReason)
 		}
 		if s.lastGood != nil && !controlExpired(s.lastGood, serverNow) {
 			held := *s.lastGood
@@ -341,16 +419,101 @@ func stillServed(hp *discovery.ProgramState, mrid string) bool {
 	return hp.DefaultControl != nil && hp.DefaultControl.MRID == mrid
 }
 
-// plausibleControl reports whether every active-power limit on the control
-// decodes to a finite, physically-plausible magnitude (≤ maxPlausibleLimitW).
-// A malformed/overflow value (audit: malform-huge-activepower) makes this false
-// so the control is rejected rather than adopted as an effectively-infinite cap.
+// plausibleControl reports whether the control passes every plausibility
+// gate (implausibleReason == ""). Kept under its pre-WP-8 name: the fuzz
+// property test (FuzzUnmarshalDERControlList) pins it, and it remains the
+// boolean face of the gate for callers that don't need the reason.
 func plausibleControl(ac *ActiveControl) bool {
+	return implausibleReason(ac) == ""
+}
+
+// implausibleReason reports why the control fails the plausibility gate, or
+// "" when every gated value is plausible. The pre-WP-8 gate (every
+// active-power limit finite and ≤ maxPlausibleLimitW — audit:
+// malform-huge-activepower) keeps its "implausible-limit" reason verbatim
+// and now also covers the gen/load/target limits; WP-8 adds the
+// advanced-numeric gates:
+//
+//   - "implausible-pf":    a fixed-PF displacement outside (0, 1]
+//   - "implausible-var":   |opModFixedVar| beyond 100 % of setMaxVar
+//   - "implausible-curve": a RESOLVED curve with 0 or > 10 breakpoints, or a
+//     breakpoint whose multiplier-scaled value is non-finite (the same
+//     overflow-bait class maxPlausibleLimitW exists for — xMult/yMult reach
+//     ±127, so x×10^mult can be ±Inf)
+//
+// A control that fails ANY gate is rejected whole — never adopted, never
+// stored as last-known-good — exactly the fail-closed path the scalar gate
+// has always taken. Unresolvable curve hrefs are NOT a reject: the mode's
+// content simply cannot be published, which the walker's ignored-content
+// sweep alarms (reject would let a dangling href unseat a live safety cap).
+func implausibleReason(ac *ActiveControl) string {
 	b := ac.Base
-	return plausibleLimit(b.OpModExpLimW) &&
+	if !(plausibleLimit(b.OpModExpLimW) &&
 		plausibleLimit(b.OpModMaxLimW) &&
 		plausibleLimit(b.OpModImpLimW) &&
-		plausibleLimit(b.OpModFixedW)
+		plausibleLimit(b.OpModFixedW) &&
+		plausibleLimit(b.OpModGenLimW) &&
+		plausibleLimit(b.OpModLoadLimW)) {
+		return "implausible-limit"
+	}
+	if ac.Extended != nil && !plausibleLimit(ac.Extended.OpModTargetW) {
+		return "implausible-limit"
+	}
+	if !plausiblePF(b.OpModFixedPFInjectW) || !plausiblePF(b.OpModFixedPFAbsorbW) {
+		return "implausible-pf"
+	}
+	if b.OpModFixedVar != nil {
+		if v := b.OpModFixedVar.Value.Value; v > 10000 || v < -10000 {
+			return "implausible-var"
+		}
+	}
+	for _, mc := range ac.ResolvedModeCurves() {
+		if !PlausibleCurve(mc.Curve) {
+			return "implausible-curve"
+		}
+	}
+	return ""
+}
+
+// plausiblePF reports whether a fixed-PF command (SignedPerCent, hundredths
+// of a percent of unity: 9500 ⇒ 0.95, sign = excitation) decodes to a
+// displacement power factor in (0, 1]. nil imposes nothing and is plausible.
+func plausiblePF(pf *model.SignedPerCent) bool {
+	if pf == nil {
+		return true
+	}
+	v := pf.Value
+	if v < 0 {
+		v = -v
+	}
+	return v > 0 && v <= 10000
+}
+
+// PlausibleCurve reports whether a resolved DERCurve's content is
+// executable: 1–10 breakpoints (the 2030.5 DERCurve bound; zero points is
+// nothing to adopt) and every multiplier-scaled breakpoint finite. Note the
+// finite half is defense-in-depth, not a live gate today: int32×10^int8
+// tops out near 2.1e136, comfortably inside float64's ~1.8e308 range, so no
+// wire-representable curve point scales to NaN/Inf — the check is kept so a
+// future model change to wider point/multiplier types inherits it instead
+// of a silent gap (the same overflow-bait class maxPlausibleLimitW guards on
+// the ActivePower side, audit: malform-huge-activepower). Exported because
+// publish's CurveSet builder applies the identical gate as its defensive
+// last line (a malformed curve must never produce a CurveSet entry).
+func PlausibleCurve(c model.DERCurve) bool {
+	if len(c.CurveData) == 0 || len(c.CurveData) > 10 {
+		return false
+	}
+	xm := math.Pow10(int(c.XMultiplier))
+	ym := math.Pow10(int(c.YMultiplier))
+	for _, p := range c.CurveData {
+		x := float64(p.XValue) * xm
+		y := float64(p.YValue) * ym
+		if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
+			return false
+		}
+	}
+	return true
 }
 
 // plausibleLimit reports whether ap (when present) decodes to a finite watt
@@ -406,12 +569,26 @@ func (s *Scheduler) activeEvent(ps *discovery.ProgramState, serverNow int64) *Ac
 	}
 
 	effectiveStart := s.randomizedStart(best)
-	return &ActiveControl{
+	ac := &ActiveControl{
 		Base:       best.DERControlBase,
 		Source:     "event",
 		MRID:       best.MRID,
 		ValidUntil: effectiveStart + s.randomizedDuration(best),
+		// WP-8 carriage (never evaluated — see the field docs). SetGradW/
+		// SetSoftGradW stay nil on an event: those ramp defaults are
+		// DefaultDERControl-only per the CSIP ramp-rate rule.
+		Curves:      ps.Curves,
+		ProgramHref: ps.Program.Href,
 	}
+	if ps.ExtendedControls != nil {
+		for i := range ps.ExtendedControls.DERControl {
+			if ps.ExtendedControls.DERControl[i].MRID == best.MRID {
+				ac.Extended = &ps.ExtendedControls.DERControl[i].DERControlBase
+				break
+			}
+		}
+	}
+	return ac
 }
 
 // randomizedStart returns the effective start time for ctrl, applying the

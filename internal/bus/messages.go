@@ -62,6 +62,14 @@ type BattMetrics struct {
 // ActiveControl is published by the csip service after every discovery walk.
 // Watt values already have the IEEE 2030.5 ActivePower multiplier applied.
 // Source is "event", "default", or "none" (no programs / no active control).
+//
+// WP-8 (standards-buildout C1, architecture §2.2) added the advanced-control
+// scalars below — additive optional fields at ActiveControlV=1 (AD-006: an
+// old subscriber ignores the unknown keys; a new subscriber reading an old
+// publisher sees them nil-absent). Curve CONTENT does not ride this message —
+// it rides the separate retained CurveSet doc on TopicCSIPCurves (D6/§2.3),
+// referenced here only by CurveSetID — so this doc stays small and the
+// TASK-042 retained-control staleness/rewalk machinery is untouched.
 type ActiveControl struct {
 	Envelope
 	Source      string   `json:"source"`
@@ -73,7 +81,46 @@ type ActiveControl struct {
 	FixedW      *float64 `json:"fixed_w,omitempty"`     // fixed dispatch (W)
 	ClockOffset int64    `json:"clock_offset"`          // server_time − local_time (s)
 	ValidUntil  int64    `json:"valid_until,omitempty"` // Unix seconds; 0 = no expiry
-	Ts          int64    `json:"ts"`
+
+	// WP-8 additive advanced-control scalars (architecture §2.2, normative
+	// names/types). All *float64 fields participate in Finite() (GAP-09).
+	Energize      *bool    `json:"energize,omitempty"`        // opModEnergize (distinct from connect)
+	GenLimW       *float64 `json:"gen_lim_w,omitempty"`       // opModGenLimW (gross generation cap — CSIP-AUS)
+	LoadLimW      *float64 `json:"load_lim_w,omitempty"`      // opModLoadLimW (gross load cap — CSIP-AUS)
+	TargetW       *float64 `json:"target_w,omitempty"`        // opModTargetW (parse-through; enforcement TBD)
+	FixedPFInject *FixedPF `json:"fixed_pf_inject,omitempty"` // opModFixedPFInjectW
+	FixedPFAbsorb *FixedPF `json:"fixed_pf_absorb,omitempty"` // opModFixedPFAbsorbW
+	FixedVarPct   *float64 `json:"fixed_var_pct,omitempty"`   // opModFixedVar, signed % of setMaxVar
+	// SetGradW/SetSoftGradW are the DefaultDERControl-only ramp-rate defaults
+	// (2030.5 setGradW/setSoftGradW, decoded to percent of setMaxW per
+	// second). Per the CSIP ramp-rate rule they ride ONLY a default-sourced
+	// control — nil on event-sourced controls, whose ramp is RampTms-driven.
+	SetGradW     *float64 `json:"set_grad_w,omitempty"`
+	SetSoftGradW *float64 `json:"set_soft_grad_w,omitempty"`
+	// RvrtTmsS is the computed device reversion window (C3). Computation is
+	// hub-side at desired-doc authoring (WP-9: ValidUntil−now clamped) — the
+	// northbound publisher leaves it nil; the field is carriage per §2.2.
+	RvrtTmsS *int64 `json:"rvrt_tms_s,omitempty"`
+	// CurveSetID is the content hash (CurveSet.SetID) of the matching
+	// retained lexa/csip/curves doc; "" = the active control links no
+	// resolvable curves.
+	CurveSetID string `json:"curve_set_id,omitempty"`
+
+	Ts int64 `json:"ts"`
+}
+
+// FixedPF is a fixed power-factor command (opModFixedPFInjectW /
+// opModFixedPFAbsorbW) on ActiveControl (WP-8, architecture §2.2).
+//
+// PF is the displacement power factor in (0, 1]. The vendored csipmodel
+// folds 2030.5's PowerFactorWithExcitation into a signed per-cent value
+// (hundredths of a percent of unity: 9500 ⇒ 0.95); the SIGN carries the
+// excitation half — non-negative ⇒ over-excited (injecting VArs), negative ⇒
+// under-excited — which the publisher decodes into OverExcited so no
+// subscriber re-derives sign conventions from raw wire values.
+type FixedPF struct {
+	PF          float64 `json:"pf"` // displacement power factor, (0, 1]
+	OverExcited bool    `json:"over_excited"`
 }
 
 // RewalkRequest is published by lexa-hub on TopicCSIPRewalk (TASK-042, not

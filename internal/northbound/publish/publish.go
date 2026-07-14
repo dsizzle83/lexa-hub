@@ -10,6 +10,7 @@ package publish
 import (
 	"log"
 	"math"
+	"sync"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -311,6 +312,16 @@ func unitValueToFloat(uv *model.UnitValue) float64 {
 }
 
 // ToActiveControl converts a scheduler.ActiveControl to the MQTT bus message.
+//
+// WP-8 (standards-buildout C1, architecture §2.2): beyond the four original
+// scalar limits, this now emits the advanced-control scalars — energize,
+// gen/load limits, fixed PF (inject/absorb), fixed var %, target W, the
+// DefaultDERControl-only ramp defaults (set_grad_w/set_soft_grad_w, the CSIP
+// ramp-rate rule — the scheduler only populates them for a default-sourced
+// control), and the content hash of the matching lexa/csip/curves doc
+// (curve_set_id, "" = no resolvable curves). rvrt_tms_s stays nil here: its
+// computation is hub-side at desired-doc authoring (C3/WP-9). Curve CONTENT
+// never rides this message — see the Curves publisher below.
 func ToActiveControl(ac *scheduler.ActiveControl, clockOffset int64) bus.ActiveControl {
 	msg := bus.ActiveControl{
 		Envelope:    bus.Envelope{V: bus.ActiveControlV},
@@ -341,9 +352,141 @@ func ToActiveControl(ac *scheduler.ActiveControl, clockOffset int64) bus.ActiveC
 		w := apW(ac.Base.OpModFixedW)
 		msg.FixedW = &w
 	}
+
+	// WP-8 additive scalars (§2.2). Scalar modes come off the Base (always
+	// populated — the walker's scalar projection copies them from the
+	// extended fetch); target W and the curve content live only on the
+	// carried Extended base.
+	msg.Energize = ac.Base.OpModEnergize
+	if ac.Base.OpModGenLimW != nil {
+		w := apW(ac.Base.OpModGenLimW)
+		msg.GenLimW = &w
+	}
+	if ac.Base.OpModLoadLimW != nil {
+		w := apW(ac.Base.OpModLoadLimW)
+		msg.LoadLimW = &w
+	}
+	msg.FixedPFInject = toFixedPF(ac.Base.OpModFixedPFInjectW)
+	msg.FixedPFAbsorb = toFixedPF(ac.Base.OpModFixedPFAbsorbW)
+	if ac.Base.OpModFixedVar != nil {
+		pct := float64(ac.Base.OpModFixedVar.Value.Value) / 100.0
+		msg.FixedVarPct = &pct
+	}
+	if ac.Extended != nil && ac.Extended.OpModTargetW != nil {
+		w := apW(ac.Extended.OpModTargetW)
+		msg.TargetW = &w
+	}
+	if ac.SetGradW != nil {
+		g := float64(*ac.SetGradW) / 100.0 // hundredths of a % → % of setMaxW per second
+		msg.SetGradW = &g
+	}
+	if ac.SetSoftGradW != nil {
+		g := float64(*ac.SetSoftGradW) / 100.0
+		msg.SetSoftGradW = &g
+	}
+	entries := curveSetEntries(ac)
+	msg.CurveSetID = bus.CurveSetContentHash(entries)
 	return msg
+}
+
+// toFixedPF decodes the model's signed fixed-PF per-cent (hundredths of a
+// percent of unity, sign = excitation: non-negative ⇒ over-excited) into the
+// bus FixedPF shape. See bus.FixedPF's doc for the convention.
+func toFixedPF(pf *model.SignedPerCent) *bus.FixedPF {
+	if pf == nil {
+		return nil
+	}
+	v := pf.Value
+	over := v >= 0
+	if v < 0 {
+		v = -v
+	}
+	return &bus.FixedPF{PF: float64(v) / 10000.0, OverExcited: over}
 }
 
 func apW(ap *model.ActivePower) float64 {
 	return float64(ap.Value) * math.Pow10(int(ap.Multiplier))
+}
+
+// ─── lexa/csip/curves publisher (WP-8, architecture §2.3/§5(b)/D6) ──────────
+
+// Curves publishes the active control's resolved curve content retained on
+// bus.TopicCSIPCurves as one bus.CurveSet, deduping on the set-level content
+// hash: call Publish on the SAME cadence the ActiveControl publish runs
+// (once per walk cycle, run.RunOnce), and it re-publishes only when the
+// content hash actually changed — an unchanged set relies on the retained
+// doc for rewalk/reconnect redelivery. An active control with NO resolvable
+// curves publishes an explicit empty set (SetID "", matching the "" =
+// no-curves sentinel on ActiveControl.CurveSetID) so a superseded curve set
+// never lingers retained.
+//
+// One Curves instance per Discovery walk loop; the zero value is ready to
+// use. The mutex is for the paho-callback-vs-walk-goroutine discipline the
+// other publish state in this repo follows, not because Publish has two
+// callers today.
+type Curves struct {
+	mu        sync.Mutex
+	published bool   // false until the first Publish this process
+	lastHash  string // SetID of the last successfully published set
+}
+
+// Publish converts ac's resolved curve-linked modes to a bus.CurveSet and
+// publishes it retained on bus.TopicCSIPCurves iff the content hash differs
+// from the last successful publish (always publishes the first time this
+// process, so a stale retained set from a previous run is superseded even
+// when the new content is empty).
+func (c *Curves) Publish(mc mqtt.Client, ac *scheduler.ActiveControl) {
+	entries := curveSetEntries(ac)
+	msg := bus.CurveSet{
+		Envelope: bus.Envelope{V: bus.CurveSetV},
+		SetID:    bus.CurveSetContentHash(entries),
+		Curves:   entries,
+		Ts:       time.Now().Unix(),
+	}
+	if ac != nil {
+		msg.MRID = ac.MRID
+		msg.Program = ac.ProgramHref
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.published && msg.SetID == c.lastHash {
+		return // unchanged content — the retained doc already carries it
+	}
+	if err := mqttutil.PublishJSONRetained(mc, bus.TopicCSIPCurves, msg); err != nil {
+		log.Printf("lexa-northbound: publish curves: %v", err)
+		return // not recorded — retried on the next cycle
+	}
+	c.published = true
+	c.lastHash = msg.SetID
+}
+
+// curveSetEntries builds the bus.CurveSetEntry list for ac's resolved
+// curve-linked modes. Defense in depth: an entry whose curve content fails
+// scheduler.PlausibleCurve is dropped AND alarmed (a malformed curve must
+// never produce a CurveSet entry) — normally unreachable, because the
+// scheduler rejects a control whose active curves fail the identical gate,
+// but a held last-known-good adopted before this gate existed, or a future
+// call-site slip, must not smuggle garbage breakpoints to a reconciler.
+func curveSetEntries(ac *scheduler.ActiveControl) []bus.CurveSetEntry {
+	var out []bus.CurveSetEntry
+	for _, mc := range ac.ResolvedModeCurves() {
+		if !scheduler.PlausibleCurve(mc.Curve) {
+			discovery.ReportIgnoredContent("malformed-curve", ac.MRID+"/"+mc.Mode)
+			continue
+		}
+		e := bus.CurveSetEntry{
+			Mode:      mc.Mode,
+			MRID:      mc.Curve.MRID,
+			CurveType: mc.Curve.CurveType,
+			XMult:     mc.Curve.XMultiplier,
+			YMult:     mc.Curve.YMultiplier,
+			YRefType:  mc.Curve.YRefType,
+		}
+		for _, pt := range mc.Curve.CurveData {
+			e.Points = append(e.Points, bus.CurvePoint{X: pt.XValue, Y: pt.YValue})
+		}
+		out = append(out, e)
+	}
+	return out
 }

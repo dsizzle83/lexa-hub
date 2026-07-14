@@ -110,6 +110,36 @@ func (a ActiveControl) Finite() error {
 	if err := finite("fixed_w", a.FixedW); err != nil {
 		return err
 	}
+	// WP-8 additive advanced-control scalars (architecture §2.2): every new
+	// *float64 joins the check, same GAP-09 discipline as the four above.
+	if err := finite("gen_lim_w", a.GenLimW); err != nil {
+		return err
+	}
+	if err := finite("load_lim_w", a.LoadLimW); err != nil {
+		return err
+	}
+	if err := finite("target_w", a.TargetW); err != nil {
+		return err
+	}
+	if err := finite("fixed_var_pct", a.FixedVarPct); err != nil {
+		return err
+	}
+	if err := finite("set_grad_w", a.SetGradW); err != nil {
+		return err
+	}
+	if err := finite("set_soft_grad_w", a.SetSoftGradW); err != nil {
+		return err
+	}
+	if a.FixedPFInject != nil {
+		if err := finiteVal("fixed_pf_inject.pf", a.FixedPFInject.PF); err != nil {
+			return err
+		}
+	}
+	if a.FixedPFAbsorb != nil {
+		if err := finiteVal("fixed_pf_absorb.pf", a.FixedPFAbsorb.PF); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

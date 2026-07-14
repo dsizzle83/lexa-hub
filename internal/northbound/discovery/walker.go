@@ -18,9 +18,13 @@ import (
 	"encoding/xml"
 	"fmt"
 	"log"
+	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"lexa-hub/internal/bus"
 	model "lexa-proto/csipmodel"
 )
 
@@ -102,8 +106,50 @@ type ProgramState struct {
 	ExtendedControls *model.ExtendedDERControlList
 	// ExtendedDefault is the DefaultDERControl with the full extended base.
 	ExtendedDefault *model.ExtendedDefaultDERControl
+	// DefaultSetGradW/DefaultSetSoftGradW are the DefaultDERControl's
+	// setGradW/setSoftGradW ramp-rate defaults (2030.5 PerCent: hundredths
+	// of a percent of setMaxW per second), parsed by the walker's local XML
+	// wrapper (WP-8) because the vendored csipmodel type predates them and
+	// WP-1 was the only planned proto pin bump. Per the CSIP ramp-rate rule
+	// these ride ONLY the DefaultDERControl — events ramp via RampTms.
+	DefaultSetGradW     *uint16
+	DefaultSetSoftGradW *uint16
 	// Curves maps DERCurve href → DERCurve for fast resolution of curve links.
 	Curves map[string]model.DERCurve
+}
+
+// CurveModeLink pairs a curve-linked mode's bus vocabulary name
+// (bus.CurveMode*, matching DERScheduleSlot's JSON keys) with that mode's
+// CurveLink field on an ExtendedDERControlBase. CurveModeLinks is the single
+// owner of the mode↔field mapping — the walker's ignored-content sweep, the
+// scheduler's curve plausibility gate, and publish's CurveSet builder all
+// iterate it, so a mode added to the model shows up (or alarms) everywhere
+// at once instead of silently missing one consumer.
+type CurveModeLink struct {
+	Mode string
+	Link *model.CurveLink
+}
+
+// CurveModeLinks returns the 14 curve-linked modes of base in a fixed,
+// deterministic order (nil Link entries included — callers decide whether an
+// absent link matters).
+func CurveModeLinks(base *model.ExtendedDERControlBase) []CurveModeLink {
+	return []CurveModeLink{
+		{bus.CurveModeVoltVar, base.OpModVoltVar},
+		{bus.CurveModeFreqWatt, base.OpModFreqWatt},
+		{bus.CurveModeWattPF, base.OpModWattPF},
+		{bus.CurveModeVoltWatt, base.OpModVoltWatt},
+		{bus.CurveModeHFRTMayTrip, base.OpModHFRTMayTrip},
+		{bus.CurveModeHFRTMustTrip, base.OpModHFRTMustTrip},
+		{bus.CurveModeHVRTMayTrip, base.OpModHVRTMayTrip},
+		{bus.CurveModeHVRTMomentaryCessation, base.OpModHVRTMomentaryCessation},
+		{bus.CurveModeHVRTMustTrip, base.OpModHVRTMustTrip},
+		{bus.CurveModeLFRTMayTrip, base.OpModLFRTMayTrip},
+		{bus.CurveModeLFRTMustTrip, base.OpModLFRTMustTrip},
+		{bus.CurveModeLVRTMayTrip, base.OpModLVRTMayTrip},
+		{bus.CurveModeLVRTMomentaryCessation, base.OpModLVRTMomentaryCessation},
+		{bus.CurveModeLVRTMustTrip, base.OpModLVRTMustTrip},
+	}
 }
 
 // DERResourceState holds device-level monitoring data for one DER.
@@ -272,17 +318,23 @@ func (w *Walker) Discover(ctx context.Context, dcapPath string) (*ResourceTree, 
 		for _, prog := range progList.DERProgram {
 			ps := ProgramState{Program: prog}
 
-			// Step 6a: DefaultDERControl — fetch once as extended; derive simple for scheduler.
+			// Step 6a: DefaultDERControl — fetch once as extended; derive the
+			// scheduler's scalar evaluation view alongside (the full base is
+			// carried in ExtendedDefault, WP-8 — nothing is dropped).
 			if prog.DefaultDERControlLink != nil {
 				exd, err := w.fetchExtendedDefaultDERControl(ctx, prog.DefaultDERControlLink.Href)
 				if err != nil {
 					return nil, fmt.Errorf("step 6 (DefaultDERControl for %s): %w", prog.MRID, err)
 				}
-				ps.ExtendedDefault = exd
-				ps.DefaultControl = extendedDefaultToSimple(exd)
+				ps.ExtendedDefault = &exd.ExtendedDefaultDERControl
+				ps.DefaultSetGradW = exd.SetGradW
+				ps.DefaultSetSoftGradW = exd.SetSoftGradW
+				ps.DefaultControl = extendedDefaultToSimple(&exd.ExtendedDefaultDERControl)
 			}
 
-			// Step 6b: DERControlList — fetch once as extended; derive simple for scheduler.
+			// Step 6b: DERControlList — fetch once as extended; derive the
+			// scheduler's scalar evaluation view alongside (the full base is
+			// carried in ExtendedControls, WP-8 — nothing is dropped).
 			if prog.DERControlListLink != nil {
 				ext, err := w.fetchExtendedDERControlList(ctx, prog.DERControlListLink.Href)
 				if err != nil {
@@ -316,6 +368,11 @@ func (w *Walker) Discover(ctx context.Context, dcapPath string) (*ResourceTree, 
 					}
 				}
 			}
+
+			// WP-8: alarm (never silently drop) any served control content
+			// the bus carriage still cannot represent — see
+			// reportIgnoredContent.
+			w.reportIgnoredContent(&ps)
 
 			tree.Programs = append(tree.Programs, ps)
 		}
@@ -424,8 +481,21 @@ func (w *Walker) fetchExtendedDERControlList(ctx context.Context, path string) (
 	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
-func (w *Walker) fetchExtendedDefaultDERControl(ctx context.Context, path string) (*model.ExtendedDefaultDERControl, error) {
-	var r model.ExtendedDefaultDERControl
+// extendedDefaultDERControlDoc wraps the vendored ExtendedDefaultDERControl
+// with the two DefaultDERControl-only ramp-rate defaults the vendored model
+// predates (2030.5 setGradW/setSoftGradW, PerCent: hundredths of a percent
+// of setMaxW per second). encoding/xml promotes the embedded struct's fields
+// (including its XMLName), so this parses the exact same <DefaultDERControl>
+// element with two extra children — no proto pin bump needed (WP-1 was the
+// only planned bump).
+type extendedDefaultDERControlDoc struct {
+	model.ExtendedDefaultDERControl
+	SetGradW     *uint16 `xml:"setGradW"`
+	SetSoftGradW *uint16 `xml:"setSoftGradW"`
+}
+
+func (w *Walker) fetchExtendedDefaultDERControl(ctx context.Context, path string) (*extendedDefaultDERControlDoc, error) {
+	var r extendedDefaultDERControlDoc
 	return &r, w.fetchAndParse(ctx, path, &r)
 }
 
@@ -467,8 +537,13 @@ func (w *Walker) fetchResponseSetPostPath(ctx context.Context, listHref string) 
 	return rsl.ResponseSet[0].ResponseList.Href, nil
 }
 
-// extendedDefaultToSimple converts ExtendedDefaultDERControl to the plain
-// DefaultDERControl used by the scheduler (which only touches scalar modes).
+// extendedDefaultToSimple projects an ExtendedDefaultDERControl onto the
+// plain DefaultDERControl the scheduler's decision logic evaluates (scalar
+// modes only). Since WP-8 this is a VIEW, not a drop: the full extended base
+// stays carried in ProgramState.ExtendedDefault, rides through
+// scheduler.Evaluate on ActiveControl.Extended, and is emitted on the bus
+// (publish.ToActiveControl + publish.Curves); anything the carriage still
+// cannot represent is alarmed by reportIgnoredContent, never silently lost.
 func extendedDefaultToSimple(e *model.ExtendedDefaultDERControl) *model.DefaultDERControl {
 	return &model.DefaultDERControl{
 		Resource:    e.Resource,
@@ -492,8 +567,12 @@ func extendedDefaultToSimple(e *model.ExtendedDefaultDERControl) *model.DefaultD
 	}
 }
 
-// extendedListToSimple converts ExtendedDERControlList to DERControlList for
-// the scheduler (which only touches scalar modes).
+// extendedListToSimple projects an ExtendedDERControlList onto the plain
+// DERControlList the scheduler's decision logic evaluates (scalar modes
+// only). Since WP-8 this is a VIEW, not a drop — same contract as
+// extendedDefaultToSimple above: the full extended bases stay carried in
+// ProgramState.ExtendedControls and ride through to the bus; unrepresentable
+// content is alarmed by reportIgnoredContent, never silently lost.
 func extendedListToSimple(e *model.ExtendedDERControlList) *model.DERControlList {
 	list := &model.DERControlList{
 		Resource: e.Resource,
@@ -529,6 +608,107 @@ func extendedListToSimple(e *model.ExtendedDERControlList) *model.DERControlList
 		})
 	}
 	return list
+}
+
+// ─── Ignored-content alarm (WP-8, closes the 10_BACKLOG ignored-curve item) ──
+//
+// The extended→simple projection used to drop curve/PF/energize content
+// silently. WP-8 carries the full extended base + resolved curves through to
+// the bus, so the only content still lost is what the ActiveControl/CurveSet
+// carriage cannot represent yet. That residue is ALARMED here — a
+// rate-limited WARN edge (first occurrence of a distinct item, then every
+// ignoredLogEveryNth, mirroring bus.RejectAndAlarm's journal-budget shape)
+// plus a monotonic total for the lexa_nb_ignored_control_content_total
+// counter (exposed via IgnoredContentTotal for cmd/northbound's metrics
+// Collect callback). Package-level state, not Walker fields, because run.
+// RunOnce constructs a fresh Walker every walk cycle.
+//
+// Detected kinds:
+//   - "target_var":   opModTargetVar — no ActiveControl field yet (§2.2 has
+//     target_w only).
+//   - "freq_droop":   opModFreqDroop — inline droop params ride neither
+//     ActiveControl nor CurveSet yet (they DO ride DERScheduleMsg slots,
+//     but the WP-9 adv-doc author consumes ActiveControl+CurveSet).
+//   - "unresolvable-curve": a curve-linked opMod whose href is empty or not
+//     present in the program's fetched DERCurveList (including the whole
+//     list failing to fetch) — the mode is commanded but its content cannot
+//     be published.
+//   - "malformed-curve": a resolved curve that fails the content gate
+//     (publish-side defense; the scheduler separately REJECTS a control
+//     whose active curves fail plausibility — that path alarms via
+//     RejectHook/ImplausibleReject, not here).
+//
+// Truly unknown XML opMod elements (outside the vendored model entirely) are
+// discarded by encoding/xml before any code here runs; detecting those needs
+// schema-aware raw parsing and stays out of scope.
+
+var (
+	ignoredContentTotal uint64   // atomic; monotonic across all kinds
+	ignoredContentSeen  sync.Map // "kind|detail" → *uint64 per-item count
+)
+
+// ignoredLogEveryN is the WARN rate-limit divisor (first + every Nth per
+// distinct item). A var, not a const, only so tests can shrink it.
+var ignoredLogEveryN uint64 = 100
+
+// ReportIgnoredContent records one occurrence of served control content the
+// bus carriage cannot represent. Exported because publish's CurveSet builder
+// shares the same alarm for its defensive malformed-entry drop.
+func ReportIgnoredContent(kind, detail string) {
+	atomic.AddUint64(&ignoredContentTotal, 1)
+	v, _ := ignoredContentSeen.LoadOrStore(kind+"|"+detail, new(uint64))
+	n := atomic.AddUint64(v.(*uint64), 1)
+	if n == 1 || n%ignoredLogEveryN == 0 {
+		slog.Warn("walker: IGNORED control content the bus carriage cannot represent",
+			"kind", kind, "detail", detail, "count", n)
+	}
+}
+
+// IgnoredContentTotal returns the monotonic total of ignored-content
+// occurrences, for lexa_nb_ignored_control_content_total (a metrics Collect
+// callback in cmd/northbound scrapes it — same pattern as bus.VersionRejects).
+func IgnoredContentTotal() uint64 {
+	return atomic.LoadUint64(&ignoredContentTotal)
+}
+
+// reportIgnoredContent sweeps one discovered program's served controls
+// (extended default + every extended event) for content the carriage cannot
+// represent and alarms each occurrence. Runs every walk on everything the
+// server serves — not just the currently-active control — because any served
+// event is a future adoption candidate and the alarm must fire before the
+// content is needed, not after.
+func (w *Walker) reportIgnoredContent(ps *ProgramState) {
+	if ps.ExtendedDefault != nil {
+		w.sweepExtendedBase(ps, &ps.ExtendedDefault.DERControlBase, ps.ExtendedDefault.MRID)
+	}
+	if ps.ExtendedControls != nil {
+		for i := range ps.ExtendedControls.DERControl {
+			c := &ps.ExtendedControls.DERControl[i]
+			w.sweepExtendedBase(ps, &c.DERControlBase, c.MRID)
+		}
+	}
+}
+
+func (w *Walker) sweepExtendedBase(ps *ProgramState, base *model.ExtendedDERControlBase, mrid string) {
+	where := ps.Program.MRID + "/" + mrid
+	if base.OpModTargetVar != nil {
+		ReportIgnoredContent("target_var", where)
+	}
+	if base.OpModFreqDroop != nil {
+		ReportIgnoredContent("freq_droop", where)
+	}
+	for _, ml := range CurveModeLinks(base) {
+		if ml.Link == nil {
+			continue
+		}
+		if ml.Link.Href == "" {
+			ReportIgnoredContent("unresolvable-curve", where+"/"+ml.Mode+"(empty href)")
+			continue
+		}
+		if _, ok := ps.Curves[ml.Link.Href]; !ok {
+			ReportIgnoredContent("unresolvable-curve", where+"/"+ml.Mode+"("+ml.Link.Href+")")
+		}
+	}
 }
 
 // fetchAndParse is the single point where HTTP and XML meet.
