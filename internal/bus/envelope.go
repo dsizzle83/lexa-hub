@@ -82,6 +82,9 @@ const (
 	// CurveSet schema (WP-8, standards-buildout C1/D6). Born at 1, same
 	// convention as every family above.
 	CurveSetV = 1 // lexa/csip/curves (CurveSet)
+	// DesiredAdvanced schema (WP-9, standards-buildout C1/C3/C4, D6). Born at
+	// 1, same convention as every family above.
+	DesiredAdvancedV = 1 // lexa/desired/adv/{device} (DesiredAdvanced)
 )
 
 // LegacyV0Accepted is the transition switch for AD-006's compatibility

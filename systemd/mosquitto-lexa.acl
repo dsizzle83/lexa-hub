@@ -35,6 +35,12 @@ topic read lexa/desired/battery/+
 # bus.DesiredTopic("solar", <device>) (retained) — TASK-029 solar reconciler
 # consumes the hub's retained inverter desired-state doc (explicit CeilingW).
 topic read lexa/desired/solar/+
+# bus.SubDesiredAdv (retained) — WP-9/WP-10 (architecture §2.3): the hub's
+# advanced desired docs (bus.DesiredAdvanced, curve/PF/energize/droop/trip
+# axes). WP-10's adv reconciler shell is the consumer; granted now so the
+# WP-9 flip is releasable without an ACL follow-up (the scalar shells'
+# class dispatch ignores the "adv" class untouched meanwhile).
+topic read lexa/desired/adv/+
 # bus.TopicScanRequest (TASK-082) — unit 5.2 scan controller subscribes;
 # lexa-api's POST /scan (unit 4.3) is the writer. Refused
 # (ScanStatus{Phase:"refused"}) unless the service owns zero live devices or
@@ -108,6 +114,10 @@ topic write lexa/desired/solar/+
 # bus.DesiredTopic("evse", <station>) (retained) — TASK-030 hub-side EVSE
 # desired-doc publisher. Matches the lexa-ocpp evse read grant.
 topic write lexa/desired/evse/+
+# bus.DesiredAdvTopic(<device>) (retained) — WP-9 advanced desired-doc
+# author (cmd/hub/adv.go, behind hub.json advanced_der:"on"). Matches the
+# lexa-modbus adv read grant (architecture §2.3).
+topic write lexa/desired/adv/+
 # bus.CtrlSolarTopic("<device>").
 topic write lexa/control/solar/+
 # bus.EVSECommandTopic("<station>").

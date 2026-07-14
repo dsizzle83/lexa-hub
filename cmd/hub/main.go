@@ -439,6 +439,25 @@ func main() {
 	dersite := newDersiteAggregator(mc, cfg, reg.Counter("lexa_hub_dersite_publishes_total"))
 	go dersite.loop()
 
+	// WP-9 (standards-buildout C1/C3/C4): the advanced desired-doc author
+	// (cmd/hub/adv.go). Constructed ONLY when advanced_der is "on" — flag off
+	// means no author, no lexa/csip/curves subscription, and zero
+	// bus.DesiredAdvanced publishes (byte-zero behavior change; the
+	// constraint_shadow precedent). When on, it consumes the existing
+	// lexa/csip/control and lexa/northbound/schedule subscriptions additively
+	// (hooks below) plus its own lexa/csip/curves subscription, arbitrates
+	// modes per D7, and publishes one retained lexa/desired/adv/{device} doc
+	// per inverter/battery. Publishes are async fire-then-harvest (TASK-046)
+	// on subscription goroutines and its own ticker — never the engine tick.
+	adv := maybeNewAdvAuthor(mc, cfg,
+		reg.Counter("lexa_hub_ignored_modes_total"),
+		reg.Counter("lexa_hub_desired_adv_publishes_total"),
+		desiredPublishFailuresCtr)
+	if adv != nil {
+		go adv.loop()
+		log.Printf("lexa-hub: advanced DER author ENABLED for %d device(s) (retained lexa/desired/adv/+; no reconciler consumes these until WP-10)", len(adv.devices))
+	}
+
 	// TASK-041 restore-on-start: gated behind cfg.Snapshot.Enabled (WS-4.1,
 	// 2026-07-09: ships true in configs/hub.json after the write-only soak
 	// campaign — see SnapshotConfig's doc). This MUST run before the reconciler
@@ -831,6 +850,12 @@ func main() {
 	// is byte-identical to before.
 	if err := mqttutil.SubscribeDecodeErr(mc, bus.TopicCSIPControl, func(topic string, msg bus.ActiveControl) {
 		reader.onCSIPControl(topic, msg)
+		// WP-9: feed the advanced desired-doc author additively (nil when
+		// advanced_der is off). Its evaluation publishes async only — this
+		// callback never blocks on a PUBACK.
+		if adv != nil {
+			adv.OnControl(msg)
+		}
 		// A disconnect order must not wait out the ticker interval: force an
 		// immediate tick so cease-to-energize is applied within MQTT latency.
 		if msg.Connect != nil && !*msg.Connect {
@@ -852,8 +877,26 @@ func main() {
 	// Subscribe to northbound DER schedule → extract DER constraints for planner.
 	if err := mqttutil.Subscribe(mc, bus.TopicNorthboundSchedule, func(_ string, sched bus.DERScheduleMsg) {
 		eng.SetDERConstraints(derConstraintsFromSchedule(sched))
+		// WP-9: the schedule is the ONLY bus carriage for opModFreqDroop
+		// parameters (WP-8's carriage seam — see droopFromSchedule in adv.go);
+		// the adv author correlates them to the active control by MRID.
+		if adv != nil {
+			adv.OnSchedule(sched)
+		}
 	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe northbound schedule: %v", err)
+	}
+
+	// WP-9: the adv author's own curve-content subscription (retained
+	// bus.CurveSet, correlated to the control by curve_set_id). Subscribed
+	// only when the author exists — flag off leaves the hub's subscription
+	// set byte-identical to pre-WP-9.
+	if adv != nil {
+		if err := mqttutil.Subscribe(mc, bus.TopicCSIPCurves, func(_ string, cs bus.CurveSet) {
+			adv.OnCurves(cs)
+		}); err != nil {
+			log.Fatalf("lexa-hub: subscribe csip curves: %v", err)
+		}
 	}
 
 	// Subscribe to live pricing → extract per-step prices for planner.

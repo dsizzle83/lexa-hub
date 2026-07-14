@@ -21,6 +21,19 @@ type DeviceConfig struct {
 	Role string  `json:"role"`  // "inverter" | "battery" | "meter"
 	MaxW float64 `json:"max_w"` // nameplate capacity (W)
 
+	// DERGen names the device's advanced-DER model generation for the WP-9
+	// adv-doc author's per-device axis mapping (architecture D6/D7 rule 4):
+	// "7xx" (SunSpec IEEE-1547 models 701–712 — full advanced axes) or "12x"
+	// (legacy 12x-series curve models — reduced axis set, see
+	// advCapabilityAxes in adv.go). Empty (the default) means UNKNOWN
+	// capability: the device gets NO advanced axes in its doc and every
+	// commanded axis raises the ignored-mode alarm — never advertise/command
+	// what a device may lack the model for (the same
+	// omission-over-fabrication stance as G27). Any other value is a fatal
+	// config error (loadConfig), mirroring the mode/reconciler validation
+	// discipline. Read only when `advanced_der` is "on".
+	DERGen string `json:"der_gen,omitempty"`
+
 	// Plant is the optional per-device physical-response block (TASK-057,
 	// AD-007): ramp/latency/taper/lag parameters that will replace the
 	// bench-calibrated optimizer globals. Absent block ⇒ nil ⇒ the orchestrator
@@ -228,6 +241,19 @@ type Config struct {
 	// (architecture.md §3's table).
 	LogEventMinIntervalS int `json:"logevent_min_interval_s"`
 
+	// AdvancedDER gates the WP-9 advanced desired-doc author (cmd/hub/adv.go,
+	// architecture §3's `advanced_der` row): "off" (the default — the author
+	// is NOT even constructed, no lexa/csip/curves subscription, zero
+	// DesiredAdvanced publishes; the constraint_shadow flag-off precedent) or
+	// "on" (consume ActiveControl+CurveSet+schedule droop, arbitrate per D7,
+	// publish one retained lexa/desired/adv/{device} doc per inverter/
+	// battery). Empty ⇒ "off"; any other value is a FATAL config error
+	// (loadConfig), mirroring the reconciler-mode/mode validation — a typo
+	// must not silently leave the advanced path off (or on). The flip to "on"
+	// is releasable before WP-10: the docs sit retained and harmless, nothing
+	// consumes them yet.
+	AdvancedDER string `json:"advanced_der"`
+
 	// DERType overrides the derived 2030.5 DERCapability type code the WP-4
 	// dersite aggregator publishes (architecture D2: "config override
 	// der_type for utility-handbook fiat"). 0/absent = derive from the
@@ -395,6 +421,26 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.DERType < 0 || cfg.DERType > 255 {
 		return nil, fmt.Errorf("invalid der_type %d: want 0 (derive) or a 2030.5 DERType code 1..255", cfg.DERType)
+	}
+	// advanced_der (WP-9): empty ⇒ "off"; anything else unknown is a FATAL
+	// config error, not a silent fallback — same discipline as mode above.
+	if cfg.AdvancedDER == "" {
+		cfg.AdvancedDER = "off"
+	}
+	if cfg.AdvancedDER != "off" && cfg.AdvancedDER != "on" {
+		return nil, fmt.Errorf("invalid advanced_der %q: want \"off\" or \"on\"", cfg.AdvancedDER)
+	}
+	// der_gen (WP-9 per-device advanced capability): empty = unknown (no adv
+	// axes); "7xx"/"12x" select an axis set (adv.go's advCapabilityAxes).
+	// Anything else is a fatal config error — an unrecognized generation must
+	// not silently degrade to "unknown" and strip a device's axes.
+	for i := range cfg.Devices {
+		switch cfg.Devices[i].DERGen {
+		case "", "7xx", "12x":
+		default:
+			return nil, fmt.Errorf("device %q: invalid der_gen %q: want \"7xx\", \"12x\", or omitted (unknown)",
+				cfg.Devices[i].Name, cfg.Devices[i].DERGen)
+		}
 	}
 	if err := decodePlantBlocks(&cfg); err != nil {
 		return nil, err

@@ -128,6 +128,12 @@ func SupportedV(topic string) int {
 		return CertStatusV
 	case topic == TopicHubPlan:
 		return PlanLogV
+	case strings.HasPrefix(topic, "lexa/desired/adv/"):
+		// WP-9's DesiredAdvanced family occupies the {class}="adv" slot of the
+		// desired-topic shape (D6) and versions independently of the scalar
+		// DesiredState docs — this arm must stay ABOVE the broader
+		// "lexa/desired/" prefix arm below or it would never match.
+		return DesiredAdvancedV
 	case strings.HasPrefix(topic, "lexa/desired/"):
 		// AD-013's DesiredStateV case, deferred from TASK-026 (the reconciler
 		// core landed unwired) to TASK-027, whose hub-side publisher is the
