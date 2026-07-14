@@ -40,6 +40,7 @@ import (
 	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
+	"lexa-hub/internal/northbound/derreport"
 	"lexa-hub/internal/northbound/egress"
 	"lexa-hub/internal/northbound/flowres"
 	"lexa-hub/internal/northbound/identity"
@@ -147,6 +148,11 @@ func main() {
 	// dimension (the certmon.go precedent).
 	logeventsPostedCtr := reg.Counter("lexa_nb_logevents_posted_total")
 	logeventsDroppedCtr := reg.Counter("lexa_nb_logevents_dropped_total")
+	// WP-4: successful DER* PUTs vs failed/skipped ones — registered
+	// unconditionally (stable scrape surface even with der_report=false;
+	// the registered-but-zero convention, TASK-044).
+	derreportPutsCtr := reg.Counter("lexa_nb_derreport_puts_total")
+	derreportErrsCtr := reg.Counter("lexa_nb_derreport_errors_total")
 
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
@@ -225,6 +231,28 @@ func main() {
 	discovery := run.New(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, nbm, run.PollRateConfig{Mode: cfg.PollRateMode()})
 	discovery.SetLogEventSink(logevManager)
 
+	// WP-4 DER* PUT reporter: rides the RESPONSE fetcher's TLS session, for
+	// the same egress-plane reasoning that put the WP-6 LogEvent poster
+	// there — DER* PUTs are periodic reporting egress (rare, small, driven
+	// from the walk cadence and MQTT-goroutine content changes), the same
+	// plane as Response/LogEvent POSTs, and keeping them off the DISCOVERY
+	// session preserves the three-session isolation's point: the long-lived
+	// walk session never serves two masters (an MQTT-driven capability PUT
+	// contending with an in-flight walk fetch under the discovery mutex).
+	// Rotation safety is identical either way — TASK-073's Reload swaps
+	// sessions under the same per-fetcher mutex Put takes. (Architecture D3
+	// sketched the discovery session; WP-4 chooses consistency with WP-6's
+	// landed egress-plane split instead — deviation documented here and in
+	// the WP-4 report.)
+	var derReporter *derreport.Manager
+	if cfg.DERReportEnabled() {
+		derReporter = derreport.New(fetcherResp, clk, derreportPutsCtr, derreportErrsCtr)
+		derReporter.SetEgressGate(egressGate)
+		discovery.SetDERReporter(derReporter)
+	} else {
+		slog.Info("lexa-northbound: der_report disabled — DER* PUT reporting off (G28–G30 duty not served)")
+	}
+
 	// WP-7 (D5): the scheduler's receipt-reject hook — a plausibility-gate
 	// rejection (malformed/implausible control, never adopted) posts Table 27
 	// status 253 (invalid/out-of-range), deduped per mRID by the tracker.
@@ -301,6 +329,15 @@ func main() {
 	// LogEventListLink (retry-once-then-drop; dedupe on LogEventMsg.DedupeKey).
 	if err := mqttutil.Subscribe(mc, bus.TopicHubLogEvent, logevManager.HandleLogEvent); err != nil {
 		log.Printf("lexa-northbound: subscribe logevent: %v", err)
+	}
+
+	// WP-4: the hub's retained GFEMS dersite aggregate → DERCapability/
+	// DERSettings PUT on content change (the walk drives the DERStatus/
+	// DERAvailability cadence via SetDERReporter above).
+	if derReporter != nil {
+		if err := mqttutil.Subscribe(mc, bus.TopicHubDERSite, derReporter.HandleDERSite); err != nil {
+			log.Printf("lexa-northbound: subscribe dersite: %v", err)
+		}
 	}
 
 	// sd_notify READY (TASK-008): subscriptions registered; only the walk

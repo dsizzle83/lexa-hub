@@ -150,6 +150,31 @@ func TestLoadConfig_LegacyCannotComplyCode(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_DERReport pins WP-4's default-ON reporting flag (reporting
+// truthful data is the compliance duty, G28–G30) and the explicit opt-out.
+func TestLoadConfig_DERReport(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want bool
+	}{
+		{"absent defaults to true", `{"mqtt_broker":"tcp://localhost:1883"}`, true},
+		{"explicit true", `{"mqtt_broker":"tcp://localhost:1883","der_report":true}`, true},
+		{"explicit false disables", `{"mqtt_broker":"tcp://localhost:1883","der_report":false}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadConfig(writeTempConfig(t, tc.json))
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if got := cfg.DERReportEnabled(); got != tc.want {
+				t.Errorf("DERReportEnabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func writeTempConfig(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "cfg.json")

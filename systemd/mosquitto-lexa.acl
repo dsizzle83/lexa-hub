@@ -84,6 +84,11 @@ topic read lexa/csip/rewalk
 # LogEventListLink; a missing grant silently drops them (RSK-09 pattern,
 # same as the three hub→northbound lines above).
 topic read lexa/hub/logevent
+# bus.TopicHubDERSite (retained) — hub → northbound (WP-4): the GFEMS
+# dersite aggregate the derreport manager PUTs upstream as DERCapability/
+# DERSettings/DERStatus/DERAvailability; a missing grant silently starves
+# the DER* reporting duty (RSK-09 pattern).
+topic read lexa/hub/dersite
 
 user lexa-hub
 # bus.CtrlBatteryTopic("<device>").
@@ -120,6 +125,9 @@ topic write lexa/csip/rewalk
 # bus.TopicHubLogEvent (WP-6, edge — never retained) — see lexa-northbound's
 # matching read grant.
 topic write lexa/hub/logevent
+# bus.TopicHubDERSite (retained, WP-4) — see lexa-northbound's matching
+# read grant.
+topic write lexa/hub/dersite
 # bus.SubMeasurements.
 topic read lexa/measurements/+
 # bus.SubBattMetrics.

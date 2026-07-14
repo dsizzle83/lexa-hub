@@ -180,6 +180,8 @@ func SupportedV(topic string) int {
 		return PendingStationsV
 	case topic == TopicHubLogEvent:
 		return LogEventV
+	case topic == TopicHubDERSite:
+		return DERSiteReportV
 	default:
 		return 1
 	}
@@ -260,6 +262,16 @@ const TopicHubPlan = "lexa/hub/plan"
 // at-least-once redelivery made idempotent by LogEventMsg.DedupeKey. See
 // internal/bus/logevent.go for the full contract.
 const TopicHubLogEvent = "lexa/hub/logevent"
+
+// TopicHubDERSite carries the hub's GFEMS site-aggregate DER report
+// (bus.DERSiteReport — D2 ratings/settings/modes truth-mask plus the live
+// status block) from cmd/hub's dersite aggregator to lexa-northbound's
+// derreport manager (WP-4, standards-buildout A2). STATE, retained at QoS 1
+// (PubQoS's non-measurement default): latest wins, a restarting
+// lexa-northbound re-seeds from the broker, and the hub republishes on
+// content change (min 60 s apart) plus an unchanged-content heartbeat. See
+// internal/bus/dersite.go for the full contract.
+const TopicHubDERSite = "lexa/hub/dersite"
 
 // Intent/scan/mode/status topics (TASK-082, docs/DEVICE_ROADMAP.md §1.1/§1.3).
 //

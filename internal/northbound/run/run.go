@@ -95,6 +95,15 @@ type Discovery struct {
 	// single discovery goroutine thereafter.
 	logEvents LogEventSink
 
+	// derReport is the optional WP-4 DER* PUT reporter (nil when not wired,
+	// i.e. der_report=false): after each successful walk, RunOnce hands it
+	// the self EndDevice's DERList entry's sub-resource hrefs (OnWalk),
+	// which is both its href refresh and its per-walk status/availability
+	// PUT cadence — the walk interval is already pollRate-paced (TASK-071),
+	// so per-walk IS the G30 DERList-pollRate cadence. Same set-once/
+	// read-from-walk-goroutine discipline as logEvents above.
+	derReport DERReportSink
+
 	// pollCfg/lastTree: TASK-071 (§12) walk-cadence pacing. pollCfg is fixed
 	// at construction (New); lastTree is the most recently SUCCESSFUL walk's
 	// tree (nil until the first success, and left untouched by a failed
@@ -147,6 +156,22 @@ type LogEventSink interface {
 // refresh entirely.
 func (d *Discovery) SetLogEventSink(s LogEventSink) {
 	d.logEvents = s
+}
+
+// DERReportSink is the slice of internal/northbound/derreport.Manager this
+// package needs (defined at the point of consumption, 05 §2): the per-walk
+// href refresh + PUT-cadence trigger. Empty strings mean the walk found no
+// link for that sub-resource.
+type DERReportSink interface {
+	OnWalk(capabilityHref, settingsHref, statusHref, availabilityHref string)
+}
+
+// SetDERReporter wires the WP-4 DER* PUT reporter into the walk cycle. Call
+// once from main() before Loop starts (same additive-setter shape as
+// SetLogEventSink); nil — the default, and der_report=false's wiring —
+// disables the per-walk trigger entirely.
+func (d *Discovery) SetDERReporter(s DERReportSink) {
+	d.derReport = s
 }
 
 // HandleRewalk is bus.TopicCSIPRewalk's subscription handler (TASK-042):
@@ -432,6 +457,46 @@ func (d *Discovery) RunOnce(ctx context.Context) {
 		}
 		d.logEvents.SetPath(href)
 	}
+
+	// DER* reporting (WP-4): hand the reporter the DER sub-resource hrefs
+	// this walk observed. This is also its per-walk PUT trigger (DERStatus/
+	// DERAvailability every walk — the pollRate-paced cadence, see the
+	// derReport field doc; DERCapability/DERSettings when the dersite
+	// content hash changed). During a PIN freeze RunOnce returns before this
+	// line, so DER* egress rides the walk freeze for free (D4), and the
+	// reporter re-checks the shared egress gate itself for its MQTT-driven
+	// path.
+	if d.derReport != nil {
+		cap, set, stat, avail := derHrefsFromTree(tree)
+		d.derReport.OnWalk(cap, set, stat, avail)
+	}
+}
+
+// derHrefsFromTree extracts the GFEMS DER entry's sub-resource hrefs from a
+// walked tree (WP-4). The GFEMS profile is ONE EndDevice with ONE DERList
+// entry (UTIL-002's per-DER mechanics are out of scope), so the FIRST entry
+// is authoritative; extra entries — nothing this product provisions — are
+// ignored here rather than guessed at. Missing links yield "" (the walker
+// fetched these same links at walker.go's step 3c; this reuses its
+// observations, never hardcoding a path).
+func derHrefsFromTree(tree *discovery.ResourceTree) (capability, settings, status, availability string) {
+	if tree == nil || tree.DERList == nil || len(tree.DERList.DER) == 0 {
+		return "", "", "", ""
+	}
+	der := tree.DERList.DER[0]
+	if der.DERCapabilityLink != nil {
+		capability = der.DERCapabilityLink.Href
+	}
+	if der.DERSettingsLink != nil {
+		settings = der.DERSettingsLink.Href
+	}
+	if der.DERStatusLink != nil {
+		status = der.DERStatusLink.Href
+	}
+	if der.DERAvailabilityLink != nil {
+		availability = der.DERAvailabilityLink.Href
+	}
+	return capability, settings, status, availability
 }
 
 // lastPublishedStore caches the most recent bus.ActiveControl this process

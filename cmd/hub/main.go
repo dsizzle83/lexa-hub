@@ -429,6 +429,16 @@ func main() {
 	logEvents := newLogEventDetector(cfg.LogEventMinInterval())
 	logEventsPub := newLogEventPublisher(mc, reg.Counter("lexa_hub_logevents_total"))
 
+	// WP-4 (CORE-009/CORE-014/BASIC-028): the GFEMS dersite aggregator
+	// (cmd/hub/dersite.go). Fed from the same measurement/battery-metrics/
+	// EVSE-state subscriptions below plus the breach-episode level inside
+	// emitAlerts; publishes the retained bus.DERSiteReport on
+	// lexa/hub/dersite from its own fixed-cadence goroutine (change-detect +
+	// 60 s min republish + heartbeat), async fire-then-harvest (TASK-046) —
+	// no feed path or tick ever blocks on it.
+	dersite := newDersiteAggregator(mc, cfg, reg.Counter("lexa_hub_dersite_publishes_total"))
+	go dersite.loop()
+
 	// TASK-041 restore-on-start: gated behind cfg.Snapshot.Enabled (WS-4.1,
 	// 2026-07-09: ships true in configs/hub.json after the write-only soak
 	// campaign — see SnapshotConfig's doc). This MUST run before the reconciler
@@ -528,11 +538,16 @@ func main() {
 		}
 		// Reflect the current episode state on EVERY call so the gauge tracks the
 		// merged evidence, including ticks/reports that produced no edge.
-		if episodes.Active() {
+		active := episodes.Active()
+		if active {
 			breachActiveGauge.Set(1)
 		} else {
 			breachActiveGauge.Set(0)
 		}
+		// WP-4: mirror the same merged level into the dersite status block's
+		// alarm bitmap (EMERGENCY_REMOTE category — the LEVEL counterpart of
+		// the WP-6 LogEvent edges emitted above).
+		dersite.SetBreachActive(active)
 	}
 
 	// planLogPending is the previous pass's plan-log publish, harvested at
@@ -794,10 +809,16 @@ func main() {
 	if err := mqttutil.Subscribe(mc, bus.SubMeasurements, func(topic string, msg bus.Measurement) {
 		reader.onMeasurement(topic, msg)
 		logEventsPub.publish(logEvents.OnMeasurement(msg, time.Now()))
+		// WP-4: the dersite aggregator stores the slice it needs (W + alarm
+		// bits) under its own lock; no publish happens on this goroutine.
+		dersite.OnMeasurement(msg)
 	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe measurements: %v", err)
 	}
-	if err := mqttutil.Subscribe(mc, bus.SubBattMetrics, reader.onBattMetrics); err != nil {
+	if err := mqttutil.Subscribe(mc, bus.SubBattMetrics, func(topic string, msg bus.BattMetrics) {
+		reader.onBattMetrics(topic, msg)
+		dersite.OnBattMetrics(msg) // WP-4: SOC/capacity/rate feed
+	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe batt metrics: %v", err)
 	}
 	// TASK-042 (GAP-02): SubscribeDecodeErr instead of Subscribe on this one
@@ -821,7 +842,10 @@ func main() {
 	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe csip control: %v", err)
 	}
-	if err := mqttutil.Subscribe(mc, bus.SubEVSEState, reader.onEVSEState); err != nil {
+	if err := mqttutil.Subscribe(mc, bus.SubEVSEState, func(topic string, msg bus.EVSEState) {
+		reader.onEVSEState(topic, msg)
+		dersite.OnEVSEState(msg) // WP-4: stored, inert until ev_storage (D2)
+	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe evse state: %v", err)
 	}
 

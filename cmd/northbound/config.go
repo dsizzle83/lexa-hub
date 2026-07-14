@@ -113,6 +113,19 @@ type Config struct {
 	// MTR-4 paired-change discipline).
 	LegacyCannotComplyCode bool `json:"legacy_cannotcomply_code,omitempty"`
 
+	// DERReport (WP-4, standards-buildout A2 — CORE-009/CORE-014/BASIC-028)
+	// enables the DER* PUT reporter (internal/northbound/derreport): the
+	// hub's lexa/hub/dersite aggregate PUT upstream as DERCapability/
+	// DERSettings (on content change) and DERStatus/DERAvailability (per
+	// walk). Absent/null defaults to TRUE — reporting truthful data IS the
+	// compliance duty (G28–G30) and carries no control risk (architecture §3
+	// defaults table); an explicit false disables the reporter entirely. A
+	// pointer, not a plain bool, because false is a meaningful configured
+	// value distinct from "not configured" (the RedirectMax convention).
+	// Per-resource 404/405 responses are auto-tolerated once then skipped —
+	// a server that doesn't offer a DER sub-resource needs no config change.
+	DERReport *bool `json:"der_report,omitempty"`
+
 	// ResponseStatePath is the WS-4.2 durable persistence path for
 	// responses.Tracker's posted/alerted maps (TASK-041's acknowledged
 	// northbound half — internal/northbound/responses/persist.go): a small
@@ -151,6 +164,12 @@ func (c *Config) RedirectMaxValue() int {
 // WS-4.2 persistence via the literal "off" value.
 func (c *Config) ResponseStateDisabled() bool {
 	return c.ResponseStatePath == "off"
+}
+
+// DERReportEnabled resolves the der_report key: absent ⇒ true (the WP-4
+// default — see the field doc); an explicit value wins.
+func (c *Config) DERReportEnabled() bool {
+	return c.DERReport == nil || *c.DERReport
 }
 
 // JournalConfig is the on-disk "journal" block — a duplicate of cmd/hub's

@@ -15,6 +15,7 @@
   "response_set_path": "/rsps/0/r",
   "registration_pin": 0,
   "legacy_cannotcomply_code": true,
+  "der_report": true,
   "redirect_max": 3,
   "cert_expiry_warn_days": 30,
   "journal": {

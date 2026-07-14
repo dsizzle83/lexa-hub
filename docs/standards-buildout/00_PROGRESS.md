@@ -8,17 +8,17 @@ Status legend: ⬜ pending · 🔵 in progress · ✅ done (tests green) · 🟠
 | WP | Title | Size | Deps | Status | Notes |
 |---|---|---|---|---|---|
 | WP-1 | lexa-proto change-set (THE pin bump) | L | — | ✅ 24081a2 | derbase Measurements ext · csipmodel LogEvent+Table27 · scanner 3-base · ocppserver16 |
-| WP-2 | bus.Measurement enrichment + modbus publishers | M | 1 | 🔵 | BUS LANE start |
+| WP-2 | bus.Measurement enrichment + modbus publishers | M | 1 | ✅ f639016 | BUS LANE start |
 | WP-3 | tlsclient PUT + redirects | S | — | ✅ 6f14518 | closes ERR-001 code half |
-| WP-4 | DER* reporting (dersite + derreport) | M | 2,3 | ⬜ | closes CORE-009/014, BASIC-028 |
-| WP-5 | telemetry VAr + Wh MMRs | S | 2 | ⬜ | closes BASIC-029 VAr gap |
-| WP-6 | LogEvent pipeline | M | 1,2 | ⬜ | closes BASIC-027 |
-| WP-7 | PIN verify + Table 27 codes | S | 1 | ⬜ | closes CORE-003 PIN, CORE-022 codes; kills 0xF0 default |
-| WP-8 | Advanced-control carriage northbound | M | 2 | ⬜ | BUS LANE; retires extended→simple silent drop |
+| WP-4 | DER* reporting (dersite + derreport) | M | 2,3 | 🔵 | closes CORE-009/014, BASIC-028 |
+| WP-5 | telemetry VAr + Wh MMRs | S | 2 | ✅ 656a0fe | closes BASIC-029 VAr gap |
+| WP-6 | LogEvent pipeline | M | 1,2 | ✅ 16d2bef | closes BASIC-027; gridsim LogEvent endpoint pending (bench queue) |
+| WP-7 | PIN verify + Table 27 codes | S | 1 | ✅ ea8b228 | 252 + 13/14 are documented seams; bench config keeps legacy 0xF0 until gridsim flips |
+| WP-8 | Advanced-control carriage northbound | M | 2 | 🔵 | BUS LANE; retires extended→simple silent drop |
 | WP-9 | Adv desired doc + hub authoring | M | 8 | ⬜ | BUS LANE; `advanced_der` flag |
 | WP-10 | Advanced reconciler execution | L | 9 | ⬜ | `reconciler.adv` off/shadow/active; closes BASIC-004..012 exec half |
 | WP-11 | GenLimW/LoadLimW enforcement (AUS) | M | 8 | ⬜ | cascade+shadow pair; `enforce_aus_limits` |
-| WP-12 | OCPP 1.6J dual-stack | M/L | 1 | 🔵 | port_16, ocppserver16; worktree |
+| WP-12 | OCPP 1.6J dual-stack | M/L | 1 | ✅ fcdd98e | 2.0.1 path byte-identical |
 | WP-13 | Pairing gate + ClearChargingProfile | M | 12 (+bus slot after 9) | ⬜ | closes R8 |
 | WP-14 | V2G type enablers | M | 9,13 (bus lane tail) | ⬜ | `ev_storage`; flag-off byte-identical plans |
 | WP-15 | lexa-openadr service | L | 2 (+bus slot last) | ⬜ | metrics :9108; pure Go |
@@ -35,3 +35,5 @@ set legacy_cannotcomply_code=true).
 
 Bench-deferred queue (WP-17f): adv-shell shadow soak · AUS shadow week · 1.6 evsim · PIN drill ·
 COMM-004 pcaps · dersite/PUT vs gridsim (gridsim needs PUT/LogEvent endpoints — csip-tls-test work).
+
+Vendor quirk for next proto bump (found in WP-5): csipmodel KindVoltage=12 collides with 2030.5 KindType energy(12); KindFreq=38 is not a KindType member. Telemetry uses local spec-correct constants meanwhile.

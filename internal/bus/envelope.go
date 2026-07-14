@@ -75,6 +75,10 @@ const (
 	// LogEvent schema (WP-6, standards-buildout A4). Born at 1, same
 	// convention as every family above.
 	LogEventV = 1 // lexa/hub/logevent (LogEventMsg)
+
+	// DERSiteReport schema (WP-4, standards-buildout A2). Born at 1, same
+	// convention as every family above.
+	DERSiteReportV = 1 // lexa/hub/dersite (DERSiteReport)
 )
 
 // LegacyV0Accepted is the transition switch for AD-006's compatibility

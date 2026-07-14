@@ -227,6 +227,14 @@ type Config struct {
 	// complete late, never lost. 0/absent defaults to 10 in loadConfig
 	// (architecture.md §3's table).
 	LogEventMinIntervalS int `json:"logevent_min_interval_s"`
+
+	// DERType overrides the derived 2030.5 DERCapability type code the WP-4
+	// dersite aggregator publishes (architecture D2: "config override
+	// der_type for utility-handbook fiat"). 0/absent = derive from the
+	// device mix (deriveDERType, cmd/hub/dersite.go): 83 for the product's
+	// common inverters+batteries case. Values outside 1..255 are a fatal
+	// config error, not a silent clamp.
+	DERType int `json:"der_type,omitempty"`
 }
 
 // ConstraintMode is one FIX-F constraint's per-axis operating mode.
@@ -384,6 +392,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.LogEventMinIntervalS <= 0 {
 		cfg.LogEventMinIntervalS = 10
+	}
+	if cfg.DERType < 0 || cfg.DERType > 255 {
+		return nil, fmt.Errorf("invalid der_type %d: want 0 (derive) or a 2030.5 DERType code 1..255", cfg.DERType)
 	}
 	if err := decodePlantBlocks(&cfg); err != nil {
 		return nil, err
