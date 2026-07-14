@@ -217,6 +217,16 @@ type Config struct {
 	// comfortably above normal republish jitter and comfortably below "this
 	// might be a resurrected corpse."
 	RetainedAdoptionMaxAgeS int `json:"retained_adoption_max_age_s"`
+
+	// LogEventMinIntervalS is the per-device-per-alarm-bit rate floor (in
+	// seconds) on the WP-6 LogEvent edge detector (cmd/hub/logevent.go): a
+	// chattering device's alarm-bit flapping must not turn every measurement
+	// poll into a lexa/hub/logevent edge + journal line (flash budget,
+	// docs/FLASH_BUDGET.md). A transition suppressed by the floor is
+	// re-detected on the first measurement after it, so alarm/RTN pairs
+	// complete late, never lost. 0/absent defaults to 10 in loadConfig
+	// (architecture.md §3's table).
+	LogEventMinIntervalS int `json:"logevent_min_interval_s"`
 }
 
 // ConstraintMode is one FIX-F constraint's per-axis operating mode.
@@ -372,6 +382,9 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.RetainedAdoptionMaxAgeS <= 0 {
 		cfg.RetainedAdoptionMaxAgeS = 300
 	}
+	if cfg.LogEventMinIntervalS <= 0 {
+		cfg.LogEventMinIntervalS = 10
+	}
 	if err := decodePlantBlocks(&cfg); err != nil {
 		return nil, err
 	}
@@ -478,4 +491,10 @@ func (c *Config) SafetyInterval() time.Duration {
 // MQTTSystemReader.SetRetainedAdoptionMaxAge (TASK-042).
 func (c *Config) RetainedAdoptionMaxAge() time.Duration {
 	return time.Duration(c.RetainedAdoptionMaxAgeS) * time.Second
+}
+
+// LogEventMinInterval is LogEventMinIntervalS as a time.Duration, for
+// newLogEventDetector (WP-6).
+func (c *Config) LogEventMinInterval() time.Duration {
+	return time.Duration(c.LogEventMinIntervalS) * time.Second
 }

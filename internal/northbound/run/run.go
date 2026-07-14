@@ -87,6 +87,14 @@ type Discovery struct {
 	// TASK-068). Touched only from the single discovery goroutine (Loop).
 	failures int
 
+	// logEvents is the optional WP-6 LogEvent poster (nil when not wired):
+	// after each successful walk, RunOnce feeds it the self EndDevice's
+	// LogEventListLink href — the same per-walk path refresh the
+	// flow-reservation manager gets via SetRequestPath. Set once at wiring
+	// time (SetLogEventSink, before Loop starts) and only read from the
+	// single discovery goroutine thereafter.
+	logEvents LogEventSink
+
 	// pollCfg/lastTree: TASK-071 (§12) walk-cadence pacing. pollCfg is fixed
 	// at construction (New); lastTree is the most recently SUCCESSFUL walk's
 	// tree (nil until the first success, and left untouched by a failed
@@ -124,6 +132,21 @@ func New(mc mqtt.Client, fetcher discovery.Fetcher, lfdi string, sched *schedule
 		rewalkGate: &rewalkGate{},
 		pollCfg:    pollCfg,
 	}
+}
+
+// LogEventSink is the slice of internal/northbound/logevent.Manager this
+// package needs (defined at the point of consumption, 05 §2): the per-walk
+// LogEventListLink path refresh.
+type LogEventSink interface {
+	SetPath(href string)
+}
+
+// SetLogEventSink wires the WP-6 LogEvent poster's path refresh into the
+// walk cycle. Call once from main() before Loop starts (an additive setter
+// rather than an eleventh New parameter); nil — the default — disables the
+// refresh entirely.
+func (d *Discovery) SetLogEventSink(s LogEventSink) {
+	d.logEvents = s
 }
 
 // HandleRewalk is bus.TopicCSIPRewalk's subscription handler (TASK-042):
@@ -397,6 +420,18 @@ func (d *Discovery) RunOnce(ctx context.Context) {
 	// current reservation statuses.
 	d.frm.SetRequestPath(tree.FlowReservationRequestPath)
 	publish.FlowReservations(d.mc, tree)
+
+	// LogEvent (WP-6, §11.4): refresh the poster's POST target from the self
+	// EndDevice's LogEventListLink — "" when the server exposes none (the
+	// function set is optional both sides; the poster drops-and-counts in
+	// that case rather than spooling).
+	if d.logEvents != nil {
+		href := ""
+		if tree.SelfDevice != nil && tree.SelfDevice.LogEventListLink != nil {
+			href = tree.SelfDevice.LogEventListLink.Href
+		}
+		d.logEvents.SetPath(href)
+	}
 }
 
 // lastPublishedStore caches the most recent bus.ActiveControl this process

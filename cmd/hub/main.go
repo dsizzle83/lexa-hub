@@ -419,6 +419,16 @@ func main() {
 	}
 	episodes := newBreachEpisodes(jw, snapPath)
 
+	// WP-6 (BASIC-027/G31/G32): the CSIP Table 14 LogEvent alarm-edge
+	// detector + its async publisher (cmd/hub/logevent.go). Fed from two
+	// sources: alarm-bit transitions on the measurement subscription below,
+	// and breach-episode edges inside emitAlerts. Publishes edge (never
+	// retained) QoS 1 bus.LogEventMsg on lexa/hub/logevent for
+	// lexa-northbound's poster; publishes are fire-then-harvest async
+	// (TASK-046) so neither feed path ever blocks on a PUBACK.
+	logEvents := newLogEventDetector(cfg.LogEventMinInterval())
+	logEventsPub := newLogEventPublisher(mc, reg.Counter("lexa_hub_logevents_total"))
+
 	// TASK-041 restore-on-start: gated behind cfg.Snapshot.Enabled (WS-4.1,
 	// 2026-07-09: ships true in configs/hub.json after the write-only soak
 	// campaign — see SnapshotConfig's doc). This MUST run before the reconciler
@@ -510,6 +520,11 @@ func main() {
 			if err := mqttutil.PublishJSONTimeout(mc, bus.TopicCSIPComplianceAlert, false, alert, complianceAlertTimeout); err != nil {
 				log.Printf("lexa-hub: publish compliance alert: %v", err)
 			}
+			// WP-6: mirror the episode edge as a CSIP Table 14 LogEvent pair
+			// (EMERGENCY_REMOTE alarm at onset, RTN at clear — see
+			// logEventDetector.OnBreachAlert for the mapping rationale).
+			// Async publish; never blocks the tick path.
+			logEventsPub.publish(logEvents.OnBreachAlert(alert, time.Now()))
 		}
 		// Reflect the current episode state on EVERY call so the gauge tracks the
 		// merged evidence, including ticks/reports that produced no edge.
@@ -772,8 +787,14 @@ func main() {
 		r.Counter("lexa_hub_engine_cmd_dropped_total").Set(eng.CmdDropped())
 	})
 
-	// Subscribe to all state topics.
-	if err := mqttutil.Subscribe(mc, bus.SubMeasurements, reader.onMeasurement); err != nil {
+	// Subscribe to all state topics. The measurement handler also feeds the
+	// WP-6 alarm-edge detector (alarm_bits transitions → lexa/hub/logevent);
+	// the detector is a pure diff against its own baseline and the publish is
+	// async, so this adds no blocking to the measurement path.
+	if err := mqttutil.Subscribe(mc, bus.SubMeasurements, func(topic string, msg bus.Measurement) {
+		reader.onMeasurement(topic, msg)
+		logEventsPub.publish(logEvents.OnMeasurement(msg, time.Now()))
+	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe measurements: %v", err)
 	}
 	if err := mqttutil.Subscribe(mc, bus.SubBattMetrics, reader.onBattMetrics); err != nil {

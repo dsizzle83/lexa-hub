@@ -178,6 +178,8 @@ func SupportedV(topic string) int {
 		return ScanResultV
 	case topic == TopicOCPPPending:
 		return PendingStationsV
+	case topic == TopicHubLogEvent:
+		return LogEventV
 	default:
 		return 1
 	}
@@ -249,6 +251,15 @@ const TopicNorthboundCertStatus = "lexa/northbound/certstatus"
 // doubles as an engine heartbeat: a hub whose /status last_plan timestamp
 // stops advancing has a wedged control loop (QA gaps doc, "wedge detection").
 const TopicHubPlan = "lexa/hub/plan"
+
+// TopicHubLogEvent carries CSIP Table 14 DER alarm/RTN occurrences
+// (bus.LogEventMsg) from the hub's alarm-edge detector to lexa-northbound's
+// LogEvent poster (WP-6, BASIC-027/G31/G32). An EDGE, never retained (a
+// retained edge replays as a false edge after a restart — same discipline as
+// TopicCSIPComplianceAlert); QoS 1 via PubQoS's non-measurement default, with
+// at-least-once redelivery made idempotent by LogEventMsg.DedupeKey. See
+// internal/bus/logevent.go for the full contract.
+const TopicHubLogEvent = "lexa/hub/logevent"
 
 // Intent/scan/mode/status topics (TASK-082, docs/DEVICE_ROADMAP.md §1.1/§1.3).
 //

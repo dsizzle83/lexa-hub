@@ -71,6 +71,10 @@ const (
 	ScanStatusV          = 1 // lexa/scan/status
 	ScanResultV          = 1 // lexa/scan/result
 	PendingStationsV     = 1 // lexa/ocpp/pending
+
+	// LogEvent schema (WP-6, standards-buildout A4). Born at 1, same
+	// convention as every family above.
+	LogEventV = 1 // lexa/hub/logevent (LogEventMsg)
 )
 
 // LegacyV0Accepted is the transition switch for AD-006's compatibility

@@ -43,6 +43,7 @@ import (
 	"lexa-hub/internal/northbound/egress"
 	"lexa-hub/internal/northbound/flowres"
 	"lexa-hub/internal/northbound/identity"
+	"lexa-hub/internal/northbound/logevent"
 	"lexa-hub/internal/northbound/responses"
 	"lexa-hub/internal/northbound/run"
 	"lexa-hub/internal/northbound/scheduler"
@@ -140,6 +141,12 @@ func main() {
 		ImplausibleRejects: reg.Counter("lexa_nb_implausible_rejects_total"),
 	}
 	responsesPostedCtr := reg.Counter("lexa_nb_responses_posted_total")
+	// WP-6 (§8 of the standards-buildout architecture): confirmed LogEvent
+	// POSTs vs retry-exhausted/undeliverable drops — two flat names rather
+	// than one labeled counter because internal/metrics has no label
+	// dimension (the certmon.go precedent).
+	logeventsPostedCtr := reg.Counter("lexa_nb_logevents_posted_total")
+	logeventsDroppedCtr := reg.Counter("lexa_nb_logevents_dropped_total")
 
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {
@@ -202,13 +209,21 @@ func main() {
 
 	// WP-7 (D4): one shared egress gate for everything this process sends
 	// to the utility server — the PIN verifier suspends it on mismatch, and
-	// every server-egress poster (Responses, flow reservations; WP-4 DER*
-	// PUTs and WP-6 LogEvents when they land) checks it before transmitting.
+	// every server-egress poster (Responses, flow reservations, LogEvents;
+	// WP-4 DER* PUTs when they land) checks it before transmitting.
 	egressGate := &egress.Gate{}
 	respTracker.SetEgressGate(egressGate)
 	frManager.SetEgressGate(egressGate)
 
+	// WP-6 LogEvent poster: rides the RESPONSE fetcher's TLS session — a
+	// LogEvent is the same egress plane as a Response POST (rare, small,
+	// MQTT-goroutine-driven), the fetcher serializes callers under its own
+	// mutex, and the three-session isolation above exists to keep POST churn
+	// off the long-lived DISCOVERY session, which this preserves; a fourth
+	// wolfSSL session on the SOM would buy no isolation for real memory.
+	logevManager := logevent.New(fetcherResp, clk, logeventsPostedCtr, logeventsDroppedCtr)
 	discovery := run.New(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, nbm, run.PollRateConfig{Mode: cfg.PollRateMode()})
+	discovery.SetLogEventSink(logevManager)
 
 	// WP-7 (D5): the scheduler's receipt-reject hook — a plausibility-gate
 	// rejection (malformed/implausible control, never adopted) posts Table 27
@@ -235,7 +250,13 @@ func main() {
 	if cfg.RegistrationPIN == 0 {
 		slog.Warn("lexa-northbound: registration_pin not configured — Registration PIN verification disabled (WP-7/D4, CORE-003/BASIC-001); set registration_pin to the utility-issued PIN to enable the fail-closed mismatch posture")
 	} else {
-		pinVerifier = run.NewPinVerifier(cfg.RegistrationPIN, egressGate, pinGauge, func() { certMon.CheckOnce() })
+		// The LogEvent poster's suspend flag mirrors the gate at every verdict
+		// transition (the only moments the verifier flips the gate), so PIN
+		// freeze/heal covers LogEvent egress too (D4 item 2).
+		pinVerifier = run.NewPinVerifier(cfg.RegistrationPIN, egressGate, pinGauge, func() {
+			logevManager.SetEgressSuspended(egressGate.Suspended())
+			certMon.CheckOnce()
+		})
 		discovery.SetPinVerifier(pinVerifier)
 	}
 	certMon.SetPinOK(pinVerifier.PinOK)
@@ -274,6 +295,12 @@ func main() {
 		discovery.HandleRewalk(req)
 	}); err != nil {
 		log.Printf("lexa-northbound: subscribe rewalk request: %v", err)
+	}
+
+	// WP-6: LogEvent edges from the hub → POST to the EndDevice's
+	// LogEventListLink (retry-once-then-drop; dedupe on LogEventMsg.DedupeKey).
+	if err := mqttutil.Subscribe(mc, bus.TopicHubLogEvent, logevManager.HandleLogEvent); err != nil {
+		log.Printf("lexa-northbound: subscribe logevent: %v", err)
 	}
 
 	// sd_notify READY (TASK-008): subscriptions registered; only the walk

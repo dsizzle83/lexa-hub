@@ -79,6 +79,11 @@ topic read lexa/csip/flowreservation/request
 # silently drops the retained-control re-request the same way a missing
 # compliance/alert or FR-request grant silently drops those (RSK-09 pattern).
 topic read lexa/csip/rewalk
+# bus.TopicHubLogEvent — hub → northbound (WP-6): CSIP Table 14 alarm/RTN
+# LogEvent edges the logevent poster POSTs to the EndDevice's
+# LogEventListLink; a missing grant silently drops them (RSK-09 pattern,
+# same as the three hub→northbound lines above).
+topic read lexa/hub/logevent
 
 user lexa-hub
 # bus.CtrlBatteryTopic("<device>").
@@ -112,6 +117,9 @@ topic write lexa/csip/compliance/alert
 topic write lexa/csip/flowreservation/request
 # bus.TopicCSIPRewalk (TASK-042) — see lexa-northbound's matching read grant.
 topic write lexa/csip/rewalk
+# bus.TopicHubLogEvent (WP-6, edge — never retained) — see lexa-northbound's
+# matching read grant.
+topic write lexa/hub/logevent
 # bus.SubMeasurements.
 topic read lexa/measurements/+
 # bus.SubBattMetrics.
