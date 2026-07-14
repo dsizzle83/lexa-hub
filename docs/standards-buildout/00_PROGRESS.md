@@ -10,7 +10,7 @@ Status legend: ⬜ pending · 🔵 in progress · ✅ done (tests green) · 🟠
 | WP-1 | lexa-proto change-set (THE pin bump) | L | — | ✅ 24081a2 | derbase Measurements ext · csipmodel LogEvent+Table27 · scanner 3-base · ocppserver16 |
 | WP-2 | bus.Measurement enrichment + modbus publishers | M | 1 | ✅ f639016 | BUS LANE start |
 | WP-3 | tlsclient PUT + redirects | S | — | ✅ 6f14518 | closes ERR-001 code half |
-| WP-4 | DER* reporting (dersite + derreport) | M | 2,3 | 🔵 | closes CORE-009/014, BASIC-028 |
+| WP-4 | DER* reporting (dersite + derreport) | M | 2,3 | ✅ (see git log) | closes CORE-009/014, BASIC-028 |
 | WP-5 | telemetry VAr + Wh MMRs | S | 2 | ✅ 656a0fe | closes BASIC-029 VAr gap |
 | WP-6 | LogEvent pipeline | M | 1,2 | ✅ 16d2bef | closes BASIC-027; gridsim LogEvent endpoint pending (bench queue) |
 | WP-7 | PIN verify + Table 27 codes | S | 1 | ✅ ea8b228 | 252 + 13/14 are documented seams; bench config keeps legacy 0xF0 until gridsim flips |
@@ -36,4 +36,4 @@ set legacy_cannotcomply_code=true).
 Bench-deferred queue (WP-17f): adv-shell shadow soak · AUS shadow week · 1.6 evsim · PIN drill ·
 COMM-004 pcaps · dersite/PUT vs gridsim (gridsim needs PUT/LogEvent endpoints — csip-tls-test work).
 
-Vendor quirk for next proto bump (found in WP-5): csipmodel KindVoltage=12 collides with 2030.5 KindType energy(12); KindFreq=38 is not a KindType member. Telemetry uses local spec-correct constants meanwhile.
+Vendor quirks for next proto bump: (WP-4) csipmodel DERList lacks pollRate; DERCapability/Settings lack rtg/setMaxWh; DERStatus lacks alarmStatus; derreport parses putResult error strings for 404/405 — switch to typed error when tlsclient gains one. (WP-5) csipmodel KindVoltage=12 collides with 2030.5 KindType energy(12); KindFreq=38 is not a KindType member. Telemetry uses local spec-correct constants meanwhile.
