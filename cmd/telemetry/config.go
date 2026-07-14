@@ -29,6 +29,17 @@ type Config struct {
 
 	MUPPostRateS int `json:"mup_post_rate_s"` // default 300
 
+	// PostVar/PostWh gate the WP-5 MMR quantity rows: reactive power (VAr,
+	// uom 63) and lifetime import/export energy (Wh, uom 72, flowDirection
+	// split) — see cmd/telemetry/main.go's buildMMRs for the encoding.
+	// nil/absent ⇒ true: the product default posts all four CSIP Table 2
+	// mandatory quantities (W/V/Hz/VAr — BASIC-029) plus the Wh
+	// accumulators; the keys exist so a bench against an older stand-in
+	// server that rejects the new ReadingTypes can switch the rows off
+	// without a rebuild. Same *bool nil⇒true pattern as cmd/api's TLS/MDNS.
+	PostVar *bool `json:"post_var"`
+	PostWh  *bool `json:"post_wh"`
+
 	// MetricsAddr is the Prometheus /metrics listen address (TASK-044).
 	// Empty ⇒ default "127.0.0.1:9105" (product default: loopback-only); the
 	// literal "off" disables the listener. See cmd/hub/config.go's
@@ -69,6 +80,18 @@ func loadConfig(path string) (*Config, error) {
 
 func (c *Config) MUPPostRate() time.Duration {
 	return time.Duration(c.MUPPostRateS) * time.Second
+}
+
+// PostVarEnabled reports whether the reactive-power (VAr) MMR row is posted
+// (WP-5). nil/absent PostVar ⇒ true.
+func (c *Config) PostVarEnabled() bool {
+	return c.PostVar == nil || *c.PostVar
+}
+
+// PostWhEnabled reports whether the lifetime import/export energy (Wh) MMR
+// rows are posted (WP-5). nil/absent PostWh ⇒ true.
+func (c *Config) PostWhEnabled() bool {
+	return c.PostWh == nil || *c.PostWh
 }
 
 // Uncommissioned reports whether this config describes a factory-fresh or

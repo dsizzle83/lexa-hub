@@ -11,5 +11,7 @@
   "client_key": "/etc/lexa/certs/client-key.pem",
   "lfdi": "",
   "devices": ["inverter-0", "battery-0", "meter-0"],
-  "mup_post_rate_s": 60
+  "mup_post_rate_s": 60,
+  "post_var": true,
+  "post_wh": true
 }

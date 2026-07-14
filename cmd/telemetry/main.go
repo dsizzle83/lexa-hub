@@ -132,10 +132,23 @@ func main() {
 	// tlsclient.WolfSSLFetcher.PostContext's doc comment).
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// WP-5: which optional quantity rows this process posts, resolved once
+	// (config is immutable after load). The label rides the MUP Description
+	// so the registration — initial and the 3-failure re-registration below
+	// — advertises the same quantity set the MMR posts will carry.
+	postVar, postWh := cfg.PostVarEnabled(), cfg.PostWhEnabled()
+	qlabel := "W/V/Hz"
+	if postVar {
+		qlabel += "/VAr"
+	}
+	if postWh {
+		qlabel += "/Wh"
+	}
+
 	// Register MUPs for each configured device.
 	var mups []mupEntry
 	for _, dev := range cfg.Devices {
-		path, err := registerMUP(ctx, fetcher, lfdi, dev, cfg.MUPPostRateS)
+		path, err := registerMUP(ctx, fetcher, lfdi, dev, qlabel, cfg.MUPPostRateS)
 		if err != nil {
 			log.Printf("lexa-telemetry: MUP register %s: %v — skipping", dev, err)
 			continue
@@ -162,12 +175,21 @@ func main() {
 	latest := make(map[string]device.Measurements)
 	var clockOffset int64
 
-	// Initialise to NaN so we don't post zeros before the first poll.
+	// Initialise to NaN so we don't post zeros before the first poll. Every
+	// quantity postMeasurements can encode must start NaN (G27, "never
+	// fabricate"): a zero-value float64 here would post a fabricated 0 for a
+	// device that has never reported that quantity.
 	for _, dev := range cfg.Devices {
-		latest[dev] = device.Measurements{W: math.NaN(), V: math.NaN(), Hz: math.NaN()}
+		latest[dev] = device.Measurements{
+			W: math.NaN(), V: math.NaN(), Hz: math.NaN(),
+			Var: math.NaN(), WhImpTotal: math.NaN(), WhExpTotal: math.NaN(),
+		}
 	}
 
-	// Subscribe to measurements from the modbus service.
+	// Subscribe to measurements from the modbus service. Nil (absent)
+	// pointer fields never overwrite the NaN init above, so a quantity the
+	// device does not report stays NaN and is skipped at encode time —
+	// nil-skip and NaN-skip are the same discipline (G27).
 	if err := mqttutil.Subscribe(mc, bus.SubMeasurements, func(_ string, msg bus.Measurement) {
 		mu.Lock()
 		m := latest[msg.Device]
@@ -179,6 +201,15 @@ func main() {
 		}
 		if msg.Hz != nil {
 			m.Hz = *msg.Hz
+		}
+		if msg.VarW != nil {
+			m.Var = *msg.VarW
+		}
+		if msg.WhImpTotal != nil {
+			m.WhImpTotal = *msg.WhImpTotal
+		}
+		if msg.WhExpTotal != nil {
+			m.WhExpTotal = *msg.WhExpTotal
 		}
 		latest[msg.Device] = m
 		mu.Unlock()
@@ -250,7 +281,7 @@ func main() {
 				}
 				ep := &mups[i]
 				m := snap[ep.device]
-				err := postMeasurements(ctx, fetcher, ep.device, ep.path, m, offset, cfg.MUPPostRateS)
+				err := postMeasurements(ctx, fetcher, ep.device, ep.path, m, offset, cfg.MUPPostRateS, postVar, postWh)
 				// TASK-044: lexa_telemetry_connected is this service's
 				// "connection state" gauge — telemetry has no persistent
 				// session like OCPP's WS connections, so the closest
@@ -264,7 +295,7 @@ func main() {
 					ep.fails++
 					if ep.fails >= 3 {
 						log.Printf("lexa-telemetry: re-registering MUP for %s after %d failures", ep.device, ep.fails)
-						newPath, rerr := registerMUP(ctx, fetcher, lfdi, ep.device, cfg.MUPPostRateS)
+						newPath, rerr := registerMUP(ctx, fetcher, lfdi, ep.device, qlabel, cfg.MUPPostRateS)
 						if rerr == nil {
 							ep.path = newPath
 							ep.fails = 0
@@ -361,14 +392,14 @@ func runIdle(cfg *Config) {
 	}
 }
 
-func registerMUP(ctx context.Context, fetcher *tlsclient.WolfSSLFetcher, lfdi, devName string, rateS int) (string, error) {
+func registerMUP(ctx context.Context, fetcher *tlsclient.WolfSSLFetcher, lfdi, devName, quantities string, rateS int) (string, error) {
 	prefix := lfdi
 	if len(prefix) > 8 {
 		prefix = prefix[:8]
 	}
 	mup := model.MirrorUsagePoint{
 		MRID:                prefix + "-" + devName,
-		Description:         devName + " Measurements (W/V/Hz)",
+		Description:         devName + " Measurements (" + quantities + ")",
 		RoleFlags:           0x0002,
 		ServiceCategoryKind: 0,
 		Status:              1,
@@ -387,6 +418,32 @@ func registerMUP(ctx context.Context, fetcher *tlsclient.WolfSSLFetcher, lfdi, d
 	return loc, nil
 }
 
+// IEEE 2030.5 ReadingType codes for the WP-5 quantities (VAr + lifetime Wh).
+// These live here rather than in lexa-proto/csipmodel because vendor/ is
+// outside this work package's write set (WP-5 touches cmd/telemetry +
+// configs/telemetry.json only); fold them into csipmodel's UomType/KindType
+// blocks on the next proto bump.
+const (
+	uomVAr uint8 = 63 // UomType: reactive power (var)
+	uomWh  uint8 = 72 // UomType: real energy (Wh)
+
+	// kindEnergy is 2030.5 KindType 12 (energy). KindType has no
+	// reactive-specific member — reactive power is encoded as
+	// kind=power(37) + uom=var(63) — so the VAr row reuses model.KindPower.
+	kindEnergy uint8 = 12
+
+	// FlowDirectionType: which way a Wh accumulator counts. Forward =
+	// "delivered to the customer" (import/absorbed), reverse = "received
+	// from the customer" (export/injected).
+	flowDirectionForward uint8 = 1
+	flowDirectionReverse uint8 = 19
+
+	// AccumulationBehaviourType 3 (Cumulative): the value is the total of
+	// the accumulated quantity at the time of the reading — a lifetime
+	// register/odometer read, which is exactly what the Wh totals are.
+	accumulationCumulative uint8 = 3
+)
+
 // quantity describes one measured value and how to encode it as a
 // self-describing IEEE 2030.5 MirrorMeterReading. A reading is only meaningful
 // to the server if its ReadingType declares the unit (uom) and scale
@@ -399,6 +456,94 @@ type quantity struct {
 	kind       uint8
 	multiplier int8 // powerOfTenMultiplier: value = encoded × 10^multiplier
 	suffix     string
+
+	// flow/cumulative describe the WP-5 lifetime-energy rows. flow is the
+	// ReadingType flowDirection (0 = omitted — signed instantaneous
+	// quantities like W/VAr carry direction in the value's sign);
+	// cumulative marks a lifetime accumulator register, encoded as a
+	// register snapshot rather than interval data — see buildMMRs.
+	flow       uint8
+	cumulative bool
+}
+
+// buildMMRs assembles one self-describing MirrorMeterReading per available
+// quantity for a device snapshot. Split from postMeasurements (WP-5) so the
+// encoding discipline — ReadingType fields, stable per-device-per-quantity
+// mRIDs, and the NaN-skip that implements G27's "never fabricate" — is
+// unit-testable without a TLS fetcher. now is the server-clock Unix time
+// (local time + CSIP clock offset), satisfying G25's mandatory timestamp in
+// the server's timescale.
+//
+// Two ReadingType representations are used:
+//
+//   - Instantaneous quantities (W/V/Hz, and VAr per WP-5): dataQualifier =
+//     average with intervalLength = the posting interval, timestamped over
+//     the interval just elapsed — unchanged from the original W/V/Hz rows.
+//   - Lifetime accumulators (Wh import/export): these are cumulative
+//     registers, not interval data, and 2030.5's ReadingType can say so
+//     honestly: accumulationBehaviour=3 (Cumulative), flowDirection split
+//     (forward=import / reverse=export), kind=energy, uom=Wh, and NO
+//     dataQualifier/intervalLength (both 0 ⇒ omitted — there is no
+//     interval, and the value is a register snapshot, not an average). The
+//     reading's time period is the read instant (start=now, duration=0):
+//     G25's timestamp without fabricating an interval the register doesn't
+//     represent.
+func buildMMRs(devName string, m device.Measurements, now int64, intervalS int, postVar, postWh bool) []model.MirrorMeterReading {
+	dur := uint32(intervalS)
+	start := now - int64(dur)
+
+	// One MirrorMeterReading per quantity, each carrying its own ReadingType.
+	// V and Hz are scaled ×100 (multiplier −2); W/VAr/Wh are sent whole.
+	quantities := []quantity{
+		{m.W, 1, model.UomWatts, model.KindPower, 0, "W", 0, false},
+		{m.V, 100, model.UomVolts, model.KindVoltage, -2, "V", 0, false},
+		{m.Hz, 100, model.UomHertz, model.KindFreq, -2, "Hz", 0, false},
+	}
+	if postVar {
+		quantities = append(quantities,
+			quantity{m.Var, 1, uomVAr, model.KindPower, 0, "VAr", 0, false})
+	}
+	if postWh {
+		quantities = append(quantities,
+			quantity{m.WhImpTotal, 1, uomWh, kindEnergy, 0, "Wh-imp", flowDirectionForward, true},
+			quantity{m.WhExpTotal, 1, uomWh, kindEnergy, 0, "Wh-exp", flowDirectionReverse, true})
+	}
+
+	var mmrs []model.MirrorMeterReading
+	for _, q := range quantities {
+		if math.IsNaN(q.value) {
+			continue
+		}
+		rt := &model.ReadingType{
+			DataQualifier:        model.DataQualifierAverage,
+			Kind:                 q.kind,
+			PowerOfTenMultiplier: q.multiplier,
+			Uom:                  q.uom,
+			IntervalLength:       dur,
+		}
+		rStart, rDur := start, dur
+		if q.cumulative {
+			rt.DataQualifier = 0 // register snapshot, not an average
+			rt.IntervalLength = 0
+			rt.AccumulationBehaviour = accumulationCumulative
+			rt.FlowDirection = q.flow
+			rStart, rDur = now, 0
+		}
+		mmrs = append(mmrs, model.MirrorMeterReading{
+			MRID:        devName + "-" + q.suffix,
+			Description: devName + " " + q.suffix,
+			ReadingType: rt,
+			MirrorReadingSet: []model.MirrorReadingSet{{
+				StartTime: rStart,
+				Duration:  rDur,
+				Reading: []model.Reading{{
+					Value:      int64(math.Round(q.value * q.scale)),
+					TimePeriod: &model.DateTimeInterval{Start: rStart, Duration: rDur},
+				}},
+			}},
+		})
+	}
+	return mmrs
 }
 
 func postMeasurements(
@@ -408,49 +553,18 @@ func postMeasurements(
 	m device.Measurements,
 	clockOffset int64,
 	intervalS int,
+	postVar, postWh bool,
 ) error {
 	now := time.Now().Unix() + clockOffset
-	dur := uint32(intervalS)
-	start := now - int64(dur)
-
-	// One MirrorMeterReading per quantity, each carrying its own ReadingType.
-	// V and Hz are scaled ×100 (multiplier −2); W is sent as whole watts.
-	quantities := []quantity{
-		{m.W, 1, model.UomWatts, model.KindPower, 0, "W"},
-		{m.V, 100, model.UomVolts, model.KindVoltage, -2, "V"},
-		{m.Hz, 100, model.UomHertz, model.KindFreq, -2, "Hz"},
-	}
 
 	posted := 0
-	for _, q := range quantities {
-		if math.IsNaN(q.value) {
-			continue
-		}
-		mmr := model.MirrorMeterReading{
-			MRID:        devName + "-" + q.suffix,
-			Description: devName + " " + q.suffix,
-			ReadingType: &model.ReadingType{
-				DataQualifier:        model.DataQualifierAverage,
-				Kind:                 q.kind,
-				PowerOfTenMultiplier: q.multiplier,
-				Uom:                  q.uom,
-				IntervalLength:       dur,
-			},
-			MirrorReadingSet: []model.MirrorReadingSet{{
-				StartTime: start,
-				Duration:  dur,
-				Reading: []model.Reading{{
-					Value:      int64(math.Round(q.value * q.scale)),
-					TimePeriod: &model.DateTimeInterval{Start: start, Duration: dur},
-				}},
-			}},
-		}
+	for _, mmr := range buildMMRs(devName, m, now, intervalS, postVar, postWh) {
 		body, err := xml.Marshal(&mmr)
 		if err != nil {
 			return err
 		}
 		if _, _, err = fetcher.PostContext(ctx, mupPath, body, "application/sep+xml"); err != nil {
-			log.Printf("lexa-telemetry: POST %s %s: %v", devName, q.suffix, err)
+			log.Printf("lexa-telemetry: POST %s: %v", mmr.MRID, err)
 			return err
 		}
 		posted++
@@ -464,7 +578,9 @@ func postMeasurements(
 	// (lexa_telemetry_mup_posts_total, lexa_telemetry_post_failures_total)
 	// already cover "is posting happening"; the POST-error path above stays
 	// at Info (it is an edge, not steady-state).
-	slog.Debug("lexa-telemetry: posted", "device", devName, "w", m.W, "v", m.V, "hz", m.Hz)
+	slog.Debug("lexa-telemetry: posted", "device", devName,
+		"w", m.W, "v", m.V, "hz", m.Hz,
+		"var", m.Var, "wh_imp", m.WhImpTotal, "wh_exp", m.WhExpTotal)
 	return nil
 }
 
