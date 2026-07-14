@@ -184,6 +184,8 @@ func SupportedV(topic string) int {
 		return ScanResultV
 	case topic == TopicOCPPPending:
 		return PendingStationsV
+	case topic == TopicOCPPPairing:
+		return PairingDecisionV
 	case topic == TopicHubLogEvent:
 		return LogEventV
 	case topic == TopicHubDERSite:

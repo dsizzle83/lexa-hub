@@ -536,6 +536,59 @@ func TestDesiredPublishingEVSEActuator_Mapping(t *testing.T) {
 	}
 }
 
+// TestDesiredPublishingEVSEActuator_ReleaseSentinel (WP-13, B3): a command
+// at/above the station's rated maximum is a RELEASE and publishes the
+// explicit bus.RestoreCurrentA sentinel — mirroring the solar actuator's
+// NaN-CurtailToW → RestoreCeilingW mapping (release is a value, never an
+// absence; AD-013). Values below rated (throttle, 0-suspend) pass through
+// verbatim, and two release-shaped commands (rated and over-rated) dedupe to
+// ONE publish because both map to the same sentinel content.
+func TestDesiredPublishingEVSEActuator_ReleaseSentinel(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, nil, nil, nil)
+	a.ratedMaxA = 32
+
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 32}); err != nil {
+		t.Fatal(err) // full rate = release
+	}
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 40}); err != nil {
+		t.Fatal(err) // over-rated = same release content ⇒ deduped
+	}
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16}); err != nil {
+		t.Fatal(err) // real throttle passes through verbatim
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("release(+deduped re-release) then throttle must be 2 publishes, got %d", len(mc.publishes))
+	}
+	var release, throttle bus.DesiredState
+	_ = json.Unmarshal(mc.publishes[0].payload, &release)
+	_ = json.Unmarshal(mc.publishes[1].payload, &throttle)
+	if release.MaxCurrentA == nil || *release.MaxCurrentA != bus.RestoreCurrentA {
+		t.Fatalf("full-rate command must publish the explicit RestoreCurrentA sentinel, got %v", release.MaxCurrentA)
+	}
+	if throttle.MaxCurrentA == nil || *throttle.MaxCurrentA != 16 {
+		t.Fatalf("below-rated command must pass through verbatim, got %v", throttle.MaxCurrentA)
+	}
+}
+
+// TestDesiredPublishingEVSEActuator_NoRatedNoMapping: with ratedMaxA unset
+// (0 — unknown rating), the release mapping is disabled and the command value
+// passes through verbatim (the ocpp-side rated check still releases
+// independently; this only pins the hub-side behavior).
+func TestDesiredPublishingEVSEActuator_NoRatedNoMapping(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, nil, nil, nil)
+
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 32}); err != nil {
+		t.Fatal(err)
+	}
+	var doc bus.DesiredState
+	_ = json.Unmarshal(mc.publishes[0].payload, &doc)
+	if doc.MaxCurrentA == nil || *doc.MaxCurrentA != 32 {
+		t.Fatalf("with no rated maximum the value must pass through verbatim, got %v", doc.MaxCurrentA)
+	}
+}
+
 // TestDesiredPublishingSolarActuator_NilConnectByteStable is the Unit 3.6
 // upgrade-storm guard for solar: a SolarCommand with a nil Connect (optimizer
 // mode — DefaultOptimizer never sets it) must leave the published doc's Connect

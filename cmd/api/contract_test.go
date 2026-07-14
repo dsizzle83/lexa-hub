@@ -365,6 +365,42 @@ func TestContract_IntentRequests(t *testing.T) {
 	}
 }
 
+// TestContract_Pairing is the POST /devices/evse/{id}/pairing drift gate
+// (WP-13): the documented request fixture must still be ACCEPTED by the real
+// handler (202, exactly one bus publish — QoS 1, NOT retained, on
+// lexa/ocpp/pairing), and the response body must conform to its golden
+// fixture. An additive route: apicontract.Version stays 1 per the bumping
+// rule (docs/API_CONTRACT.md — "a new route" is additive).
+func TestContract_Pairing(t *testing.T) {
+	body := apicontract.Golden("pairing_request.json")
+	if body == nil {
+		t.Fatal("missing embedded fixture pairing_request.json")
+	}
+	fc := &fakeAPIMQTTClient{}
+	h := pairingHandler(fc)
+
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodPost, "/devices/evse/ev-unknown/pairing", bytes.NewReader(body)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (documented request must be accepted): %s", rec.Code, rec.Body.String())
+	}
+	if len(fc.publishes) != 1 {
+		t.Fatalf("expected exactly 1 publish, got %d", len(fc.publishes))
+	}
+	pub := fc.publishes[0]
+	if pub.topic != bus.TopicOCPPPairing {
+		t.Errorf("published to %q, want %q", pub.topic, bus.TopicOCPPPairing)
+	}
+	if pub.retained {
+		t.Error("pairing decision published RETAINED — it is an edge, never retained (D10/topics discipline)")
+	}
+	if pub.qos != bus.QoS1 {
+		t.Errorf("pairing decision QoS = %d, want 1", pub.qos)
+	}
+	assertConforms(t, "pairing_response.json", rec.Body.Bytes())
+}
+
 // TestContract_VersionHeader pins that the withContractVersion middleware
 // stamps X-Lexa-Contract-Version on a wrapped response.
 func TestContract_VersionHeader(t *testing.T) {

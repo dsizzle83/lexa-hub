@@ -70,6 +70,18 @@ type DesiredState struct {
 // value on the wire, never an absent field (AD-013 field-absence semantics).
 const RestoreCeilingW = 1e9
 
+// RestoreCurrentA is the EVSE sibling of RestoreCeilingW (WP-13, B3): an
+// explicit "no CSMS-imposed charging limit" MaxCurrentA — far above any
+// hardware rating, so a release is a VALUE on the wire, never an absent
+// field (AD-013 field-absence semantics). The lexa-ocpp reconciler shell maps
+// a desired MaxCurrentA at/above the station's rated maximum (this sentinel
+// included, by construction) to an OCPP ClearChargingProfile — removing the
+// standing TxDefaultProfile — instead of re-setting a large numeric limit.
+// Convergence for a release is trivial under the one-sided metered-current
+// rule (an EV under its limit is always compliant), so Clear-Accepted is the
+// write success and the next plausible sample converges it.
+const RestoreCurrentA = 1e6
+
 // Desired-state device classes, the {class} segment of DesiredTopic.
 const (
 	DesiredClassBattery = "battery"

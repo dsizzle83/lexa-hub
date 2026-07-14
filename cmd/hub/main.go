@@ -1032,7 +1032,12 @@ func main() {
 
 	// Wire actuators for known EVSE stations (desired-doc publisher only).
 	for _, sc := range cfg.Stations {
-		eng.RegisterEVSEActuator(sc.ID, newDesiredPublishingEVSEActuator(mc, sc.ID, desiredPublishesTotalCtr, desiredPublishFailuresCtr, tickTime, jw))
+		evseAct := newDesiredPublishingEVSEActuator(mc, sc.ID, desiredPublishesTotalCtr, desiredPublishFailuresCtr, tickTime, jw)
+		// WP-13 (B3): a command at/above the station's rated maximum is a
+		// release and publishes the explicit bus.RestoreCurrentA sentinel —
+		// see the actuator's ratedMaxA field doc.
+		evseAct.ratedMaxA = sc.MaxCurrentA
+		eng.RegisterEVSEActuator(sc.ID, evseAct)
 	}
 
 	// TASK-044: start serving /metrics before eng.Start() so a scrape during

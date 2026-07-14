@@ -12,10 +12,13 @@ import (
 )
 
 // recordingProfileDriver captures every profile apply and can be told to fail
-// (simulating a delivered-but-rejected SetChargingProfile, ledger L11).
+// (simulating a delivered-but-rejected SetChargingProfile, ledger L11). WP-13
+// adds the ApplyClear release path (same failure knob — a rejected Clear is
+// the same L11 error class).
 type recordingProfileDriver struct {
 	applied []float64 // limitA per apply that SUCCEEDED
-	err     error     // non-nil ⇒ every Apply fails (rejected)
+	cleared int       // ApplyClear calls that SUCCEEDED
+	err     error     // non-nil ⇒ every Apply/ApplyClear fails (rejected)
 	calls   int
 }
 
@@ -25,6 +28,15 @@ func (d *recordingProfileDriver) Apply(_ string, _ int, limitA float64) error {
 		return d.err
 	}
 	d.applied = append(d.applied, limitA)
+	return nil
+}
+
+func (d *recordingProfileDriver) ApplyClear(_ string, _ int) error {
+	d.calls++
+	if d.err != nil {
+		return d.err
+	}
+	d.cleared++
 	return nil
 }
 

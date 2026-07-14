@@ -316,6 +316,12 @@ func main() {
 	// never open; see auth.go's doc).
 	mux.HandleFunc("/site", requireBearer(apiToken, siteHandler(serial, cfg.SiteCacheFile)))
 	mux.HandleFunc("/devices", requireBearer(apiToken, devicesHandler(store)))
+	// WP-13 (D10): POST /devices/evse/{id}/pairing — installer approve/deny
+	// for a pending OCPP station, published as a bus.PairingDecision edge on
+	// lexa/ocpp/pairing. "/devices/evse/" (trailing slash) is a ServeMux
+	// SUBTREE pattern, same style as "/config/" below; pairing.go parses the
+	// {id} itself. A WRITE route ⇒ requireBearerStrict, like /intent.
+	mux.HandleFunc(pairingPathPrefix, requireBearerStrict(apiToken, pairingHandler(mc)))
 	mux.HandleFunc("/telemetry/recent", requireBearer(apiToken, telemetryRecentHandler(store.telemetry)))
 	mux.HandleFunc("/mode", requireBearer(apiToken, modeHandler(store)))
 	// GAP-7: the 24-hour plan/forecast series (staged-rollout requireBearer,

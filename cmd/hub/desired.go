@@ -535,6 +535,19 @@ type desiredPublishingEVSEActuator struct {
 	mc        mqtt.Client
 	stationID string
 
+	// ratedMaxA is the station's configured hardware maximum (hub.json
+	// stations[].max_current_a), set at wiring time (main.go). WP-13 (B3): a
+	// command at/above it is a RELEASE — the optimizer's "charge at full
+	// rate" (applyEVChargingRule emits MaxCurrentA = evse.MaxCurrentA) — and
+	// is published as the explicit bus.RestoreCurrentA sentinel, mirroring
+	// how the solar actuator maps NaN CurtailToW to bus.RestoreCeilingW:
+	// release is a value on the wire, never an absence (AD-013), and the
+	// lexa-ocpp reconciler maps the sentinel to an OCPP ClearChargingProfile
+	// instead of re-setting a large numeric limit. 0 (unset — tests, unknown
+	// rating) disables the mapping and the command value passes through
+	// verbatim (the ocpp-side rated check still releases independently).
+	ratedMaxA float64
+
 	// connect is the standing connect intent. It defaults to true (see the type
 	// doc) — set lazily on first Apply — so optimizer-mode docs (nil
 	// EVSECommand.Connect) publish Connect=true exactly as they always have; a
@@ -610,6 +623,12 @@ func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECo
 		a.connect = &c
 	}
 	maxA := cmd.MaxCurrentA
+	// WP-13 (B3): map a full-rate/over-rated command to the explicit release
+	// sentinel — see the ratedMaxA field doc. A suspend (0) or any throttle
+	// below rated passes through verbatim.
+	if a.ratedMaxA > 0 && maxA >= a.ratedMaxA {
+		maxA = bus.RestoreCurrentA
+	}
 	connect := *a.connect
 	doc := bus.DesiredState{
 		Envelope:    bus.Envelope{V: bus.DesiredStateV},

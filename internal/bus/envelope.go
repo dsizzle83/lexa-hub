@@ -92,6 +92,11 @@ const (
 	OpenADRPricesV = 1 // lexa/openadr/prices (OpenADRPrices)
 	OpenADRLimitsV = 1 // lexa/openadr/limits (OpenADRLimits)
 	OpenADRStatusV = 1 // lexa/openadr/status (OpenADRStatus)
+
+	// PairingDecision schema (WP-13, standards-buildout B2/D10). Born at 1,
+	// same convention as every family above; type + topic constant in
+	// internal/bus/pairing.go.
+	PairingDecisionV = 1 // lexa/ocpp/pairing (PairingDecision)
 )
 
 // LegacyV0Accepted is the transition switch for AD-006's compatibility

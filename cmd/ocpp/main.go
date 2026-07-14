@@ -30,6 +30,8 @@ import (
 	"syscall"
 	"time"
 
+	core16 "github.com/lorenzodonini/ocpp-go/ocpp1.6/core"
+	remotetrigger16 "github.com/lorenzodonini/ocpp-go/ocpp1.6/remotetrigger"
 	ocpp2 "github.com/lorenzodonini/ocpp-go/ocpp2.0.1"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/availability"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/meter"
@@ -133,6 +135,32 @@ func main() {
 
 		bridge := newMQTTBridge(mc, srv.CSMS(), cfg.Stations, pendingGauge)
 		bridge.transactionsTotal = transactionsTotalCtr
+
+		// WP-13/D10: the pairing gate — one instance shared by BOTH stacks'
+		// forwarders. Wired before either listener starts (read via its own
+		// mutex thereafter). In gated mode, persisted decisions also seed the
+		// pending surface's never-track set so an approved/denied station
+		// doesn't re-surface as pending after a restart; open mode skips the
+		// seeding so the bench's pending-surface behavior is byte-identical.
+		stationIDs := make([]string, len(cfg.Stations))
+		for i, sc := range cfg.Stations {
+			stationIDs[i] = sc.ID
+		}
+		gate := newPairingGate(cfg.PairingMode, stationIDs, cfg.AllowlistPath,
+			reg.Counter("lexa_ocpp_pairing_dropped_total"))
+		bridge.gate = gate
+		if cfg.PairingMode == PairingGated {
+			for _, id := range gate.decidedStations() {
+				bridge.pending.neverTrack(id)
+			}
+			log.Printf("lexa-ocpp: pairing gate GATED (allowlist %s) — unknown stations Boot as Pending until approved via lexa-api", cfg.AllowlistPath)
+		}
+		if err := mqttutil.Subscribe(mc, bus.TopicOCPPPairing, func(_ string, d bus.PairingDecision) {
+			bridge.handlePairingDecision(d, time.Now())
+		}); err != nil {
+			log.Printf("lexa-ocpp: subscribe pairing decisions: %v", err)
+		}
+
 		// Unit 6.1: clear any stale retained lexa/ocpp/pending left over from
 		// a prior run (since-approved or long-departed entries) even before
 		// anything has connected this time around — see
@@ -169,6 +197,10 @@ func main() {
 			shells := make(map[string]*evseShell)
 			for _, sc := range cfg.Stations {
 				sh := newEVSEShell(sc.ID, reg, mode, drv)
+				// WP-13 (B3): the station's rated maximum — a desired current
+				// at/above it releases via ClearChargingProfile (see
+				// evseShell.releaseLimit). Set before any doc/observe arrives.
+				sh.ratedMaxA = sc.MaxCurrentA
 				// TASK-031: forward device-level non-convergence to the hub's
 				// breach-episode component (active mode only).
 				if mode == modeActive {
@@ -319,6 +351,19 @@ type stationState struct {
 	energyWh    float64
 }
 
+// centralSystem201 is the slice of ocpp2.CSMS the bridge needs for
+// CSMS-initiated 2.0.1 sends — the 2.0.1 sibling of centralSystem16
+// (bridge16.go), narrowed to an interface so tests can record
+// SetChargingProfile/ClearChargingProfile/TriggerMessage calls without a
+// live WebSocket server. Production always wires the full ocpp2.CSMS
+// (newMQTTBridge assigns the csms argument, which satisfies this by
+// construction); handler REGISTRATION stays on the concrete csms field.
+type centralSystem201 interface {
+	SetChargingProfile(clientID string, callback func(*smartcharging.SetChargingProfileResponse, error), evseID int, chargingProfile *types.ChargingProfile, props ...func(request *smartcharging.SetChargingProfileRequest)) error
+	ClearChargingProfile(clientID string, callback func(*smartcharging.ClearChargingProfileResponse, error), props ...func(request *smartcharging.ClearChargingProfileRequest)) error
+	TriggerMessage(clientID string, callback func(*remotecontrol.TriggerMessageResponse, error), requestedMessage remotecontrol.MessageTrigger, props ...func(request *remotecontrol.TriggerMessageRequest)) error
+}
+
 // mqttBridge wraps the OCPP CSMS and publishes EVSE state changes to MQTT.
 //
 // mu protects stations and all stationState fields. Callers must hold mu
@@ -330,6 +375,19 @@ type mqttBridge struct {
 	mc       mqtt.Client
 	csms     ocpp2.CSMS
 	stations map[string]*stationState
+
+	// cs201 is the 2.0.1 send seam (see centralSystem201). Set once by
+	// newMQTTBridge (to csms) before any connection is accepted, then
+	// read-only — same no-lock discipline as cs16/shells. Tests may override
+	// it with a fake immediately after construction.
+	cs201 centralSystem201
+
+	// gate is the WP-13/D10 pairing gate — the single, stack-shared owner of
+	// "may this station become plant?". Set once at startup (main), before
+	// any listener starts, then only accessed through its own mutex. nil
+	// (pre-WP-13 tests) behaves as OPEN mode — every gate method is
+	// nil-receiver-safe, so all prior behavior is byte-identical.
+	gate *pairingGate
 
 	// transactionsTotal counts OCPP transaction Started events
 	// (lexa_ocpp_transactions_total, TASK-044); nil-safe (metrics.Counter's
@@ -393,6 +451,7 @@ func newMQTTBridge(mc mqtt.Client, csms ocpp2.CSMS, configuredStations []Station
 	b := &mqttBridge{
 		mc:       mc,
 		csms:     csms,
+		cs201:    csms,
 		stations: make(map[string]*stationState),
 	}
 	b.pending = newPendingStations(ids, func(doc bus.PendingStations) error {
@@ -414,6 +473,16 @@ func newMQTTBridge(mc mqtt.Client, csms ocpp2.CSMS, configuredStations []Station
 // as before Unit 6.1) so tests can drive it directly with a fake
 // ocpp2.ChargingStationConnection, without a live WebSocket handshake.
 func (b *mqttBridge) onConnect(cs ocpp2.ChargingStationConnection) {
+	// WP-13/D10 pairing gate: a non-approved station in gated mode is NEVER
+	// promoted to a stationState (no plant, no lexa/evse/{station}/state) —
+	// it is only surfaced on the pending doc so an installer can decide.
+	// Open mode (and every pre-WP-13 test, via the nil gate) takes the
+	// unchanged path below.
+	if !b.gate.allowed(cs.ID()) {
+		log.Printf("[ocpp] connected (pairing-gated, not adopted): %s addr=%s", cs.ID(), cs.RemoteAddr())
+		b.pending.upsert(cs.ID(), "", "", cs.RemoteAddr().String(), time.Now())
+		return
+	}
 	b.mu.Lock()
 	s, created := b.getOrCreateLocked(cs.ID())
 	s.connected = true
@@ -606,7 +675,7 @@ func (b *mqttBridge) Apply(stationID string, evseID int, limitA float64) error {
 		err    error
 	}
 	resCh := make(chan spResult, 1)
-	callErr := b.csms.SetChargingProfile(
+	callErr := b.cs201.SetChargingProfile(
 		stationID,
 		func(resp *smartcharging.SetChargingProfileResponse, err error) {
 			r := spResult{err: err}
@@ -640,11 +709,132 @@ func (b *mqttBridge) Apply(stationID string, evseID int, limitA float64) error {
 
 func (b *mqttBridge) triggerStatusNotification(stationID string) {
 	time.Sleep(500 * time.Millisecond)
-	_ = b.csms.TriggerMessage(
+	_ = b.cs201.TriggerMessage(
 		stationID,
 		func(_ *remotecontrol.TriggerMessageResponse, _ error) {},
 		remotecontrol.MessageTriggerStatusNotification,
 	)
+}
+
+// ApplyClear implements profileDriver's release path (WP-13, B3): remove the
+// CSMS's standing TxDefaultProfile from the station's connector with an OCPP
+// ClearChargingProfile, instead of re-setting a large numeric limit. Same
+// per-proto dispatch and contract as Apply: a disconnected station is a
+// silent no-op (the reconnect reassert re-issues the standing desired doc,
+// which re-derives the release), evseID 0 → 1, each call bounded at 10 s.
+//
+// Response handling: Accepted is success. UNKNOWN — the only other status
+// either stack's vocabulary defines, "no profile matched the clear criteria"
+// — is ALSO success: a charger already carrying no CSMS profile IS the
+// released state, and treating it as an error would retry a Clear forever
+// against a charger with nothing to clear. Any other (nonconforming) status,
+// a transport error, or a timeout is an error, L11-style — the release did
+// not verifiably take, so the reconcile core retries on its backoff.
+// Convergence after a successful Clear is trivial under the one-sided
+// metered-current rule (release has no measurable target; any plausible
+// under-limit sample converges) — see bus.RestoreCurrentA's doc.
+func (b *mqttBridge) ApplyClear(stationID string, evseID int) error {
+	b.mu.RLock()
+	s, ok := b.stations[stationID]
+	connected := ok && s.connected
+	var proto string
+	if ok {
+		proto = s.proto
+	}
+	b.mu.RUnlock()
+	if !connected {
+		return nil
+	}
+	if evseID == 0 {
+		evseID = 1
+	}
+	if proto == protoOCPP16 {
+		return b.applyClear16(stationID, evseID)
+	}
+	type ccpResult struct {
+		status smartcharging.ClearChargingProfileStatus
+		err    error
+	}
+	resCh := make(chan ccpResult, 1)
+	callErr := b.cs201.ClearChargingProfile(
+		stationID,
+		func(resp *smartcharging.ClearChargingProfileResponse, err error) {
+			r := ccpResult{err: err}
+			if resp != nil {
+				r.status = resp.Status
+			}
+			resCh <- r
+		},
+		func(req *smartcharging.ClearChargingProfileRequest) {
+			// Clear exactly what Apply installs: the TxDefaultProfile on this
+			// EVSE — never a blanket clear of profiles some other authority
+			// may have placed.
+			id := evseID
+			req.ChargingProfileCriteria = &smartcharging.ClearChargingProfileType{
+				EvseID:                 &id,
+				ChargingProfilePurpose: types.ChargingProfilePurposeTxDefaultProfile,
+			}
+		},
+	)
+	if callErr != nil {
+		return fmt.Errorf("ClearChargingProfile %s evse=%d call failed: %w", stationID, evseID, callErr)
+	}
+	t := time.NewTimer(10 * time.Second)
+	defer t.Stop()
+	select {
+	case r := <-resCh:
+		if r.err != nil {
+			return fmt.Errorf("ClearChargingProfile %s evse=%d failed: %w", stationID, evseID, r.err)
+		}
+		if r.status != smartcharging.ClearChargingProfileStatusAccepted &&
+			r.status != smartcharging.ClearChargingProfileStatusUnknown {
+			return fmt.Errorf("ClearChargingProfile %s evse=%d rejected: status=%q", stationID, evseID, r.status)
+		}
+		return nil
+	case <-t.C:
+		return fmt.Errorf("ClearChargingProfile %s evse=%d timed out after 10s", stationID, evseID)
+	}
+}
+
+// handlePairingDecision consumes one bus.PairingDecision edge from
+// lexa/ocpp/pairing (WP-13): apply it to the gate (validate + persist),
+// resolve the station off the pending surface, and — on an approval — nudge
+// the (possibly still-connected, Pending-registered) station to re-send its
+// BootNotification immediately instead of waiting out its 60 s Boot-retry
+// interval. A malformed decision is rejected loudly and changes nothing.
+func (b *mqttBridge) handlePairingDecision(d bus.PairingDecision, now time.Time) {
+	if err := b.gate.applyDecision(d); err != nil {
+		log.Printf("[ocpp] REJECT pairing decision station=%q action=%q: %v", d.StationID, d.Action, err)
+		return
+	}
+	log.Printf("[ocpp] pairing decision applied: station=%s action=%s actor=%s", d.StationID, d.Action, d.Actor)
+	b.pending.resolve(d.StationID, now)
+	if d.Action == bus.PairingActionApprove {
+		b.nudgeBootNotification(d.StationID)
+	}
+}
+
+// nudgeBootNotification fire-and-forgets a TriggerMessage(BootNotification)
+// at stationID on BOTH stacks (a gated-pending station was never promoted to
+// a stationState, so its proto tag is unknown; the stack it is not connected
+// on errors harmlessly inside the library and is ignored). Best-effort by
+// design — a station that misses the nudge re-Boots on its Pending-interval
+// cadence anyway.
+func (b *mqttBridge) nudgeBootNotification(stationID string) {
+	go func() {
+		_ = b.cs201.TriggerMessage(
+			stationID,
+			func(_ *remotecontrol.TriggerMessageResponse, _ error) {},
+			remotecontrol.MessageTriggerBootNotification,
+		)
+		if b.cs16 != nil {
+			_ = b.cs16.TriggerMessage(
+				stationID,
+				func(_ *remotetrigger16.TriggerMessageConfirmation, _ error) {},
+				remotetrigger16.MessageTrigger(core16.BootNotificationFeatureName),
+			)
+		}
+	}()
 }
 
 // ── OCPP handler forwarders ───────────────────────────────────────────────────
@@ -660,17 +850,48 @@ type provisioningForwarder struct{ bridge *mqttBridge }
 // place this information is ever offered by the OCPP protocol — and feeds it
 // into the pending-station upsert (a no-op merge for an already-configured
 // station; see pendingStations.upsert). Response shape mirrors
-// lexa-proto/ocppserver/handlers.go's default handler exactly (Accepted,
-// 60s heartbeat interval) since this override's only job is to ALSO capture
-// vendor/model, not to change registration behavior.
+// lexa-proto/ocppserver/handlers.go's default handler (60s heartbeat
+// interval); WP-13/D10 makes the RegistrationStatus the pairing gate's
+// verdict — Accepted for configured/approved stations (and everything in
+// open mode, today's behavior unchanged), Pending for an unknown station in
+// gated mode (the protocol-sanctioned holding state; the 60 s interval is
+// its Boot-retry cadence, so an approval takes effect within a minute even
+// without the TriggerMessage nudge), Rejected for a persisted deny.
+//
+// An ACCEPTED boot also ensures the stationState exists and is marked
+// connected (the request just arrived on a live socket by construction) —
+// on a normal connect that is a no-op after onConnect, but it is what
+// promotes a just-approved station whose onConnect ran while it was still
+// gated (mirroring the 1.6 forwarder's getOrCreate16Locked-at-boot).
 func (h *provisioningForwarder) OnBootNotification(csID string, req *provisioning.BootNotificationRequest) (*provisioning.BootNotificationResponse, error) {
-	log.Printf("[ocpp] BootNotification cs=%s reason=%s model=%s vendor=%s",
-		csID, req.Reason, req.ChargingStation.Model, req.ChargingStation.VendorName)
 	h.bridge.pending.upsert(csID, req.ChargingStation.VendorName, req.ChargingStation.Model, "", time.Now())
+	status := provisioning.RegistrationStatusAccepted
+	switch h.bridge.gate.verdict(csID) {
+	case bootPending:
+		status = provisioning.RegistrationStatusPending
+	case bootReject:
+		status = provisioning.RegistrationStatusRejected
+	default:
+		h.bridge.mu.Lock()
+		s, created := h.bridge.getOrCreateLocked(csID)
+		if created {
+			// Only the just-approved case (onConnect ran while still gated,
+			// so no stationState exists yet) takes this branch — a normal
+			// boot after onConnect leaves state and the publish stream
+			// byte-identical to pre-WP-13.
+			s.connected = true
+			h.bridge.mu.Unlock()
+			h.bridge.publishAll(csID)
+		} else {
+			h.bridge.mu.Unlock()
+		}
+	}
+	log.Printf("[ocpp] BootNotification cs=%s reason=%s model=%s vendor=%s status=%s",
+		csID, req.Reason, req.ChargingStation.Model, req.ChargingStation.VendorName, status)
 	resp := provisioning.NewBootNotificationResponse(
 		types.NewDateTime(time.Now()),
 		60, // heartbeat interval in seconds
-		provisioning.RegistrationStatusAccepted,
+		status,
 	)
 	return resp, nil
 }
@@ -688,6 +909,13 @@ func (h *availForwarder) OnHeartbeat(csID string, _ *availability.HeartbeatReque
 }
 
 func (h *availForwarder) OnStatusNotification(csID string, req *availability.StatusNotificationRequest) (*availability.StatusNotificationResponse, error) {
+	// WP-13/D10: a StatusNotification from a non-approved station is RECORDED
+	// on the pending surface (LastSeen refresh — the installer sees a live,
+	// talking charger) but never folded into plant state.
+	if !h.bridge.gate.allowed(csID) {
+		h.bridge.pending.upsert(csID, "", "", "", time.Now())
+		return &availability.StatusNotificationResponse{}, nil
+	}
 	status := connectorStatus(req.ConnectorStatus)
 	h.bridge.mu.Lock()
 	s, created := h.bridge.getOrCreateLocked(csID)
@@ -763,6 +991,11 @@ func applySamplesLocked(s *stationState, meterValues []types.MeterValue) {
 }
 
 func (h *meterForwarder) OnMeterValues(csID string, req *meter.MeterValuesRequest) (*meter.MeterValuesResponse, error) {
+	// WP-13/D10: meter data from a non-approved station is dropped (edge
+	// log + counter) — never folded, never published as plant telemetry.
+	if !h.bridge.gate.permitOrLogDrop(csID, "MeterValues") {
+		return meter.NewMeterValuesResponse(), nil
+	}
 	h.bridge.mu.Lock()
 	s, _ := h.bridge.getOrCreateLocked(csID)
 	applySamplesLocked(s, req.MeterValue)
@@ -790,6 +1023,11 @@ type txForwarder struct{ bridge *mqttBridge }
 // transition). Ended events zero the current so site power drops immediately
 // instead of holding the last sample.
 func (h *txForwarder) OnTransactionEvent(csID string, req *transactions.TransactionEventRequest) (*transactions.TransactionEventResponse, error) {
+	// WP-13/D10: no transactions folded from a non-approved station (edge
+	// log + counter) — the session neither counts nor reaches the bus.
+	if !h.bridge.gate.permitOrLogDrop(csID, "TransactionEvent") {
+		return transactions.NewTransactionEventResponse(), nil
+	}
 	if req.EventType == transactions.TransactionEventStarted {
 		h.bridge.transactionsTotal.Inc() // lexa_ocpp_transactions_total (TASK-044)
 	}

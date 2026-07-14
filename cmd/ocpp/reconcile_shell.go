@@ -90,10 +90,19 @@ const (
 )
 
 // profileDriver is how an ACTIVE shell writes a converged current limit to a
-// charger. The one production implementation is *mqttBridge (bridge.Apply). Nil
-// in shadow mode.
+// charger. The one production implementation is *mqttBridge (bridge.Apply /
+// bridge.ApplyClear). Nil in shadow mode.
+//
+// ApplyClear is the WP-13/B3 release path: the shell routes a desired
+// MaxCurrentA at/above the station's rated maximum (bus.RestoreCurrentA
+// included, by construction) here — an OCPP ClearChargingProfile removing
+// the standing TxDefaultProfile — instead of Apply with a large numeric
+// limit. Release is still a VALUE on the wire (AD-013): the desired doc
+// carries the explicit sentinel/rated figure; only the hardware verb
+// differs.
 type profileDriver interface {
 	Apply(stationID string, evseID int, limitA float64) error
+	ApplyClear(stationID string, evseID int) error
 }
 
 // evseCurrentTolerance is the one-sided over-limit slack (A) before a metered
@@ -113,6 +122,14 @@ type evseShell struct {
 	r           *reconcile.Reconciler
 
 	driver profileDriver // nil in shadow mode
+
+	// ratedMaxA is the station's configured hardware maximum (cfg.Stations'
+	// MaxCurrentA), set once at startup by main.go's shell wiring. A desired
+	// current at/above it is a RELEASE (WP-13/B3) and dispatches
+	// driver.ApplyClear instead of Apply — see applyActionLocked. 0 (unset —
+	// older tests, unknown rating) disables the rated-value mapping; the
+	// bus.RestoreCurrentA sentinel still releases regardless.
+	ratedMaxA float64
 
 	desiredMaxA    float64
 	haveDesiredMax bool
@@ -309,12 +326,38 @@ func (s *evseShell) tick(now time.Time) {
 // folded Connect into (0 A for a disconnect, the doc's own MaxCurrentA
 // otherwise) — this function needs no Connect-specific branch of its own;
 // "honoring Connect" and "writing MaxCurrentA" are the same write for OCPP.
+//
+// WP-13 (B3) release dispatch: a limit that IS a release — the
+// bus.RestoreCurrentA sentinel, or any value at/above the station's rated
+// maximum (releaseLimit) — goes through driver.ApplyClear
+// (ClearChargingProfile) instead of Apply. Clear-Accepted is the write
+// success; convergence needs no special case because release has no
+// measurable target — the one-sided rule (observe: metered current at/under
+// the limit reads back as the limit) makes any plausible post-release sample
+// converge trivially. Corollary, deliberate: a FAILED Clear is counted and
+// logged (L11) but is NOT divergence-retried — the charger holding its old,
+// more-restrictive limit stays under the release target, which the one-sided
+// contract treats as compliant (the fail-SAFE direction; the EV draws less
+// than allowed, never more). Its retry vectors are reassert-on-reconnect and
+// any later desired change.
 func (s *evseShell) applyActionLocked(action reconcile.Action) {
 	if action.Kind != reconcile.ActionWrite {
 		return
 	}
 	limitA, ok := action.Fields[reconcile.MaxCurrentA]
 	if !ok {
+		return
+	}
+	if s.releaseLimit(limitA) {
+		if err := s.driver.ApplyClear(s.stationID, s.connectorID); err != nil {
+			s.writeFailures.Inc()
+			log.Printf("lexa-ocpp: reconciler[active] %s: ClearChargingProfile (release, MaxCurrentA=%.1f, %s) failed: %v",
+				s.stationID, limitA, action.Reason, err)
+			return
+		}
+		s.writes.Inc()
+		log.Printf("lexa-ocpp: reconciler[active] %s: released charging profile (ClearChargingProfile) connector=%d (reason=%s)",
+			s.stationID, s.connectorID, action.Reason)
 		return
 	}
 	if err := s.driver.Apply(s.stationID, s.connectorID, limitA); err != nil {
@@ -326,6 +369,18 @@ func (s *evseShell) applyActionLocked(action reconcile.Action) {
 	s.writes.Inc()
 	log.Printf("lexa-ocpp: reconciler[active] %s: applied MaxCurrentA=%.1f connector=%d (reason=%s)",
 		s.stationID, limitA, s.connectorID, action.Reason)
+}
+
+// releaseLimit reports whether limitA means "no CSMS-imposed limit" (WP-13,
+// B3): the explicit bus.RestoreCurrentA sentinel always does; a value
+// at/above the station's rated maximum does when the rating is known
+// (ratedMaxA > 0). A suspend (0 A) or any throttle below rated is a real
+// limit and never a release.
+func (s *evseShell) releaseLimit(limitA float64) bool {
+	if limitA >= bus.RestoreCurrentA {
+		return true
+	}
+	return s.ratedMaxA > 0 && limitA >= s.ratedMaxA
 }
 
 // markReconnected is the OCPP connect hook's callback: atomic store only.

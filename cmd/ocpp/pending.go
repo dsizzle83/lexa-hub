@@ -141,6 +141,32 @@ func (p *pendingStations) upsert(stationID, vendor, model, remoteAddr string, no
 	p.publishRateLimited(now)
 }
 
+// neverTrack adds id to the never-track-as-pending set (the same set
+// cfg.Stations seeds at construction) without publishing — used at startup
+// to seed persisted pairing decisions (WP-13: an approved or denied station
+// is decided, so it must not re-surface as pending after a restart the way
+// a config-approved station never does).
+func (p *pendingStations) neverTrack(id string) {
+	p.mu.Lock()
+	p.configured[id] = true
+	p.mu.Unlock()
+}
+
+// resolve removes id from the pending surface AND marks it never-tracked
+// again, then republishes the retained doc (rate-limit bypassed — a pairing
+// decision is a rare, installer-driven edge, and the surface must reflect it
+// immediately). Called when a pairing decision lands (WP-13): approve or
+// deny, the entry's job — "surface this station for a decision" — is done.
+func (p *pendingStations) resolve(id string, now time.Time) {
+	p.mu.Lock()
+	p.configured[id] = true
+	delete(p.entries, id)
+	p.lastPublish = now
+	doc := p.buildDocLocked(now)
+	p.mu.Unlock()
+	p.doPublish(doc)
+}
+
 // publishRateLimited publishes the current doc unless one already went out
 // within pendingPublishMinInterval of now, in which case this call is a
 // silent no-op (the rewalkRateLimit-style policy — see the const doc).

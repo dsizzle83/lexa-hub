@@ -62,6 +62,10 @@ import (
 // (wireOCPP16 below).
 type centralSystem16 interface {
 	SetChargingProfile(clientID string, callback func(*smartcharging16.SetChargingProfileConfirmation, error), connectorID int, chargingProfile *types16.ChargingProfile, props ...func(request *smartcharging16.SetChargingProfileRequest)) error
+	// ClearChargingProfile (WP-13, B3): the release path. Satisfied by the
+	// full ocpp16.CentralSystem the vendored ocppserver16.Server.
+	// CentralSystem() already exposes — no vendored-package change needed.
+	ClearChargingProfile(clientID string, callback func(*smartcharging16.ClearChargingProfileConfirmation, error), props ...func(request *smartcharging16.ClearChargingProfileRequest)) error
 	TriggerMessage(clientID string, callback func(*remotetrigger16.TriggerMessageConfirmation, error), requestedMessage remotetrigger16.MessageTrigger, props ...func(request *remotetrigger16.TriggerMessageRequest)) error
 }
 
@@ -105,6 +109,13 @@ func (b *mqttBridge) getOrCreate16Locked(id string) (*stationState, bool) {
 // charger that drops and returns gets its standing limit re-sent immediately),
 // publish state, and re-trigger a StatusNotification.
 func (b *mqttBridge) onConnect16(cp ocpp16.ChargePointConnection) {
+	// WP-13/D10: the SAME pairing gate as the 2.0.1 onConnect — a
+	// non-approved station is surfaced pending, never promoted to plant.
+	if !b.gate.allowed(cp.ID()) {
+		log.Printf("[ocpp16] connected (pairing-gated, not adopted): %s addr=%s", cp.ID(), cp.RemoteAddr())
+		b.pending.upsert(cp.ID(), "", "", cp.RemoteAddr().String(), time.Now())
+		return
+	}
 	b.mu.Lock()
 	s, created := b.getOrCreate16Locked(cp.ID())
 	s.connected = true
@@ -196,6 +207,55 @@ func (b *mqttBridge) apply16(stationID string, connectorID int, limitA float64) 
 	}
 }
 
+// applyClear16 is the 1.6 half of bridge.ApplyClear's per-proto dispatch
+// (WP-13, B3): remove the TxDefaultProfile Apply installed on connectorID.
+// Same contract as the 2.0.1 path (see ApplyClear's doc): 10 s bound,
+// Accepted OR Unknown (nothing to clear ⇒ already released) is success, any
+// other status / transport error / timeout is an error, L11-style. The
+// caller has already handled the disconnected no-op and connectorID 0→1.
+func (b *mqttBridge) applyClear16(stationID string, connectorID int) error {
+	type ccpResult struct {
+		status smartcharging16.ClearChargingProfileStatus
+		err    error
+	}
+	resCh := make(chan ccpResult, 1)
+	callErr := b.cs16.ClearChargingProfile(
+		stationID,
+		func(resp *smartcharging16.ClearChargingProfileConfirmation, err error) {
+			r := ccpResult{err: err}
+			if resp != nil {
+				r.status = resp.Status
+			}
+			resCh <- r
+		},
+		func(req *smartcharging16.ClearChargingProfileRequest) {
+			// Clear exactly what apply16 installs: the TxDefaultProfile on
+			// this connector — never a blanket clear.
+			id := connectorID
+			req.ConnectorId = &id
+			req.ChargingProfilePurpose = types16.ChargingProfilePurposeTxDefaultProfile
+		},
+	)
+	if callErr != nil {
+		return fmt.Errorf("ClearChargingProfile(1.6) %s connector=%d call failed: %w", stationID, connectorID, callErr)
+	}
+	t := time.NewTimer(10 * time.Second)
+	defer t.Stop()
+	select {
+	case r := <-resCh:
+		if r.err != nil {
+			return fmt.Errorf("ClearChargingProfile(1.6) %s connector=%d failed: %w", stationID, connectorID, r.err)
+		}
+		if r.status != smartcharging16.ClearChargingProfileStatusAccepted &&
+			r.status != smartcharging16.ClearChargingProfileStatusUnknown {
+			return fmt.Errorf("ClearChargingProfile(1.6) %s connector=%d rejected: status=%q", stationID, connectorID, r.status)
+		}
+		return nil
+	case <-t.C:
+		return fmt.Errorf("ClearChargingProfile(1.6) %s connector=%d timed out after 10s", stationID, connectorID)
+	}
+}
+
 // ── 1.6 handler forwarders ───────────────────────────────────────────────────
 
 // forwarder16 carries the five seam-covered 1.6 Core messages onto the shared
@@ -203,22 +263,38 @@ func (b *mqttBridge) apply16(stationID string, connectorID int, limitA float64) 
 type forwarder16 struct{ bridge *mqttBridge }
 
 // OnBootNotification mirrors the 2.0.1 provisioningForwarder: capture
-// vendor/model for the pending-station surface and respond Accepted with a
-// 60 s heartbeat interval. It also stamps the proto tag (WP-12: "set at
-// boot/connect") — on a live socket the connect handler already did, but a
-// boot must be sufficient on its own. NO pairing gate here (WP-13/D10):
-// registration behavior stays auto-accept, exactly like 2.0.1 today.
+// vendor/model for the pending-station surface, answer with the SAME pairing
+// gate's verdict (WP-13/D10 — one gate, both stacks: Accepted for
+// configured/approved stations and everything in open mode, Pending for an
+// unknown station in gated mode, Rejected for a persisted deny), and — only
+// when accepted — ensure the stationState exists with its proto tag stamped
+// (WP-12: "set at boot/connect"; a gated station must never be promoted).
 func (f *forwarder16) OnBootNotification(cpID string, req *core16.BootNotificationRequest) (*core16.BootNotificationConfirmation, error) {
-	log.Printf("[ocpp16] BootNotification cs=%s model=%s vendor=%s",
-		cpID, req.ChargePointModel, req.ChargePointVendor)
-	f.bridge.mu.Lock()
-	f.bridge.getOrCreate16Locked(cpID)
-	f.bridge.mu.Unlock()
 	f.bridge.pending.upsert(cpID, req.ChargePointVendor, req.ChargePointModel, "", time.Now())
+	status := core16.RegistrationStatusAccepted
+	switch f.bridge.gate.verdict(cpID) {
+	case bootPending:
+		status = core16.RegistrationStatusPending
+	case bootReject:
+		status = core16.RegistrationStatusRejected
+	default:
+		f.bridge.mu.Lock()
+		s, created := f.bridge.getOrCreate16Locked(cpID)
+		if created {
+			// Just-approved case: onConnect16 ran while still gated, so no
+			// stationState exists yet. The boot arrived on a live socket by
+			// construction, so connected=true is truthful. A normal boot
+			// (station already tracked) leaves state byte-identical.
+			s.connected = true
+		}
+		f.bridge.mu.Unlock()
+	}
+	log.Printf("[ocpp16] BootNotification cs=%s model=%s vendor=%s status=%s",
+		cpID, req.ChargePointModel, req.ChargePointVendor, status)
 	return core16.NewBootNotificationConfirmation(
 		types16.NewDateTime(time.Now()),
 		60, // heartbeat interval in seconds — same as the 2.0.1 forwarder
-		core16.RegistrationStatusAccepted,
+		status,
 	), nil
 }
 
@@ -249,6 +325,12 @@ func mapStatus16(st core16.ChargePointStatus) connectorStatus {
 
 // OnStatusNotification mirrors the 2.0.1 availForwarder, through mapStatus16.
 func (f *forwarder16) OnStatusNotification(cpID string, req *core16.StatusNotificationRequest) (*core16.StatusNotificationConfirmation, error) {
+	// WP-13/D10: recorded on the pending surface only, never folded — the
+	// same policy as the 2.0.1 availForwarder.
+	if !f.bridge.gate.allowed(cpID) {
+		f.bridge.pending.upsert(cpID, "", "", "", time.Now())
+		return core16.NewStatusNotificationConfirmation(), nil
+	}
 	status := mapStatus16(req.Status)
 	f.bridge.mu.Lock()
 	s, created := f.bridge.getOrCreate16Locked(cpID)
@@ -309,6 +391,10 @@ func applySamples16Locked(s *stationState, meterValues []types16.MeterValue) {
 // reconciler shell outside mu (post-L11, so by construction plausible), log
 // at Debug (steady-state, per the TASK-045 demotion table), publish.
 func (f *forwarder16) OnMeterValues(cpID string, req *core16.MeterValuesRequest) (*core16.MeterValuesConfirmation, error) {
+	// WP-13/D10: dropped (edge log + counter) from a non-approved station.
+	if !f.bridge.gate.permitOrLogDrop(cpID, "MeterValues(1.6)") {
+		return core16.NewMeterValuesConfirmation(), nil
+	}
 	f.bridge.mu.Lock()
 	s, _ := f.bridge.getOrCreate16Locked(cpID)
 	applySamples16Locked(s, req.MeterValue)
@@ -329,6 +415,16 @@ func (f *forwarder16) OnMeterValues(cpID string, req *core16.MeterValuesRequest)
 // the station state. Session lifecycle is driven from here, never inferred
 // from bare MeterValues (OCPP-1 invariant, ocppserver16 CLAUDE.md).
 func (f *forwarder16) OnStartTransaction(cpID string, req *core16.StartTransactionRequest) (*core16.StartTransactionConfirmation, error) {
+	// WP-13/D10: no transactions from a non-approved station. 1.6 requires a
+	// confirmation with an IdTagInfo and a transaction ID — answer Invalid
+	// (the 1.6 analog of D10's "Authorize → Invalid where used") with a real
+	// CSMS-assigned ID so a nonconforming charger's later StopTransaction
+	// still references something well-formed; nothing folds, nothing counts.
+	if !f.bridge.gate.permitOrLogDrop(cpID, "StartTransaction(1.6)") {
+		txID := int(atomic.AddInt32(&f.bridge.nextTxID16, 1))
+		return core16.NewStartTransactionConfirmation(
+			types16.NewIdTagInfo(types16.AuthorizationStatusInvalid), txID), nil
+	}
 	f.bridge.transactionsTotal.Inc() // lexa_ocpp_transactions_total (TASK-044)
 	txID := int(atomic.AddInt32(&f.bridge.nextTxID16, 1))
 	f.bridge.mu.Lock()
@@ -355,6 +451,10 @@ func (f *forwarder16) OnStartTransaction(cpID string, req *core16.StartTransacti
 // converge through observeShell (the same forced-measured-0 contract as
 // TransactionEvent Ended, CLAUDE.md's EVSE reconciler section).
 func (f *forwarder16) OnStopTransaction(cpID string, req *core16.StopTransactionRequest) (*core16.StopTransactionConfirmation, error) {
+	// WP-13/D10: dropped (edge log + counter) from a non-approved station.
+	if !f.bridge.gate.permitOrLogDrop(cpID, "StopTransaction(1.6)") {
+		return core16.NewStopTransactionConfirmation(), nil
+	}
 	f.bridge.mu.Lock()
 	s, _ := f.bridge.getOrCreate16Locked(cpID)
 	applySamples16Locked(s, req.TransactionData)

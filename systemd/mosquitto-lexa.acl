@@ -207,6 +207,12 @@ topic read lexa/desired/evse/+
 # stations that dialed the CSMS, for installer approval instead of silent
 # adoption; lexa-api (unit 4.2) projects it into GET /devices.
 topic write lexa/ocpp/pending
+# bus.TopicOCPPPairing (edge — never retained) (WP-13/D10) — the pairing
+# gate consumes installer approve/deny decisions; lexa-api's POST
+# /devices/evse/{id}/pairing is the SOLE writer (see its stanza). A missing
+# grant here silently drops approvals the same way a missing
+# compliance/alert grant silently drops CannotComply (RSK-09 pattern).
+topic read lexa/ocpp/pairing
 
 # bus.ReconcileReportTopic("evse", station) (TASK-030/031) — EVSE
 # reconciler verdicts (HOTFIX 2026-07-09, see modbus stanza note).
@@ -276,6 +282,10 @@ topic read lexa/scan/result
 # bus.TopicOCPPPending (retained) (TASK-082) — unit 4.2 GET /devices
 # projection; unit 6.1 (ocpp pending-station surface) is the writer.
 topic read lexa/ocpp/pending
+# bus.TopicOCPPPairing (edge — never retained) (WP-13/D10) — POST
+# /devices/evse/{id}/pairing publishes installer approve/deny decisions;
+# lexa-ocpp's pairing gate is the SOLE reader (see its stanza).
+topic write lexa/ocpp/pairing
 
 user lexa-cloudlink
 # bus.SubMeasurements (TASK-082) — unit 2.2 uplink collector, telemetry

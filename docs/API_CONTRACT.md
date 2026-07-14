@@ -128,6 +128,14 @@ Each is pinned by a golden fixture and the CI gate. Fields are grouped by route;
 - **`POST /intent` request bodies** (`intent_<kind>_request.json` for
   `mode|evgoal|reserve|tariff|chargenow`): the `{kind, body{…}}` shapes the app
   sends. `chargenow` requires `ttl_s > 0`; state kinds ignore any `ttl_s`.
+- **`POST /devices/evse/{id}/pairing`** (`pairing_request.json` /
+  `pairing_response.json`, WP-13): request `{action ∈ approve|deny}`; response
+  `202 {station_id, action, outcome:"accepted"}`. The effect is asynchronous —
+  lexa-ocpp applies and persists the decision, and the station's next
+  BootNotification reflects it — so `202` is the terminal success status
+  (there is no result topic to await, unlike `/intent`). A write route:
+  bearer auth is strict (401 with no token configured). Added as a NEW route
+  — additive per the rule above, `apicontract.Version` unchanged at 1.
 
 ## Non-JSON contract surfaces (not golden-fixtured)
 

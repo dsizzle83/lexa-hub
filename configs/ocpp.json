@@ -13,6 +13,8 @@
   "basic_auth_pass": "DEPLOY-PROVISIONED-see-deploy-hub-pi.sh---enable-ocpp-sp2",
   "bench": false,
   "reconciler": "active",
+  "pairing_mode": "",
+  "allowlist_path": "/var/lib/lexa/ocpp-allowlist.json",
   "stations": [
     {
       "id": "cs-001",

@@ -47,18 +47,27 @@ func newFakeCPConn(id, addr string) fakeCPConn {
 // seam and answers the SetChargingProfile callback with a configurable
 // status/error (default Accepted), asynchronously like the real library.
 type fakeSender16 struct {
-	mu      sync.Mutex
-	sp      []spCall16
-	trig    []remotetrigger16.MessageTrigger
-	status  smartcharging16.ChargingProfileStatus // "" ⇒ Accepted
-	cbErr   error                                 // handed to the callback (transport failure)
-	callErr error                                 // returned from SetChargingProfile itself
+	mu          sync.Mutex
+	sp          []spCall16
+	clears      []clearCall16
+	trig        []remotetrigger16.MessageTrigger
+	status      smartcharging16.ChargingProfileStatus      // "" ⇒ Accepted
+	clearStatus smartcharging16.ClearChargingProfileStatus // "" ⇒ Accepted
+	cbErr       error                                      // handed to the callback (transport failure)
+	callErr     error                                      // returned from SetChargingProfile itself
 }
 
 type spCall16 struct {
 	stationID   string
 	connectorID int
 	profile     *types16.ChargingProfile
+}
+
+// clearCall16 records one ClearChargingProfile send (WP-13 release path),
+// with the request as the props built it so tests can assert the criteria.
+type clearCall16 struct {
+	stationID string
+	req       *smartcharging16.ClearChargingProfileRequest
 }
 
 func (f *fakeSender16) SetChargingProfile(stationID string, cb func(*smartcharging16.SetChargingProfileConfirmation, error), connectorID int, profile *types16.ChargingProfile, _ ...func(*smartcharging16.SetChargingProfileRequest)) error {
@@ -84,6 +93,45 @@ func (f *fakeSender16) SetChargingProfile(stationID string, cb func(*smartchargi
 		cb(smartcharging16.NewSetChargingProfileConfirmation(status), nil)
 	}()
 	return nil
+}
+
+// ClearChargingProfile records the WP-13 release path: the request is built
+// via the props (as the real library does) so tests can assert the criteria
+// (connector + TxDefaultProfile purpose); the callback is answered with a
+// configurable status (default Accepted), asynchronously.
+func (f *fakeSender16) ClearChargingProfile(stationID string, cb func(*smartcharging16.ClearChargingProfileConfirmation, error), props ...func(*smartcharging16.ClearChargingProfileRequest)) error {
+	req := smartcharging16.NewClearChargingProfileRequest()
+	for _, p := range props {
+		p(req)
+	}
+	f.mu.Lock()
+	clearStatus := f.clearStatus
+	if clearStatus == "" {
+		clearStatus = smartcharging16.ClearChargingProfileStatusAccepted
+	}
+	cbErr := f.cbErr
+	callErr := f.callErr
+	if callErr == nil {
+		f.clears = append(f.clears, clearCall16{stationID: stationID, req: req})
+	}
+	f.mu.Unlock()
+	if callErr != nil {
+		return callErr
+	}
+	go func() {
+		if cbErr != nil {
+			cb(nil, cbErr)
+			return
+		}
+		cb(smartcharging16.NewClearChargingProfileConfirmation(clearStatus), nil)
+	}()
+	return nil
+}
+
+func (f *fakeSender16) clearCalls() []clearCall16 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]clearCall16(nil), f.clears...)
 }
 
 func (f *fakeSender16) TriggerMessage(_ string, cb func(*remotetrigger16.TriggerMessageConfirmation, error), requestedMessage remotetrigger16.MessageTrigger, _ ...func(*remotetrigger16.TriggerMessageRequest)) error {

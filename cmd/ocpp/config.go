@@ -96,6 +96,30 @@ type Config struct {
 	// and reassert-on-reconnect.
 	Reconciler string `json:"reconciler"`
 
+	// PairingMode selects the WP-13/D10 pairing gate posture: "gated" (an
+	// unknown station's BootNotification — either stack — is answered
+	// RegistrationStatus Pending, never adopted into plant state, until an
+	// installer approves it via lexa-api's POST /devices/evse/{id}/pairing)
+	// or "open" (today's auto-accept behavior, unchanged). Configured
+	// stations[] are implicitly allowlisted in both modes.
+	//
+	// Empty resolves per profile in loadConfig: "gated" is the PRODUCT
+	// default (fail-closed — roadmap R8, "any dialing charger becomes
+	// plant"); the bench profile (Bench/OCPP_PROFILE=bench, same knobs as
+	// the SP2 gate) defaults to "open" so every existing bench/Mayhem flow —
+	// evsim dialing in with unconfigured station IDs included — is
+	// byte-identical. An explicit value always wins, either way.
+	PairingMode string `json:"pairing_mode"`
+
+	// AllowlistPath is where the pairing gate persists installer
+	// approve/deny decisions (0600, atomic write; crash-only — a restart
+	// re-seeds from this file). Default /var/lib/lexa/ocpp-allowlist.json.
+	// The directory is provisioning's job (V1RC finding D:
+	// StateDirectory=lexa on the unit, or deploy-hub-pi.sh's install -d) —
+	// an unwritable path degrades to RAM-only decisions with a loud error,
+	// never a refusal to start.
+	AllowlistPath string `json:"allowlist_path"`
+
 	// MQTTDeafRestartAfterS bounds how long lexa-ocpp keeps kicking the
 	// systemd watchdog while mc.IsConnected() reports true but the broker
 	// connection has actually been down the whole time (WS-9.1):
@@ -116,6 +140,19 @@ const (
 	ReconcilerShadow = "shadow"
 	ReconcilerActive = "active"
 )
+
+// Pairing gate modes (WP-13/D10). loadConfig resolves an empty PairingMode to
+// PairingGated (product) or PairingOpen (bench profile), so cfg.PairingMode is
+// always one of these two after a successful load.
+const (
+	PairingGated = "gated"
+	PairingOpen  = "open"
+)
+
+// defaultAllowlistPath is AllowlistPath's default when empty/absent — under
+// /var/lib/lexa per the V1RC finding D provisioning discipline (the same
+// state root northbound's response-state store uses).
+const defaultAllowlistPath = "/var/lib/lexa/ocpp-allowlist.json"
 
 // ReconcilerMode returns the configured EVSE reconciler mode, defaulting to
 // ReconcilerOff when empty. loadConfig has already rejected any other value.
@@ -203,6 +240,25 @@ func loadConfig(path string) (*Config, error) {
 		// value syntax ok; migrated-class requirement checked below
 	default:
 		return nil, fmt.Errorf("reconciler: unknown mode %q (want off|shadow|active)", cfg.Reconciler)
+	}
+	// WP-13/D10 pairing gate posture. Empty resolves per profile: bench ⇒
+	// "open" (every existing bench flow — evsim dialing in unconfigured —
+	// stays byte-identical), product ⇒ "gated" (fail-closed, roadmap R8). An
+	// explicit value always wins.
+	switch cfg.PairingMode {
+	case "":
+		if benchProfile(&cfg) {
+			cfg.PairingMode = PairingOpen
+		} else {
+			cfg.PairingMode = PairingGated
+		}
+	case PairingGated, PairingOpen:
+		// explicit value, either profile
+	default:
+		return nil, fmt.Errorf("pairing_mode: unknown mode %q (want gated|open)", cfg.PairingMode)
+	}
+	if cfg.AllowlistPath == "" {
+		cfg.AllowlistPath = defaultAllowlistPath
 	}
 	// TASK-032: the legacy lexa/evse/{station}/command path was deleted, so EVSE
 	// is reconciler-only. If stations are configured, the reconciler MUST be
