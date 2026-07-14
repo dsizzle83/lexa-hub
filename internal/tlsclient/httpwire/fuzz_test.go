@@ -98,6 +98,7 @@ func FuzzReadHTTPResponse(f *testing.F) {
 	f.Add([]byte("\r\n\r\n"))                                                                                                 // terminator only, no status line
 	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))                                                             // zero-length body
 	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 999\r\n\r\nhello"))                                 // duplicate CL
+	f.Add([]byte("HTTP/1.1 302 Found\r\nLocation: /dcap\r\nContent-Length: 0\r\n\r\n"))                                       // 302 + Location (WP-3; corpus: redirect-30{1,2}.raw)
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		resp, err := ReadHTTPResponse(varyingChunkReader(data), prodMaxHeader, prodMaxBody)

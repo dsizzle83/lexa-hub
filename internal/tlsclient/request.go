@@ -43,3 +43,22 @@ func buildPostRequest(path, host string, body []byte, contentType string) []byte
 		path, host, contentType, len(body))
 	return append([]byte(header), body...)
 }
+
+// buildPutRequest constructs an HTTP/1.1 PUT request with body — the same
+// shape as buildPostRequest with only the verb changed (WP-3/D3: DER*
+// reporting PUTs a full resource representation, Content-Length framed).
+// Like the other builders this is a pure formatter: the CRLF/space
+// injection guard (validateRequestParam) is applied by the Client verb
+// methods to the path before this ever runs, and the host is the
+// configured ServerAddr, never attacker-controlled.
+func buildPutRequest(path, host string, body []byte, contentType string) []byte {
+	header := fmt.Sprintf(
+		"PUT %s HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"Content-Type: %s\r\n"+
+			"Content-Length: %d\r\n"+
+			"Connection: keep-alive\r\n"+
+			"\r\n",
+		path, host, contentType, len(body))
+	return append([]byte(header), body...)
+}

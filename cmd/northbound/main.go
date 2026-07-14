@@ -94,6 +94,7 @@ func main() {
 		CACertPath:     cfg.CACert,
 		ClientCertPath: cfg.ClientCert,
 		ClientKeyPath:  cfg.ClientKey,
+		RedirectMax:    cfg.RedirectMaxValue(),
 	}
 	// Three independent wolfSSL sessions: discovery (long-lived keep-alive
 	// walk), response (CORE-022 Response POSTs), flow-reservation (§10.9

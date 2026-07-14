@@ -249,6 +249,24 @@ func (c *Client) Post(path string, body []byte, contentType string) ([]byte, err
 	return c.readResponse()
 }
 
+// Put sends an HTTP PUT request with body and returns the raw response.
+// Mirrors Post exactly — same injection guard on the path, same
+// Content-Length-aware reader, connection kept alive after the round
+// trip (WP-3/D3: the PUT verb for DER* reporting).
+func (c *Client) Put(path string, body []byte, contentType string) ([]byte, error) {
+	if c.ssl == nil {
+		return nil, errors.New("client not connected; call Dial first")
+	}
+	if err := validateRequestParam(path, "path"); err != nil {
+		return nil, err
+	}
+	req := buildPutRequest(path, c.cfg.ServerAddr, body, contentType)
+	if _, err := wolfssl.Write(c.ssl, req); err != nil {
+		return nil, fmt.Errorf("write request: %w", err)
+	}
+	return c.readResponse()
+}
+
 // Get sends an HTTP GET request for the given path and returns the raw
 // response (headers + body). Uses Content-Length to determine when the
 // response is complete, leaving the TLS session open for subsequent

@@ -81,6 +81,16 @@ type Config struct {
 	// every few seconds costs nothing.
 	CertRotatePollIntervalS int `json:"cert_rotate_poll_interval_s,omitempty"`
 
+	// RedirectMax bounds how many 301/302 redirects the TLS fetchers follow
+	// per logical GET/POST/PUT (WP-3/D3, ERR-001 — same-host only, never
+	// scheme-downgrade; internal/tlsclient/redirect.go has the fail-closed
+	// rules). Absent/null defaults to defaultRedirectMax (3); an explicit 0
+	// disables following entirely, surfacing a 30x as a status error —
+	// the pre-WP-3 behavior. A pointer, not a plain int, because 0 is a
+	// meaningful configured value distinct from "not configured" — the
+	// integer analogue of MetricsAddr's literal-"off" convention.
+	RedirectMax *int `json:"redirect_max,omitempty"`
+
 	// ResponseStatePath is the WS-4.2 durable persistence path for
 	// responses.Tracker's posted/alerted maps (TASK-041's acknowledged
 	// northbound half — internal/northbound/responses/persist.go): a small
@@ -98,6 +108,22 @@ type Config struct {
 
 // defaultResponseStatePath is ResponseStatePath's default when empty/absent.
 const defaultResponseStatePath = "/var/lib/lexa/journal/northbound/response-state.ndjson"
+
+// defaultRedirectMax is RedirectMax's default when the key is absent (WP-3/
+// D3): 3 hops comfortably covers CSIP rediscovery (one 302 per moved
+// resource is the realistic case) while bounding a hostile redirect chain.
+const defaultRedirectMax = 3
+
+// RedirectMaxValue resolves the redirect_max key: absent ⇒
+// defaultRedirectMax; an explicit value — including 0, which disables
+// following — wins. Negative values behave as 0 (tlsclient's followRedirects
+// treats anything <= 0 as disabled).
+func (c *Config) RedirectMaxValue() int {
+	if c.RedirectMax == nil {
+		return defaultRedirectMax
+	}
+	return *c.RedirectMax
+}
 
 // ResponseStateDisabled reports whether the config explicitly opted out of
 // WS-4.2 persistence via the literal "off" value.

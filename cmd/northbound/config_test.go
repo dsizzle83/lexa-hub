@@ -82,6 +82,33 @@ func TestLoadConfig_PollRateModeExplicitOverridePassesThrough(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_RedirectMax verifies WP-3's redirect_max key semantics:
+// absent defaults to 3, an explicit 0 disables (and is NOT clobbered back to
+// the default — the reason the field is *int), an explicit value passes
+// through.
+func TestLoadConfig_RedirectMax(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want int
+	}{
+		{"absent defaults to 3", `{"mqtt_broker":"tcp://localhost:1883"}`, 3},
+		{"explicit zero disables", `{"mqtt_broker":"tcp://localhost:1883","redirect_max":0}`, 0},
+		{"explicit value passes through", `{"mqtt_broker":"tcp://localhost:1883","redirect_max":5}`, 5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadConfig(writeTempConfig(t, tc.json))
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if got := cfg.RedirectMaxValue(); got != tc.want {
+				t.Errorf("RedirectMaxValue() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func writeTempConfig(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "cfg.json")

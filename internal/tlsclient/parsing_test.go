@@ -90,6 +90,40 @@ func TestParseHTTPResponse_ErrorStatus(t *testing.T) {
 	}
 }
 
+// TestParseHTTPResponse_RedirectLocation pins that a 301/302's Location
+// header lands on HTTPResponse.Location — the field followRedirects
+// (redirect.go, WP-3/D3) acts on. Location was previously only exercised
+// via 201 Created; a parser regression that made it 201-specific would
+// break redirect following while every other test stayed green.
+func TestParseHTTPResponse_RedirectLocation(t *testing.T) {
+	cases := []struct {
+		status   string
+		wantCode int
+	}{
+		{"301 Moved Permanently", 301},
+		{"302 Found", 302},
+	}
+	for _, tc := range cases {
+		t.Run(tc.status, func(t *testing.T) {
+			raw := []byte(
+				"HTTP/1.1 " + tc.status + "\r\n" +
+					"Location: /dcap-v2\r\n" +
+					"Content-Length: 0\r\n" +
+					"\r\n")
+			resp, err := parseHTTPResponse(raw)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+			if resp.StatusCode != tc.wantCode {
+				t.Errorf("StatusCode = %d, want %d", resp.StatusCode, tc.wantCode)
+			}
+			if resp.Location != "/dcap-v2" {
+				t.Errorf("Location = %q, want /dcap-v2", resp.Location)
+			}
+		})
+	}
+}
+
 func TestParseHTTPResponse_Malformed(t *testing.T) {
 	cases := []struct {
 		name string

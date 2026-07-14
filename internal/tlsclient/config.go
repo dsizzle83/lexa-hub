@@ -51,4 +51,15 @@ type Config struct {
 	// may block forever — test/debug only). On timeout the request fails and
 	// the fetcher discards the session and re-dials.
 	ReadTimeout time.Duration
+
+	// RedirectMax bounds how many 301/302 redirects one logical
+	// Get/Post/Put on a WolfSSLFetcher will follow (WP-3/D3, ERR-001).
+	// Zero (the zero value) disables following entirely — a 30x response
+	// surfaces as a status error, exactly the pre-WP-3 behavior — so
+	// constructors that never set it (cmd/telemetry) are unchanged.
+	// Redirects are same-host only and never scheme-downgrade; see
+	// resolveRedirectLocation (redirect.go) for the fail-closed rules.
+	// cmd/northbound plumbs its `redirect_max` config key (default 3)
+	// through here.
+	RedirectMax int
 }

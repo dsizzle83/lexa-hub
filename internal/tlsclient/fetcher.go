@@ -212,8 +212,40 @@ func (f *WolfSSLFetcher) doPost(path string, body []byte, contentType string) (*
 	return resp, nil
 }
 
+// doPut executes one PUT, reconnecting once on failure. f.mu must be held.
+func (f *WolfSSLFetcher) doPut(path string, body []byte, contentType string) (*HTTPResponse, error) {
+	if err := f.ensureDialed(); err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+	raw, err := f.client.Put(path, body, contentType)
+	if err != nil {
+		f.client.Close()
+		if err2 := f.client.Dial(); err2 != nil {
+			return nil, fmt.Errorf("redial: %w", err2)
+		}
+		raw, err = f.client.Put(path, body, contentType)
+		if err != nil {
+			f.client.Close()
+			return nil, err
+		}
+	}
+	resp, err := parseHTTPResponse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse response from %s: %w", path, err)
+	}
+	if resp.ConnClose {
+		f.client.Close()
+	}
+	return resp, nil
+}
+
 // Get satisfies discovery.Fetcher. Returns the response body on 200 with
 // Content-Type application/sep+xml; any other status/type is an error.
+//
+// 301/302 redirects are followed within Config.RedirectMax hops before the
+// status check runs (WP-3/D3, ERR-001 — same-host only, never
+// scheme-downgrade; see redirect.go). RedirectMax 0 (the zero value)
+// disables following and a 30x fails the status check exactly as before.
 //
 // Cancellation contract (TASK-070, R5): ctx is checked once, after
 // acquiring the session mutex and before dialing or writing any bytes —
@@ -237,7 +269,7 @@ func (f *WolfSSLFetcher) Get(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 
-	resp, err := f.doGet(path)
+	resp, err := followRedirects("GET", path, f.client.cfg.RedirectMax, f.client.cfg.ServerAddr, f.doGet)
 	if err != nil {
 		return nil, err
 	}
@@ -260,6 +292,16 @@ func postResult(path string, resp *HTTPResponse) ([]byte, string, error) {
 	return resp.Body, resp.Location, nil
 }
 
+// doPostFollowing runs doPost through the shared redirect driver
+// (followRedirects, redirect.go) — one helper so Post and PostContext can no
+// more drift on redirect behavior than postResult lets them drift on status
+// handling. Each hop re-issues the SAME body/contentType (D3:
+// verb-preserving). f.mu must be held.
+func (f *WolfSSLFetcher) doPostFollowing(path string, body []byte, contentType string) (*HTTPResponse, error) {
+	return followRedirects("POST", path, f.client.cfg.RedirectMax, f.client.cfg.ServerAddr,
+		func(p string) (*HTTPResponse, error) { return f.doPost(p, body, contentType) })
+}
+
 // Post performs a single HTTP POST over the persistent wolfSSL session.
 // Returns the response body and Location header (for 201 Created).
 // Accepts 201 and 204; any other status is an error.
@@ -273,7 +315,7 @@ func (f *WolfSSLFetcher) Post(path string, body []byte, contentType string) ([]b
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	resp, err := f.doPost(path, body, contentType)
+	resp, err := f.doPostFollowing(path, body, contentType)
 	if err != nil {
 		return nil, "", err
 	}
@@ -297,16 +339,81 @@ func (f *WolfSSLFetcher) PostContext(ctx context.Context, path string, body []by
 		return nil, "", err
 	}
 
-	resp, err := f.doPost(path, body, contentType)
+	resp, err := f.doPostFollowing(path, body, contentType)
 	if err != nil {
 		return nil, "", err
 	}
 	return postResult(path, resp)
 }
 
+// putResult validates a PUT's HTTPResponse and extracts the body. Shared by
+// Put and PutContext so the two never drift on what counts as a successful
+// PUT. Success is 200, 201, or 204 (WP-3/D3): a PUT writes a full resource
+// representation to a path the caller already knows, so unlike postResult
+// there is no Location to hand back.
+func putResult(path string, resp *HTTPResponse) ([]byte, error) {
+	if resp.StatusCode != 200 && resp.StatusCode != 201 && resp.StatusCode != 204 {
+		return nil, fmt.Errorf("PUT %s: status %d", path, resp.StatusCode)
+	}
+	return resp.Body, nil
+}
+
+// doPutFollowing is doPostFollowing's PUT sibling: doPut through the shared
+// redirect driver, same body/contentType on every hop. f.mu must be held.
+func (f *WolfSSLFetcher) doPutFollowing(path string, body []byte, contentType string) (*HTTPResponse, error) {
+	return followRedirects("PUT", path, f.client.cfg.RedirectMax, f.client.cfg.ServerAddr,
+		func(p string) (*HTTPResponse, error) { return f.doPut(p, body, contentType) })
+}
+
+// Put performs a single HTTP PUT over the persistent wolfSSL session and
+// returns the response body. Accepts 200, 201, and 204; any other status is
+// an error (WP-3/D3 — the DER* reporting verb, no Location dependency).
+//
+// Put takes the SAME f.mu as Get/Post/GetStatus, so DER* PUTs riding the
+// discovery fetcher serialize with the walk and — critically — cert
+// rotation via Reload keeps working for free: Reload swaps the session
+// under this mutex, so a Put observes either the old or the new session,
+// never a torn one. 301/302 redirects are followed within
+// Config.RedirectMax hops, same rules as Get (redirect.go).
+//
+// No ctx parameter, mirroring Post: see PostContext's doc for the split.
+func (f *WolfSSLFetcher) Put(path string, body []byte, contentType string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	resp, err := f.doPutFollowing(path, body, contentType)
+	if err != nil {
+		return nil, err
+	}
+	return putResult(path, resp)
+}
+
+// PutContext is Put with the same between-requests cancellation contract
+// documented on Get: ctx is checked once, after acquiring the session mutex
+// and before dialing or writing — a canceled ctx never starts a new PUT,
+// and does not interrupt one already in flight (nor its redirect hops,
+// which are part of the same logical request).
+func (f *WolfSSLFetcher) PutContext(ctx context.Context, path string, body []byte, contentType string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	resp, err := f.doPutFollowing(path, body, contentType)
+	if err != nil {
+		return nil, err
+	}
+	return putResult(path, resp)
+}
+
 // GetStatus performs a GET and returns the raw HTTP status code without
 // enforcing that it must be 200. Used by conformance tests that need to
-// verify the server correctly returns 404, 405, etc. Not part of the
+// verify the server correctly returns 404, 405, etc. — which is also why it
+// deliberately does NOT follow 301/302 (WP-3): its whole contract is
+// observing the raw status, and a conformance check asserting a redirect
+// must see the 30x itself, not the post-redirect result. Not part of the
 // discovery.Fetcher interface and out of TASK-070's scope — no production
 // caller in this repo holds a ctx at its call site today.
 func (f *WolfSSLFetcher) GetStatus(path string) (int, []byte, error) {

@@ -13,6 +13,7 @@
   "discovery_interval_s": 20,
   "poll_rate_mode": "override",
   "response_set_path": "/rsps/0/r",
+  "redirect_max": 3,
   "cert_expiry_warn_days": 30,
   "journal": {
     "dir": "/var/lib/lexa/journal/northbound",
