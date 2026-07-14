@@ -483,5 +483,17 @@ type CertStatus struct {
 	DaysLeft       int    `json:"days_left"` // min(ClientDaysLeft, CADaysLeft) among the certs successfully inspected
 	ClientErr      string `json:"client_err,omitempty"`
 	CAErr          string `json:"ca_err,omitempty"`
-	Ts             int64  `json:"ts"` // Unix seconds this check ran
+
+	// PinOK (WP-7, D4 — additive at CertStatusV=1 per AD-006) is the
+	// registration-PIN verification verdict from lexa-northbound's per-walk
+	// check of the server's Registration resource (CORE-003/BASIC-001).
+	// nil = the check is disabled (registration_pin=0, the shipped default)
+	// or has not yet produced a verdict (no successful walk since process
+	// start — the INCONCLUSIVE-safe state); false = PIN mismatch or a
+	// Registration fetch failure while the check is required — northbound is
+	// holding its adopted control fail-closed and has suspended server
+	// egress (internal/northbound/run/pin.go); true = verified this walk.
+	PinOK *bool `json:"pin_ok,omitempty"`
+
+	Ts int64 `json:"ts"` // Unix seconds this check ran
 }

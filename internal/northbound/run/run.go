@@ -29,7 +29,6 @@ import (
 	"lexa-hub/internal/northbound/responses"
 	"lexa-hub/internal/northbound/schedule"
 	"lexa-hub/internal/northbound/scheduler"
-	"lexa-hub/internal/tlsclient"
 	"lexa-hub/internal/utilitytime"
 	"lexa-hub/internal/watchdog"
 )
@@ -57,14 +56,24 @@ type Metrics struct {
 // itself (Loop): the ticker, the TASK-042 rewalk channel, and the watchdog
 // kicks that prove liveness.
 type Discovery struct {
-	mc      mqtt.Client
-	fetcher *tlsclient.WolfSSLFetcher
+	mc mqtt.Client
+	// fetcher is this Discovery's dedicated TLS session. Typed as the
+	// discovery.Fetcher interface (WP-7) rather than the concrete
+	// *tlsclient.WolfSSLFetcher solely so RunOnce is exercisable in unit
+	// tests with a fake resource tree; production wiring still passes the
+	// wolfSSL fetcher (cmd/northbound/main.go), which satisfies it.
+	fetcher discovery.Fetcher
 	lfdi    string
 	sched   *scheduler.Scheduler
 	clk     *utilitytime.Clock
 	tracker *responses.Tracker
 	frm     *flowres.Manager
 	metrics Metrics
+
+	// pin is the optional WP-7/D4 registration-PIN verifier (nil =
+	// registration_pin 0/disabled — the shipped default). Set via
+	// SetPinVerifier before Loop starts; read only from the walk goroutine.
+	pin *PinVerifier
 
 	// lastPub/rewalkChan/rewalkGate: the TASK-042 (GAP-01/02 re-request path)
 	// rewalk single-flight mechanism. See lastPublishedStore and
@@ -100,7 +109,7 @@ type Discovery struct {
 // docs in pollrate.go). Passing PollRateConfig{} (Go zero value, Mode "")
 // reproduces pre-TASK-071 behavior exactly: effectiveInterval treats any
 // Mode other than PollRateHonor as PollRateOverride.
-func New(mc mqtt.Client, fetcher *tlsclient.WolfSSLFetcher, lfdi string, sched *scheduler.Scheduler, clk *utilitytime.Clock, tracker *responses.Tracker, frm *flowres.Manager, m Metrics, pollCfg PollRateConfig) *Discovery {
+func New(mc mqtt.Client, fetcher discovery.Fetcher, lfdi string, sched *scheduler.Scheduler, clk *utilitytime.Clock, tracker *responses.Tracker, frm *flowres.Manager, m Metrics, pollCfg PollRateConfig) *Discovery {
 	return &Discovery{
 		mc:         mc,
 		fetcher:    fetcher,
@@ -122,6 +131,14 @@ func New(mc mqtt.Client, fetcher *tlsclient.WolfSSLFetcher, lfdi string, sched *
 // handleRewalkRequest for the mechanism.
 func (d *Discovery) HandleRewalk(req bus.RewalkRequest) {
 	handleRewalkRequest(d.mc, d.lastPub, d.rewalkGate, d.rewalkChan, req, time.Now())
+}
+
+// SetPinVerifier wires the WP-7/D4 registration-PIN verifier. Call before
+// Loop starts (the field is read only from the walk goroutine); leaving it
+// unset (registration_pin=0, the shipped default) disables the check
+// entirely — RunOnce behaves exactly as before WP-7.
+func (d *Discovery) SetPinVerifier(v *PinVerifier) {
+	d.pin = v
 }
 
 // Loop runs the first discovery walk immediately, then loops on interval
@@ -294,6 +311,35 @@ func (d *Discovery) RunOnce(ctx context.Context) {
 	// wall-clock step (see the Anchor call's comment). Computed ONCE per walk
 	// and shared across Evaluate/Build/SupersededMRIDs, exactly as before.
 	serverNow := d.clk.ServerNow()
+
+	// WP-7 (D4): verify the Registration PIN before adopting ANYTHING from
+	// this walk's tree. On mismatch/fetch-failure the verifier freezes
+	// (edge-logged Error + gauge + certstatus pin_ok inside Check): hold the
+	// currently-adopted control via the scheduler's own last-known-good
+	// discipline — Evaluate with no programs is the exact fail-closed hold
+	// an absent program list gets, so the held control still releases at its
+	// own ValidUntil, never sooner and never later — adopt no new control,
+	// and republish the held control with a fresh Ts each walk (so the hub's
+	// retained-staleness check, TASK-042, does not fire a rewalk storm at a
+	// server we are deliberately not walking new state from). Every OTHER
+	// consumer of this tree is skipped: schedule/pricing/billing/flow-
+	// reservation publishes carry new server state (frozen out with the
+	// rest), and the response tracker's Update is server egress (suspended;
+	// its own egress gate additionally backstops the async CannotComply
+	// path). Clock resync above deliberately still runs — LKG expiry
+	// evaluation needs utility time regardless. Self-healing: the next walk
+	// re-checks, and a match resumes the normal path below.
+	if d.pin.Check(ctx, walker, tree.SelfDevice) {
+		held := d.sched.Evaluate(nil, serverNow)
+		msg := publish.ToActiveControl(held, tree.ClockOffset)
+		if err := mqttutil.PublishJSONRetained(d.mc, bus.TopicCSIPControl, msg); err != nil {
+			log.Printf("lexa-northbound: publish control: %v", err)
+		} else {
+			d.lastPub.set(msg)
+		}
+		return
+	}
+
 	active := d.sched.Evaluate(tree.Programs, serverNow)
 
 	if active != nil && active.Held {

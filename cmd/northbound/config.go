@@ -91,6 +91,28 @@ type Config struct {
 	// integer analogue of MetricsAddr's literal-"off" convention.
 	RedirectMax *int `json:"redirect_max,omitempty"`
 
+	// RegistrationPIN (WP-7, architecture D4 — CORE-003/BASIC-001) is the
+	// utility-issued registration PIN to verify against the server's
+	// Registration resource on every discovery walk. 0 (the shipped
+	// default) disables the check with one startup WARN — the WS-8
+	// disabled-default pattern, so existing deployments are untouched.
+	// Non-zero enables the D4 fail-closed posture on mismatch or a
+	// Registration fetch failure: adopted control held (LKG discipline),
+	// no new adoption, server egress suspended, pin_ok=false on the
+	// retained certstatus doc, lexa_nb_pin_mismatch gauge — self-healing on
+	// the next matching walk. See internal/northbound/run/pin.go.
+	RegistrationPIN uint32 `json:"registration_pin,omitempty"`
+
+	// LegacyCannotComplyCode (WP-7, architecture D5): false (the shipped
+	// default) makes responses.Tracker emit standard IEEE 2030.5 Table 27
+	// codes (8 at breach-episode onset, 3/8/10 at event end, 253 at
+	// receipt-reject) — interop bug #6's 0xF0 is dead by default. true
+	// restores the pre-WP-7 LEXA 0xF0 extension byte-for-byte, for benches
+	// whose gridsim expectation has not been updated in the same session
+	// (configs/northbound.json ships true for exactly that reason —
+	// MTR-4 paired-change discipline).
+	LegacyCannotComplyCode bool `json:"legacy_cannotcomply_code,omitempty"`
+
 	// ResponseStatePath is the WS-4.2 durable persistence path for
 	// responses.Tracker's posted/alerted maps (TASK-041's acknowledged
 	// northbound half — internal/northbound/responses/persist.go): a small

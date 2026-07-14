@@ -259,6 +259,34 @@ func TestMonitor_CheckOnce_Valid(t *testing.T) {
 	if status.V != 1 {
 		t.Errorf("Envelope.V = %d, want 1 (bus.CertStatusV)", status.V)
 	}
+	if status.PinOK != nil {
+		t.Errorf("PinOK with no provider wired = %v, want nil (field omitted)", status.PinOK)
+	}
+}
+
+// TestMonitor_CheckOnce_PinOK (WP-7, D4): the pin_ok provider's verdict
+// folds into the retained certstatus doc — false during a PIN freeze, true
+// once verified, nil (field omitted) when the provider reports no verdict.
+func TestMonitor_CheckOnce_PinOK(t *testing.T) {
+	clientPath := writeTestCertFile(t, time.Now().Add(-time.Hour), time.Now().Add(365*24*time.Hour))
+	caPath := writeTestCertFile(t, time.Now().Add(-time.Hour), time.Now().Add(3650*24*time.Hour))
+
+	m := NewMonitor(&fakeClient{}, clientPath, caPath, 30, nil)
+	verdict := false
+	m.SetPinOK(func() *bool { return &verdict })
+	if st := m.CheckOnce(); st.PinOK == nil || *st.PinOK {
+		t.Fatalf("PinOK during freeze = %v, want false", st.PinOK)
+	}
+	verdict = true
+	if st := m.CheckOnce(); st.PinOK == nil || !*st.PinOK {
+		t.Fatalf("PinOK after heal = %v, want true", st.PinOK)
+	}
+
+	m2 := NewMonitor(&fakeClient{}, clientPath, caPath, 30, nil)
+	m2.SetPinOK(func() *bool { return nil }) // check disabled / no verdict yet
+	if st := m2.CheckOnce(); st.PinOK != nil {
+		t.Fatalf("PinOK with nil-verdict provider = %v, want nil", st.PinOK)
+	}
 }
 
 func TestMonitor_CheckOnce_ExpiringSoon(t *testing.T) {

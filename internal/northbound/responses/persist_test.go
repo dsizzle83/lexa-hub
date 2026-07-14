@@ -96,8 +96,8 @@ func TestPersist_CannotComplyRecordedButUnpostedRetriesAfterRestart(t *testing.T
 	rt2.AlertCannotComply("E20", "E20@100#1")
 	rt2.AlertCannotComply("E20", "E20@100#1") // redelivered — must not double-post
 
-	if got := fp2.statusesFor("E20"); len(got) != 1 || got[0] != model.ResponseCannotComply {
-		t.Fatalf("CannotComply after restart = %v, want exactly one CannotComply POST", got)
+	if got := fp2.statusesFor("E20"); len(got) != 1 || got[0] != model.ResponsePartialOptOut {
+		t.Fatalf("breach-onset Response after restart = %v, want exactly one status-8 POST (WP-7 default vocabulary)", got)
 	}
 }
 
@@ -255,14 +255,121 @@ func TestStore_NilIsNoop(t *testing.T) {
 	s.AppendPosted("E1", model.ResponseEventReceived)
 	s.AppendAlerted("E1", "")
 	s.AppendClear()
+	s.AppendEpisode(EpisodeState{MRID: "E1"})
 	if s.NeedsCompact() {
 		t.Fatal("nil *Store.NeedsCompact() = true, want false")
 	}
-	if err := s.Compact(nil, nil); err != nil {
+	if err := s.Compact(nil, nil, nil); err != nil {
 		t.Fatalf("nil *Store.Compact() = %v, want nil", err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("nil *Store.Close() = %v, want nil", err)
+	}
+}
+
+// TestPersist_EpisodeRoundTrip_EndCodeSurvivesRestart (WP-7, D5) drives an
+// event to Started with an overlapping breach, "restarts" the tracker from
+// the persisted state, and verifies (a) the episode record round-trips,
+// (b) the restored activeMRID means no duplicate Started, and (c) the
+// end-of-event reconciliation still knows the event breached throughout —
+// posting 10, not a false 3 — despite the restart.
+func TestPersist_EpisodeRoundTrip_EndCodeSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.ndjson")
+
+	store1, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	fp1 := &fakePoster{}
+	rt1 := New(fp1, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil, store1, State{})
+	rt1.Update(treeWith(ctrl("E40", 0)), eventActive("E40"), nil) // received + started
+	rt1.AlertCannotComply("E40", "E40@1#1")                       // breach onset, marks episode
+	rt1.Update(treeWith(ctrl("E40", 0)), eventActive("E40"), nil) // breach sample
+	if err := store1.Close(); err != nil {
+		t.Fatalf("store1.Close: %v", err)
+	}
+
+	initial, err := LoadState(path)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if initial.Episode == nil || initial.Episode.MRID != "E40" ||
+		!initial.Episode.SawBreach || !initial.Episode.BreachActive {
+		t.Fatalf("restored episode = %+v, want E40 with SawBreach+BreachActive", initial.Episode)
+	}
+
+	store2, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("OpenStore (restart): %v", err)
+	}
+	defer store2.Close()
+	fp2 := &fakePoster{}
+	rt2 := New(fp2, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil, store2, initial)
+
+	// Same event still active after the restart: no duplicate Started.
+	rt2.Update(treeWith(ctrl("E40", 0)), eventActive("E40"), nil)
+	if got := fp2.statusesFor("E40"); len(got) != 0 {
+		t.Fatalf("restarted tracker re-posted %v for the restored active event", got)
+	}
+
+	// Event ends still breaching, never a compliant sample → 10.
+	rt2.Update(treeWith(ctrl("E40", 0)), nil, nil)
+	eq(t, fp2.statusesFor("E40"), model.ResponseNoParticipation)
+}
+
+// TestStore_CompactPreservesEpisode verifies a compaction checkpoint carries
+// the live episode record — without it, the record (and its restart
+// guarantees above) would silently vanish on the first compaction.
+func TestStore_CompactPreservesEpisode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.ndjson")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+
+	epi := EpisodeState{MRID: "E50", SawBreach: true, BreachActive: true}
+	store.AppendEpisode(epi)
+	if err := store.Compact(map[string]uint8{"E50": model.ResponseEventStarted}, map[string]bool{}, &epi); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	st, err := LoadState(path)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if st.Episode == nil || *st.Episode != epi {
+		t.Fatalf("episode after compaction = %+v, want %+v", st.Episode, epi)
+	}
+	if st.Posted["E50"] != model.ResponseEventStarted {
+		t.Fatalf("posted[E50] after compaction = %v, want Started", st.Posted["E50"])
+	}
+}
+
+// TestPersist_EpisodeClearedAtEventEnd verifies the end-of-event reset is
+// durable too: after completeActive, a fresh LoadState carries no episode
+// (so a restart cannot resurrect an already-ended event's activeMRID and
+// double-post its end code).
+func TestPersist_EpisodeClearedAtEventEnd(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.ndjson")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	fp := &fakePoster{}
+	rt := New(fp, "LFDI", "/rsps/0/r", utilitytime.New(utilitytime.Config{}), nil, nil, store, State{})
+	rt.Update(treeWith(ctrl("E60", 0)), eventActive("E60"), nil) // received + started
+	rt.Update(treeWith(ctrl("E60", 0)), nil, nil)                // completed
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	st, err := LoadState(path)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if st.Episode != nil {
+		t.Fatalf("episode after event end = %+v, want nil", st.Episode)
 	}
 }
 

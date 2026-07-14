@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/northbound/egress"
 	model "lexa-proto/csipmodel"
 )
 
@@ -34,11 +35,24 @@ type Manager struct {
 	fetcher     Poster
 	lfdi        string
 	requestPath string // EndDevice FlowReservationRequestListLink.Href; guarded by mu
+
+	// gate is the optional WP-7/D4 egress gate: when suspended (the
+	// registration-PIN freeze), HandleRequest transmits nothing. nil (the
+	// default) never suspends — egress.Gate's nil convention.
+	gate *egress.Gate
 }
 
 // New constructs a Manager that POSTs via f, identifying as lfdi.
 func New(f Poster, lfdi string) *Manager {
 	return &Manager{fetcher: f, lfdi: lfdi}
+}
+
+// SetEgressGate wires the WP-7/D4 egress gate. Call at wiring time, before
+// the MQTT subscription that drives HandleRequest starts.
+func (m *Manager) SetEgressGate(g *egress.Gate) {
+	m.mu.Lock()
+	m.gate = g
+	m.mu.Unlock()
 }
 
 // SetRequestPath updates the server path to POST new requests to. Called
@@ -60,7 +74,14 @@ func (m *Manager) HandleRequest(payload []byte) {
 	}
 	m.mu.RLock()
 	requestPath := m.requestPath
+	gate := m.gate
 	m.mu.RUnlock()
+	if gate.Suspended() {
+		// WP-7 (D4): server egress suspended (registration-PIN freeze).
+		// Rare — hub-driven requests only — so this is an edge, not spam.
+		log.Printf("lexa-northbound: flowreservation POST suppressed — server egress suspended (%s)", gate.Reason())
+		return
+	}
 	if requestPath == "" {
 		log.Printf("lexa-northbound: flowreservation: no request path yet — server may not support FR")
 		return

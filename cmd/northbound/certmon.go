@@ -149,6 +149,14 @@ type Monitor struct {
 
 	now func() time.Time // seam for tests; defaults to time.Now
 
+	// pinOK (WP-7, D4) is the optional provider for the additive
+	// CertStatus.PinOK field — run.PinVerifier.PinOK in production. nil, or
+	// a provider returning nil, omits the field (check disabled / no
+	// verdict yet). Set via SetPinOK before any CheckOnce caller starts
+	// (the monitor goroutine, the rotation controller's onCommit, and the
+	// verifier's own onChange all invoke CheckOnce).
+	pinOK func() *bool
+
 	// checked is set after the first CheckOnce: a healthy result logs at Info
 	// on the very first (startup) check, then demotes to Debug on later
 	// checks that are still healthy (steady-state, not a transition — same
@@ -180,6 +188,12 @@ func NewMonitor(mc mqtt.Client, clientPath, caPath string, warnDays int, reg *me
 		m.caExpiring = reg.Gauge("lexa_cert_expiring_ca")
 	}
 	return m
+}
+
+// SetPinOK wires the WP-7/D4 pin_ok provider (see the pinOK field doc).
+// Call during wiring, before Run/CheckOnce goroutines start.
+func (m *Monitor) SetPinOK(provider func() *bool) {
+	m.pinOK = provider
 }
 
 // Run performs an immediate check, then re-checks every interval until ctx
@@ -247,6 +261,12 @@ func (m *Monitor) CheckOnce() bus.CertStatus {
 		status.DaysLeft = status.CADaysLeft
 	default:
 		status.DaysLeft = 0
+	}
+
+	// WP-7 (D4): fold the registration-PIN verdict into the retained doc so
+	// lexa-api's /status can surface it; nil (disabled/no verdict) omits it.
+	if m.pinOK != nil {
+		status.PinOK = m.pinOK()
 	}
 
 	m.logAlarm(status, clientErr, caErr)

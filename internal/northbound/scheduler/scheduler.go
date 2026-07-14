@@ -100,6 +100,21 @@ type Scheduler struct {
 	// transient empty/malformed discovery cycle fails CLOSED to it rather than
 	// dropping an unexpired safety control (see Evaluate / failClosed).
 	lastGood *ActiveControl
+
+	// RejectHook (WP-7, D5), when non-nil, is invoked by failClosed each
+	// Evaluate cycle that REJECTS a freshly-served control at receipt —
+	// today only the plausibility gate (plausibleControl, audit:
+	// malform-huge-activepower) — with the REJECTED control's mRID and a
+	// short reason ("implausible-limit"), so the response tracker can post
+	// the Table 27 rejection Response (253 invalid/out-of-range; the
+	// tracker dedupes per mRID, since a persistently-served malformed
+	// control re-fires this every walk). Purely observational: the hook
+	// cannot veto or alter any fail-closed decision, and nil (the default)
+	// preserves pre-WP-7 behavior exactly. Called with s.mu held; safe
+	// because the tracker never calls back into the scheduler (responses
+	// imports scheduler only for the ActiveControl type). Wire it before
+	// the first Evaluate (main.go wiring, single walk goroutine).
+	RejectHook func(mrid, reason string)
 }
 
 // maxPlausibleLimitW bounds an adopted CSIP power limit. It sits far above any
@@ -241,6 +256,12 @@ func (s *Scheduler) failClosed(resolved *ActiveControl, programFound bool, hp *d
 	// server response cannot unseat an active safety cap. programFound is
 	// irrelevant here — a malformed control is never an explicit clear.
 	if resolved != nil {
+		// WP-7 (D5): surface the receipt-reject to the response tracker
+		// (Table 27 status 253) — observation only, before and independent
+		// of the unchanged hold-vs-release decision below.
+		if s.RejectHook != nil {
+			s.RejectHook(resolved.MRID, "implausible-limit")
+		}
 		if s.lastGood != nil && !controlExpired(s.lastGood, serverNow) {
 			held := *s.lastGood
 			held.Held = true

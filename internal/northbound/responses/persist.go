@@ -60,7 +60,30 @@ const (
 	opAlerted = "alerted" // a CONFIRMED (POST succeeded) CannotComply for mrid(+episodeID)
 	opClear   = "clear"   // Tracker.ClearAlerts(): breach episode ended, re-arm
 	opCompact = "compact" // full checkpoint superseding every prior line
+	// opEpisode (WP-7, D5) records the tracker's live breach-overlap record
+	// for the CURRENT active event (see EpisodeState), so a restart
+	// mid-event still posts the correct Table 27 end-of-event code (3/8/10)
+	// and does not re-post Started. Additive at stateSchemaV=1: an older
+	// binary replaying a newer file skips the unknown op in applyEntry's
+	// switch (and json.Unmarshal ignores the unknown "episode" field on
+	// other ops), which is exactly the "bump only on a breaking change"
+	// rule stateSchemaV documents.
+	opEpisode = "episode"
 )
+
+// EpisodeState is the tracker's breach-overlap record for the current
+// active event (WP-7, D5 end-of-event reconciliation): which event is
+// active, whether any breach episode overlapped it, whether any observed
+// poll cycle was compliant, and whether a breach is active right now. A
+// zero value (MRID "") means "no active event". Consumed by Tracker's
+// end-of-event code selection (tracker.go endOfEventCode) and round-tripped
+// through this store so the record survives a lexa-northbound restart.
+type EpisodeState struct {
+	MRID         string `json:"mrid,omitempty"`
+	SawBreach    bool   `json:"saw_breach,omitempty"`
+	SawCompliant bool   `json:"saw_compliant,omitempty"`
+	BreachActive bool   `json:"breach_active,omitempty"`
+}
 
 // stateEntry is one NDJSON line. Only the fields relevant to Op are
 // populated; the rest stay zero/omitted.
@@ -74,6 +97,11 @@ type stateEntry struct {
 
 	Posted  map[string]uint8 `json:"posted,omitempty"`  // opCompact only
 	Alerted []string         `json:"alerted,omitempty"` // opCompact only
+
+	// Episode carries the live EpisodeState for opEpisode lines and, so a
+	// compaction cannot lose it, for opCompact checkpoints too (WP-7, D5).
+	// nil / empty-MRID both mean "no active event".
+	Episode *EpisodeState `json:"episode,omitempty"`
 }
 
 // ErrStateCorrupt is returned by LoadState when a state file exists, is
@@ -86,11 +114,14 @@ var ErrStateCorrupt = errors.New("responses: state file has no valid entries")
 // not understand.
 var ErrStateVersion = errors.New("responses: unsupported state schema version")
 
-// State is Tracker's reconstructed posted/alerted maps, as read back by
-// LoadState and consumed by New's initial parameter.
+// State is Tracker's reconstructed posted/alerted maps plus (WP-7, D5) the
+// active event's breach-overlap record, as read back by LoadState and
+// consumed by New's initial parameter. Episode is nil when no event was
+// active (or the file predates WP-7).
 type State struct {
 	Posted  map[string]uint8
 	Alerted map[string]bool
+	Episode *EpisodeState
 }
 
 // LoadState reads and replays path (an NDJSON append-log written by
@@ -168,6 +199,8 @@ func applyEntry(st *State, e stateEntry) {
 		}
 	case opClear:
 		st.Alerted = map[string]bool{}
+	case opEpisode:
+		st.Episode = copyEpisode(e.Episode)
 	case opCompact:
 		posted := make(map[string]uint8, len(e.Posted))
 		for k, v := range e.Posted {
@@ -181,7 +214,18 @@ func applyEntry(st *State, e stateEntry) {
 		}
 		st.Posted = posted
 		st.Alerted = alerted
+		st.Episode = copyEpisode(e.Episode)
 	}
+}
+
+// copyEpisode normalizes a persisted episode record: nil or an empty MRID
+// (no active event) both load as nil; anything else loads as an owned copy.
+func copyEpisode(e *EpisodeState) *EpisodeState {
+	if e == nil || e.MRID == "" {
+		return nil
+	}
+	cp := *e
+	return &cp
 }
 
 // Store is the write side of response-state persistence: it appends one
@@ -256,6 +300,16 @@ func (s *Store) AppendClear() {
 	s.append(stateEntry{Op: opClear})
 }
 
+// AppendEpisode durably records the tracker's live breach-overlap record
+// for the current active event (WP-7, D5). Called only on CHANGE (the
+// record's flags are one-way per event and BreachActive toggles once per
+// breach episode — see Tracker.setEpisode), never per poll cycle, so the
+// append rate stays bounded by event/episode edges. A zero-value
+// EpisodeState (MRID "") records "no active event".
+func (s *Store) AppendEpisode(e EpisodeState) {
+	s.append(stateEntry{Op: opEpisode, Episode: &e})
+}
+
 func (s *Store) append(e stateEntry) {
 	if s == nil {
 		return
@@ -319,10 +373,11 @@ func (s *Store) NeedsCompact() bool {
 }
 
 // Compact atomically rewrites the state file to a single opCompact line
-// representing exactly the (already terminal-pruned) live state in posted
-// and the keys of confirmedAlerted. Safe to call directly (e.g. from a
+// representing exactly the (already terminal-pruned) live state in posted,
+// the keys of confirmedAlerted, and the active event's episode record (nil
+// when no event is active — WP-7). Safe to call directly (e.g. from a
 // test) as well as via Tracker's automatic NeedsCompact-triggered path.
-func (s *Store) Compact(posted map[string]uint8, confirmedAlerted map[string]bool) error {
+func (s *Store) Compact(posted map[string]uint8, confirmedAlerted map[string]bool, episode *EpisodeState) error {
 	if s == nil {
 		return nil
 	}
@@ -338,7 +393,7 @@ func (s *Store) Compact(posted map[string]uint8, confirmedAlerted map[string]boo
 	}
 	sort.Strings(keys) // deterministic file content
 
-	e := stateEntry{V: stateSchemaV, Ts: time.Now().Unix(), Op: opCompact, Posted: live, Alerted: keys}
+	e := stateEntry{V: stateSchemaV, Ts: time.Now().Unix(), Op: opCompact, Posted: live, Alerted: keys, Episode: copyEpisode(episode)}
 	b, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("responses: marshal compact entry: %w", err)

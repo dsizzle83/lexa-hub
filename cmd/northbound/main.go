@@ -40,6 +40,7 @@ import (
 	"lexa-hub/internal/logutil"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/mqttutil"
+	"lexa-hub/internal/northbound/egress"
 	"lexa-hub/internal/northbound/flowres"
 	"lexa-hub/internal/northbound/identity"
 	"lexa-hub/internal/northbound/responses"
@@ -49,6 +50,7 @@ import (
 	"lexa-hub/internal/utilitytime"
 	"lexa-hub/internal/watchdog"
 	"lexa-hub/internal/wolfssl"
+	model "lexa-proto/csipmodel"
 )
 
 func main() {
@@ -193,8 +195,50 @@ func main() {
 	}
 
 	respTracker := responses.New(fetcherResp, lfdi, cfg.ResponseSetPath, clk, responsesPostedCtr, jw, respStore, initialState)
+	// WP-7 (D5): Table 27 codes by default; legacy_cannotcomply_code=true
+	// restores the pre-WP-7 0xF0 wire behavior byte-for-byte (bench compat).
+	respTracker.SetLegacyCannotComplyCode(cfg.LegacyCannotComplyCode)
 	frManager := flowres.New(fetcherFR, lfdi)
+
+	// WP-7 (D4): one shared egress gate for everything this process sends
+	// to the utility server — the PIN verifier suspends it on mismatch, and
+	// every server-egress poster (Responses, flow reservations; WP-4 DER*
+	// PUTs and WP-6 LogEvents when they land) checks it before transmitting.
+	egressGate := &egress.Gate{}
+	respTracker.SetEgressGate(egressGate)
+	frManager.SetEgressGate(egressGate)
+
 	discovery := run.New(mc, fetcherDisc, lfdi, sched, clk, respTracker, frManager, nbm, run.PollRateConfig{Mode: cfg.PollRateMode()})
+
+	// WP-7 (D5): the scheduler's receipt-reject hook — a plausibility-gate
+	// rejection (malformed/implausible control, never adopted) posts Table 27
+	// status 253 (invalid/out-of-range), deduped per mRID by the tracker.
+	// 252 (parameter not applicable) is the documented WP-9 seam — no
+	// capability/modesSupported classification exists northbound yet.
+	sched.RejectHook = func(mrid, _ string) {
+		respTracker.ReceiptReject(mrid, model.ResponseRejectedInvalid)
+	}
+
+	// TASK-072/§10.5 cert-expiry monitor, constructed BEFORE the walk loop
+	// starts so the WP-7 PIN verifier's onChange can safely force a
+	// certstatus republish from the very first walk; its own goroutine
+	// (certMon.Run) still starts below, after the loop.
+	certMon := NewMonitor(mc, cfg.ClientCert, cfg.CACert, cfg.CertExpiryWarnDays, reg)
+
+	// WP-7 (D4): registration-PIN verification. 0 (the shipped default) =
+	// disabled with one startup WARN (WS-8 disabled-default pattern); the
+	// gauge is registered either way so dashboards see a stable 0, and the
+	// certstatus pin_ok provider is nil-verifier-safe (reports nil = check
+	// disabled).
+	pinGauge := reg.Gauge("lexa_nb_pin_mismatch")
+	var pinVerifier *run.PinVerifier
+	if cfg.RegistrationPIN == 0 {
+		slog.Warn("lexa-northbound: registration_pin not configured — Registration PIN verification disabled (WP-7/D4, CORE-003/BASIC-001); set registration_pin to the utility-issued PIN to enable the fail-closed mismatch posture")
+	} else {
+		pinVerifier = run.NewPinVerifier(cfg.RegistrationPIN, egressGate, pinGauge, func() { certMon.CheckOnce() })
+		discovery.SetPinVerifier(pinVerifier)
+	}
+	certMon.SetPinOK(pinVerifier.PinOK)
 
 	// FlowReservationRequest from the hub. Bypasses mqttutil.Subscribe (needs
 	// the raw payload for HandleRequest, not a JSON-decoded T) so it carries
@@ -244,8 +288,8 @@ func main() {
 	// shared state with the discovery walk loop (05 §4). Run performs its
 	// startup inspection immediately (before its first 24h tick), so the
 	// very first WARN/ERROR alarm (if any) lands within moments of process
-	// start rather than up to a day later.
-	certMon := NewMonitor(mc, cfg.ClientCert, cfg.CACert, cfg.CertExpiryWarnDays, reg)
+	// start rather than up to a day later. (Constructed above, before the
+	// walk loop — WP-7 wiring order.)
 	go certMon.Run(ctx, certCheckInterval)
 
 	// TASK-073/§10.5/§8.6/RSK-07: staged cert-rotation controller — its own

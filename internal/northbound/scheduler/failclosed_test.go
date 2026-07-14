@@ -163,6 +163,60 @@ func TestEvaluate_RejectsImplausibleWithNoPrior(t *testing.T) {
 	}
 }
 
+// TestEvaluate_RejectHookFiresOnImplausibleOnly (WP-7, D5): the receipt-
+// reject hook fires with the REJECTED control's mRID on every plausibility
+// rejection — in both the held-LKG and no-prior branches — and never on a
+// valid adoption, an empty-programs hold, or an explicit clear. Dedupe is
+// the tracker's job, not the scheduler's, so a persistently-served
+// malformed control re-fires each cycle.
+func TestEvaluate_RejectHookFiresOnImplausibleOnly(t *testing.T) {
+	s := New()
+	type reject struct{ mrid, reason string }
+	var rejects []reject
+	s.RejectHook = func(mrid, reason string) { rejects = append(rejects, reject{mrid, reason}) }
+
+	// Valid adoption: no hook.
+	if ac := s.Evaluate(progs(eventWithExpLim("GOOD", epoch, 3600, 1000, 0)), epoch); ac == nil || ac.MRID != "GOOD" {
+		t.Fatalf("expected GOOD control, got %+v", ac)
+	}
+	if len(rejects) != 0 {
+		t.Fatalf("hook fired on a valid adoption: %v", rejects)
+	}
+
+	// Empty programs (fail-closed hold): no hook — not a receipt reject.
+	if held := s.Evaluate(nil, epoch+5); held == nil || !held.Held {
+		t.Fatalf("expected held LKG, got %+v", held)
+	}
+	if len(rejects) != 0 {
+		t.Fatalf("hook fired on an empty-programs hold: %v", rejects)
+	}
+
+	// Implausible control with LKG present: hook fires with the BAD mrid,
+	// and again on the next cycle (no scheduler-side dedupe).
+	garbage := progs(eventWithExpLim("BAD", epoch, 3600, 32767, 9))
+	if got := s.Evaluate(garbage, epoch+10); got == nil || got.MRID != "GOOD" {
+		t.Fatalf("expected held GOOD, got %+v", got)
+	}
+	s.Evaluate(garbage, epoch+15)
+	if len(rejects) != 2 || rejects[0].mrid != "BAD" || rejects[1].mrid != "BAD" {
+		t.Fatalf("rejects = %v, want two BAD entries", rejects)
+	}
+	if rejects[0].reason != "implausible-limit" {
+		t.Fatalf("reject reason = %q, want implausible-limit", rejects[0].reason)
+	}
+
+	// Implausible with no prior (fresh scheduler): still fires.
+	s2 := New()
+	var mrids []string
+	s2.RejectHook = func(mrid, _ string) { mrids = append(mrids, mrid) }
+	if got := s2.Evaluate(garbage, epoch); got != nil {
+		t.Fatalf("expected nil (no prior), got %+v", got)
+	}
+	if len(mrids) != 1 || mrids[0] != "BAD" {
+		t.Fatalf("no-prior rejects = %v, want [BAD]", mrids)
+	}
+}
+
 // When the server explicitly clears its controls — the DERProgram exists but
 // carries no active event and no DefaultDERControl — the scheduler must release
 // the last-known-good immediately (curtailment-release fix). Holding in this

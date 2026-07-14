@@ -109,6 +109,47 @@ func TestLoadConfig_RedirectMax(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_RegistrationPIN pins WP-7's WS-8-style default: an absent
+// registration_pin is 0 (check disabled — main() WARNs and constructs no
+// verifier), and a non-zero value passes through to enable D4 verification.
+func TestLoadConfig_RegistrationPIN(t *testing.T) {
+	cfg, err := loadConfig(writeTempConfig(t, `{"mqtt_broker":"tcp://localhost:1883"}`))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.RegistrationPIN != 0 {
+		t.Fatalf("RegistrationPIN absent = %d, want 0 (disabled default)", cfg.RegistrationPIN)
+	}
+
+	cfg, err = loadConfig(writeTempConfig(t, `{"mqtt_broker":"tcp://localhost:1883","registration_pin":111115}`))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.RegistrationPIN != 111115 {
+		t.Fatalf("RegistrationPIN = %d, want 111115", cfg.RegistrationPIN)
+	}
+}
+
+// TestLoadConfig_LegacyCannotComplyCode pins WP-7's D5 default: standard
+// Table 27 codes unless the bench explicitly opts back into 0xF0.
+func TestLoadConfig_LegacyCannotComplyCode(t *testing.T) {
+	cfg, err := loadConfig(writeTempConfig(t, `{"mqtt_broker":"tcp://localhost:1883"}`))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.LegacyCannotComplyCode {
+		t.Fatal("LegacyCannotComplyCode absent = true, want false (Table 27 codes by default)")
+	}
+
+	cfg, err = loadConfig(writeTempConfig(t, `{"mqtt_broker":"tcp://localhost:1883","legacy_cannotcomply_code":true}`))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !cfg.LegacyCannotComplyCode {
+		t.Fatal("LegacyCannotComplyCode = false with explicit true in config")
+	}
+}
+
 func writeTempConfig(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "cfg.json")

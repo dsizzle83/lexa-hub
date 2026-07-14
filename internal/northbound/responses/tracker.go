@@ -19,6 +19,7 @@ import (
 	"lexa-hub/internal/journal"
 	"lexa-hub/internal/metrics"
 	"lexa-hub/internal/northbound/discovery"
+	"lexa-hub/internal/northbound/egress"
 	"lexa-hub/internal/northbound/scheduler"
 	"lexa-hub/internal/utilitytime"
 	model "lexa-proto/csipmodel"
@@ -79,6 +80,34 @@ type Tracker struct {
 	// persist.go's package doc for the format and why it is not
 	// internal/journal.Writer reused as-is.
 	store *Store
+
+	// legacyCannotComply (WP-7, D5): true restores the pre-WP-7 wire
+	// behavior byte-for-byte — 0xF0 (model.ResponseCannotComply) at breach
+	// onset, Completed(3) at every event end, and no receipt-reject
+	// Responses at all — for benches whose gridsim still expects the LEXA
+	// profile extension (config legacy_cannotcomply_code). false (the
+	// default) emits standard IEEE 2030.5 Table 27 codes: 8 at episode
+	// onset, 3/8/10 at event end (endOfEventCode), 252/253 at receipt
+	// rejection (ReceiptReject). Set via SetLegacyCannotComplyCode at
+	// wiring time, before subscriptions/walks start.
+	legacyCannotComply bool
+
+	// gate is the optional WP-7/D4 egress gate: when suspended (the
+	// registration-PIN freeze), postResponse transmits nothing. nil = never
+	// suspended (egress.Gate's nil convention). During a freeze the walk
+	// loop already skips Update() entirely (run.RunOnce); this gate
+	// backstops the async AlertCannotComply path, which arrives on the MQTT
+	// subscription goroutine regardless of walk state.
+	gate *egress.Gate
+
+	// epi (WP-7, D5) is the breach-overlap record for the CURRENT active
+	// event, feeding endOfEventCode's 3/8/10 selection at event end.
+	// Sampled once per Update cycle (walk cadence) while the event stays
+	// active, marked directly at breach onset/clear, reset on event
+	// start/end, and persisted on every change (setEpisode) so a restart
+	// mid-event keeps both the record and activeMRID. Guarded by mu like
+	// every other tracker field.
+	epi EpisodeState
 }
 
 // New constructs a Tracker that POSTs Responses via p, identifying as lfdi,
@@ -90,6 +119,10 @@ type Tracker struct {
 // restart); a zero State starts empty exactly as before WS-4.2. Every key
 // present in initial.Alerted is treated as already confirmed-persisted
 // (LoadState only ever returns confirmed entries — see persist.go).
+// initial.Episode (WP-7) additionally restores the active event's
+// breach-overlap record AND its activeMRID, so a restart mid-event neither
+// re-posts Started nor forgets the breach history its end-of-event code
+// (3/8/10) depends on.
 func New(p Poster, lfdi, responseSetPath string, clk *utilitytime.Clock, responsesPosted *metrics.Counter, jw *journal.Writer, store *Store, initial State) *Tracker {
 	posted := initial.Posted
 	if posted == nil {
@@ -103,7 +136,7 @@ func New(p Poster, lfdi, responseSetPath string, clk *utilitytime.Clock, respons
 	for k := range alerted {
 		confirmed[k] = true
 	}
-	return &Tracker{
+	rt := &Tracker{
 		poster:           p,
 		lfdi:             lfdi,
 		responseSetPath:  responseSetPath,
@@ -115,6 +148,31 @@ func New(p Poster, lfdi, responseSetPath string, clk *utilitytime.Clock, respons
 		jw:               jw,
 		store:            store,
 	}
+	if initial.Episode != nil && initial.Episode.MRID != "" {
+		rt.epi = *initial.Episode
+		rt.activeMRID = initial.Episode.MRID
+	}
+	return rt
+}
+
+// SetLegacyCannotComplyCode selects the wire vocabulary (WP-7, D5): true
+// restores the pre-WP-7 0xF0/Completed-only behavior byte-for-byte (config
+// legacy_cannotcomply_code, for gridsim/bench compat); false — the default,
+// and a fresh Tracker's zero value — emits standard Table 27 codes. Call at
+// wiring time, before the walk loop and MQTT subscriptions start.
+func (rt *Tracker) SetLegacyCannotComplyCode(on bool) {
+	rt.mu.Lock()
+	rt.legacyCannotComply = on
+	rt.mu.Unlock()
+}
+
+// SetEgressGate wires the WP-7/D4 egress gate postResponse consults before
+// transmitting; nil (the default) never suspends. Call at wiring time,
+// before the walk loop and MQTT subscriptions start.
+func (rt *Tracker) SetEgressGate(g *egress.Gate) {
+	rt.mu.Lock()
+	rt.gate = g
+	rt.mu.Unlock()
 }
 
 // AlertCannotComply posts a single CannotComply Response per breach episode.
@@ -139,7 +197,25 @@ func (rt *Tracker) AlertCannotComply(mrid, episodeID string) {
 	if episodeID != "" {
 		rt.alerted[episodeID] = true
 	}
-	posted := rt.postResponse(mrid, model.ResponseCannotComply)
+
+	// WP-7 (D5): mark the breach against the active event's episode record
+	// so end-of-event reconciliation can pick 8 vs 10 — regardless of
+	// whether the POST below succeeds (the breach happened either way).
+	if mrid == rt.activeMRID && rt.activeMRID != "" {
+		e := rt.epi
+		e.SawBreach = true
+		e.BreachActive = true
+		rt.setEpisode(e)
+	}
+
+	// Wire code (WP-7, D5): standard mode posts 8 (partial completion) at
+	// episode onset — the earliest Table 27 signal that execution is
+	// degraded; legacy mode keeps the LEXA 0xF0 extension byte-for-byte.
+	code := model.ResponsePartialOptOut
+	if rt.legacyCannotComply {
+		code = model.ResponseCannotComply
+	}
+	posted := rt.postResponse(mrid, code)
 
 	// WS-4.2: persist ONLY once the POST is confirmed — deliberately AFTER
 	// the in-memory mark above, not alongside it. A process crash between
@@ -181,7 +257,29 @@ func (rt *Tracker) ClearAlerts() {
 	defer rt.mu.Unlock()
 	rt.alerted = make(map[string]bool)
 	rt.confirmedAlerted = make(map[string]bool)
+	// WP-7 (D5): the breach ended while the event may still be running —
+	// SawBreach stays (history for the end-of-event code), only the live
+	// flag clears so subsequent Update samples count as compliant.
+	if rt.epi.BreachActive {
+		e := rt.epi
+		e.BreachActive = false
+		rt.setEpisode(e)
+	}
 	rt.store.AppendClear()
+	rt.maybeCompact()
+}
+
+// setEpisode replaces the active event's breach-overlap record, persisting
+// on change only (WP-7, D5). Change-gated so the per-cycle Update sample
+// costs nothing once its flag is already set — appends happen on event
+// start/end and breach onset/clear/first-sample edges, never per tick.
+// Must be called with rt.mu held.
+func (rt *Tracker) setEpisode(e EpisodeState) {
+	if rt.epi == e {
+		return
+	}
+	rt.epi = e
+	rt.store.AppendEpisode(e)
 	rt.maybeCompact()
 }
 
@@ -196,16 +294,29 @@ func (rt *Tracker) maybeCompact() {
 	if rt.store == nil || !rt.store.NeedsCompact() {
 		return
 	}
-	if err := rt.store.Compact(rt.posted, rt.confirmedAlerted); err != nil {
+	var epi *EpisodeState
+	if rt.epi.MRID != "" {
+		e := rt.epi
+		epi = &e
+	}
+	if err := rt.store.Compact(rt.posted, rt.confirmedAlerted, epi); err != nil {
 		slog.Warn("lexa-northbound: response-state compaction failed", "path", rt.store.Path, "err", err)
 	}
 }
 
 // terminalResponse reports whether a response status ends an event's lifecycle:
 // no further responses are sent for an mRID once it reaches one of these.
+//
+// 8 (ResponsePartialOptOut) and 10 (ResponseNoParticipation) are terminal
+// HERE because they only ever enter the posted map as end-of-event codes
+// (completeActive → endOfEventCode, WP-7/D5) — the episode-ONSET 8 posted by
+// AlertCannotComply deliberately bypasses set()/posted[] (it always has,
+// back when it was 0xF0), so an onset-8 never freezes a still-running
+// event's lifecycle.
 func terminalResponse(status uint8) bool {
 	switch status {
-	case model.ResponseEventCompleted, model.ResponseEventCancelled, model.ResponseEventSuperseded:
+	case model.ResponseEventCompleted, model.ResponseEventCancelled, model.ResponseEventSuperseded,
+		model.ResponsePartialOptOut, model.ResponseNoParticipation:
 		return true
 	default:
 		return false
@@ -239,6 +350,7 @@ func (rt *Tracker) Update(tree *discovery.ResourceTree, active *scheduler.Active
 					rt.set(mrid, model.ResponseEventCancelled)
 					if rt.activeMRID == mrid {
 						rt.activeMRID = ""
+						rt.setEpisode(EpisodeState{}) // WP-7: event over, drop its record
 					}
 				}
 				continue
@@ -253,6 +365,7 @@ func (rt *Tracker) Update(tree *discovery.ResourceTree, active *scheduler.Active
 				rt.set(mrid, model.ResponseEventSuperseded)
 				if rt.activeMRID == mrid {
 					rt.activeMRID = ""
+					rt.setEpisode(EpisodeState{}) // WP-7: event over, drop its record
 				}
 			}
 		}
@@ -268,6 +381,27 @@ func (rt *Tracker) Update(tree *discovery.ResourceTree, active *scheduler.Active
 		rt.completeActive()
 		rt.set(active.MRID, model.ResponseEventStarted)
 		rt.activeMRID = active.MRID
+		// WP-7 (D5): fresh episode record for the new event. Seeded from the
+		// alerted map: a breach alert for this mRID that raced ahead of this
+		// Started (the hub adopts the control from the SAME walk cycle that
+		// posts Started, and its alert rides a separate MQTT goroutine) still
+		// counts as overlapping from the start. No compliance sample this
+		// first cycle — sampling starts next cycle, so an event that breaches
+		// within its first walk interval can still reconcile as 10.
+		seed := rt.alerted[active.MRID]
+		rt.setEpisode(EpisodeState{MRID: active.MRID, SawBreach: seed, BreachActive: seed})
+	} else {
+		// WP-7 (D5): one breach-overlap sample per poll cycle while the
+		// event stays active — the walk-cadence evidence endOfEventCode
+		// reconciles into 3 (never breached), 8 (both compliant and
+		// breached cycles observed), or 10 (every observed cycle breached).
+		e := rt.epi
+		if e.BreachActive {
+			e.SawBreach = true
+		} else {
+			e.SawCompliant = true
+		}
+		rt.setEpisode(e)
 	}
 
 	if active.ValidUntil > 0 && serverNow >= active.ValidUntil {
@@ -275,17 +409,70 @@ func (rt *Tracker) Update(tree *discovery.ResourceTree, active *scheduler.Active
 	}
 }
 
-// completeActive posts Completed(3) for the current active event unless it has
-// already reached a terminal state (e.g. it was just cancelled or superseded),
-// then clears the active mRID.
+// completeActive posts the end-of-event Response for the current active
+// event unless it has already reached a terminal state (e.g. it was just
+// cancelled or superseded), then clears the active mRID and its episode
+// record. The code is Completed(3) in legacy mode (pre-WP-7 byte-compat) or
+// endOfEventCode's D5 reconciliation (3/8/10) in standard mode.
 func (rt *Tracker) completeActive() {
 	if rt.activeMRID == "" {
 		return
 	}
 	if !terminalResponse(rt.posted[rt.activeMRID]) {
-		rt.set(rt.activeMRID, model.ResponseEventCompleted)
+		rt.set(rt.activeMRID, rt.endOfEventCode())
 	}
 	rt.activeMRID = ""
+	rt.setEpisode(EpisodeState{})
+}
+
+// endOfEventCode maps the active event's episode record to its Table 27
+// end-of-event Response code (WP-7, D5):
+//
+//	3  (Completed)        — no breach episode overlapped the event;
+//	8  (PartialOptOut)    — breach and compliance both observed (partial);
+//	10 (NoParticipation)  — every observed sample of the event's tenure was
+//	                        breaching: onset at/before start (or before the
+//	                        first post-start cycle) and never cleared.
+//
+// "Throughout" is judged on walk-cadence evidence (rt.epi's per-cycle
+// samples) — the finest granularity the tracker observes; sub-cycle
+// compliant intervals are invisible by construction. Legacy mode always
+// answers 3, preserving the pre-WP-7 wire behavior byte-for-byte.
+func (rt *Tracker) endOfEventCode() uint8 {
+	if rt.legacyCannotComply || !rt.epi.SawBreach {
+		return model.ResponseEventCompleted
+	}
+	if rt.epi.SawCompliant {
+		return model.ResponsePartialOptOut
+	}
+	return model.ResponseNoParticipation
+}
+
+// ReceiptReject posts a Table 27 receipt-rejection Response for mrid (WP-7,
+// D5 "rejected at receipt — never adopted"). Today's only producer is the
+// scheduler's plausibility-gate hook (scheduler.Scheduler.RejectHook →
+// code 253, ResponseRejectedInvalid). code 252 (ResponseRejectedParam —
+// mode the site cannot execute) is the documented seam for WP-9's
+// modesSupported/capability knowledge: no component can classify
+// "incapable" yet, so nothing calls this with 252 until then.
+//
+// Deduped per event mRID via the posted map (the hook re-fires every walk
+// while the malformed control stays served): a repeat of the same code, or
+// any terminal status, suppresses the post. The recorded status is
+// non-terminal on purpose — a server that FIXES the event content under
+// the same mRID can still be adopted and Start it later. No-op in legacy
+// mode (pre-WP-7 posted no rejection Responses — byte-compat) and for an
+// empty mrid.
+func (rt *Tracker) ReceiptReject(mrid string, code uint8) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.legacyCannotComply || mrid == "" {
+		return
+	}
+	if last, seen := rt.posted[mrid]; seen && (last == code || terminalResponse(last)) {
+		return
+	}
+	rt.set(mrid, code)
 }
 
 // set posts a Response and records it as the latest status for mrid. Its
@@ -310,6 +497,15 @@ func (rt *Tracker) set(mrid string, status uint8) {
 // call site (set, above) still discards it, preserving the pre-TASK-040
 // behavior bit-for-bit.
 func (rt *Tracker) postResponse(mrid string, status uint8) bool {
+	// WP-7 (D4): server egress suspended (registration-PIN freeze) —
+	// transmit nothing. Reached only from the async AlertCannotComply path
+	// during a freeze (the walk loop skips Update entirely), so this stays
+	// an edge, not a per-tick line.
+	if rt.gate.Suspended() {
+		slog.Warn("lexa-northbound: response POST suppressed — server egress suspended",
+			"reason", rt.gate.Reason(), "mrid", mrid, "status", status)
+		return false
+	}
 	resp := model.Response{
 		CreatedDateTime: rt.clk.ServerNow(),
 		EndDeviceLFDI:   rt.lfdi,
@@ -326,7 +522,15 @@ func (rt *Tracker) postResponse(mrid string, status uint8) bool {
 		return false
 	}
 	rt.responsesPosted.Inc()
-	names := map[uint8]string{1: "Received", 2: "Started", 3: "Completed", 6: "Cancelled", 7: "Superseded", model.ResponseCannotComply: "CannotComply"}
+	names := map[uint8]string{
+		1: "Received", 2: "Started", 3: "Completed", 6: "Cancelled", 7: "Superseded",
+		model.ResponsePartialOptOut:   "PartialOptOut",
+		model.ResponseNoParticipation: "NoParticipation",
+		model.ResponseRejectedParam:   "RejectedParam",
+		model.ResponseRejectedInvalid: "RejectedInvalid",
+		model.ResponseRejectedExpired: "RejectedExpired",
+		model.ResponseCannotComply:    "CannotComply",
+	}
 	name := names[status]
 	if name == "" {
 		name = fmt.Sprintf("status=%d", status)
