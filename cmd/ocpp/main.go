@@ -47,6 +47,7 @@ import (
 	"lexa-hub/internal/mqttutil"
 	"lexa-hub/internal/watchdog"
 	"lexa-proto/ocppserver"
+	"lexa-proto/ocppserver16"
 )
 
 func main() {
@@ -199,6 +200,30 @@ func main() {
 		// The EVSE reconciler (above) owns SetChargingProfile via the retained
 		// lexa/desired/evse/{station} doc, so config must set reconciler = "active".
 
+		// WP-12: optional OCPP 1.6J compatibility listener — a SECOND
+		// ws.WsServer on port_16 (0 = disabled, the product default) whose
+		// forwarders feed the SAME bridge state map (bridge16.go); the same
+		// cert/key + Basic Auth fields secure it, and the same lifecycle
+		// applies (started here, stopped on shutdown; the watchdog ticker
+		// below is untouched — process + MQTT stay the liveness definition,
+		// OCPP listener health is not probed on either stack). Wired before
+		// either listener starts: SetHandlers must precede Start
+		// (ocppserver16 doc), and cs16 must be set before any 1.6 station
+		// can connect and later take an Apply.
+		if cfg.Port16 > 0 {
+			srv16 := ocppserver16.New(ocppserver16.Config{
+				Port:          cfg.Port16,
+				CertPath:      cfg.CertPath,
+				KeyPath:       cfg.KeyPath,
+				BasicAuthUser: cfg.BasicAuthUser,
+				BasicAuthPass: cfg.BasicAuthPass,
+			})
+			wireOCPP16(bridge, srv16)
+			log.Printf("lexa-ocpp: OCPP 1.6J compatibility listener enabled on :%d (2.0.1 stays on :%d)", cfg.Port16, cfg.Port)
+			go srv16.Start()
+			defer srv16.Stop()
+		}
+
 		go srv.Start()
 		defer srv.Stop()
 	}
@@ -268,9 +293,24 @@ type connState struct {
 	status      connectorStatus
 }
 
+// Station protocol tags (WP-12): which OCPP stack a station last spoke, set at
+// boot/connect by the respective listener's handlers. bridge.Apply dispatches
+// its SetChargingProfile shape on this tag — the 2.0.1 path for protoOCPP201,
+// the TxDefaultProfile/Amperes 1.6 path (bridge16.go) for protoOCPP16.
+const (
+	protoOCPP16  = "1.6"
+	protoOCPP201 = "2.0.1"
+)
+
 type stationState struct {
-	id          string
-	connected   bool
+	id        string
+	connected bool
+	// proto is the station's OCPP stack tag (protoOCPP16/protoOCPP201).
+	// Defaults to protoOCPP201 at creation (getOrCreateLocked) — every
+	// pre-WP-12 station is 2.0.1 by construction — and is (re)stamped by
+	// each stack's connect/boot handlers, so a station that switches stacks
+	// across reconnects (e.g. a firmware upgrade) dispatches correctly.
+	proto       string
 	connectors  map[int]*connState
 	currentA    float64
 	maxCurrentA float64
@@ -308,6 +348,20 @@ type mqttBridge struct {
 	// ever accessed through its own mutex — never bridge.mu — so nothing here
 	// needs bridge's lock.
 	pending *pendingStations
+
+	// cs16 is the OCPP 1.6J send seam (WP-12): the CentralSystem the 1.6
+	// apply/trigger paths issue SetChargingProfile/TriggerMessage through.
+	// nil when port_16 is 0 (1.6 disabled) — no station can carry the
+	// protoOCPP16 tag then, so the 1.6 dispatch branch is unreachable. Set
+	// once at startup by wireOCPP16 (bridge16.go), before any connection is
+	// accepted, then read-only — same no-lock discipline as shells above.
+	cs16 centralSystem16
+
+	// nextTxID16 assigns the CSMS-side transaction IDs 1.6 StartTransaction
+	// confirmations carry (in 1.6 the Central System owns transaction IDs —
+	// lexa-proto/ocppserver16 CLAUDE.md's session-lifecycle invariant).
+	// Accessed atomically from the 1.6 forwarder only.
+	nextTxID16 int32
 }
 
 // connectedStationCount returns how many known stations currently have an
@@ -363,6 +417,7 @@ func (b *mqttBridge) onConnect(cs ocpp2.ChargingStationConnection) {
 	b.mu.Lock()
 	s, created := b.getOrCreateLocked(cs.ID())
 	s.connected = true
+	s.proto = protoOCPP201 // WP-12: (re)stamp at connect; see stationState.proto
 	b.mu.Unlock()
 	log.Printf("[ocpp] connected: %s addr=%s", cs.ID(), cs.RemoteAddr())
 	// Unit 6.1: a station this bridge did not already know about is, by
@@ -409,6 +464,7 @@ func (b *mqttBridge) getOrCreateLocked(id string) (*stationState, bool) {
 	}
 	s := &stationState{
 		id:          id,
+		proto:       protoOCPP201, // WP-12 default; 1.6 handlers re-stamp (bridge16.go)
 		connectors:  make(map[int]*connState),
 		maxCurrentA: 32,
 		voltageV:    230,
@@ -513,16 +569,28 @@ func (b *mqttBridge) observeShell(stationID string, currentA, maxA float64, conn
 // is an error, not success (ledger L11): the charger kept its previous limit.
 // Each call is bounded at 10 s (OCPP timeout); an active-mode backoff must be ≥
 // that so calls to one station never overlap.
+//
+// WP-12: Apply dispatches per station proto tag — a station stamped
+// protoOCPP16 takes the 1.6 SetChargingProfile shape (apply16, bridge16.go)
+// under the exact same contract (disconnected no-op, evseID 0→1, 10 s bound,
+// rejected-as-error); everything else takes the 2.0.1 path below unchanged.
 func (b *mqttBridge) Apply(stationID string, evseID int, limitA float64) error {
 	b.mu.RLock()
 	s, ok := b.stations[stationID]
 	connected := ok && s.connected
+	var proto string
+	if ok {
+		proto = s.proto
+	}
 	b.mu.RUnlock()
 	if !connected {
 		return nil
 	}
 	if evseID == 0 {
 		evseID = 1
+	}
+	if proto == protoOCPP16 {
+		return b.apply16(stationID, evseID, limitA)
 	}
 	limit := limitA
 	period := types.NewChargingSchedulePeriod(0, limit)

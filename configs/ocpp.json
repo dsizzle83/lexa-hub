@@ -6,6 +6,7 @@
   "mqtt_pass_file": "",
   "metrics_addr": "",
   "port": 8887,
+  "port_16": 0,
   "cert_path": "/etc/lexa/certs/ocpp-cert.pem",
   "key_path": "/etc/lexa/certs/ocpp-key.pem",
   "basic_auth_user": "evse-bench",

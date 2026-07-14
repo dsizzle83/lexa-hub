@@ -43,6 +43,23 @@ type Config struct {
 	CertPath string `json:"cert_path"` // TLS cert; plain WS when empty (bench-only)
 	KeyPath  string `json:"key_path"`
 
+	// Port16 enables the OCPP 1.6J compatibility listener (WP-12) on this
+	// port ALONGSIDE the 2.0.1 listener above — ocpp-go gives each protocol
+	// version its own ws.WsServer with its own Start(port, path), so
+	// dual-stack is two listeners; the BRIDGE is version-dispatching, the
+	// listener is not (docs/standards-buildout/architecture.md §0.2; 8886 is
+	// the conventional choice, ocppserver16.DefaultPort). 0 (the default)
+	// disables 1.6J entirely: no socket bound, zero regression surface for
+	// the hardened 2.0.1 path.
+	//
+	// The 1.6 listener reuses the SAME CertPath/KeyPath/BasicAuthUser/
+	// BasicAuthPass fields, so the WS-1 SP2 fail-closed gate in loadConfig
+	// below covers BOTH listeners with no extra condition: any config that
+	// would actually serve chargers (stations configured, not bench) already
+	// refuses blank SP2 fields regardless of which listener a charger dials,
+	// and the uncommissioned-idle state never binds either listener.
+	Port16 int `json:"port_16"`
+
 	// BasicAuthUser/BasicAuthPass: HTTP Basic Auth for the charging station
 	// link. Ignored (no auth enforced) when BasicAuthUser is empty — that
 	// state is bench-only, same as an empty CertPath/KeyPath above.
