@@ -14,14 +14,14 @@ Status legend: ⬜ pending · 🔵 in progress · ✅ done (tests green) · 🟠
 | WP-5 | telemetry VAr + Wh MMRs | S | 2 | ✅ 656a0fe | closes BASIC-029 VAr gap |
 | WP-6 | LogEvent pipeline | M | 1,2 | ✅ 16d2bef | closes BASIC-027; gridsim LogEvent endpoint pending (bench queue) |
 | WP-7 | PIN verify + Table 27 codes | S | 1 | ✅ ea8b228 | 252 + 13/14 are documented seams; bench config keeps legacy 0xF0 until gridsim flips |
-| WP-8 | Advanced-control carriage northbound | M | 2 | 🔵 | BUS LANE; retires extended→simple silent drop |
-| WP-9 | Adv desired doc + hub authoring | M | 8 | ⬜ | BUS LANE; `advanced_der` flag |
-| WP-10 | Advanced reconciler execution | L | 9 | ⬜ | `reconciler.adv` off/shadow/active; closes BASIC-004..012 exec half |
-| WP-11 | GenLimW/LoadLimW enforcement (AUS) | M | 8 | ⬜ | cascade+shadow pair; `enforce_aus_limits` |
+| WP-8 | Advanced-control carriage northbound | M | 2 | ✅ 619494c | BUS LANE; retires extended→simple silent drop |
+| WP-9 | Adv desired doc + hub authoring | M | 8 | ✅ eae6b4d | BUS LANE; `advanced_der` flag |
+| WP-10 | Advanced reconciler execution | L | 9 | 🔵 | `reconciler.adv` off/shadow/active; closes BASIC-004..012 exec half |
+| WP-11 | GenLimW/LoadLimW enforcement (AUS) | M | 8 | ✅ 593620a | cascade+shadow pair; `enforce_aus_limits` |
 | WP-12 | OCPP 1.6J dual-stack | M/L | 1 | ✅ fcdd98e | 2.0.1 path byte-identical |
-| WP-13 | Pairing gate + ClearChargingProfile | M | 12 (+bus slot after 9) | ⬜ | closes R8 |
+| WP-13 | Pairing gate + ClearChargingProfile | M | 12 (+bus slot after 9) | 🔵 | closes R8 |
 | WP-14 | V2G type enablers | M | 9,13 (bus lane tail) | ⬜ | `ev_storage`; flag-off byte-identical plans |
-| WP-15 | lexa-openadr service | L | 2 (+bus slot last) | ⬜ | metrics :9108; pure Go |
+| WP-15 | lexa-openadr service | L | 2 (+bus slot last) | 🟡 c9c2984 svc half | metrics :9108; pure Go |
 | WP-16 | CSIP-AUS checklist + verify-sweep docs | S | 11 | ⬜ | AUS spec-gap disclosure |
 | WP-17 | Integration & verification gate | M | all | ⬜ | ACL re-derive (incl. pre-existing lexa-api certstatus gap), envelope audit, -race+arm64, apicontract, CLAUDE.md updates |
 
