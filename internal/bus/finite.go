@@ -53,6 +53,21 @@ func (m Measurement) Finite() error {
 	if err := finite("hz", m.Hz); err != nil {
 		return err
 	}
+	if err := finite("var_w", m.VarW); err != nil {
+		return err
+	}
+	if err := finite("va", m.VA); err != nil {
+		return err
+	}
+	if err := finite("pf", m.PF); err != nil {
+		return err
+	}
+	if err := finite("wh_imp_total", m.WhImpTotal); err != nil {
+		return err
+	}
+	if err := finite("wh_exp_total", m.WhExpTotal); err != nil {
+		return err
+	}
 	return nil
 }
 

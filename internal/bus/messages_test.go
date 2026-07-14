@@ -171,3 +171,90 @@ func TestPublishedTypesLegacyV0GoldenPayload(t *testing.T) {
 		})
 	}
 }
+
+// measurementPreWP2 replicates Measurement's exact wire shape BEFORE the
+// WP-2 enrichment fields landed (device/w/voltage_v/hz/ts only). It exists
+// so TestMeasurementWP2CrossDecode can prove old-subscriber tolerance
+// against the real pre-change shape, not a hand-waved approximation.
+type measurementPreWP2 struct {
+	Envelope
+	Device   string   `json:"device"`
+	W        *float64 `json:"w,omitempty"`
+	VoltageV *float64 `json:"voltage_v,omitempty"`
+	Hz       *float64 `json:"hz,omitempty"`
+	Ts       int64    `json:"ts"`
+}
+
+// measurementWP2Golden is the wire shape a WP-2 publisher emits with every
+// enrichment field populated, still at "v":1 (additive-at-same-version,
+// AD-006/architecture §2.1). Kept as a literal so the JSON keys themselves
+// are pinned, not derived from the very struct tags under test.
+const measurementWP2Golden = `{"v":1,"device":"meter0","w":-2500,"voltage_v":240.1,"hz":60.02,` +
+	`"var_w":150.5,"va":2600,"pf":0.96,"op_state":1,"conn_state":1,"alarm_bits":4,` +
+	`"wh_imp_total":12500000,"wh_exp_total":3400000,"ts":1752451200}`
+
+// TestMeasurementWP2CrossDecode pins WP-2's additive-fields contract in both
+// directions:
+//
+//  1. an OLD payload (pre-WP-2 publisher, no new keys) decodes into the NEW
+//     struct with every enrichment field nil-absent — a new subscriber never
+//     mistakes an old publisher for one reporting zeros;
+//  2. a NEW payload (every enrichment field present) decodes into the OLD
+//     struct shape without error, all pre-existing fields intact — an
+//     old subscriber tolerates a new publisher, which is exactly why V
+//     stays 1 instead of bumping.
+func TestMeasurementWP2CrossDecode(t *testing.T) {
+	t.Run("old payload into new struct: enrichment fields all nil", func(t *testing.T) {
+		old := `{"v":1,"device":"inv0","w":1000.5,"voltage_v":240.5,"hz":60.0,"ts":1752451200}`
+		var m Measurement
+		if err := json.Unmarshal([]byte(old), &m); err != nil {
+			t.Fatalf("Unmarshal old payload: %v", err)
+		}
+		if m.W == nil || *m.W != 1000.5 || m.VoltageV == nil || *m.VoltageV != 240.5 {
+			t.Errorf("pre-existing fields mis-decoded: %+v", m)
+		}
+		if m.VarW != nil || m.VA != nil || m.PF != nil ||
+			m.OpState != nil || m.ConnState != nil || m.AlarmBits != nil ||
+			m.WhImpTotal != nil || m.WhExpTotal != nil {
+			t.Errorf("enrichment fields must all be nil for an old payload, got %+v", m)
+		}
+		if err := m.Finite(); err != nil {
+			t.Errorf("Finite() on decoded old payload = %v, want nil", err)
+		}
+	})
+
+	t.Run("new payload into new struct: enrichment fields populated", func(t *testing.T) {
+		var m Measurement
+		if err := json.Unmarshal([]byte(measurementWP2Golden), &m); err != nil {
+			t.Fatalf("Unmarshal new payload: %v", err)
+		}
+		if m.VarW == nil || *m.VarW != 150.5 || m.VA == nil || *m.VA != 2600 ||
+			m.PF == nil || *m.PF != 0.96 {
+			t.Errorf("power-quality fields mis-decoded: %+v", m)
+		}
+		if m.OpState == nil || *m.OpState != 1 || m.ConnState == nil || *m.ConnState != 1 ||
+			m.AlarmBits == nil || *m.AlarmBits != 4 {
+			t.Errorf("state fields mis-decoded: %+v", m)
+		}
+		if m.WhImpTotal == nil || *m.WhImpTotal != 12500000 || m.WhExpTotal == nil || *m.WhExpTotal != 3400000 {
+			t.Errorf("energy fields mis-decoded: %+v", m)
+		}
+		if err := m.Finite(); err != nil {
+			t.Errorf("Finite() on decoded new payload = %v, want nil", err)
+		}
+	})
+
+	t.Run("new payload into pre-WP2 struct shape: old-subscriber tolerance", func(t *testing.T) {
+		var m measurementPreWP2
+		if err := json.Unmarshal([]byte(measurementWP2Golden), &m); err != nil {
+			t.Fatalf("Unmarshal new payload into pre-WP2 shape: %v (an old subscriber must tolerate the new keys)", err)
+		}
+		if m.V != 1 || m.Device != "meter0" ||
+			m.W == nil || *m.W != -2500 ||
+			m.VoltageV == nil || *m.VoltageV != 240.1 ||
+			m.Hz == nil || *m.Hz != 60.02 ||
+			m.Ts != 1752451200 {
+			t.Errorf("pre-existing fields mis-decoded by old shape: %+v", m)
+		}
+	})
+}

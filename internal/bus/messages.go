@@ -24,7 +24,26 @@ type Measurement struct {
 	W        *float64 `json:"w,omitempty"`         // net power (W): + discharge/gen, - charge/load
 	VoltageV *float64 `json:"voltage_v,omitempty"` // voltage (V)
 	Hz       *float64 `json:"hz,omitempty"`        // frequency (Hz)
-	Ts       int64    `json:"ts"`                  // Unix seconds
+
+	// WP-2 (A1) enrichment — additive optional fields at V=1 (AD-006: an old
+	// subscriber ignores the unknown keys; a new subscriber reading an old
+	// publisher sees them nil-absent). Every *float64 here is covered by
+	// Measurement.Finite (GAP-09). Sources: inverter/battery via
+	// derbase.Measurements (701 or legacy 10x), meter via models 201/203;
+	// a device that lacks a quantity leaves the field nil — never fabricated
+	// (G27). The Wh totals are lifetime accumulators, monotonic non-decreasing
+	// per device; cmd/modbus withholds a sample that moves backwards
+	// (scale-factor/register-wrap suspicion — see whMonotonicGate there).
+	VarW       *float64 `json:"var_w,omitempty"`        // reactive power (VAr), + = injecting/capacitive (device convention)
+	VA         *float64 `json:"va,omitempty"`           // apparent power (VA)
+	PF         *float64 `json:"pf,omitempty"`           // power factor [-1, 1]
+	OpState    *uint16  `json:"op_state,omitempty"`     // 701 St (or 103 St mapped); operational state enum
+	ConnState  *uint16  `json:"conn_state,omitempty"`   // 701 ConnSt bitfield
+	AlarmBits  *uint32  `json:"alarm_bits,omitempty"`   // 701 Alrm bitfield (raw; mapping to CSIP Table 14 happens hub-side)
+	WhImpTotal *float64 `json:"wh_imp_total,omitempty"` // lifetime import energy (Wh) — meter TotWhImp / 701 TotWhAbs
+	WhExpTotal *float64 `json:"wh_exp_total,omitempty"` // lifetime export energy (Wh) — meter TotWhExp / 701 TotWhInj
+
+	Ts int64 `json:"ts"` // Unix seconds
 }
 
 // BattMetrics is published by the modbus service for battery-role devices after

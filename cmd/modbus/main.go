@@ -361,6 +361,10 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 		deviceRole[dc.Name] = dc.Role
 		nameplate[dc.Name] = dc.MaxW
 	}
+	// WP-2: per-device monotonic gate for the lifetime Wh accumulators.
+	// In-memory only — baselines reset on process restart by design (crash-
+	// only, AD-011: retained topics don't carry this and shouldn't).
+	whMono := newWhMonotonicGate()
 
 	for upd := range updates {
 		// TASK-008 watchdog kick: first statement of the update-drain body so
@@ -420,6 +424,37 @@ func publishMeasurements(mc mqtt.Client, cfg *Config, updates <-chan registry.Me
 		}
 		if !math.IsNaN(m.Hz) {
 			msg.Hz = &m.Hz
+		}
+		// WP-2 (A1) enrichment: power quality, 701 state/alarms, lifetime Wh.
+		// Absent stays nil (G27) — a NaN from the parse layer (device lacks
+		// the point / sentinel scale factor) is never turned into a value.
+		if !math.IsNaN(m.Var) {
+			msg.VarW = &m.Var
+		}
+		if !math.IsNaN(m.VA) {
+			msg.VA = &m.VA
+		}
+		if !math.IsNaN(m.PF) {
+			msg.PF = &m.PF
+		}
+		// The state pointers are nil-absent already (701-only; legacy 10x and
+		// meter paths leave them nil), so they pass through unconditionally.
+		msg.OpState = m.OpSt
+		msg.ConnState = m.ConnSt
+		msg.AlarmBits = m.Alrm
+		// Lifetime energy accumulators pass the per-device monotonic gate: a
+		// total that moved backwards is scale-factor/register-wrap suspicion
+		// (the Wh analog of the nameplate W gate above) and is withheld.
+		impOK, expOK, whEdge := whMono.admit(upd.Name, m.WhImpTotal, m.WhExpTotal)
+		if whEdge {
+			slog.Warn("lexa-modbus: REJECT non-monotonic Wh total — withholding energy fields (suspect scale factor/register wrap)",
+				"device", upd.Name, "wh_imp", m.WhImpTotal, "wh_exp", m.WhExpTotal)
+		}
+		if impOK {
+			msg.WhImpTotal = &m.WhImpTotal
+		}
+		if expOK {
+			msg.WhExpTotal = &m.WhExpTotal
 		}
 		// Measurement plane is QoS 0 (bus.PubQoS): high-frequency, freshness-
 		// gated by subscribers, so a dropped sample under broker congestion
@@ -498,6 +533,64 @@ func plausibleW(w, maxW float64) bool {
 		return true
 	}
 	return math.Abs(w) <= maxW*nameplateToleranceW
+}
+
+// whMonotonicGate withholds lifetime-energy accumulators that move backwards
+// (WP-2). A SunSpec TotWh accumulator is monotonic non-decreasing by
+// definition, so a sample below the last value this process accepted signals
+// a corrupted scale factor or a register-wrap mis-read — the same fault class
+// the nameplate gate (plausibleW) catches for W (GS-1/MTR-1). The suspect
+// field is withheld (nil on the bus, G27) rather than published for a
+// consumer to difference into a negative energy interval.
+//
+// The baseline only advances on ACCEPTED samples: a stuck-low fault stays
+// withheld until the reading recovers past the last good value, and a GENUINE
+// counter reset (meter replacement/factory reset — rare) stays withheld,
+// loudly via the edge WARN, until the service restarts and re-baselines
+// (crash-only, AD-011). That is the deliberate fail-closed trade against
+// silently re-baselining onto a corrupt value.
+//
+// Not safe for concurrent use; owned by the single publishMeasurements
+// goroutine.
+type whMonotonicGate struct {
+	lastImp map[string]float64
+	lastExp map[string]float64
+	suspect map[string]bool // device currently withholding ⇒ edge already logged
+}
+
+func newWhMonotonicGate() *whMonotonicGate {
+	return &whMonotonicGate{
+		lastImp: map[string]float64{},
+		lastExp: map[string]float64{},
+		suspect: map[string]bool{},
+	}
+}
+
+// admit judges this poll's import/export totals for device. impOK/expOK
+// report whether each value may be published (a NaN — absent — is never
+// publishable and never suspect). logEdge is true only on the transition
+// into the withholding state, so the caller logs once per fault episode,
+// not per tick (flash budget).
+func (g *whMonotonicGate) admit(device string, imp, exp float64) (impOK, expOK, logEdge bool) {
+	impOK = admitMonotonic(g.lastImp, device, imp)
+	expOK = admitMonotonic(g.lastExp, device, exp)
+	bad := (!impOK && !math.IsNaN(imp)) || (!expOK && !math.IsNaN(exp))
+	logEdge = bad && !g.suspect[device]
+	g.suspect[device] = bad
+	return impOK, expOK, logEdge
+}
+
+// admitMonotonic accepts v when it is finite and not below the device's last
+// accepted value, advancing the baseline only then.
+func admitMonotonic(last map[string]float64, device string, v float64) bool {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return false
+	}
+	if prev, ok := last[device]; ok && v < prev {
+		return false
+	}
+	last[device] = v
+	return true
 }
 
 // activePowerFromWatts encodes a watt value as a SunSpec ActivePower,

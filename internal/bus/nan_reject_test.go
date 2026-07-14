@@ -93,6 +93,11 @@ func TestFiniteRejectsSlippedThroughNaN(t *testing.T) {
 		{"Measurement/W=NaN", Measurement{Device: "d0", W: &nan, Ts: 1}, "w"},
 		{"Measurement/VoltageV=+Inf", Measurement{Device: "d0", VoltageV: &posInf, Ts: 1}, "voltage_v"},
 		{"Measurement/Hz=-Inf", Measurement{Device: "d0", Hz: &negInf, Ts: 1}, "hz"},
+		{"Measurement/VarW=NaN", Measurement{Device: "d0", VarW: &nan, Ts: 1}, "var_w"},
+		{"Measurement/VA=+Inf", Measurement{Device: "d0", VA: &posInf, Ts: 1}, "va"},
+		{"Measurement/PF=NaN", Measurement{Device: "d0", PF: &nan, Ts: 1}, "pf"},
+		{"Measurement/WhImpTotal=-Inf", Measurement{Device: "d0", WhImpTotal: &negInf, Ts: 1}, "wh_imp_total"},
+		{"Measurement/WhExpTotal=NaN", Measurement{Device: "d0", WhExpTotal: &nan, Ts: 1}, "wh_exp_total"},
 		{"BattMetrics/SOC=NaN", BattMetrics{Device: "b0", SOC: &nan, Ts: 1}, "soc_pct"},
 		{"BattMetrics/MaxChargeW=+Inf", BattMetrics{Device: "b0", MaxChargeW: &posInf, Ts: 1}, "max_charge_w"},
 		{"EVSEState/PowerW=NaN", EVSEState{StationID: "e0", PowerW: &nan, Ts: 1}, "power_w"},
@@ -126,6 +131,17 @@ func TestFiniteAcceptsNilAndValidFields(t *testing.T) {
 	}
 	if err := (Measurement{Device: "d0", W: &w, Ts: 1}).Finite(); err != nil {
 		t.Errorf("Finite() on valid Measurement = %v, want nil", err)
+	}
+	varW, va, pf, whImp, whExp := 120.0, 4600.0, 0.98, 1.25e7, 3.4e6
+	opSt, connSt := uint16(1), uint16(1)
+	alrm := uint32(0)
+	full := Measurement{
+		Device: "d0", W: &w, VarW: &varW, VA: &va, PF: &pf,
+		OpState: &opSt, ConnState: &connSt, AlarmBits: &alrm,
+		WhImpTotal: &whImp, WhExpTotal: &whExp, Ts: 1,
+	}
+	if err := full.Finite(); err != nil {
+		t.Errorf("Finite() on fully-populated valid Measurement (WP-2 fields) = %v, want nil", err)
 	}
 	if err := (BattMetrics{Device: "b0", Ts: 1}).Finite(); err != nil {
 		t.Errorf("Finite() on all-nil BattMetrics = %v, want nil", err)

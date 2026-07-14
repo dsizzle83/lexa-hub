@@ -99,7 +99,10 @@ func (m *Meter) Close() error { return m.transport.Close() }
 //   - W: net real power (positive = importing, negative = exporting)
 //   - V: Phase A L-N voltage (volts)
 //   - Hz: AC frequency (Hz)
-//   - VA, Var, PF: power quality (where available)
+//   - VA, Var, PF: power quality (where available; NaN when the model/device
+//     doesn't report it)
+//   - WhImpTotal, WhExpTotal: lifetime energy accumulators (Wh), models
+//     201/203 (WP-2); NaN when absent
 //   - DCV, DCW: always 0 (meters have no DC side)
 //   - TmpCab: always NaN (meters don't report temperature)
 func (m *Meter) ReadMeasurements() (device.Measurements, error) {
@@ -137,10 +140,21 @@ func parseMeterModel(regs []uint16, modelID uint16) device.Measurements {
 	}
 	sf := func(offset int) int16 { return int16(get(offset)) }
 
-	meas := device.Measurements{TmpCab: math.NaN()}
+	// Fields the model/device may not report start NaN (the absent-value
+	// convention, matching derbase's parse paths) so cmd/modbus never
+	// publishes a fabricated zero for them (G27). W/V/Hz keep their
+	// long-standing zero-default behavior — every 20x model carries them.
+	meas := device.Measurements{
+		TmpCab: math.NaN(), SOC: math.NaN(),
+		VA: math.NaN(), Var: math.NaN(), PF: math.NaN(),
+		WhImpTotal: math.NaN(), WhExpTotal: math.NaN(),
+	}
 
-	// Select per-model register offsets.
-	type offsets struct{ w, wSF, v, vSF, hz, hzSF, va, vaSF, varr, varrSF, pf, pfSF int }
+	// Select per-model register offsets. -1 = not parsed for that model.
+	type offsets struct {
+		w, wSF, v, vSF, hz, hzSF, va, vaSF, varr, varrSF, pf, pfSF int
+		whImp, whExp, whSF                                         int
+	}
 	var o offsets
 	switch modelID {
 	case sunspec.ModelMeterSinglePh: // 201
@@ -151,6 +165,7 @@ func parseMeterModel(regs []uint16, modelID uint16) device.Measurements {
 			va: sunspec.M201_VA, vaSF: sunspec.M201_VA_SF,
 			varr: sunspec.M201_VAR, varrSF: sunspec.M201_VAR_SF,
 			pf: sunspec.M201_PF, pfSF: sunspec.M201_PF_SF,
+			whImp: sunspec.M201_TotWhImp, whExp: sunspec.M201_TotWhExp, whSF: sunspec.M201_TotWh_SF,
 		}
 	case sunspec.ModelMeterSplitPh: // 202
 		o = offsets{
@@ -159,6 +174,7 @@ func parseMeterModel(regs []uint16, modelID uint16) device.Measurements {
 			hz: sunspec.M202_Hz, hzSF: sunspec.M202_Hz_SF,
 			// 202 does not have per-total VA/VAR/PF at these offsets in this impl
 			va: -1, varr: -1, pf: -1,
+			whImp: -1, whExp: -1,
 		}
 	case sunspec.ModelMeterThreePh: // 203
 		o = offsets{
@@ -168,6 +184,10 @@ func parseMeterModel(regs []uint16, modelID uint16) device.Measurements {
 			va: sunspec.M203_VA, vaSF: sunspec.M203_VA_SF,
 			varr: sunspec.M203_VAR, varrSF: sunspec.M203_VAR_SF,
 			pf: sunspec.M203_PF, pfSF: sunspec.M203_PF_SF,
+			// 203 shares the M201 common-meter offsets (models.go declares the
+			// TotWh points once, on the M201 block, per its "same common-meter
+			// offsets as M201" note).
+			whImp: sunspec.M201_TotWhImp, whExp: sunspec.M201_TotWhExp, whSF: sunspec.M201_TotWh_SF,
 		}
 	default:
 		return meas
@@ -192,5 +212,29 @@ func parseMeterModel(regs []uint16, modelID uint16) device.Measurements {
 		// SunSpec PF stored ×100; divide back to get [-1, +1].
 		meas.PF = sunspec.ApplyScaleSigned(get(o.pf), sf(o.pfSF)) / 100.0
 	}
+	if o.whImp >= 0 && len(regs) > o.whSF {
+		meas.WhImpTotal = accEnergy(regs, o.whImp, sf(o.whSF))
+		meas.WhExpTotal = accEnergy(regs, o.whExp, sf(o.whSF))
+	}
 	return meas
+}
+
+// accEnergy decodes a SunSpec acc32 energy accumulator (two registers,
+// big-endian high word first — the same assembly as sunspec.View's rawU32)
+// at offset o and applies the TotWh scale factor. It returns NaN — the
+// absent-value convention — when the accumulator reads 0 (acc32's
+// not-implemented sentinel is 0, not 0xFFFFFFFF; a device that has genuinely
+// accumulated zero energy is indistinguishable and withheld the same way,
+// G27) or when sf is the sunssf not-implemented sentinel
+// (sunspec.ApplyScaleUint returns NaN for it, reused here via a raw of 1 so
+// the sentinel logic stays single-sourced).
+func accEnergy(regs []uint16, o int, sf int16) float64 {
+	if o+1 >= len(regs) {
+		return math.NaN()
+	}
+	raw := uint32(regs[o])<<16 | uint32(regs[o+1])
+	if raw == 0 {
+		return math.NaN()
+	}
+	return float64(raw) * sunspec.ApplyScaleUint(1, sf)
 }
