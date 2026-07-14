@@ -157,6 +157,14 @@ topic read lexa/evse/+/state
 topic read lexa/northbound/schedule
 # bus.TopicCSIPPricing (retained).
 topic read lexa/csip/pricing
+# bus.TopicOpenADRPrices (retained) (WP-15 hub-adoption slice) — D9 price
+# precedence (CSIP tariff > OpenADR CP prices > app/cloud tariff intent,
+# cmd/hub/openadr_adopt.go); lexa-openadr is the writer (see its stanza).
+topic read lexa/openadr/prices
+# bus.TopicOpenADRLimits (retained) (WP-15 hub-adoption slice) — merged into
+# GridState most-restrictive-with-CSIP (D9, cmd/hub/state.go); lexa-openadr
+# is the writer (see its stanza).
+topic read lexa/openadr/limits
 # bus.TopicIntentMode (retained) (TASK-082) — unit 3.3 hub intent adopter
 # subscribes this kind explicitly (no lexa/intent/+ wildcard — topics.go's
 # design rule, kept exact here too); lexa-cloudlink (unit 2.4) and lexa-api
@@ -286,6 +294,9 @@ topic read lexa/ocpp/pending
 # /devices/evse/{id}/pairing publishes installer approve/deny decisions;
 # lexa-ocpp's pairing gate is the SOLE reader (see its stanza).
 topic write lexa/ocpp/pairing
+# bus.TopicOpenADRStatus (retained) (WP-15 hub-adoption slice) — VEN health
+# projection onto GET /status; lexa-openadr is the writer (see its stanza).
+topic read lexa/openadr/status
 
 user lexa-cloudlink
 # bus.SubMeasurements (TASK-082) — unit 2.2 uplink collector, telemetry
@@ -346,15 +357,15 @@ topic write lexa/cloudlink/status
 
 user lexa-openadr
 # bus.TopicOpenADRPrices (retained) (WP-15) — translated CP-profile price
-# series (PRICE/EXPORT_PRICE/GHG/ALERT_*); the cmd/hub adoption slice (after
-# WP-11) is the future reader — its matching hub read grant lands with that
-# slice, not here.
+# series (PRICE/EXPORT_PRICE/GHG/ALERT_*); cmd/hub's adoption slice
+# (cmd/hub/openadr_adopt.go) is the reader — see its matching read grant in
+# the lexa-hub stanza above.
 topic write lexa/openadr/prices
 # bus.TopicOpenADRLimits (retained) (WP-15) — most-restrictive
-# IMPORT/EXPORT_CAPACITY_LIMIT caps in watts; same future hub reader.
+# IMPORT/EXPORT_CAPACITY_LIMIT caps in watts; same cmd/hub reader.
 topic write lexa/openadr/limits
 # bus.TopicOpenADRStatus (retained) (WP-15) — VEN health doc; lexa-api's
-# /status projection is the future reader (read grant lands with it).
+# /status projection is the reader (see its matching read grant).
 topic write lexa/openadr/status
 # bus.SubMeasurements (WP-15) — TELEMETRY_USAGE report source (E1).
 topic read lexa/measurements/+

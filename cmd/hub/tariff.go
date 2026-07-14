@@ -13,6 +13,15 @@ package main
 // compileTariff is a pure function: it performs no I/O and touches no engine
 // state, so unit 3.3 and its tests can call it freely.
 //
+// D9 precedence (docs/standards-buildout/architecture.md, WP-15): CSIP tariff
+// (the §10.5 walk, lexa/csip/pricing → Engine.SetPrices) sits above OpenADR CP
+// prices (lexa/openadr/prices), which sit above this file's app/cloud tariff
+// intent (SetFallbackTOU) — the lowest tier. The SetPrices-vs-SetFallbackTOU
+// split described above already models "the higher tier wins when present,
+// the lower tier only fills what it left empty"; OpenADR slots into that same
+// two-seam surface rather than a third seam of its own — see
+// cmd/hub/openadr_adopt.go's openADRAdopter doc for exactly how.
+//
 // Zone discipline: the compiled TOUCostModel evaluates its hour boundaries via
 // t.Hour() in whatever time.Location the caller's time carries — i.e. the SOM
 // process zone — exactly like DefaultTOUCostModel and the planner. This file

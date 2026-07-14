@@ -221,6 +221,21 @@ type MQTTSystemReader struct {
 	// stale-adoption check and the control topic's decode-error handler in
 	// main.go, via RequestRewalk) — see requestRewalkLocked's doc.
 	lastRewalkPublish time.Time
+
+	// openADRLimits/openADRBindImport/openADRBindExport/
+	// openADRLimitsExpiredLogged back the WP-15 hub-adoption slice
+	// (openadr_adopt.go, D9): onOpenADRLimits stores the latest retained
+	// lexa/openadr/limits doc; mergeOpenADRLimitsLocked (called from
+	// ReadSystemState below) folds it into GridState and records, per axis,
+	// whether OpenADR alone is the binding cap this tick (read back via
+	// OpenADRBoundAxis for the CannotComply gate in main.go's planObserver).
+	// Zero value ("have" false) is exactly "no OpenADR limit adopted" —
+	// harmless when the openadr_adopt config gate leaves this subscription
+	// unwired.
+	openADRLimits              openADRLimitsSnapshot
+	openADRBindImport          bool
+	openADRBindExport          bool
+	openADRLimitsExpiredLogged bool
 }
 
 // rewalkRateLimit bounds how often the hub may publish bus.TopicCSIPRewalk
@@ -757,6 +772,13 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 			}
 		}
 	}
+
+	// WP-15 hub-adoption slice (D9): fold the adopted OpenADR capacity
+	// limits into Grid.Import/ExportLimitW. The most-restrictive-with-CSIP
+	// merge comes for free from the EXISTING deriveGridConstraints nanMin
+	// (internal/orchestrator/optimizer.go, unchanged) — see
+	// mergeOpenADRLimitsLocked's doc in openadr_adopt.go.
+	r.mergeOpenADRLimitsLocked(&state.Grid, now)
 
 	// TASK-037: edge-triggered local (wall-clock) step detection/logging, like
 	// noteStaleness above. This is purely observability — utility-time

@@ -285,6 +285,29 @@ type Config struct {
 	// common inverters+batteries case. Values outside 1..255 are a fatal
 	// config error, not a silent clamp.
 	DERType int `json:"der_type,omitempty"`
+
+	// OpenADRAdopt gates the WP-15 hub-adoption slice (cmd/hub/openadr_adopt.go,
+	// architecture.md §3's table): whether the hub subscribes to the retained
+	// lexa/openadr/prices and lexa/openadr/limits documents at all. Default
+	// true — adopting a retained doc is passive consumption (no egress, no
+	// hardware write of its own) and lexa-openadr ships uncommissioned
+	// (vtn_url == "" ⇒ it never publishes anything), so leaving this on by
+	// default costs nothing on a site with no VTN configured. A *bool (not a
+	// plain bool) so loadConfig can tell "key absent" (⇒ true) from
+	// "explicitly false" — mirrors bus.TariffSpec's *float64 fields
+	// (cmd/hub/tariff.go), not the enforce_aus_limits/constraint_shadow
+	// default-false bools above.
+	OpenADRAdopt *bool `json:"openadr_adopt,omitempty"`
+
+	// OpenADRPriceMaxAgeS bounds (in seconds) how old an adopted
+	// lexa/openadr/prices document's top-level Ts may be at ADOPTION time
+	// before the hub skips it (TASK-042 pattern, D9): a price SERIES carries
+	// no expiry of its own (unlike lexa/openadr/limits' ValidUntil), so
+	// staleness can only be judged against the publish time. Stale ⇒ WARN +
+	// skip, never fabricate/adopt. 0/absent defaults to 3600 in loadConfig
+	// (an hour — generous relative to lexa-openadr's poll_interval_s default
+	// of 60, comfortably below "this VEN has gone dark").
+	OpenADRPriceMaxAgeS int `json:"openadr_price_max_age_s"`
 }
 
 // ConstraintMode is one FIX-F constraint's per-axis operating mode.
@@ -448,6 +471,16 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.DERType < 0 || cfg.DERType > 255 {
 		return nil, fmt.Errorf("invalid der_type %d: want 0 (derive) or a 2030.5 DERType code 1..255", cfg.DERType)
 	}
+	// openadr_adopt (WP-15 hub-adoption slice): absent key ⇒ true (see the
+	// field doc — a *bool, not a plain bool, precisely so this default can be
+	// true without losing the ability to explicitly opt out).
+	if cfg.OpenADRAdopt == nil {
+		on := true
+		cfg.OpenADRAdopt = &on
+	}
+	if cfg.OpenADRPriceMaxAgeS <= 0 {
+		cfg.OpenADRPriceMaxAgeS = 3600
+	}
 	// advanced_der (WP-9): empty ⇒ "off"; anything else unknown is a FATAL
 	// config error, not a silent fallback — same discipline as mode above.
 	if cfg.AdvancedDER == "" {
@@ -580,4 +613,19 @@ func (c *Config) RetainedAdoptionMaxAge() time.Duration {
 // newLogEventDetector (WP-6).
 func (c *Config) LogEventMinInterval() time.Duration {
 	return time.Duration(c.LogEventMinIntervalS) * time.Second
+}
+
+// OpenADRAdoptEnabled reports whether the hub should subscribe to
+// lexa/openadr/prices and lexa/openadr/limits at all (WP-15 hub-adoption
+// slice). loadConfig always leaves OpenADRAdopt non-nil (defaulting absent to
+// true), so this is never called before that default is applied; the nil
+// check is defensive only (mirrors the *bool field's own doc).
+func (c *Config) OpenADRAdoptEnabled() bool {
+	return c.OpenADRAdopt == nil || *c.OpenADRAdopt
+}
+
+// OpenADRPriceMaxAge is OpenADRPriceMaxAgeS as a time.Duration, for
+// newOpenADRAdopter (openadr_adopt.go).
+func (c *Config) OpenADRPriceMaxAge() time.Duration {
+	return time.Duration(c.OpenADRPriceMaxAgeS) * time.Second
 }

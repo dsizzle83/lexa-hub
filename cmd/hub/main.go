@@ -13,6 +13,10 @@
 //	lexa/evse/+/state         → MQTTSystemReader (EVSE connector state)
 //	lexa/northbound/schedule  → Engine.SetDERConstraints (24h DER envelope)
 //	lexa/csip/pricing         → Engine.SetPrices (TOU import/export rates)
+//	lexa/openadr/prices      → Engine.SetPrices (WP-15, D9: below CSIP, above
+//	                            app/cloud tariff intent — openadr_adopt.go)
+//	lexa/openadr/limits      → MQTTSystemReader (WP-15, D9: most-restrictive
+//	                            merge with CSIP into GridState)
 //	                                      ↓
 //	                      DailyPlanner.Plan (24h DP, every 15 min)
 //	                      + Optimizer.Optimize (reactive rules, every 15 s)
@@ -605,6 +609,12 @@ func main() {
 	// needed even though it is closed over here.
 	var planLogPending *mqttutil.PendingPub
 
+	// openADRGateWasActive edge-tracks the WP-15 CannotComply gate below (D9's
+	// last bullet) so its WARN log fires once per transition, not every tick a
+	// gated breach persists — same single-writer-closure reasoning as
+	// planLogPending above.
+	var openADRGateWasActive bool
+
 	// Plan-log enrichment seams (Unit 3.6). planObserver is defined here, before
 	// modeMgr/eng exist, so it reaches them through these function values —
 	// harmless no-op defaults until they are wired to modeMgr.Mode /
@@ -757,7 +767,28 @@ func main() {
 		// semantics (onset / new-mRID re-alert / clear) and the Safety-plan guard
 		// (a safety plan's nil Breach is "not assessed", never a clear edge).
 		// lexa_hub_breach_active is updated inside emitAlerts on every pass.
-		emitAlerts(episodes.OnPlan(plan, time.Now()))
+		//
+		// WP-15 hub-adoption slice (D9's last bullet): a breach bound SOLELY by
+		// an OpenADR-tighter capacity limit must never produce a 2030.5
+		// CannotComply — reader.OpenADRBoundAxis reports that per axis from this
+		// SAME tick's ReadSystemState pass (see openadr_adopt.go). Only the
+		// optimizer's meter-level plan.Breach is gated here; breach.go itself is
+		// untouched, and the reconciler's device-level NonConverged evidence
+		// (fed separately via OnReport) is NOT gated — see openadr_adopt.go's
+		// OpenADRBoundAxis doc and this task's report for why that path is left
+		// as attribute-and-document rather than a clean gate.
+		breachForEpisodes := plan
+		if plan.Breach != nil && reader.OpenADRBoundAxis(plan.Breach.LimitType) {
+			if !openADRGateWasActive {
+				openADRGateWasActive = true
+				slog.Warn("lexa-hub: breach bound solely by an OpenADR capacity limit — suppressing CannotComply episode evidence (CSIP is not the binding cap; OpenADR opt-out reporting owns this)",
+					"limit_type", plan.Breach.LimitType, "limit_w", plan.Breach.LimitW, "measured_w", plan.Breach.MeasuredW)
+			}
+			breachForEpisodes.Breach = nil
+		} else {
+			openADRGateWasActive = false
+		}
+		emitAlerts(episodes.OnPlan(breachForEpisodes, time.Now()))
 	}
 
 	// Unit 3.4 (§3.5): the mode manager is the runtime switch between the two
@@ -929,14 +960,41 @@ func main() {
 		}
 	}
 
+	// WP-15 hub-adoption slice (D9 price precedence: CSIP tariff > OpenADR CP
+	// prices > app/cloud tariff intent — cmd/hub/openadr_adopt.go). Built
+	// unconditionally (cheap) so the CSIP handler below can always mark it;
+	// only the lexa/openadr/* SUBSCRIPTIONS are gated on openadr_adopt.
+	openadr := newOpenADRAdopter(cfg.OpenADRPriceMaxAge())
+
 	// Subscribe to live pricing → extract per-step prices for planner.
 	if err := mqttutil.Subscribe(mc, bus.TopicCSIPPricing, func(_ string, pricing bus.PricingUpdate) {
 		imp, exp := pricesFromPricingUpdate(pricing, time.Now())
 		if imp != nil {
+			openadr.MarkCSIPPriceSeen() // D9: CSIP wins outright and keeps winning
 			eng.SetPrices(imp, exp)
 		}
 	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe csip pricing: %v", err)
+	}
+
+	// WP-15 hub-adoption slice: lexa/openadr/prices and lexa/openadr/limits.
+	// Gated on openadr_adopt (default true; a config-level off-switch, not a
+	// safety concern — adopting a retained doc is passive consumption and
+	// lexa-openadr ships uncommissioned) — mirrors the `if adv != nil` gating
+	// pattern just above for the WP-9 curves subscription.
+	if cfg.OpenADRAdoptEnabled() {
+		if err := mqttutil.Subscribe(mc, bus.TopicOpenADRPrices, func(_ string, msg bus.OpenADRPrices) {
+			if imp, exp, ok := openadr.AdoptPrices(msg, time.Now()); ok {
+				eng.SetPrices(imp, exp)
+			}
+		}); err != nil {
+			log.Fatalf("lexa-hub: subscribe openadr prices: %v", err)
+		}
+		if err := mqttutil.Subscribe(mc, bus.TopicOpenADRLimits, func(topic string, msg bus.OpenADRLimits) {
+			reader.onOpenADRLimits(topic, msg)
+		}); err != nil {
+			log.Fatalf("lexa-hub: subscribe openadr limits: %v", err)
+		}
 	}
 
 	// Intent adoption layer (Unit 3.3, TASK-082/DEVICE_ROADMAP.md §3.1): seven
