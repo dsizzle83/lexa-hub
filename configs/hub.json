@@ -8,6 +8,7 @@
   "engine_interval_s": 15,
   "debug": false,
   "enforce_aus_limits": false,
+  "ev_storage": false,
   "constraint_shadow": false,
   "constraint_modes": {
     "export": "off",

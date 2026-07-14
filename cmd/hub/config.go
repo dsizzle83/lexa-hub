@@ -138,6 +138,18 @@ type Config struct {
 	// ≥1 week bench shadow before any default-flip proposal.
 	EnforceAusLimits bool `json:"enforce_aus_limits"`
 
+	// EVStorage gates the D8/WP-14 planner EV-storage discharge term:
+	// off (default) ⇒ the DP's EV action space stays charge-only/
+	// non-negative exactly as before this WP, so plan output is
+	// byte-identical (orchestrator.PlannerParams.EVStorage's doc pins the
+	// exact contract); on ⇒ the EV becomes a bidirectional (V2G) DP asset
+	// honoring EVGoal departure/target SOC/capacity like the battery, and
+	// an EVGoal-stated capacity can seed the asset even without a static
+	// "planner.ev_capacity_kwh". Actuation stays charge-only regardless —
+	// cmd/ocpp's mqttBridge.Apply clamps any discharge setpoint to 0 A
+	// (suspend) until a V2X hardware path exists.
+	EVStorage bool `json:"ev_storage"`
+
 	// ConstraintShadow enables the observe-only constraint-stack shadow harness
 	// (TASK-059): every economic tick runs the candidate constraint Stack
 	// ALONGSIDE the authoritative DefaultOptimizer, diffs their final per-device

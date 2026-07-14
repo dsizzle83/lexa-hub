@@ -766,11 +766,28 @@ func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSESta
 	evCmds := 0
 	for _, ev := range evses {
 		if ev.Connected && ev.SessionActive {
-			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+			cmd := EVSECommand{
 				StationID:   ev.StationID,
 				ConnectorID: ev.ConnectorID,
 				MaxCurrentA: target.EVMaxCurrentA,
-			})
+			}
+			// D8/WP-14: a genuine discharge target (positive W, battery
+			// convention) from an ev_storage-enabled plan switches the
+			// command to setpoint mode. target.EVSetpointW can only be
+			// positive when PlannerParams.EVStorage was true when this
+			// plan was built (planner.go's PlanInterval.EVSetpointW doc),
+			// so this is unreachable — and MaxCurrentA is used exactly as
+			// before — whenever the flag is off. MaxCurrentA is zeroed
+			// here to avoid publishing a stale ceiling value alongside a
+			// setpoint the desired-doc/OCPP-bridge layer will treat as
+			// authoritative instead (EVSECommand.SetpointW's doc: "nil ⇒
+			// ceiling mode; non-nil ⇒ MaxCurrentA ignored downstream").
+			if !math.IsNaN(target.EVSetpointW) && target.EVSetpointW > 0 {
+				w := target.EVSetpointW
+				cmd.SetpointW = &w
+				cmd.MaxCurrentA = 0
+			}
+			plan.EVSECommands = append(plan.EVSECommands, cmd)
 			evCmds++
 		}
 	}

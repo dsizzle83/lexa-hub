@@ -53,6 +53,17 @@ type EVGoal struct {
 	// InitialSocKwh is the user's stated pack energy at plug-in (kWh). Negative
 	// means "not stated" — the live EVSE SOC (if any) is used instead.
 	InitialSocKwh float64
+
+	// CapacityKwh is the user/app-stated vehicle pack capacity (kWh). 0 means
+	// "not stated". Completes the plumb cmd/hub/intent.go's applyEVGoal
+	// previously left validation-only (D8/WP-14): when the Engine's
+	// ev_storage flag is on and hub.json has no static
+	// "planner.ev_capacity_kwh", buildPlannerParams uses this to seed
+	// PlannerParams.EVCapacityKwh so a goal arriving before any static
+	// config exists still models the asset. Ignored (never read) while
+	// ev_storage is off — that flag's whole contract is "off ⇒ byte-
+	// identical to before this field existed".
+	CapacityKwh float64
 }
 
 // ExternalForecast is a solar-generation forecast supplied from outside the box
@@ -123,6 +134,13 @@ type Engine struct {
 	// Daily planner — produces 24-hour cost-optimal dispatch plans.
 	planner    *DailyPlanner
 	plannerCfg PlannerCfg
+
+	// evStorage is hub.json's `ev_storage` flag (D8/WP-14), set once at
+	// construction (New) and read-only thereafter — same immutable-at-
+	// construction shape as Debug. buildPlannerParams copies it onto every
+	// PlannerParams.EVStorage and gates the EVGoal.CapacityKwh fallback
+	// (see EVGoal's doc). Default false ⇒ zero behavior change.
+	evStorage bool
 
 	plannerWake chan struct{} // buffered(1): signals the planner goroutine
 
@@ -237,6 +255,12 @@ type Config struct {
 	// computed (before actuation). Used by cmd/hub to forward compliance
 	// breaches to the northbound service. Must not block.
 	PlanObserver func(Plan)
+	// EVStorage is hub.json's `ev_storage` flag (D8/WP-14): lets the EV
+	// asset discharge (V2G) within the daily planner's DP and honor an
+	// EVGoal-stated capacity even without static planner config. Default
+	// false — see PlannerParams.EVStorage's doc for the byte-identical
+	// contract this gates.
+	EVStorage bool
 }
 
 // New creates an Engine.  Call RegisterBatteryActuator, RegisterSolarActuator,
@@ -254,6 +278,7 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 		cmdCh:          make(chan engineCmd, 16),
 		planner:        NewDailyPlanner(),
 		plannerCfg:     cfg.Planner,
+		evStorage:      cfg.EVStorage,
 		plannerWake:    make(chan struct{}, 1),
 		planObserver:   cfg.PlanObserver,
 		Debug:          cfg.Debug,
@@ -678,6 +703,7 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 		ImportPricePerKwh: inp.importPrices,
 		ExportPricePerKwh: inp.exportPrices,
 		SOCStepKwh:        cfg.SOCStepKwh,
+		EVStorage:         e.evStorage,
 	}
 
 	// Solar forecast: a clear-sky diurnal bell curve scaled to a peak estimate,
@@ -764,9 +790,23 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 		break // use first connected battery
 	}
 
-	// EV: config capacity + live SOC from EVSE state.
-	if cfg.EVCapacityKwh > 0 {
-		p.EVCapacityKwh = cfg.EVCapacityKwh
+	// EV: config capacity + live SOC from EVSE state. WP-14 completes the
+	// EVGoal.CapacityKwh plumb (cmd/hub/intent.go's applyEVGoal previously
+	// left it validation-only): when ev_storage is on and hub.json has no
+	// static "planner.ev_capacity_kwh", an app/cloud-stated goal capacity
+	// seeds the asset itself. Gated to e.evStorage so the flag-off path
+	// (every deployment before this WP, and any deployment with the flag
+	// left at its default) never consults inp.evGoal.CapacityKwh at all —
+	// a plain evgoal intent under a static-capacity-less config behaves
+	// exactly as it always has (silently un-modelled).
+	evCapKwh := cfg.EVCapacityKwh
+	if e.evStorage {
+		if g := inp.evGoal; g != nil && g.CapacityKwh > 0 && evCapKwh <= 0 {
+			evCapKwh = g.CapacityKwh
+		}
+	}
+	if evCapKwh > 0 {
+		p.EVCapacityKwh = evCapKwh
 		p.EVMaxChargeKw = cfg.EVMaxChargeKw
 		p.EVEfficiency = cfg.EVEfficiency
 		p.EVVoltageV = cfg.EVVoltageV
@@ -776,7 +816,7 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 		// Pick live EV SOC if an active session is present.
 		for _, ev := range state.EVSEs {
 			if ev.SessionActive && !math.IsNaN(ev.SOC) {
-				p.InitialEVSocKwh = ev.SOC / 100 * cfg.EVCapacityKwh
+				p.InitialEVSocKwh = ev.SOC / 100 * evCapKwh
 				if cfg.EVMaxChargeKw == 0 && ev.MaxCurrentA > 0 {
 					p.EVMaxChargeKw = ev.MaxCurrentA * p.EVVoltageV / 1000
 				}
@@ -784,7 +824,7 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 		}
 		// Target SOC and departure time.
 		if cfg.EVTargetSocPct > 0 {
-			p.EVTargetSocKwh = cfg.EVTargetSocPct / 100 * cfg.EVCapacityKwh
+			p.EVTargetSocKwh = cfg.EVTargetSocPct / 100 * evCapKwh
 			if cfg.EVDepartureHH > 0 || cfg.EVDepartureMM > 0 {
 				p.EVDepartureUnix = nextDailyOccurrence(now, cfg.EVDepartureHH, cfg.EVDepartureMM).Unix()
 			}

@@ -523,7 +523,7 @@ func TestBridge_ApplyDispatchesPerProto(t *testing.T) {
 
 	// 1.6 station: connect tags it, Apply routes to the 1.6 sender.
 	bridge.onConnect16(newFakeCPConn("cp-16", "10.0.0.11:9000"))
-	if err := bridge.Apply("cp-16", 0, 12); err != nil {
+	if err := bridge.Apply("cp-16", 0, 12, nil); err != nil {
 		t.Fatalf("Apply on 1.6 station: %v", err)
 	}
 	calls := fake.spCalls()
@@ -557,7 +557,7 @@ func TestBridge_ApplyDispatchesPerProto(t *testing.T) {
 	// 2.0.1 station: Apply must go down the 2.0.1 path (which errors here —
 	// the test CSMS is never started) and must NOT touch the 1.6 sender.
 	bridge.onConnect(newFakeCSConn("cs-201", "10.0.0.12:9000"))
-	err := bridge.Apply("cs-201", 0, 12)
+	err := bridge.Apply("cs-201", 0, 12, nil)
 	if err == nil {
 		t.Fatal("Apply on a 2.0.1 station against a never-started CSMS should error (proves 2.0.1 routing)")
 	}
@@ -570,7 +570,7 @@ func TestBridge_ApplyDispatchesPerProto(t *testing.T) {
 
 	// Disconnected 1.6 station: silent no-op, no send.
 	bridge.onDisconnect16(newFakeCPConn("cp-16", "10.0.0.11:9000"))
-	if err := bridge.Apply("cp-16", 0, 8); err != nil {
+	if err := bridge.Apply("cp-16", 0, 8, nil); err != nil {
 		t.Fatalf("Apply on disconnected 1.6 station must be a silent no-op, got %v", err)
 	}
 	if len(fake.spCalls()) != 1 {
@@ -587,7 +587,7 @@ func TestBridge16_ApplyRejectedIsError(t *testing.T) {
 	fake.mu.Lock()
 	fake.status = smartcharging16.ChargingProfileStatusRejected
 	fake.mu.Unlock()
-	err := bridge.Apply("cp-16", 0, 12)
+	err := bridge.Apply("cp-16", 0, 12, nil)
 	if err == nil {
 		t.Fatal("rejected 1.6 profile must be an error, not success (L11)")
 	}
@@ -600,8 +600,96 @@ func TestBridge16_ApplyRejectedIsError(t *testing.T) {
 	fake.status = ""
 	fake.cbErr = errors.New("boom")
 	fake.mu.Unlock()
-	if err := bridge.Apply("cp-16", 0, 12); err == nil || !strings.Contains(err.Error(), "boom") {
+	if err := bridge.Apply("cp-16", 0, 12, nil); err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Errorf("transport error must surface, got: %v", err)
+	}
+}
+
+// ── D8/WP-14: setpoint-mode Apply — the greppable discharge clamp ────────────
+
+// TestBridge_Apply_DischargeSetpointClampsToZero is the bridge clamp test the
+// WP-14 acceptance gate calls for: a genuine discharge setpoint (positive W,
+// battery convention) has no SetChargingProfile equivalent, so Apply must
+// send 0 A (suspend), never a negative limit.
+func TestBridge_Apply_DischargeSetpointClampsToZero(t *testing.T) {
+	bridge, fake, _ := newBridge16ForTest(t, []StationConfig{{ID: "cp-16", MaxCurrentA: 32, VoltageV: 230}})
+	bridge.onConnect16(newFakeCPConn("cp-16", "10.0.0.20:9000"))
+
+	discharge := 4600.0 // + = discharge (battery convention)
+	if err := bridge.Apply("cp-16", 0, 12, &discharge); err != nil {
+		t.Fatalf("Apply with discharge setpoint: %v", err)
+	}
+	calls := fake.spCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly one SetChargingProfile, got %d", len(calls))
+	}
+	if lim := calls[0].profile.ChargingSchedule.ChargingSchedulePeriod[0].Limit; lim != 0 {
+		t.Errorf("discharge setpoint must clamp to 0A (charge-only actuation, D8/WP-14), got %v", lim)
+	}
+}
+
+// TestBridge_Apply_ChargeSetpointConvertsWtoA: a charge setpoint (negative W)
+// converts to a positive amp ceiling at the station's voltage and flows
+// through exactly like today's MaxCurrentA limits — no clamp, no log.
+func TestBridge_Apply_ChargeSetpointConvertsWtoA(t *testing.T) {
+	bridge, fake, _ := newBridge16ForTest(t, []StationConfig{{ID: "cp-16", MaxCurrentA: 32, VoltageV: 230}})
+	bridge.onConnect16(newFakeCPConn("cp-16", "10.0.0.21:9000"))
+
+	charge := -2300.0 // − = charge; 2300W / 230V = 10A
+	if err := bridge.Apply("cp-16", 0, 12, &charge); err != nil {
+		t.Fatalf("Apply with charge setpoint: %v", err)
+	}
+	calls := fake.spCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly one SetChargingProfile, got %d", len(calls))
+	}
+	if lim := calls[0].profile.ChargingSchedule.ChargingSchedulePeriod[0].Limit; lim != 10 {
+		t.Errorf("charge setpoint conversion = %v, want 10A (2300W/230V)", lim)
+	}
+}
+
+// TestBridge_Apply_NilSetpointUsesLimitAUnchanged pins the flag-off/ceiling-
+// mode contract at the bridge layer: a nil setpointW (every deployment
+// before D8/WP-14, and every ceiling-mode command since) must send limitA
+// verbatim — Apply's new setpoint branch is provably inert.
+func TestBridge_Apply_NilSetpointUsesLimitAUnchanged(t *testing.T) {
+	bridge, fake, _ := newBridge16ForTest(t, []StationConfig{{ID: "cp-16", MaxCurrentA: 32, VoltageV: 230}})
+	bridge.onConnect16(newFakeCPConn("cp-16", "10.0.0.22:9000"))
+
+	if err := bridge.Apply("cp-16", 0, 16, nil); err != nil {
+		t.Fatalf("Apply with nil setpoint: %v", err)
+	}
+	calls := fake.spCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly one SetChargingProfile, got %d", len(calls))
+	}
+	if lim := calls[0].profile.ChargingSchedule.ChargingSchedulePeriod[0].Limit; lim != 16 {
+		t.Errorf("nil setpoint must pass limitA through verbatim, got %v want 16", lim)
+	}
+}
+
+// TestEvseChargeAmpsFromSetpoint pins the pure W→A conversion (D8/WP-14):
+// charge (negative W) → positive A; discharge (positive W) → negative A
+// (the caller's job to clamp — see the bridge tests above); a non-positive
+// voltage falls back to the package's 230V station default.
+func TestEvseChargeAmpsFromSetpoint(t *testing.T) {
+	cases := []struct {
+		name             string
+		setpointW, voltV float64
+		want             float64
+	}{
+		{"charge_2300W_230V", -2300, 230, 10},
+		{"discharge_2300W_230V", 2300, 230, -10},
+		{"idle", 0, 230, 0},
+		{"zero_voltage_falls_back_to_230", -2300, 0, 10},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := evseChargeAmpsFromSetpoint(tc.setpointW, tc.voltV)
+			if got != tc.want {
+				t.Errorf("evseChargeAmpsFromSetpoint(%v, %v) = %v, want %v", tc.setpointW, tc.voltV, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -41,6 +41,19 @@ func TestDesiredStateRoundTrip(t *testing.T) {
 			IssuedAt:    1_700_000_002,
 			Seq:         3,
 		},
+		{
+			// D8/WP-14: EVSE setpoint mode reuses the SAME SetpointW field
+			// battery docs carry — MaxCurrentA stays nil (only one of the
+			// two ever carries opinion once setpoint mode is in use).
+			Envelope:    Envelope{V: DesiredStateV},
+			DeviceClass: DesiredClassEVSE,
+			DeviceID:    "station-1",
+			SetpointW:   float64ptr(3000), // discharge
+			ConnectorID: 1,
+			Source:      "economic",
+			IssuedAt:    1_700_000_003,
+			Seq:         4,
+		},
 	}
 	for _, want := range cases {
 		t.Run(want.DeviceClass, func(t *testing.T) {
@@ -142,6 +155,33 @@ func TestDesiredStateNaNNeverSerialized(t *testing.T) {
 		CeilingW: &nan,
 	}); err == nil {
 		t.Error("expected marshal to fail for CeilingW pointing to NaN; producers must pass nil")
+	}
+}
+
+// TestDesiredStateFinite pins the GAP-09 defense-in-depth check DesiredState
+// gained alongside D8/WP-14's EVSE reuse of SetpointW — mirrors
+// TestDERSiteReportFinite's table shape.
+func TestDesiredStateFinite(t *testing.T) {
+	good := DesiredState{Envelope: Envelope{V: DesiredStateV}, DeviceClass: DesiredClassBattery, DeviceID: "bat0"}
+	if err := good.Finite(); err != nil {
+		t.Fatalf("finite doc rejected: %v", err)
+	}
+
+	nan := math.NaN()
+	cases := []struct {
+		name string
+		mut  func(*DesiredState)
+	}{
+		{"ceiling_w", func(d *DesiredState) { d.CeilingW = &nan }},
+		{"setpoint_w", func(d *DesiredState) { d.SetpointW = &nan }},
+		{"max_current_a", func(d *DesiredState) { d.MaxCurrentA = &nan }},
+	}
+	for _, tc := range cases {
+		d := good
+		tc.mut(&d)
+		if err := d.Finite(); err == nil {
+			t.Errorf("%s: non-finite value accepted", tc.name)
+		}
 	}
 }
 

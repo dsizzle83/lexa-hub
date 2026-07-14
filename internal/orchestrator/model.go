@@ -319,6 +319,22 @@ type EVSECommand struct {
 	// MaxCurrentA: 0 = suspend session, >0 = set limit.
 	MaxCurrentA float64
 
+	// SetpointW is a signed power setpoint (W), matching the battery sign
+	// convention (BatteryCommand.SetpointW): + = discharge to site,
+	// − = charge (D8/WP-14 — one site-wide DER sign convention, no
+	// per-voltage A↔W ambiguity, planner symmetry with the battery DP
+	// asset). nil ⇒ today's ceiling mode is unchanged: MaxCurrentA is the
+	// sole opinion, exactly as before this field existed. Non-nil ⇒
+	// setpoint mode: MaxCurrentA is ignored downstream (cmd/hub's EVSE
+	// actuator publishes SetpointW instead of MaxCurrentA on the desired
+	// doc — see bus.DesiredState.SetpointW). The OCPP bridge
+	// (cmd/ocpp's mqttBridge.Apply) converts W→A at the station's voltage
+	// and CLAMPS a discharge value (negative A) to 0 A suspend, with a
+	// rate-limited log — the type system stops being charge-only here, but
+	// actuation stays charge-only by that one explicit, greppable clamp
+	// until a V2X hardware path exists.
+	SetpointW *float64
+
 	// Connect requests the connector's connect (true) / cease-to-energize
 	// (false) state; nil means "no opinion — leave unchanged". Same ownership
 	// and absence semantics as SolarCommand.Connect (Unit 3.6 gateway fan-out).

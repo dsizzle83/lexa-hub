@@ -255,6 +255,42 @@ func TestIntentAdopter_EVGoal_CapacityWithinBoundsApplies(t *testing.T) {
 	}
 }
 
+// TestIntentAdopter_EVGoal_CapacityPlumbedToEngine is the D8/WP-14 companion
+// to TestIntentAdopter_EVGoal_CapacityWithinBoundsApplies: a stated capacity
+// is no longer validation-only — it must reach orchestrator.EVGoal.CapacityKwh
+// (buildPlannerParams reads it when hub.json's ev_storage flag is on and no
+// static planner capacity is configured; engine.go's doc).
+func TestIntentAdopter_EVGoal_CapacityPlumbedToEngine(t *testing.T) {
+	f := newTestAdopter(t, nil)
+	msg := bus.EVGoalIntent{
+		TargetSocKwh:  ptr(40.0),
+		CapacityKwh:   ptr(60.0),
+		DepartureUnix: f.adopter.now().Add(time.Hour).Unix(),
+	}
+	f.adopter.adopt("evgoal", msg.IntentMeta, func() (string, string) { return f.adopter.applyEVGoal(msg) })
+
+	got := f.eng.lastEVGoal()
+	if got.CapacityKwh != 60 {
+		t.Errorf("CapacityKwh = %v, want 60 (plumbed from the intent, not just validated)", got.CapacityKwh)
+	}
+}
+
+// TestIntentAdopter_EVGoal_NoCapacityStatedDefaultsZero pins the "not stated"
+// sentinel: an absent CapacityKwh must plumb as 0 (buildPlannerParams' "> 0"
+// gate then correctly treats it as absent), not some other default.
+func TestIntentAdopter_EVGoal_NoCapacityStatedDefaultsZero(t *testing.T) {
+	f := newTestAdopter(t, nil)
+	msg := bus.EVGoalIntent{
+		TargetSocKwh:  ptr(40.0),
+		DepartureUnix: f.adopter.now().Add(time.Hour).Unix(),
+	}
+	f.adopter.adopt("evgoal", msg.IntentMeta, func() (string, string) { return f.adopter.applyEVGoal(msg) })
+
+	if got := f.eng.lastEVGoal(); got.CapacityKwh != 0 {
+		t.Errorf("CapacityKwh = %v, want 0 (not stated)", got.CapacityKwh)
+	}
+}
+
 func TestIntentAdopter_EVGoal_Expired(t *testing.T) {
 	f := newTestAdopter(t, nil)
 	msg := bus.EVGoalIntent{

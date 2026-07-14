@@ -33,8 +33,13 @@ type DesiredState struct {
 	// explicit large value (RestoreCeilingW), which the device clamps to WMax;
 	// nil means "no opinion", NOT "restore".
 	CeilingW *float64 `json:"ceiling_w,omitempty"`
-	// SetpointW is the battery setpoint (W): +discharge, −charge. An explicit
-	// 0 idles the pack (enforces the SOC reserve); nil means "no setpoint".
+	// SetpointW is a signed power setpoint (W): +discharge, −charge. An
+	// explicit 0 idles the pack (enforces the SOC reserve); nil means "no
+	// setpoint". Battery docs have carried this since AD-013; D8/WP-14
+	// extends it to EVSE docs (EVSECommand.SetpointW's doc) — same field,
+	// same sign convention, same "only the active mode carries opinion"
+	// rule: an EVSE doc in setpoint mode has SetpointW set and MaxCurrentA
+	// nil; in ceiling mode (today's default, unchanged) it is the reverse.
 	SetpointW *float64 `json:"setpoint_w,omitempty"`
 	// Connect cease-energizes (false) or energizes (true) the battery; nil =
 	// "no connect opinion".
@@ -88,3 +93,24 @@ const (
 	DesiredClassSolar   = "solar"
 	DesiredClassEVSE    = "evse"
 )
+
+// Finite is DesiredState's counterpart to Measurement.Finite (GAP-09
+// discipline: every *float64-bearing bus type joins this check) — added
+// alongside D8/WP-14's EVSE reuse of SetpointW. DesiredState is decoded via
+// mqttutil.Subscribe in both cmd/modbus (battery/solar) and cmd/ocpp (EVSE),
+// which runs this via the interface{ Finite() error } type assertion
+// immediately after unmarshal, so a non-finite CeilingW/SetpointW/MaxCurrentA
+// is dropped (fail-closed: the reconciler's last-known-good desired state
+// holds) rather than adopted as a live command.
+func (d DesiredState) Finite() error {
+	if err := finite("ceiling_w", d.CeilingW); err != nil {
+		return err
+	}
+	if err := finite("setpoint_w", d.SetpointW); err != nil {
+		return err
+	}
+	if err := finite("max_current_a", d.MaxCurrentA); err != nil {
+		return err
+	}
+	return nil
+}

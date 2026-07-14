@@ -536,6 +536,50 @@ func TestDesiredPublishingEVSEActuator_Mapping(t *testing.T) {
 	}
 }
 
+// TestDesiredPublishingEVSEActuator_SetpointModePublishesSignedW (D8/WP-14):
+// a non-nil EVSECommand.SetpointW switches the published doc to setpoint
+// mode — SetpointW carries the signed value verbatim (battery convention)
+// and MaxCurrentA stays nil, mirroring the "only the active class/mode
+// carries opinion" discipline bus.DesiredState's other fields already use.
+func TestDesiredPublishingEVSEActuator_SetpointModePublishesSignedW(t *testing.T) {
+	mc := &fakeHubMQTTClient{}
+	a := newDesiredPublishingEVSEActuator(mc, "cs-001", nil, nil, nil, nil)
+	a.ratedMaxA = 32
+
+	w := 3000.0 // + = discharge, battery convention
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, SetpointW: &w}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 1 {
+		t.Fatalf("expected 1 publish, got %d", len(mc.publishes))
+	}
+	var doc bus.DesiredState
+	_ = json.Unmarshal(mc.publishes[0].payload, &doc)
+	if doc.SetpointW == nil || *doc.SetpointW != 3000 {
+		t.Fatalf("doc.SetpointW = %v, want *3000", doc.SetpointW)
+	}
+	if doc.MaxCurrentA != nil {
+		t.Fatalf("doc.MaxCurrentA = %v, want nil (setpoint mode)", *doc.MaxCurrentA)
+	}
+
+	// A later ceiling-mode command (SetpointW nil) must switch straight
+	// back to MaxCurrentA — content differs, so this republishes.
+	if err := a.ApplyEVSECommand(orchestrator.EVSECommand{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 16}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mc.publishes) != 2 {
+		t.Fatalf("expected 2 publishes after switching back to ceiling mode, got %d", len(mc.publishes))
+	}
+	var doc2 bus.DesiredState
+	_ = json.Unmarshal(mc.publishes[1].payload, &doc2)
+	if doc2.SetpointW != nil {
+		t.Fatalf("doc2.SetpointW = %v, want nil (ceiling mode)", *doc2.SetpointW)
+	}
+	if doc2.MaxCurrentA == nil || *doc2.MaxCurrentA != 16 {
+		t.Fatalf("doc2.MaxCurrentA = %v, want *16", doc2.MaxCurrentA)
+	}
+}
+
 // TestDesiredPublishingEVSEActuator_ReleaseSentinel (WP-13, B3): a command
 // at/above the station's rated maximum is a RELEASE and publishes the
 // explicit bus.RestoreCurrentA sentinel — mirroring the solar actuator's

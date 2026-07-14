@@ -1304,3 +1304,56 @@ func TestEVChargingRule_SkipsAlreadyCommandedEVSE(t *testing.T) {
 		t.Errorf("must not add duplicate EVSE command, got %d", len(plan.EVSECommands))
 	}
 }
+
+// ── D8/WP-14: applyPlanRule EV setpoint wiring ────────────────────────────────
+
+// TestPlanRule_EVDischargeTarget_SetsSetpointW: a genuine discharge target
+// (positive EVSetpointW, battery convention — only reachable when the
+// planner's ev_storage flag was on) switches the EVSE command to setpoint
+// mode, and MaxCurrentA is zeroed so a stale ceiling never rides alongside
+// it (EVSECommand.SetpointW's doc: "nil ⇒ ceiling mode; non-nil ⇒
+// MaxCurrentA ignored downstream").
+func TestPlanRule_EVDischargeTarget_SetsSetpointW(t *testing.T) {
+	batteries := []BatteryState{ruleBat("bat", 0, 50, 5000)}
+	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
+	target := &PlanTarget{BattSetpointW: 1000, EVMaxCurrentA: 0, EVSetpointW: 3000}
+	plan := &Plan{}
+
+	applyPlanRule(target, batteries, evses, 10, 90, 0, plan)
+
+	if len(plan.EVSECommands) != 1 {
+		t.Fatalf("expected 1 EVSE command, got %d", len(plan.EVSECommands))
+	}
+	cmd := plan.EVSECommands[0]
+	if cmd.SetpointW == nil || *cmd.SetpointW != 3000 {
+		t.Errorf("SetpointW = %v, want *3000 (discharge, battery convention)", cmd.SetpointW)
+	}
+	if cmd.MaxCurrentA != 0 {
+		t.Errorf("MaxCurrentA = %.1f, want 0 (ignored once SetpointW is set)", cmd.MaxCurrentA)
+	}
+}
+
+// TestPlanRule_EVChargeTarget_UsesMaxCurrentAOnly: EVSetpointW <= 0
+// (charge/idle — the ENTIRE ev_storage-off universe, since the DP can only
+// ever produce a positive EVSetpointW when the flag was on) must leave
+// SetpointW nil and pass target.EVMaxCurrentA through exactly as before
+// D8/WP-14 — the flag-off byte-identity contract at the optimizer layer.
+func TestPlanRule_EVChargeTarget_UsesMaxCurrentAOnly(t *testing.T) {
+	batteries := []BatteryState{ruleBat("bat", 0, 50, 5000)}
+	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
+	target := &PlanTarget{BattSetpointW: 1000, EVMaxCurrentA: 16, EVSetpointW: -1500}
+	plan := &Plan{}
+
+	applyPlanRule(target, batteries, evses, 10, 90, 0, plan)
+
+	if len(plan.EVSECommands) != 1 {
+		t.Fatalf("expected 1 EVSE command, got %d", len(plan.EVSECommands))
+	}
+	cmd := plan.EVSECommands[0]
+	if cmd.SetpointW != nil {
+		t.Errorf("SetpointW = %v, want nil (charge/idle target must stay in ceiling mode)", *cmd.SetpointW)
+	}
+	if cmd.MaxCurrentA != 16 {
+		t.Errorf("MaxCurrentA = %.1f, want 16 (target.EVMaxCurrentA passthrough, unchanged)", cmd.MaxCurrentA)
+	}
+}

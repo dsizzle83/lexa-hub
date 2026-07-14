@@ -243,15 +243,14 @@ func (a *intentAdopter) applyEVGoal(msg bus.EVGoalIntent) (outcome, detail strin
 	if target < 0 {
 		return "rejected", "target_soc_kwh must be >= 0"
 	}
-	// PRINCIPAL RULING (this unit's brief, following the 3.1 review log's
-	// open item): CapacityKwh is VALIDATION-ONLY in v1 — it bounds the
-	// stated target against the user-stated vehicle pack size, but is never
-	// plumbed to the engine. orchestrator.EVGoal has no capacity field, and
-	// %→kWh resolution is the app/cloud layer's job (EVGoalIntent's doc
-	// comment); the hub stays unit-simple (kWh in, kWh out). A future unit
-	// that wants the hub itself to reason in percent-of-capacity would need
-	// an additive EVGoal.CapacityKwh field plus a buildPlannerParams
-	// insertion — out of scope here.
+	// CapacityKwh bounds the stated target against the user-stated vehicle
+	// pack size AND (D8/WP-14, completing this unit's original v1 gap) is
+	// now plumbed to the engine via orchestrator.EVGoal.CapacityKwh:
+	// buildPlannerParams reads it — gated to hub.json's `ev_storage` flag —
+	// to seed the DP's EVCapacityKwh when no static
+	// "planner.ev_capacity_kwh" config exists (engine.go's doc). %→kWh
+	// resolution stays the app/cloud layer's job (EVGoalIntent's doc
+	// comment); the hub stays unit-simple (kWh in, kWh out) either way.
 	if msg.CapacityKwh != nil && target > *msg.CapacityKwh {
 		return "rejected", "target exceeds stated capacity"
 	}
@@ -263,10 +262,15 @@ func (a *intentAdopter) applyEVGoal(msg bus.EVGoalIntent) (outcome, detail strin
 	if msg.InitialSocKwh != nil {
 		initial = *msg.InitialSocKwh
 	}
+	capacityKwh := 0.0 // "not stated" — buildPlannerParams' capacity plumb only reads a > 0 value
+	if msg.CapacityKwh != nil {
+		capacityKwh = *msg.CapacityKwh
+	}
 	goal := orchestrator.EVGoal{
 		TargetSocKwh:  target,
 		DepartureUnix: msg.DepartureUnix,
 		InitialSocKwh: initial,
+		CapacityKwh:   capacityKwh,
 	}
 	a.eng.SetEVGoal(goal)
 
@@ -462,6 +466,7 @@ func (a *intentAdopter) applyChargeNow(msg bus.ChargeNowIntent) (outcome, detail
 		TargetSocKwh:  a.standingEVGoal.TargetSocKwh,
 		DepartureUnix: now.Add(ttl).Unix(),
 		InitialSocKwh: a.standingEVGoal.InitialSocKwh,
+		CapacityKwh:   a.standingEVGoal.CapacityKwh,
 	}
 	a.eng.SetEVGoal(accelerated)
 

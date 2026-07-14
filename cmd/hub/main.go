@@ -814,6 +814,7 @@ func main() {
 		Debug:          cfg.Debug,
 		Planner:        cfg.Planner,
 		PlanObserver:   planObserver,
+		EVStorage:      cfg.EVStorage,
 	})
 	modeMgr.setEngine(eng) // post-construction: modeMgr.request pokes eng.Wake on a flip
 

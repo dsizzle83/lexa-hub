@@ -101,7 +101,14 @@ const (
 // carries the explicit sentinel/rated figure; only the hardware verb
 // differs.
 type profileDriver interface {
-	Apply(stationID string, evseID int, limitA float64) error
+	// Apply sets limitA (the ceiling-mode charging current). setpointW is
+	// non-nil in D8/WP-14 setpoint mode — the SAME signed value
+	// (evseShell.desiredSetpointW) the desired doc carried — and, when set,
+	// the implementation derives the actual limit from it (W→A conversion
+	// + discharge clamp) instead of trusting limitA. nil in every
+	// ceiling-mode call — the entire pre-D8 universe — so limitA is used
+	// exactly as before.
+	Apply(stationID string, evseID int, limitA float64, setpointW *float64) error
 	ApplyClear(stationID string, evseID int) error
 }
 
@@ -131,8 +138,26 @@ type evseShell struct {
 	// bus.RestoreCurrentA sentinel still releases regardless.
 	ratedMaxA float64
 
+	// ratedVoltageV is the station's configured supply voltage
+	// (cfg.Stations' VoltageV), set once at startup alongside ratedMaxA
+	// (D8/WP-14). Used by evseChargeAmpsFromSetpoint to convert a desired
+	// doc's SetpointW into the equivalent charging current the reconcile
+	// core tracks. 0 (unset — older tests) falls back to the package's
+	// standard nominal (see evseChargeAmpsFromSetpoint).
+	ratedVoltageV float64
+
 	desiredMaxA    float64
 	haveDesiredMax bool
+
+	// desiredSetpointW is the standing SetpointW opinion from the most
+	// recent desired doc (D8/WP-14), nil in ceiling mode. Remembered
+	// separately from the reconcile core's own MaxCurrentA Field — which
+	// only ever tracks a non-negative amp value, even in setpoint mode, for
+	// its OWN convergence bookkeeping (see setDesired) — so
+	// applyActionLocked can pass the ORIGINAL signed value through to
+	// driver.Apply, which does the authoritative W→A conversion + discharge
+	// clamp at the actuation boundary.
+	desiredSetpointW *float64
 
 	// desiredConnect is the shell's own standing connect opinion (Unit 6.2) —
 	// carried forward across desired docs whose Connect is nil ("no opinion",
@@ -217,6 +242,29 @@ func (s *evseShell) setDesired(doc bus.DesiredState, now time.Time) {
 		s.desiredConnect = &c
 	}
 	coreDoc := doc
+
+	// D8/WP-14: setpoint mode. A non-nil SetpointW (battery sign
+	// convention: + discharge, − charge) converts to the equivalent
+	// CHARGING current at the station's rated voltage. This is NOT the
+	// actuation-facing clamp (that lives at bridge.Apply, the one seam that
+	// logs it — see mqttBridge.Apply's doc); it IS clamped to 0 here purely
+	// for the reconcile core's own convergence bookkeeping, which only ever
+	// compares against a non-negative metered current — a negative
+	// "desired" would make the one-sided convergence rule permanently
+	// unsatisfiable. s.desiredSetpointW remembers the ORIGINAL signed value
+	// for applyActionLocked to pass through to the driver.
+	if doc.SetpointW != nil {
+		w := *doc.SetpointW
+		s.desiredSetpointW = &w
+		amps := evseChargeAmpsFromSetpoint(w, s.ratedVoltageV)
+		if amps < 0 {
+			amps = 0
+		}
+		coreDoc.MaxCurrentA = &amps
+	} else {
+		s.desiredSetpointW = nil
+	}
+
 	if s.desiredConnect != nil && !*s.desiredConnect {
 		// Disconnect WINS over any explicit current in the same doc (safety
 		// ordering): force the effective limit to 0 A regardless of
@@ -360,7 +408,7 @@ func (s *evseShell) applyActionLocked(action reconcile.Action) {
 			s.stationID, s.connectorID, action.Reason)
 		return
 	}
-	if err := s.driver.Apply(s.stationID, s.connectorID, limitA); err != nil {
+	if err := s.driver.Apply(s.stationID, s.connectorID, limitA, s.desiredSetpointW); err != nil {
 		s.writeFailures.Inc()
 		log.Printf("lexa-ocpp: reconciler[active] %s: SetChargingProfile %.1fA (%s) failed: %v",
 			s.stationID, limitA, action.Reason, err)

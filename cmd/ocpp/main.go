@@ -201,6 +201,9 @@ func main() {
 				// at/above it releases via ClearChargingProfile (see
 				// evseShell.releaseLimit). Set before any doc/observe arrives.
 				sh.ratedMaxA = sc.MaxCurrentA
+				// D8/WP-14: the station's rated voltage, for the setpoint-mode
+				// W→A conversion (evseChargeAmpsFromSetpoint).
+				sh.ratedVoltageV = sc.VoltageV
 				// TASK-031: forward device-level non-convergence to the hub's
 				// breach-episode component (active mode only).
 				if mode == modeActive {
@@ -420,6 +423,13 @@ type mqttBridge struct {
 	// lexa-proto/ocppserver16 CLAUDE.md's session-lifecycle invariant).
 	// Accessed atomically from the 1.6 forwarder only.
 	nextTxID16 int32
+
+	// dischargeClampMu/lastDischargeClampLog rate-limit Apply's D8/WP-14
+	// discharge-clamp WARN (evseDischargeClampLogInterval floor), keyed per
+	// station. Kept separate from mu (the station-state lock) since this is
+	// purely a logging concern, not station state.
+	dischargeClampMu      sync.Mutex
+	lastDischargeClampLog map[string]time.Time
 }
 
 // connectedStationCount returns how many known stations currently have an
@@ -449,10 +459,11 @@ func newMQTTBridge(mc mqtt.Client, csms ocpp2.CSMS, configuredStations []Station
 		ids[i] = sc.ID
 	}
 	b := &mqttBridge{
-		mc:       mc,
-		csms:     csms,
-		cs201:    csms,
-		stations: make(map[string]*stationState),
+		mc:                    mc,
+		csms:                  csms,
+		cs201:                 csms,
+		stations:              make(map[string]*stationState),
+		lastDischargeClampLog: make(map[string]time.Time),
 	}
 	b.pending = newPendingStations(ids, func(doc bus.PendingStations) error {
 		return mqttutil.PublishJSONRetained(mc, bus.TopicOCPPPending, doc)
@@ -643,15 +654,37 @@ func (b *mqttBridge) observeShell(stationID string, currentA, maxA float64, conn
 // protoOCPP16 takes the 1.6 SetChargingProfile shape (apply16, bridge16.go)
 // under the exact same contract (disconnected no-op, evseID 0→1, 10 s bound,
 // rejected-as-error); everything else takes the 2.0.1 path below unchanged.
-func (b *mqttBridge) Apply(stationID string, evseID int, limitA float64) error {
+//
+// D8/WP-14: setpointW is non-nil only in setpoint mode (evseShell.setDesired
+// folded a desired doc's SetpointW into the reconciler's own MaxCurrentA
+// tracking already, but that conversion clamps discharge silently for the
+// core's bookkeeping — see that function's doc). THIS is the one seam
+// (greppable: "discharge setpoint") where the actual write is derived and
+// logged: setpointW overrides limitA entirely, converting W→A at the
+// station's voltage and clamping a genuine discharge (negative A) to 0 A
+// suspend with a rate-limited WARN — actuation stays charge-only until a
+// V2X hardware path exists, even though the type system no longer is.
+func (b *mqttBridge) Apply(stationID string, evseID int, limitA float64, setpointW *float64) error {
 	b.mu.RLock()
 	s, ok := b.stations[stationID]
 	connected := ok && s.connected
 	var proto string
+	var voltageV float64
 	if ok {
 		proto = s.proto
+		voltageV = s.voltageV
 	}
 	b.mu.RUnlock()
+
+	if setpointW != nil {
+		amps := evseChargeAmpsFromSetpoint(*setpointW, voltageV)
+		if amps < 0 {
+			b.logDischargeClamp(stationID, *setpointW)
+			amps = 0
+		}
+		limitA = amps
+	}
+
 	if !connected {
 		return nil
 	}
@@ -705,6 +738,47 @@ func (b *mqttBridge) Apply(stationID string, evseID int, limitA float64) error {
 	case <-t.C:
 		return fmt.Errorf("SetChargingProfile %s evse=%d timed out after 10s", stationID, evseID)
 	}
+}
+
+// evseDischargeClampLogInterval rate-limits Apply's discharge-clamp WARN —
+// mirrors this repo's 10 s floor convention for edge-triggered alarms (e.g.
+// cmd/hub's rewalkRateLimit) so a station stuck requesting a discharge
+// setpoint every tick can't flood the journal (flash-budget discipline,
+// CLAUDE.md).
+const evseDischargeClampLogInterval = 10 * time.Second
+
+// evseChargeAmpsFromSetpoint converts a signed EV power setpoint (W, battery
+// sign convention: + discharge to site, − charge — matches
+// orchestrator.EVSECommand.SetpointW/bus.DesiredState.SetpointW, D8/WP-14) to
+// the equivalent CHARGING current (A) at voltageV. Pure arithmetic, no
+// clamping: a charge setpoint (negative W) yields a positive amp value,
+// flowing through exactly like today's MaxCurrentA limits; a discharge
+// setpoint (positive W) yields a NEGATIVE amp value here, which has no
+// SetChargingProfile equivalent — callers that actually write to hardware
+// must clamp it (Apply, the one seam that does).
+func evseChargeAmpsFromSetpoint(setpointW, voltageV float64) float64 {
+	if voltageV <= 0 {
+		voltageV = 230 // this package's station default (config.go)
+	}
+	return -setpointW / voltageV
+}
+
+// logDischargeClamp is the rate-limited WARN for a discharge setpoint
+// clamped to 0 A suspend (D8/WP-14) — see Apply's doc.
+func (b *mqttBridge) logDischargeClamp(stationID string, setpointW float64) {
+	b.dischargeClampMu.Lock()
+	now := time.Now()
+	if last, ok := b.lastDischargeClampLog[stationID]; ok && now.Sub(last) < evseDischargeClampLogInterval {
+		b.dischargeClampMu.Unlock()
+		return
+	}
+	if b.lastDischargeClampLog == nil {
+		b.lastDischargeClampLog = make(map[string]time.Time)
+	}
+	b.lastDischargeClampLog[stationID] = now
+	b.dischargeClampMu.Unlock()
+	log.Printf("lexa-ocpp: %s: discharge setpoint %.0fW clamped to 0A suspend (actuation is charge-only — D8/WP-14, no V2X hardware path yet)",
+		stationID, setpointW)
 }
 
 func (b *mqttBridge) triggerStatusNotification(stationID string) {

@@ -94,6 +94,23 @@ type PlannerParams struct {
 
 	// SOCStepKwh is the DP discretisation step. Default 0.5 kWh.
 	SOCStepKwh float64
+
+	// EVStorage is hub.json's `ev_storage` flag (D8/WP-14, default false).
+	// false (the acceptance-gated default): the EV action space is
+	// charge-only/non-negative, exactly as before this field existed —
+	// EVERY code path this flag guards is a no-op, so Plan's output is
+	// byte-identical (pinned by TestPlan_EVStorage_FlagOff_ByteIdentical).
+	// true: the EV becomes a bidirectional DP asset like the battery —
+	// discretizeEVCurrents' charge-side IEC 61851 levels are mirrored
+	// negative (discharge, symmetric charger rating — see
+	// mirrorSignedLevels), the SOC transition applies the discharge-side
+	// efficiency split (mirrors battDest's charge/discharge asymmetry),
+	// and EV discharge participates in the CSIP-AUS GenLimW/LoadLimW gross
+	// generation/load math as a DER (mirrors how battery discharge already
+	// does). EVGoal departure/target SOC/capacity honoring is UNCHANGED
+	// either way — this flag only widens the ACTION SPACE, never the goal
+	// enforcement.
+	EVStorage bool
 }
 
 // StepConstraint is the DER control envelope for one 5-min interval.
@@ -118,7 +135,7 @@ type StepConstraint struct {
 type PlanInterval struct {
 	Start         int64   // interval start (Unix s)
 	BattSetpointW float64 // + discharge, − charge; NaN = no battery
-	EVMaxCurrentA float64 // 0 = suspend EV
+	EVMaxCurrentA float64 // 0 = suspend EV; NEVER negative (see EVSetpointW)
 	ExpectedGridW float64 // + import, − export
 	MarginalCost  float64 // net cost for this interval (negative = earning)
 	// SocKwh is the planned battery state of charge (kWh) at the START of this
@@ -133,6 +150,19 @@ type PlanInterval struct {
 	// constructions use keyed fields, so this zero-value-safe addition leaves
 	// them unchanged.
 	SocKwh float64
+
+	// EVSetpointW is the D8/WP-14 signed EV power counterpart to
+	// BattSetpointW: + discharge to site, − charge (the same battery sign
+	// convention EVSECommand.SetpointW/bus.DesiredState.SetpointW carry).
+	// NaN when there is no EV asset (mirrors BattSetpointW's NaN-no-battery
+	// sentinel); otherwise ALWAYS populated — including in the charge-only
+	// (EVStorage false) universe, where it is guaranteed <= 0 (never a
+	// discharge value, since the underlying DP current can only go
+	// negative when EVStorage was true when this plan was built). This is
+	// what carries a genuine V2G discharge decision to
+	// optimizer.go's applyPlanRule → EVSECommand.SetpointW; EVMaxCurrentA
+	// keeps its pre-D8 never-negative ceiling-mode contract regardless.
+	EVSetpointW float64
 }
 
 // DailyPlan is the 24-hour cost-optimal plan produced by DailyPlanner.Plan.
@@ -150,6 +180,9 @@ type DailyPlan struct {
 type PlanTarget struct {
 	BattSetpointW float64
 	EVMaxCurrentA float64
+	// EVSetpointW is PlanInterval.EVSetpointW's counterpart here — see that
+	// field's doc (D8/WP-14).
+	EVSetpointW float64
 }
 
 // CurrentTarget returns the PlanTarget for the interval containing t,
@@ -170,6 +203,7 @@ func (dp *DailyPlan) CurrentTarget(t time.Time) *PlanTarget {
 	return &PlanTarget{
 		BattSetpointW: iv.BattSetpointW,
 		EVMaxCurrentA: iv.EVMaxCurrentA,
+		EVSetpointW:   iv.EVSetpointW,
 	}
 }
 
@@ -261,7 +295,20 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 		if v == 0 {
 			v = 240
 		}
-		evCurrents = discretizeEVCurrents(p.EVMaxChargeKw * 1000 / v)
+		chargeCurrents := discretizeEVCurrents(p.EVMaxChargeKw * 1000 / v)
+		if p.EVStorage {
+			// D8/WP-14: bidirectional action space — mirror the charge-side
+			// IEC 61851 levels negative (discharge), under the SAME charger
+			// current rating governing both directions (a symmetric-rating
+			// simplification; the J3072/V2G-AC profile carries one active-
+			// power setpoint for both directions —
+			// docs/standards-buildout/digests/v2g-ac-profile.md). Inert
+			// unless EVStorage is true, so the flag-off action space below
+			// is exactly chargeCurrents, unchanged.
+			evCurrents = mirrorSignedLevels(chargeCurrents)
+		} else {
+			evCurrents = chargeCurrents
+		}
 	}
 
 	const inf = math.MaxFloat64 / 2
@@ -333,6 +380,20 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 		evKwOf[ci] = evA * voltV / 1000
 	}
 
+	// zeroEVIdx is the index of the "no EV action" (0 A) entry in evCurrents.
+	// Always 0 for the charge-only (non-mirrored) action space — discretizeEVCurrents
+	// always starts with 0 — so this is a no-op for the flag-off path; the
+	// D8/WP-14 bidirectional (mirrored) space puts the negative levels FIRST,
+	// so 0 sits at a different index, and the evGone/no-EV gate below must
+	// find it explicitly rather than assume index 0.
+	zeroEVIdx := 0
+	for i, a := range evCurrents {
+		if a == 0 {
+			zeroEVIdx = i
+			break
+		}
+	}
+
 	// battDest[i][bi] → destination battery level index, or −1 when the SOC
 	// transition leaves the allowed band.
 	// battEffKw[i][bi] → the effective AC power implied by the *snapped*
@@ -381,11 +442,24 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 	// evDest[j][ci] → destination EV level index, or −1 when the transition
 	// overshoots the pack.  ci=0 (no charging) always maps back to j, which
 	// also covers the evGone / no-EV cases where only ci=0 is iterated.
+	//
+	// evKwOf[ci] >= 0 (charging or idle — the ENTIRE flag-off universe,
+	// since evCurrents never contains a negative entry unless EVStorage
+	// built the bidirectional action space above) uses the exact original
+	// formula. evKwOf[ci] < 0 (discharge, D8/WP-14, unreachable when the
+	// flag is off) applies the efficiency the OTHER way — more energy
+	// leaves the pack than reaches the site — mirroring battDest's
+	// charge/discharge asymmetric-efficiency split above.
 	evDest := make([][]int, nEV)
 	for j := range evDest {
 		evDest[j] = make([]int, len(evCurrents))
 		for ci := range evCurrents {
-			newESoc := evLevels[j] + evKwOf[ci]*planStepHours*p.EVEfficiency
+			var newESoc float64
+			if evKwOf[ci] >= 0 {
+				newESoc = evLevels[j] + evKwOf[ci]*planStepHours*p.EVEfficiency
+			} else {
+				newESoc = evLevels[j] + evKwOf[ci]*planStepHours/p.EVEfficiency
+			}
 			if newESoc < -1e-6 || newESoc > p.EVCapacityKwh+1e-6 {
 				evDest[j][ci] = -1
 				continue
@@ -438,7 +512,7 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 					battKwEff := battEffKw[i][bi]
 
 					for ci := range evCurrents {
-						if (evGone || !hasEV) && ci > 0 {
+						if (evGone || !hasEV) && ci != zeroEVIdx {
 							continue
 						}
 						// EV SOC transition (precomputed); −1 = overshoots pack.
@@ -478,6 +552,13 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 							if battKwEff > 0 {
 								gen += battKwEff
 							}
+							// D8/WP-14: a discharging EV is DER generation too.
+							// evKw < 0 is unreachable unless EVStorage built the
+							// bidirectional action space above, so this is a
+							// no-op for the flag-off path.
+							if evKw < 0 {
+								gen += -evKw
+							}
 							if gen > c.GenLimW/1000+1e-6 {
 								continue
 							}
@@ -486,6 +567,15 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 						// draw plus battery charge.
 						if !math.IsNaN(c.LoadLimW) {
 							load := loadKw + evKw
+							// D8/WP-14: "gross" must never NET against a
+							// discharging asset — cancel the += evKw above for
+							// a discharge (evKw < 0, unreachable when
+							// EVStorage is off) the same way battKwEff's
+							// charge-only treatment below never lets discharge
+							// reduce load.
+							if evKw < 0 {
+								load -= evKw
+							}
 							if battKwEff < 0 {
 								load += -battKwEff
 							}
@@ -606,10 +696,29 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 			margCost = gKw * planStepHours * expP
 		}
 
+		// EVMaxCurrentA keeps its pre-D8 never-negative ceiling-mode contract
+		// (0 = suspend, >0 = charge ceiling) even when EVStorage's
+		// bidirectional action space chose a discharge (negative) current
+		// for this step — that intent is carried on EVSetpointW instead
+		// (battery sign convention), never by letting this field go
+		// negative. A no-op when evA is already >= 0 (the entire flag-off
+		// universe).
+		evMaxA := math.Max(0, evA)
+
+		// EVSetpointW: NaN when no EV asset was modelled (mirrors
+		// BattSetpointW's NaN-no-battery sentinel), else always populated —
+		// including in the charge-only universe, where it is guaranteed
+		// <= 0 (never a discharge value; see the field's doc).
+		evSetpointW := math.NaN()
+		if hasEV {
+			evSetpointW = -evKw * 1000
+		}
+
 		out.Intervals[t] = PlanInterval{
 			Start:         stepT,
 			BattSetpointW: battW,
-			EVMaxCurrentA: evA,
+			EVMaxCurrentA: evMaxA,
+			EVSetpointW:   evSetpointW,
 			ExpectedGridW: gridW,
 			MarginalCost:  margCost,
 			SocKwh:        socKwh,
@@ -824,6 +933,22 @@ func discretizeEVCurrents(maxA float64) []float64 {
 	if len(out) == 1 && maxA >= 1 {
 		out = append(out, maxA) // at least one non-zero level
 	}
+	return out
+}
+
+// mirrorSignedLevels returns levels (assumed sorted ascending and starting at
+// 0 — discretizeEVCurrents' own contract) mirrored negative-then-positive,
+// e.g. [0, 6, 8] → [-8, -6, 0, 6, 8]. This is the ev_storage (D8/WP-14)
+// bidirectional EV action space: the SAME charger current rating governs
+// discharge as charge (a symmetric-rating simplification — the J3072/V2G-AC
+// profile carries one active-power setpoint for both directions;
+// docs/standards-buildout/digests/v2g-ac-profile.md).
+func mirrorSignedLevels(levels []float64) []float64 {
+	out := make([]float64, 0, 2*len(levels)-1)
+	for i := len(levels) - 1; i > 0; i-- {
+		out = append(out, -levels[i])
+	}
+	out = append(out, levels...)
 	return out
 }
 

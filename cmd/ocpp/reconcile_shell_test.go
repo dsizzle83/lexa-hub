@@ -16,18 +16,20 @@ import (
 // adds the ApplyClear release path (same failure knob — a rejected Clear is
 // the same L11 error class).
 type recordingProfileDriver struct {
-	applied []float64 // limitA per apply that SUCCEEDED
-	cleared int       // ApplyClear calls that SUCCEEDED
-	err     error     // non-nil ⇒ every Apply/ApplyClear fails (rejected)
-	calls   int
+	applied          []float64  // limitA per apply that SUCCEEDED
+	appliedSetpoints []*float64 // setpointW per apply that SUCCEEDED (D8/WP-14), parallel to applied
+	cleared          int        // ApplyClear calls that SUCCEEDED
+	err              error      // non-nil ⇒ every Apply/ApplyClear fails (rejected)
+	calls            int
 }
 
-func (d *recordingProfileDriver) Apply(_ string, _ int, limitA float64) error {
+func (d *recordingProfileDriver) Apply(_ string, _ int, limitA float64, setpointW *float64) error {
 	d.calls++
 	if d.err != nil {
 		return d.err
 	}
 	d.applied = append(d.applied, limitA)
+	d.appliedSetpoints = append(d.appliedSetpoints, setpointW)
 	return nil
 }
 
@@ -49,6 +51,18 @@ func evseDoc(maxA float64, connectorID int, seq uint64, at time.Time) bus.Desire
 	}
 }
 
+// evseSetpointDoc is evseDoc's D8/WP-14 setpoint-mode sibling: setpointW
+// carries opinion, MaxCurrentA stays nil (bus.DesiredState's per-mode
+// field-absence rule).
+func evseSetpointDoc(setpointW float64, connectorID int, seq uint64, at time.Time) bus.DesiredState {
+	w := setpointW
+	return bus.DesiredState{
+		DeviceClass: bus.DesiredClassEVSE, DeviceID: "cs-001",
+		SetpointW: &w, ConnectorID: connectorID,
+		Source: "economic", IssuedAt: at.Unix(), Seq: seq,
+	}
+}
+
 // TestEVSEShell_NewLimitWrites: a new current-limit doc is applied via the driver.
 func TestEVSEShell_NewLimitWrites(t *testing.T) {
 	mreg := metrics.New()
@@ -61,6 +75,48 @@ func TestEVSEShell_NewLimitWrites(t *testing.T) {
 	}
 	if s.connectorID != 1 { // connector 0 → 1
 		t.Errorf("connector 0 must map to 1, got %d", s.connectorID)
+	}
+}
+
+// ── D8/WP-14: setpoint-mode desired docs ──────────────────────────────────────
+
+// TestEVSEShell_SetpointDoc_PassesSignedValueToDriver: a setpoint-mode
+// desired doc (SetpointW set, MaxCurrentA nil) must reach driver.Apply's
+// setpointW parameter verbatim — the shell's own core-tracking conversion
+// (clamped, for convergence bookkeeping) must never be what the driver
+// treats as authoritative; the ORIGINAL signed value is what the greppable
+// clamp in bridge.Apply needs to see.
+func TestEVSEShell_SetpointDoc_PassesSignedValueToDriver(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingProfileDriver{}
+	s := newEVSEShell("cs-001", mreg, modeActive, drv)
+	s.ratedVoltageV = 230
+	t0 := time.Now()
+
+	s.setDesired(evseSetpointDoc(2300, 0, 1, t0), t0) // discharge, battery convention
+	if len(drv.appliedSetpoints) != 1 || drv.appliedSetpoints[0] == nil {
+		t.Fatalf("expected one apply carrying a non-nil setpoint, got %v", drv.appliedSetpoints)
+	}
+	if *drv.appliedSetpoints[0] != 2300 {
+		t.Errorf("setpoint passed to driver = %v, want *2300 (unclamped, unconverted)", *drv.appliedSetpoints[0])
+	}
+}
+
+// TestEVSEShell_CeilingDoc_PassesNilSetpointToDriver: an ordinary ceiling-mode
+// doc (the entire pre-D8 universe) must still pass nil for setpointW — the
+// new parameter is provably inert unless a doc actually sets SetpointW.
+func TestEVSEShell_CeilingDoc_PassesNilSetpointToDriver(t *testing.T) {
+	mreg := metrics.New()
+	drv := &recordingProfileDriver{}
+	s := newEVSEShell("cs-001", mreg, modeActive, drv)
+	t0 := time.Now()
+
+	s.setDesired(evseDoc(10, 0, 1, t0), t0)
+	if len(drv.appliedSetpoints) != 1 || drv.appliedSetpoints[0] != nil {
+		t.Fatalf("ceiling-mode doc must pass nil setpointW to driver, got %v", drv.appliedSetpoints)
+	}
+	if len(drv.applied) != 1 || drv.applied[0] != 10 {
+		t.Fatalf("expected one 10A apply, got %v", drv.applied)
 	}
 }
 

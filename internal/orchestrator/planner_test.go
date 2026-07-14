@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"fmt"
+	"hash/fnv"
 	"math"
 	"testing"
 	"time"
@@ -351,6 +353,193 @@ func TestPlan_EV_MeetsTargetByDeparture(t *testing.T) {
 	// Total cost must be finite.
 	if math.IsInf(plan.TotalCost, 0) || math.IsNaN(plan.TotalCost) {
 		t.Errorf("TotalCost = %v, want finite", plan.TotalCost)
+	}
+}
+
+// ── D8/WP-14: ev_storage (V2G type enablers) ──────────────────────────────────
+
+// evStorageGoldenScenario is a rich scenario (battery + EV + solar + all three
+// CSIP-AUS/CSIP DER-constraint axes + delivery-style TOU + a fixed daily
+// charge) built to exercise as much of Plan's code as one call can, for the
+// flag-off byte-identity pin below.
+func evStorageGoldenScenario() PlannerParams {
+	p := plannerTestBase()
+	p.SOCStepKwh = 0.25
+
+	p.BattCapacityKwh = 10
+	p.BattMaxChargeKw = 5
+	p.BattMaxDischargeKw = 5
+	p.InitialBattSocKwh = 6
+	p.TerminalSocKwh = 2
+
+	p.EVCapacityKwh = 40
+	p.EVMaxChargeKw = 7.2
+	p.InitialEVSocKwh = 10
+	p.EVTargetSocKwh = 30
+	p.EVVoltageV = 240
+	p.EVDepartureUnix = plannerTestNow.Add(8 * time.Hour).Unix()
+
+	p.LoadForecastKw = 1.2
+
+	p.SolarForecastKw = make([]float64, planSteps)
+	ws := p.WindowStart - (p.WindowStart % planStepSec)
+	for i := range p.SolarForecastKw {
+		if h := time.Unix(ws+int64(i)*planStepSec, 0).UTC().Hour(); h >= 9 && h < 16 {
+			p.SolarForecastKw[i] = 3.5
+		}
+	}
+
+	p.FallbackTOU = nil
+	p.ImportPricePerKwh = make([]float64, planSteps)
+	p.ExportPricePerKwh = make([]float64, planSteps)
+	for i := 0; i < planSteps; i++ {
+		stepT := time.Unix(ws+int64(i)*planStepSec, 0).UTC()
+		if stepT.Hour() >= 16 && stepT.Hour() < 21 {
+			p.ImportPricePerKwh[i] = 0.55
+		} else {
+			p.ImportPricePerKwh[i] = 0.15
+		}
+		p.ExportPricePerKwh[i] = 0.08
+	}
+
+	p.DERConstraints = make([]StepConstraint, planSteps)
+	for i := range p.DERConstraints {
+		p.DERConstraints[i] = StepConstraint{
+			ExpLimW: 4000, ImpLimW: 6000, MaxLimW: math.NaN(),
+			FixedW: math.NaN(), GenLimW: 4500, LoadLimW: 5000,
+		}
+	}
+
+	p.FixedDailyCharge = 0.85
+	return p
+}
+
+// fingerprintPlan hashes every field the pre-D8 planner ever populated
+// (Start/BattSetpointW/EVMaxCurrentA/ExpectedGridW/MarginalCost/SocKwh per
+// interval, plus TotalCost) with fixed precision, so a hash match is a strong
+// byte-identity pin without embedding a multi-KB literal fixture. It
+// deliberately does NOT include the new EVSetpointW field — that field did
+// not exist before this WP, so it is asserted separately (see the flag-off
+// test below), not folded into the "byte identical to before" pin.
+func fingerprintPlan(t *testing.T, plan *DailyPlan) string {
+	t.Helper()
+	h := fnv.New64a()
+	for _, iv := range plan.Intervals {
+		fmt.Fprintf(h, "%d|%.6f|%.6f|%.6f|%.6f|%.6f;",
+			iv.Start, iv.BattSetpointW, iv.EVMaxCurrentA, iv.ExpectedGridW, iv.MarginalCost, iv.SocKwh)
+	}
+	fmt.Fprintf(h, "TOTAL=%.6f", plan.TotalCost)
+	return fmt.Sprintf("%x", h.Sum64())
+}
+
+// evStorageGoldenFingerprint was captured by running evStorageGoldenScenario
+// through NewDailyPlanner().Plan on the pre-D8/WP-14 planner.go (before any
+// of this work package's changes) — see fingerprintPlan's doc. This is the
+// literal "golden plan equality" pin the WP-14 acceptance gate calls for:
+// flag off must reproduce it exactly.
+const evStorageGoldenFingerprint = "c43d5c61465f5d88"
+
+// TestPlan_EVStorage_FlagOff_ByteIdentical is the WP-14 acceptance gate:
+// with ev_storage off (the zero value — no deployment sets it explicitly
+// today), Plan's output must be byte-identical to the pre-WP-14 planner,
+// even for a scenario carrying every asset/constraint kind the DP evaluates.
+func TestPlan_EVStorage_FlagOff_ByteIdentical(t *testing.T) {
+	p := evStorageGoldenScenario()
+	if p.EVStorage {
+		t.Fatal("test setup bug: scenario must start with EVStorage false")
+	}
+	plan := NewDailyPlanner().Plan(p)
+	if got := fingerprintPlan(t, plan); got != evStorageGoldenFingerprint {
+		t.Errorf("flag-off fingerprint = %s, want %s (planner.go's ev_storage-off path is no longer byte-identical to pre-WP-14 — see D8's acceptance gate)",
+			got, evStorageGoldenFingerprint)
+	}
+	// EVMaxCurrentA must never go negative in the flag-off universe, and the
+	// new EVSetpointW field must never carry a discharge value (D8: "off ⇒
+	// charge-only", not just "off ⇒ same numbers as before").
+	for i, iv := range plan.Intervals {
+		if iv.EVMaxCurrentA < 0 {
+			t.Errorf("interval %d: EVMaxCurrentA = %.1f, must never be negative with ev_storage off", i, iv.EVMaxCurrentA)
+		}
+		if iv.EVSetpointW > 0 {
+			t.Errorf("interval %d: EVSetpointW = %.1f, must never be positive (discharge) with ev_storage off", i, iv.EVSetpointW)
+		}
+	}
+}
+
+// TestPlan_EVStorage_FlagOn_DischargeHonorsDeparture proves the flag actually
+// widens the action space (not just carries an inert field): given an EV well
+// above its departure target and a sharp TOU peak BEFORE departure, a
+// cost-minimising DP should discharge into the peak (arbitrage: sell high,
+// buy back low) and still land at/above its target SOC by departure — the
+// departure constraint (a hard DP filter) makes a non-degenerate, finite-cost
+// plan itself the proof that the target was met.
+func TestPlan_EVStorage_FlagOn_DischargeHonorsDeparture(t *testing.T) {
+	p := plannerTestBase()
+	p.SOCStepKwh = 0.25
+	p.EVStorage = true
+
+	p.EVCapacityKwh = 40
+	p.EVMaxChargeKw = 7.2
+	p.InitialEVSocKwh = 35 // well above target — room to discharge profitably
+	p.EVTargetSocKwh = 20
+	p.EVVoltageV = 240
+	p.LoadForecastKw = 1.0
+
+	// Departure at 22:00 — AFTER the 16:00-21:00 peak below, leaving one
+	// cheap hour to recharge to target before leaving.
+	p.EVDepartureUnix = plannerTestNow.Add(22 * time.Hour).Unix()
+
+	p.FallbackTOU = nil
+	p.ImportPricePerKwh = make([]float64, planSteps)
+	p.ExportPricePerKwh = make([]float64, planSteps)
+	ws := p.WindowStart - (p.WindowStart % planStepSec)
+	for i := 0; i < planSteps; i++ {
+		stepT := time.Unix(ws+int64(i)*planStepSec, 0).UTC()
+		if stepT.Hour() >= 16 && stepT.Hour() < 21 {
+			p.ImportPricePerKwh[i] = 1.00
+			p.ExportPricePerKwh[i] = 0.90
+		} else {
+			p.ImportPricePerKwh[i] = 0.15
+			p.ExportPricePerKwh[i] = 0.05
+		}
+	}
+
+	plan := NewDailyPlanner().Plan(p)
+
+	deptStep := int((22 * 3600) / planStepSec)
+	discharged := false
+	for i := 0; i < deptStep; i++ {
+		iv := plan.Intervals[i]
+		if iv.EVSetpointW > 100 {
+			discharged = true
+		}
+		// D8's split: the type system carries the discharge on EVSetpointW;
+		// EVMaxCurrentA (the ceiling-mode field) must never itself go
+		// negative, flag on or off.
+		if iv.EVMaxCurrentA < 0 {
+			t.Errorf("step %d: EVMaxCurrentA = %.1f, must never be negative", i, iv.EVMaxCurrentA)
+		}
+	}
+	if !discharged {
+		t.Error("EV never discharged (EVSetpointW never positive) — ev_storage had no effect on the action space")
+	}
+
+	if math.IsInf(plan.TotalCost, 0) || math.IsNaN(plan.TotalCost) || plan.TotalCost == 0 {
+		t.Errorf("TotalCost = %v, want finite and nonzero (a feasible, non-degenerate plan honoring the departure target)", plan.TotalCost)
+	}
+}
+
+// TestMirrorSignedLevels pins the D8 bidirectional-action-space helper.
+func TestMirrorSignedLevels(t *testing.T) {
+	got := mirrorSignedLevels([]float64{0, 6, 8})
+	want := []float64{-8, -6, 0, 6, 8}
+	if len(got) != len(want) {
+		t.Fatalf("mirrorSignedLevels = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("mirrorSignedLevels[%d] = %v, want %v (full: %v)", i, got[i], want[i], got)
+		}
 	}
 }
 

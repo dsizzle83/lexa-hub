@@ -622,23 +622,35 @@ func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECo
 		c := *cmd.Connect
 		a.connect = &c
 	}
-	maxA := cmd.MaxCurrentA
-	// WP-13 (B3): map a full-rate/over-rated command to the explicit release
-	// sentinel — see the ratedMaxA field doc. A suspend (0) or any throttle
-	// below rated passes through verbatim.
-	if a.ratedMaxA > 0 && maxA >= a.ratedMaxA {
-		maxA = bus.RestoreCurrentA
-	}
 	connect := *a.connect
 	doc := bus.DesiredState{
 		Envelope:    bus.Envelope{V: bus.DesiredStateV},
 		DeviceClass: bus.DesiredClassEVSE,
 		DeviceID:    a.stationID,
-		MaxCurrentA: &maxA,
 		ConnectorID: cmd.ConnectorID,
 		Connect:     &connect,
 		Source:      "economic",
 		MRID:        cmd.MRID,
+	}
+	if cmd.SetpointW != nil {
+		// D8/WP-14: setpoint mode — carry the signed W verbatim (battery
+		// sign convention: + discharge, − charge). MaxCurrentA stays nil —
+		// only one of the two ever carries opinion on an EVSE doc, mirroring
+		// bus.DesiredState's per-class field-absence discipline (a battery
+		// doc's CeilingW is always nil; here MaxCurrentA is always nil once
+		// SetpointW is set). cmd/ocpp's mqttBridge.Apply does the W→A
+		// conversion + discharge clamp at the actuation boundary.
+		w := *cmd.SetpointW
+		doc.SetpointW = &w
+	} else {
+		maxA := cmd.MaxCurrentA
+		// WP-13 (B3): map a full-rate/over-rated command to the explicit
+		// release sentinel — see the ratedMaxA field doc. A suspend (0) or
+		// any throttle below rated passes through verbatim.
+		if a.ratedMaxA > 0 && maxA >= a.ratedMaxA {
+			maxA = bus.RestoreCurrentA
+		}
+		doc.MaxCurrentA = &maxA
 	}
 
 	now := time.Now()
@@ -671,7 +683,7 @@ func (a *desiredPublishingEVSEActuator) ApplyEVSECommand(cmd orchestrator.EVSECo
 	// See ApplyBatteryCommand's twin comment: journaled only on a genuine
 	// content change, never on a WS-2 heartbeat re-stamp.
 	if contentChanged && a.jw != nil {
-		if ev, err := journal.NewDispatchEvent("hub", journal.NewDispatch(a.stationID, journal.KindEVSE, nil, nil, doc.MaxCurrentA, doc.Connect)); err == nil {
+		if ev, err := journal.NewDispatchEvent("hub", journal.NewDispatch(a.stationID, journal.KindEVSE, doc.SetpointW, nil, doc.MaxCurrentA, doc.Connect)); err == nil {
 			_ = a.jw.Append(ev)
 		}
 	}
