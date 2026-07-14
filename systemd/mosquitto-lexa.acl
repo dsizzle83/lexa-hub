@@ -334,6 +334,30 @@ topic write lexa/intent/chargenow
 # reader (its own grant above).
 topic write lexa/cloudlink/status
 
+user lexa-openadr
+# bus.TopicOpenADRPrices (retained) (WP-15) — translated CP-profile price
+# series (PRICE/EXPORT_PRICE/GHG/ALERT_*); the cmd/hub adoption slice (after
+# WP-11) is the future reader — its matching hub read grant lands with that
+# slice, not here.
+topic write lexa/openadr/prices
+# bus.TopicOpenADRLimits (retained) (WP-15) — most-restrictive
+# IMPORT/EXPORT_CAPACITY_LIMIT caps in watts; same future hub reader.
+topic write lexa/openadr/limits
+# bus.TopicOpenADRStatus (retained) (WP-15) — VEN health doc; lexa-api's
+# /status projection is the future reader (read grant lands with it).
+topic write lexa/openadr/status
+# bus.SubMeasurements (WP-15) — TELEMETRY_USAGE report source (E1).
+topic read lexa/measurements/+
+# bus.SubBattMetrics (WP-15) — STORAGE_* report source (collected now,
+# reported behind the documented seam in internal/openadr/report.go).
+topic read lexa/battery/+/metrics
+# bus.TopicCSIPComplianceAlert (WP-15) — opt-out evidence (read-only, like
+# cloudlink; the opt-out flow itself is a deferred slice).
+topic read lexa/csip/compliance/alert
+# bus.TopicHubPlan (retained) (WP-15) — forecast/dispatch reports (optional,
+# per architecture §2.3; not yet subscribed).
+topic read lexa/hub/plan
+
 # qa-inject: the QA mqttproxy's /inject endpoint (csip-tls-test cmd/mqttproxy,
 # deployed only by scripts/mqtt-chaos.sh during a Mayhem run). It forges
 # arbitrary topics/payloads/retain flags for the mqtt-* fault scenarios

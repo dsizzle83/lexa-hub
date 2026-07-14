@@ -190,6 +190,12 @@ func SupportedV(topic string) int {
 		return DERSiteReportV
 	case topic == TopicCSIPCurves:
 		return CurveSetV
+	case topic == TopicOpenADRPrices:
+		return OpenADRPricesV
+	case topic == TopicOpenADRLimits:
+		return OpenADRLimitsV
+	case topic == TopicOpenADRStatus:
+		return OpenADRStatusV
 	default:
 		return 1
 	}

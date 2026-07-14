@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "mqtt_broker": "tcp://localhost:1883",
+  "mqtt_client_id": "lexa-openadr",
+  "mqtt_user": "",
+  "mqtt_pass_file": "",
+  "metrics_addr": "",
+  "log_level": "info",
+  "vtn_url": "",
+  "client_id": "",
+  "client_secret_file": "",
+  "token_url": "",
+  "program_ids": [],
+  "poll_interval_s": 60,
+  "ven_name": "lexa-hub",
+  "report_enabled": true
+}

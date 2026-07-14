@@ -34,6 +34,9 @@ of CannotComply codes needs gridsim expectation update in csip-tls-test same ses
 set legacy_cannotcomply_code=true).
 
 Bench-deferred queue (WP-17f): adv-shell shadow soak · AUS shadow week · 1.6 evsim · PIN drill ·
-COMM-004 pcaps · dersite/PUT vs gridsim (gridsim needs PUT/LogEvent endpoints — csip-tls-test work).
+COMM-004 pcaps · dersite/PUT vs gridsim (gridsim needs PUT/LogEvent endpoints — csip-tls-test work) ·
+lexa-openadr deploy wiring (WP-15 service half shipped WITHOUT deploy-hub-pi.sh changes: the script
+must still provision /etc/lexa/mqtt/openadr.pass + patch openadr.json creds + install/enable the
+unit + a client_secret_file, per architecture §2.3's deploy note — tracked separately).
 
 Vendor quirks for next proto bump: (WP-4) csipmodel DERList lacks pollRate; DERCapability/Settings lack rtg/setMaxWh; DERStatus lacks alarmStatus; derreport parses putResult error strings for 404/405 — switch to typed error when tlsclient gains one. (WP-5) csipmodel KindVoltage=12 collides with 2030.5 KindType energy(12); KindFreq=38 is not a KindType member. Telemetry uses local spec-correct constants meanwhile.

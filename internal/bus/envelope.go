@@ -85,6 +85,13 @@ const (
 	// DesiredAdvanced schema (WP-9, standards-buildout C1/C3/C4, D6). Born at
 	// 1, same convention as every family above.
 	DesiredAdvancedV = 1 // lexa/desired/adv/{device} (DesiredAdvanced)
+
+	// OpenADR schemas (WP-15, standards-buildout E1). All born at 1, same
+	// convention as every family above; types + topic constants in
+	// internal/bus/openadr.go.
+	OpenADRPricesV = 1 // lexa/openadr/prices (OpenADRPrices)
+	OpenADRLimitsV = 1 // lexa/openadr/limits (OpenADRLimits)
+	OpenADRStatusV = 1 // lexa/openadr/status (OpenADRStatus)
 )
 
 // LegacyV0Accepted is the transition switch for AD-006's compatibility

@@ -1,0 +1,65 @@
+[Unit]
+# StartLimit* MUST live in [Unit] (systemd >=v230 ignores them in
+# [Service]); the default 5-in-10s otherwise applies and a crash
+# burst permanently disables the service. (V1RC FINDING A, 2026-07-06.)
+StartLimitIntervalSec=120
+StartLimitBurst=5
+Description=LEXA OpenADR 3.1 VEN Service
+Documentation=https://github.com/lexa/lexa-hub
+# time-sync.target ordering ONLY (no Wants=, no ConditionClockSynchronized=,
+# same rationale as lexa-telemetry): OpenADR interval starts are absolute
+# RFC3339 timestamps and the VTN's TLS cert needs a sane clock, but a SOM
+# whose clock never syncs must still boot this service and degrade to its
+# fail-closed poll-error behavior rather than hang boot.
+After=network-online.target mosquitto.service time-sync.target
+# Wants= not Requires=: a clean mosquitto stop/restart must NOT stop-propagate
+# to the lexa services — they survive broker restarts via paho auto-reconnect
+# (V1RC FINDING A root fix, 2026-07-06).
+Wants=mosquitto.service
+Wants=network-online.target
+
+[Service]
+# WS-1-style sandboxing (same block as siblings): lexa-openadr writes nothing
+# to disk (it reads openadr.json + the client-secret/mqtt-pass files) — no
+# ReadWritePaths= needed.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Type=notify + WatchdogSec (TASK-008 pattern; WP-15/architecture §8):
+# WatchdogSec=120 — the northbound sizing, since a poll cycle is a WAN
+# round-trip sequence (token POST + paged program/event GETs + report
+# POSTs), each request bounded at 15 s in cmd/openadr/main.go.
+#
+# Kick sites (both in the ONE poll-loop select, so a wedged PollOnce starves
+# them — exactly the "live but wedged" mode the watchdog exists to catch):
+# the top of every poll body (northbound run-loop pattern) AND a 10 s ticker
+# gated on mc.IsConnected() (telemetry/ocpp pattern — keeps the kick cadence
+# independent of a long configured poll_interval_s). Like ocpp/api, a
+# sustained MQTT broker outage therefore restarts this service — accepted
+# crash-only behavior (AD-011); retained lexa/openadr/* docs re-seed
+# subscribers.
+Type=notify
+NotifyAccess=main
+WatchdogSec=120
+User=lexa
+Group=lexa
+ExecStart=/usr/local/sbin/lexa-openadr -config /etc/lexa/openadr.json
+Restart=on-failure
+RestartSec=10s
+
+# journald rate cap (TASK-009 / RSK-14 flash wear): steady state is silent —
+# retained docs republish only on VTN content change, per-poll success is not
+# logged, and poll failures log once per cycle (60 s default). Burst=150
+# covers an event-storm reconciliation (one line per added/updated/deleted
+# event) without suppressing the forensic trail.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=150
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lexa-openadr
+
+[Install]
+WantedBy=multi-user.target
