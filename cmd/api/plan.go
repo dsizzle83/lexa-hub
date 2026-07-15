@@ -19,6 +19,7 @@ import (
 //	{ generated_at, horizon_h, slot_minutes,
 //	  currency, total_cost, fixed_daily_charge,
 //	  solar_forecast:[{t, solar_W}],
+//	  load_forecast:[{t, load_W}],
 //	  battery_plan:[{t, setpoint_W, soc_pct}],
 //	  ev_plan:{<station_id>:[{t, power_W}]},
 //	  price_forecast:[{t, import_per_kwh, delivery_per_kwh, export_per_kwh}],
@@ -38,6 +39,7 @@ type planResp struct {
 	TotalCost        float64                   `json:"total_cost,omitempty"`
 	FixedDailyCharge float64                   `json:"fixed_daily_charge,omitempty"`
 	SolarForecast    []solarPoint              `json:"solar_forecast"`
+	LoadForecast     []loadPoint               `json:"load_forecast"`
 	BatteryPlan      []batteryPoint            `json:"battery_plan"`
 	EVPlan           map[string][]evPowerPoint `json:"ev_plan"`
 	PriceForecast    []pricePoint              `json:"price_forecast"`
@@ -47,6 +49,14 @@ type planResp struct {
 type solarPoint struct {
 	T      string  `json:"t"`       // RFC3339 slot start
 	SolarW float64 `json:"solar_W"` // + generation
+}
+
+// loadPoint is one slot of the load_forecast series: the home-load demand the
+// plan served, a POSITIVE consumption magnitude (the generation dual of
+// solarPoint), not a signed flow.
+type loadPoint struct {
+	T     string  `json:"t"`      // RFC3339 slot start
+	LoadW float64 `json:"load_W"` // + home consumption (demand magnitude)
 }
 
 type batteryPoint struct {
@@ -123,12 +133,17 @@ func buildPlan(s bus.HubSchedule) planResp {
 		// Non-nil empty slices so the JSON always carries the arrays (the app's
 		// chart code iterates them without a null check).
 		SolarForecast: []solarPoint{},
+		LoadForecast:  []loadPoint{},
 		BatteryPlan:   []batteryPoint{},
 		EVPlan:        map[string][]evPowerPoint{},
 	}
 
 	for i, v := range s.SolarForecastW {
 		resp.SolarForecast = append(resp.SolarForecast, solarPoint{T: tAt(i), SolarW: v})
+	}
+
+	for i, v := range s.LoadForecastW {
+		resp.LoadForecast = append(resp.LoadForecast, loadPoint{T: tAt(i), LoadW: v})
 	}
 
 	// battery_plan pairs setpoint with the parallel SOC slice; a shorter/absent

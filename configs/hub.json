@@ -40,6 +40,7 @@
     "ev_target_soc_pct": 80.0,
     "ev_departure_hh": 7,
     "solar_peak_kw": 8.0,
+    "load_avg_kw": 2.0,
     "soc_step_kwh": 0.5,
     "replan_interval_s": 900
   },
@@ -78,7 +79,7 @@
   ],
   "stations": [
     {
-      "id": "cs-001",
+      "id": "evse-001",
       "max_current_a": 32.0,
       "plant": {
         "meter_lag_s": 10.0

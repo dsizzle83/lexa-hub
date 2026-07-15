@@ -20,6 +20,10 @@ type appPlan struct {
 		T      string  `json:"t"`
 		SolarW float64 `json:"solar_W"`
 	} `json:"solar_forecast"`
+	LoadForecast []struct {
+		T     string  `json:"t"`
+		LoadW float64 `json:"load_W"`
+	} `json:"load_forecast"`
 	BatteryPlan []struct {
 		T         string   `json:"t"`
 		SetpointW float64  `json:"setpoint_W"`
@@ -56,6 +60,7 @@ func TestPlanHandler_AppShape(t *testing.T) {
 		SlotMinutes:      5,
 		HorizonH:         24,
 		SolarForecastW:   []float64{0, 1500},
+		LoadForecastW:    []float64{0, 800},
 		BatterySetpointW: []float64{-1000, 2000},
 		BatterySocPct:    []*float64{&soc0, nil},
 		EVPlanW:          map[string][]float64{"evse-001": {0, -7200}},
@@ -91,6 +96,17 @@ func TestPlanHandler_AppShape(t *testing.T) {
 	}
 	if resp.SolarForecast[1].SolarW != 1500 {
 		t.Errorf("solar_forecast[1].solar_W = %v, want 1500", resp.SolarForecast[1].SolarW)
+	}
+
+	// load_forecast: RFC3339 t per slot, load_W verbatim (+consumption magnitude).
+	if len(resp.LoadForecast) != 2 {
+		t.Fatalf("load_forecast len = %d, want 2", len(resp.LoadForecast))
+	}
+	if resp.LoadForecast[1].LoadW != 800 {
+		t.Errorf("load_forecast[1].load_W = %v, want 800", resp.LoadForecast[1].LoadW)
+	}
+	if resp.LoadForecast[0].T != time.Unix(ws, 0).UTC().Format(time.RFC3339) {
+		t.Errorf("load_forecast[0].t = %s, want slot0", resp.LoadForecast[0].T)
 	}
 
 	// battery_plan: setpoint verbatim (+dis/−chg), soc_pct nullable.

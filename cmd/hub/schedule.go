@@ -113,6 +113,20 @@ func (p *schedulePublisher) build(snap orchestrator.PlanSnapshot) (bus.HubSchedu
 		hs.SolarForecastW[i] = finiteOrZero(kw) * 1000
 	}
 
+	// Load forecast (kW → W, +consumption). The home-load demand the DP planned
+	// around — present whenever the snapshot carries it (load is always modelled,
+	// unlike battery/EV). Guard the length defensively like solar above.
+	if len(snap.LoadKw) > 0 {
+		hs.LoadForecastW = make([]float64, n)
+		for i := 0; i < n; i++ {
+			var kw float64
+			if i < len(snap.LoadKw) {
+				kw = snap.LoadKw[i]
+			}
+			hs.LoadForecastW[i] = finiteOrZero(kw) * 1000
+		}
+	}
+
 	// Battery plan (setpoint W + planned SOC pct) — only when a battery was
 	// modelled (BattCapKwh > 0). BattSetpointW is NaN per-slot when there is no
 	// battery; here BattCapKwh>0 guarantees real setpoints, but stay defensive.

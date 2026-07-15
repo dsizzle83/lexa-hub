@@ -17,7 +17,7 @@
   "allowlist_path": "/var/lib/lexa/ocpp-allowlist.json",
   "stations": [
     {
-      "id": "cs-001",
+      "id": "evse-001",
       "max_current_a": 32.0,
       "voltage_v": 230.0
     }

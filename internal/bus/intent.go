@@ -229,6 +229,14 @@ type HubSchedule struct {
 	// series keyed by the configured station id. Empty when no EV was modelled.
 	EVPlanW map[string][]float64 `json:"ev_plan_w"`
 
+	// LoadForecastW is the per-slot site-load forecast the plan served (W), a
+	// POSITIVE consumption magnitude — the demand the battery/EV/grid dispatch is
+	// planned around. Unlike BatterySetpointW/GridW/EVPlanW (signed bus flows),
+	// this is a forecast magnitude like SolarForecastW (its generation dual):
+	// +consumption, never negative. Empty on a hub that predates this field
+	// (back-compat: GET /plan then renders an empty load_forecast series).
+	LoadForecastW []float64 `json:"load_forecast_w,omitempty"`
+
 	// --- Plan economics (PR-C, additive) ---
 	// The fields below surface the $ economics the DP already computes
 	// internally so GET /plan can render them; populated by a later PR

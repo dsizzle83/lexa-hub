@@ -235,6 +235,17 @@ type PlannerCfg struct {
 	// on the running high-water estimate derived from observed generation.
 	SolarPeakKw float64 `json:"solar_peak_kw"`
 
+	// LoadAvgKw is the average site load (home, excluding EV) in kW used to
+	// SYNTHESIZE a diurnal load-forecast curve (diurnalLoadForecast) when no
+	// per-step load profile arrives from an app/cloud intent. 0 (the default)
+	// disables synthesis: the planner falls back to the scalar LoadForecastKw
+	// (the live inferred load held flat), exactly as before this field existed,
+	// so a hub.json without this key plans byte-identically. A positive value
+	// gives the DP a realistic evening-peaked residential load to arbitrage
+	// against (peak-shaving, EV/solar shifting) even on a solar-masked or
+	// baseload-free bench where the instantaneous inferred load reads ~0.
+	LoadAvgKw float64 `json:"load_avg_kw"`
+
 	// DP discretisation (0 = default 0.5 kWh).
 	SOCStepKwh float64 `json:"soc_step_kwh"`
 
@@ -730,12 +741,25 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 		}
 	}
 
-	// Fixed daily charge: a flat, dispatch-independent cost added ONCE to the
-	// reported daily total. The horizon is exactly 24 h = 1 day
-	// (planStepHours*planSteps == 24), so the whole charge applies. It stays out
-	// of every per-slot MarginalCost — a constant cannot change marginal
-	// dispatch — and therefore never moves a setpoint.
-	out.TotalCost += p.FixedDailyCharge
+	// TotalCost of the RETURNED plan: the sum of its per-slot marginal costs (the
+	// true import/export $ the backtracked dispatch incurs) plus the flat daily
+	// charge. For a cleanly feasible plan this equals the forward-pass optimum
+	// dp[best] the plan was seeded with above; but when the terminal SOC/EV-target
+	// penalty forces a best-effort path, dp[best] is pinned to 0 by the
+	// "no feasible path" guard while the plan still imports to serve load — so
+	// report the marginals actually planned. This never reads misleadingly low on
+	// a plan that costs money, and keeps TotalCost consistent with the cost_plan
+	// series on the wire (which is exactly these marginals).
+	//
+	// Fixed daily charge: a flat, dispatch-independent cost added ONCE (the
+	// horizon is exactly 24 h = 1 day, planStepHours*planSteps == 24). It stays
+	// out of every per-slot MarginalCost — a constant cannot change marginal
+	// dispatch — so it never moves a setpoint, only the reported daily total.
+	planCost := 0.0
+	for i := range out.Intervals {
+		planCost += out.Intervals[i].MarginalCost
+	}
+	out.TotalCost = planCost + p.FixedDailyCharge
 
 	return out
 }
@@ -833,6 +857,54 @@ func diurnalSolarForecast(baseUnix int64, peakKw float64) []float64 {
 	out := make([]float64, planSteps)
 	for t := range out {
 		out[t] = peakKw * clearSkyShape(localHourOf(baseUnix+int64(t)*planStepSec))
+	}
+	return out
+}
+
+// residentialLoadShape returns an UNNORMALISED residential load factor at a
+// local hour-of-day: a low overnight base, a modest morning bump, and a
+// dominant early-evening peak — the demand side of the classic "duck curve".
+// Only the SHAPE matters; diurnalLoadForecast scales it to a configured average,
+// so the absolute magnitudes of the constants here are arbitrary.
+func residentialLoadShape(hour float64) float64 {
+	base := 0.5
+	morning := 0.7 * gaussianBump(hour, 7.5, 1.5)
+	midday := 0.25 * gaussianBump(hour, 13.0, 2.5)
+	evening := 1.8 * gaussianBump(hour, 19.5, 2.5)
+	return base + morning + midday + evening
+}
+
+// gaussianBump is an un-normalised Gaussian (peak 1.0 at mu) used to shape the
+// residential load curve's morning/evening humps.
+func gaussianBump(x, mu, sigma float64) float64 {
+	d := (x - mu) / sigma
+	return math.Exp(-0.5 * d * d)
+}
+
+// diurnalLoadForecast builds a per-step (5-min) site-load forecast (kW) over the
+// 24 h horizon starting at baseUnix, shaping a residential day
+// (residentialLoadShape) and scaling it so the MEAN over the window equals
+// avgKw. Returns nil when avgKw <= 0 (no synthesis — the caller keeps the scalar
+// LoadForecastKw), mirroring diurnalSolarForecast's nil-on-no-information
+// contract. The window is exactly 24 h, so it covers every hour once regardless
+// of start: the scaled mean equals avgKw no matter when the day begins.
+func diurnalLoadForecast(baseUnix int64, avgKw float64) []float64 {
+	if avgKw <= 0 {
+		return nil
+	}
+	raw := make([]float64, planSteps)
+	var sum float64
+	for t := range raw {
+		raw[t] = residentialLoadShape(localHourOf(baseUnix + int64(t)*planStepSec))
+		sum += raw[t]
+	}
+	mean := sum / float64(planSteps)
+	if mean <= 0 {
+		return nil
+	}
+	out := make([]float64, planSteps)
+	for t := range raw {
+		out[t] = avgKw * raw[t] / mean
 	}
 	return out
 }

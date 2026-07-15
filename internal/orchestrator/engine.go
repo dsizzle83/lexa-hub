@@ -214,6 +214,13 @@ type PlanSnapshot struct {
 	// EVMaxCurrentA can be rendered as power_W. 0 when no EV was modelled.
 	EVVoltageV float64
 
+	// LoadKw is the per-slot site-load forecast (kW, home load excluding EV) the
+	// plan was built against — the synthesized/profile load or the flat scalar,
+	// whichever buildPlannerParams resolved (captured via planStepLoad). Always
+	// len planSteps in a captured snapshot; surfaced so GET /plan can render a
+	// home-load series (the demand the battery/EV/grid decisions serve).
+	LoadKw []float64
+
 	// Currency is the ISO currency code the plan (TotalCost, MarginalCost, and
 	// the price arrays below) is priced in — "USD" by default (compileTariff
 	// enforces USD upstream). Never empty in a captured snapshot.
@@ -656,6 +663,14 @@ func (e *Engine) replan() {
 		currency = "USD" // compileTariff enforces USD upstream; never surface ""
 	}
 
+	// Capture the per-slot load the DP costed against (planStepLoad resolves the
+	// profile-or-scalar exactly as the DP did), so GET /plan can surface the
+	// home-load series. Freshly built each replan; same single writer.
+	loadKw := make([]float64, planSteps)
+	for t := range loadKw {
+		loadKw[t] = planStepLoad(params, t)
+	}
+
 	e.state.dailyPlan.Store(plan)
 	// GAP-7: capture the forecast the plan was built against (Plan() discards
 	// it) plus the capacity/voltage the /plan projection needs to render SOC and
@@ -666,6 +681,7 @@ func (e *Engine) replan() {
 	e.state.planSnap.Store(&PlanSnapshot{
 		Plan:             plan,
 		ForecastKw:       params.SolarForecastKw,
+		LoadKw:           loadKw,
 		BattCapKwh:       params.BattCapacityKwh,
 		EVVoltageV:       params.EVVoltageV,
 		Currency:         currency,
@@ -873,6 +889,14 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 	e.effectiveReservePct.Store(math.Float64bits(effReservePct))
 	if lp := inp.loadProfileKw; len(lp) > 0 {
 		p.LoadProfileKw = lp
+	} else if cfg.LoadAvgKw > 0 {
+		// No app/cloud load profile: synthesize a diurnal residential load curve
+		// from the configured average so the DP has a realistic evening-peaked
+		// load to arbitrage against. Precedence: intent profile ▸ synthesized
+		// config profile ▸ scalar LoadForecastKw (the live inferred load held
+		// flat, already set on p above). Absent config (LoadAvgKw==0) ⇒ the
+		// scalar path, byte-identical to pre-load-synthesis behaviour.
+		p.LoadProfileKw = diurnalLoadForecast(p.WindowStart, cfg.LoadAvgKw)
 	}
 	if inp.fallbackTOU != nil {
 		p.FallbackTOU = inp.fallbackTOU
