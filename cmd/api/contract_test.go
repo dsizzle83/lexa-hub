@@ -87,6 +87,12 @@ func statusStore(t *testing.T) *stateStore {
 	store.onCloudlinkStatus(bus.TopicCloudlinkStatus, bus.CloudlinkStatus{
 		Connected: true, Endpoint: "ssl://cloud.example:8883", SpoolBytes: 0, CertDaysLeft: 45,
 	})
+	// WP-15: seed a healthy VEN status so the live /status emits the "openadr"
+	// object the golden fixture pins (last_err stays empty ⇒ omitted, same as
+	// cert_status's client_err/ca_err above).
+	store.onOpenADRStatus(bus.TopicOpenADRStatus, bus.OpenADRStatus{
+		VTNOK: true, TokenOK: true, LastPollTs: time.Now().Unix(), Programs: 2, ActiveEvents: 1,
+	})
 	store.onModeStatus(bus.TopicHubMode, bus.ModeStatus{Mode: "gateway", Since: 500})
 
 	ep, fp, exp := 30.0, 20.0, 0.05

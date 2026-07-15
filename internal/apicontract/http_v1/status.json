@@ -78,6 +78,13 @@
     "spool_bytes": 0,
     "cert_days_left": 45
   },
+  "openadr": {
+    "vtn_ok": true,
+    "token_ok": true,
+    "last_poll_ts": "2026-07-11T00:00:00Z",
+    "programs": 2,
+    "active_events": 1
+  },
   "reserve": {
     "effective_pct": 30,
     "floor_pct": 20,

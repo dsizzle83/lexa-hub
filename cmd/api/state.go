@@ -106,6 +106,13 @@ type stateStore struct {
 	// "cloud_link" only once non-nil.
 	cloudLinkStatus *bus.CloudlinkStatus
 
+	// openADRStatus is lexa-openadr's latest retained VEN health doc
+	// (TopicOpenADRStatus, WP-15). nil until the first message arrives — the
+	// VEN is idle until openadr.json's vtn_url is set, so on an uncommissioned
+	// deployment this stays nil; folded into /status as "openadr" only once
+	// non-nil, same additive discipline as cloudLinkStatus above.
+	openADRStatus *bus.OpenADRStatus
+
 	// scanStatusRing holds the last scanStatusRingCap ScanStatus progress
 	// lines (TopicScanStatus, not retained — a transient one-shot command's
 	// progress, not state) across however many scans have run this process
@@ -308,6 +315,14 @@ func (s *stateStore) onCloudlinkStatus(_ string, c bus.CloudlinkStatus) {
 	s.mu.Unlock()
 }
 
+// onOpenADRStatus records lexa-openadr's latest retained VEN health doc
+// (TopicOpenADRStatus, WP-15).
+func (s *stateStore) onOpenADRStatus(_ string, o bus.OpenADRStatus) {
+	s.mu.Lock()
+	s.openADRStatus = &o
+	s.mu.Unlock()
+}
+
 // onScanStatus appends one commissioning-scan progress line
 // (TopicScanStatus, not retained) to the bounded ring, evicting the oldest
 // entry once scanStatusRingCap is reached.
@@ -355,6 +370,9 @@ type snapshot struct {
 	scanStatusRing  []bus.ScanStatus
 	scanResult      *bus.ScanResult
 	ocppPending     *bus.PendingStations
+
+	// WP-15: nil until the first OpenADRStatus arrives, same discipline as above.
+	openADRStatus *bus.OpenADRStatus
 
 	// GAP-8: nil until the first HubSettings arrives, same discipline as above.
 	hubSettings *bus.HubSettings
@@ -414,6 +432,10 @@ func (s *stateStore) snapshot() snapshot {
 	if s.cloudLinkStatus != nil {
 		cl := *s.cloudLinkStatus
 		out.cloudLinkStatus = &cl
+	}
+	if s.openADRStatus != nil {
+		oa := *s.openADRStatus
+		out.openADRStatus = &oa
 	}
 	if s.scanResult != nil {
 		sr := *s.scanResult

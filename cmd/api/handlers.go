@@ -69,6 +69,12 @@ type statusResp struct {
 	// until the first message arrives (no cloudlink service exists in this
 	// repo yet, TASK-085+, so today this stays omitted on every deployment).
 	CloudLink *cloudLinkJSON `json:"cloud_link,omitempty"`
+	// OpenADR is lexa-openadr's latest retained VEN status (bus.OpenADRStatus,
+	// TopicOpenADRStatus, WP-15) — vtn_ok/token_ok/last_poll_ts/programs/
+	// active_events/last_err. Additive: nil/omitted until the first
+	// OpenADRStatus arrives (the VEN is idle until openadr.json's vtn_url is
+	// set, so today this stays omitted on an uncommissioned deployment).
+	OpenADR *openADRJSON `json:"openadr,omitempty"`
 	// Reserve is the hub's effective backup-reserve floor (bus.HubSettings,
 	// TopicHubSettings, GAP-8) — effective_pct/floor_pct/source. Additive:
 	// nil/omitted until the first HubSettings arrives (the hub seeds one at
@@ -109,6 +115,18 @@ type cloudLinkJSON struct {
 	SpoolBytes   int64  `json:"spool_bytes"`
 	LastUplinkTs string `json:"last_uplink_ts,omitempty"` // RFC3339, omitted if never uplinked
 	CertDaysLeft int    `json:"cert_days_left,omitempty"`
+}
+
+// openADRJSON is /status's stable, hand-rolled shape for bus.OpenADRStatus
+// (WP-15) — decoupled from the wire envelope, the same pattern cloudLinkJSON
+// uses for bus.CloudlinkStatus (LastPollTs Unix→RFC3339, like LastUplinkTs).
+type openADRJSON struct {
+	VTNOK        bool   `json:"vtn_ok"`
+	TokenOK      bool   `json:"token_ok"`
+	LastPollTs   string `json:"last_poll_ts,omitempty"` // RFC3339, omitted if never polled
+	Programs     int    `json:"programs"`
+	ActiveEvents int    `json:"active_events"`
+	LastErr      string `json:"last_err,omitempty"`
 }
 
 // certStatusJSON is /status's stable, hand-rolled shape for bus.CertStatus —
@@ -277,6 +295,20 @@ func buildStatus(snap snapshot, hb heartbeatStatus) statusResp {
 			clj.LastUplinkTs = time.Unix(cl.LastUplinkTs, 0).UTC().Format(time.RFC3339)
 		}
 		resp.CloudLink = clj
+	}
+
+	if oa := snap.openADRStatus; oa != nil {
+		oaj := &openADRJSON{
+			VTNOK:        oa.VTNOK,
+			TokenOK:      oa.TokenOK,
+			Programs:     oa.Programs,
+			ActiveEvents: oa.ActiveEvents,
+			LastErr:      oa.LastErr,
+		}
+		if oa.LastPollTs != 0 {
+			oaj.LastPollTs = time.Unix(oa.LastPollTs, 0).UTC().Format(time.RFC3339)
+		}
+		resp.OpenADR = oaj
 	}
 
 	// GAP-8: project the hub's effective reserve + active tariff into /status's

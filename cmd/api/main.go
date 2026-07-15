@@ -241,6 +241,19 @@ func main() {
 		log.Fatalf("lexa-api: subscribe cloudlink status: %v", err)
 	}
 
+	// WP-15 (standards-buildout E1): lexa-openadr's retained VEN status,
+	// folded into GET /status as "openadr". The VEN is idle until
+	// openadr.json's vtn_url is set, so on an uncommissioned deployment this
+	// subscribe is inert (never delivers) — same forward-looking pattern as
+	// the cloudlink subscribe above. ACL grants lexa-api read on this topic
+	// (systemd/mosquitto-lexa.acl).
+	if err := mqttutil.Subscribe(mc, bus.TopicOpenADRStatus, func(topic string, o bus.OpenADRStatus) {
+		store.onOpenADRStatus(topic, o)
+		lb.Emit(fmt.Sprintf("[openadr] vtn_ok=%v programs=%d active_events=%d", o.VTNOK, o.Programs, o.ActiveEvents))
+	}); err != nil {
+		log.Fatalf("lexa-api: subscribe openadr status: %v", err)
+	}
+
 	// DEVICE_ROADMAP.md §5/§4.3: commissioning-scan progress + result.
 	if err := mqttutil.Subscribe(mc, bus.TopicScanStatus, func(topic string, s bus.ScanStatus) {
 		store.onScanStatus(topic, s)
