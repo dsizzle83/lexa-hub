@@ -90,6 +90,23 @@
 #     on every redeploy would erase a device's cloud enrollment. Once
 #     present (fresh or pre-existing), mqtt_user/mqtt_pass_file are patched
 #     into it the same way as the six services.
+#   - ALSO provisions a lexa-openadr broker user + /etc/lexa/mqtt/
+#     openadr.pass (WP-15, standards-buildout E1 — this deploy wiring is the
+#     last remaining piece; cmd/openadr, configs/openadr.json,
+#     systemd/lexa-openadr.service, and the mosquitto-lexa.acl lexa-openadr
+#     stanza already ship). Mirrors the lexa-cloudlink treatment exactly:
+#     idempotent broker credential, and /etc/lexa/openadr.json installs ONLY
+#     IF ABSENT (it carries operator-set VEN/VTN commissioning state —
+#     vtn_url, client_id, client_secret_file, program_ids — a blind overwrite
+#     would erase). Once present, mqtt_user/mqtt_pass_file are patched into
+#     it the same way as cloudlink.json.
+#   - creates /var/lib/lexa (0750 lexa:lexa) explicitly up front — several
+#     services' units auto-create it via StateDirectory=lexa on first start,
+#     but lexa-migrate and lexa-healthcheck both expect it to already exist
+#     (see cmd/lexa-migrate/main.go's package doc: /etc/lexa + /var/lib/lexa
+#     are the persistent data partition survived across an A/B rootfs
+#     update) — creating it here removes the dependency on which service's
+#     StateDirectory happens to run first.
 #   - runs /usr/local/sbin/lexa-migrate once, directly, BEFORE restarting any
 #     service (unit 1.6) — aborts the whole deploy loudly on nonzero exit.
 #   - stages the OCPP CSMS TLS cert/key + generates an idempotent Basic Auth
@@ -132,7 +149,7 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 CSIP="$(cd "$HERE/../csip-tls-test" && pwd)"
 STAGE="$CSIP/certs/client-staging"
 
-for f in lexa-hub lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-cloudlink lexa-healthcheck lexa-migrate; do
+for f in lexa-hub lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-cloudlink lexa-openadr lexa-healthcheck lexa-migrate; do
   [[ -x "$HERE/bin/arm64/$f" ]] || { echo "missing $HERE/bin/arm64/$f — run make build-arm64"; exit 1; }
 done
 # lexactl doesn't fit the lexa-* binary name pattern (it's the operator CLI,
@@ -194,6 +211,16 @@ id lexa >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/n
 install -d -m 755 /etc/lexa
 install -d -m 750 -o lexa -g lexa /etc/lexa/certs
 install -d -m 750 -o lexa -g lexa /etc/lexa/mqtt
+# /var/lib/lexa (WP-13 allowlist / V1RC-D): several services' units
+# (lexa-hub/northbound/api/cloudlink) auto-create this via
+# StateDirectory=lexa the first time any one of them starts, but
+# lexa-migrate (runs directly, below, BEFORE any service restart) and
+# lexa-healthcheck (reads /var/lib/lexa/journal/<service>, run advisory-only
+# after the restarts) both treat it as already-present persistent-partition
+# state (cmd/lexa-migrate/main.go's package doc) — so it's created
+# explicitly here rather than left to whichever unit's StateDirectory wins
+# the race.
+install -d -m 750 -o lexa -g lexa /var/lib/lexa
 
 # Per-service MQTT broker credentials (TASK-013 / W7 / AD-008). This always
 # runs, independent of --bench-insecure: every service gets a real password
@@ -241,6 +268,30 @@ if [[ -s "$PASSWD_FILE" ]]; then
   mosquitto_passwd -b "$PASSWD_FILE" lexa-cloudlink "$cloudlink_pass"
 else
   mosquitto_passwd -b -c "$PASSWD_FILE" lexa-cloudlink "$cloudlink_pass"
+fi
+# lexa-openadr broker credential (WP-15, standards-buildout E1). Mirrors the
+# lexa-cloudlink block immediately above exactly (idempotent pass-file, 0600
+# lexa:lexa, mosquitto_passwd upsert) and is deliberately NOT folded into the
+# $SERVICES loop above for the identical reason cloudlink isn't: that loop's
+# config-patch further below assumes /etc/lexa/<svc>.json already exists,
+# but /etc/lexa/openadr.json installs no-overwrite (operator-set VEN/VTN
+# commissioning state — vtn_url, client_id, client_secret_file, program_ids
+# — a blind overwrite would erase it, same reasoning as cloudlink.json). The
+# pass-file name (openadr.pass, not lexa-openadr.pass) follows the
+# cloudlink.pass precedent; the broker username (lexa-openadr) still follows
+# house convention and matches systemd/mosquitto-lexa.acl's `user
+# lexa-openadr` stanza.
+OPENADR_PASSFILE=/etc/lexa/mqtt/openadr.pass
+if [[ ! -s "$OPENADR_PASSFILE" ]]; then
+  ( umask 077 && openssl rand -hex 16 > "$OPENADR_PASSFILE" )
+  chown lexa:lexa "$OPENADR_PASSFILE"
+  chmod 600 "$OPENADR_PASSFILE"
+fi
+openadr_pass="$(cat "$OPENADR_PASSFILE")"
+if [[ -s "$PASSWD_FILE" ]]; then
+  mosquitto_passwd -b "$PASSWD_FILE" lexa-openadr "$openadr_pass"
+else
+  mosquitto_passwd -b -c "$PASSWD_FILE" lexa-openadr "$openadr_pass"
 fi
 # CORRECTED 2026-07-05 (TASK-006 bench validation): the 06931cc change to
 # root:root 0600 was based on a false premise. strace of a fresh
@@ -346,6 +397,19 @@ else
   echo "  /etc/lexa/cloudlink.json already present — left untouched (no-overwrite; may carry commissioning state)"
 fi
 
+# lexa-openadr config (WP-15, standards-buildout E1). Install ONLY IF ABSENT
+# — same reasoning as cloudlink.json immediately above: openadr.json carries
+# operator-set VEN/VTN commissioning state (vtn_url, client_id,
+# client_secret_file, token_url, program_ids, ven_name) this script never
+# re-patches, so clobbering it on every redeploy would erase a device's VEN
+# enrollment.
+if [[ ! -f /etc/lexa/openadr.json ]]; then
+  install -m 644 $D/configs/openadr.json /etc/lexa/openadr.json
+  echo "  installed /etc/lexa/openadr.json (fresh; configs/openadr.json template — vtn_url empty, no VTN commissioned yet)"
+else
+  echo "  /etc/lexa/openadr.json already present — left untouched (no-overwrite; may carry VEN/VTN commissioning state)"
+fi
+
 # Patch each service's mqtt_user/mqtt_pass_file (the config install above just
 # overwrote /etc/lexa/*.json from the repo's example, mqtt_user/
 # mqtt_pass_file both ""). Always populated, independent of --bench-insecure
@@ -391,6 +455,29 @@ PY
   echo "  mqtt_user/mqtt_pass_file patched into /etc/lexa/cloudlink.json"
 else
   echo "  /etc/lexa/cloudlink.json not present — skipped cloudlink mqtt cred patch (unexpected: install-if-absent should have created it)"
+fi
+
+# lexa-openadr mqtt_user/mqtt_pass_file (WP-15; openadr.json itself now
+# installs, no-overwrite, right above). Guarded on the config existing —
+# same belt-and-braces reasoning as the cloudlink block above. Uses the
+# openadr.pass filename set by the credential block earlier (matches the
+# cloudlink.pass precedent); the broker username (lexa-openadr) matches
+# systemd/mosquitto-lexa.acl's `user lexa-openadr` stanza.
+if [[ -f /etc/lexa/openadr.json ]]; then
+  python3 - <<'PY'
+import json
+path = "/etc/lexa/openadr.json"
+with open(path) as f:
+    cfg = json.load(f)
+cfg["mqtt_user"] = "lexa-openadr"
+cfg["mqtt_pass_file"] = "/etc/lexa/mqtt/openadr.pass"
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PY
+  echo "  mqtt_user/mqtt_pass_file patched into /etc/lexa/openadr.json"
+else
+  echo "  /etc/lexa/openadr.json not present — skipped openadr mqtt cred patch (unexpected: install-if-absent should have created it)"
 fi
 
 # lexa-api bearer-token auth (TASK-014 / AD-008 / WS-1). The config install
@@ -562,13 +649,13 @@ if ! /usr/local/sbin/lexa-migrate -config-dir /etc/lexa; then
   exit 1
 fi
 
-for s in lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-hub lexa-cloudlink; do
+for s in lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-hub lexa-cloudlink lexa-openadr; do
   systemctl enable "$s" >/dev/null
   systemctl restart "$s"
 done
 sleep 3
 echo "── Service status:"
-for s in mosquitto lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-hub lexa-cloudlink; do
+for s in mosquitto lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-hub lexa-cloudlink lexa-openadr; do
   printf '  %-18s %s\n' "$s" "$(systemctl is-active $s)"
 done
 
@@ -638,7 +725,8 @@ else
   echo "   once ../csip-tls-test/certs/ev-server-cert.pem is provisioned (gen-ev-cert.sh $PI)."
 fi
 echo
-echo "── lexa-cloudlink / lexa-migrate / lexa-commission:"
+echo "── lexa-cloudlink / lexa-openadr / lexa-migrate / lexa-commission:"
 echo "   ssh $SSHUSER@$PI sudo systemctl is-active lexa-cloudlink                    # want: active (enabled:false in cloudlink.json ⇒ idle, no cloud session)"
+echo "   ssh $SSHUSER@$PI sudo systemctl is-active lexa-openadr                      # want: active (vtn_url empty in openadr.json ⇒ idle, no VTN commissioned)"
 echo "   ssh $SSHUSER@$PI sudo journalctl -u lexa-migrate --no-pager | tail -5       # this deploy's migration run"
 echo "   ssh $SSHUSER@$PI sudo systemctl is-enabled lexa-commission.path            # want: enabled (watches /var/lib/lexa/commission/restart.request)"
