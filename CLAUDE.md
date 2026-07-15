@@ -358,11 +358,16 @@ CI: `.github/workflows/ci.yml` — vet + `-race` (pure-Go) + cgo build on every 
 
 ## Current bench deployment
 
-The ConnectCore dev kit (69.0.0.2) is offline; the hub runs on **hub-pi `dhpi4` at
-69.0.0.1** (root systemd units, passwordless sudo, SSH `dmitri@`). Deploy with
-`scripts/deploy-hub-pi.sh 69.0.0.1 dmitri` (needs `make build-arm64` first; stages client
-certs from `../csip-tls-test/certs/client-staging/`). Full topology:
-`../csip-tls-test/docs/BENCH.md`. Dev-kit runbook for when it returns: `DEVKIT.md`.
+**The hub runs on the ConnectCore dev kit `ccimx93-dvk` at 69.0.0.2** (fresh DEY/Yocto
+image 2026-07-07, SSH `root@` no password, `/usr/bin/sudo` is a shim — see `DEVKIT.md`,
+the authoritative runbook incl. the Yocto mosquitto caveats: anonymous broker, no
+mosquitto_passwd/ACL on the box). **hub-pi `dhpi4` at 69.0.0.1 is STANDBY** (lexa
+services stopped+disabled; SSH `dmitri@`, passwordless sudo) — do not deploy there
+without deliberately deciding to move the hub. Deploy with
+`scripts/deploy-hub-pi.sh 69.0.0.2 root` per DEVKIT.md (needs `make build-arm64` first;
+stages client certs from `../csip-tls-test/certs/client-staging/`). Full topology:
+`../csip-tls-test/docs/BENCH.md`. (This section was stale 2026-07-07→14, pointing at
+hub-pi — a bench round-1 deploy briefly re-activated the Pi; owner confirmed dev kit.)
 
 ## Install on the Digi SOM
 
