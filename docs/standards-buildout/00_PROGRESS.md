@@ -39,7 +39,7 @@ lexa-openadr deploy wiring (WP-15 service half shipped WITHOUT deploy-hub-pi.sh 
 must still provision /etc/lexa/mqtt/openadr.pass + patch openadr.json creds + install/enable the
 unit + a client_secret_file, per architecture §2.3's deploy note — tracked separately).
 
-Vendor quirks for next proto bump: (WP-4) csipmodel DERList lacks pollRate; DERCapability/Settings lack rtg/setMaxWh; DERStatus lacks alarmStatus; derreport parses putResult error strings for 404/405 — switch to typed error when tlsclient gains one. (WP-5) csipmodel KindVoltage=12 collides with 2030.5 KindType energy(12); KindFreq=38 is not a KindType member. Telemetry uses local spec-correct constants meanwhile.
+Vendor quirks for next proto bump: (WP-4) csipmodel DERList lacks pollRate; DERCapability/Settings lack rtg/setMaxWh; DERStatus lacks alarmStatus; derreport parses putResult error strings for 404/405 — switch to typed error when tlsclient gains one. (WP-5) csipmodel KindVoltage=12 collides with 2030.5 KindType energy(12); KindFreq=38 is not a KindType member. Telemetry uses local spec-correct constants meanwhile. (WP-13) ocppserver16 lacks an Authorize seam — 1.6 Authorize gating needs it. **(QA-A, 2026-07-15, real latent bug) `lexa-proto/modbus` `ReadRegisters` errors on any read >125 registers without chunking — the full 137-register SunSpec model 701 (a 1547-2018-certified inverter's primary measurement model) is UNREADABLE in one transaction; a real device serving it would fail. The QA sim truncates 701 to 121 regs as a workaround. FIX: split reads at the 125-register Modbus limit in the transport.**
 
 ## Campaign status (WP-17 gate, 2026-07-14)
 
