@@ -419,3 +419,16 @@ serial-download mode and run `uuu`. This is the ultimate fallback.
 - `~/projects/csip-tls-test/sim_dashboard.txt` — web dashboard (`cmd/dashboard`)
 - `~/projects/csip-tls-test/sim_{solar,battery,meter,ev}.txt` — per-Pi simulator setup
 - `CLAUDE.md` — architecture, MQTT topic map, build basics
+
+## Deploy gotchas found 2026-07-15 (bench round 2)
+
+- **Stop services before scp'ing binaries**: writing over a running binary fails
+  with `ETXTBSY` — `systemctl stop 'lexa-*'` on the kit first, then copy, then start.
+- **ocpp.json must be patched after a manual copy**: the repo example ships SP2
+  placeholder values (cert/auth paths that are not real secrets). The Pi deploy
+  script patches `bench:true` + blanks the SP2 fields on a plain deploy; the manual
+  dev-kit procedure must do the same by hand or lexa-ocpp starts in a silently
+  broken SP2 mode. Same for api.json if desktop access is needed: `bench:true`
+  (the WS-1 gate otherwise refuses a non-loopback bind without a token — correct).
+- Fresh-image note: retained MQTT state can carry a stale `mode=gateway` — check
+  `lexa/hub/mode` and publish an optimizer-mode intent if the hub was migrated.
