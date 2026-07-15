@@ -17,9 +17,11 @@ Wants=mosquitto.service
 
 [Service]
 # WS-1 sandboxing (V1.0 punch list, 2026-07-09): bounds blast radius on top
-# of the existing User=lexa. lexa-modbus writes nothing to disk (no journal/
-# snapshot block in its config; Modbus/SunSpec reconciler state is in-memory
-# + on the wire only) — no ReadWritePaths= needed.
+# of the existing User=lexa. StateDirectory grants /var/lib/lexa under
+# ProtectSystem=strict for the scan-journal block configs/modbus.json ships
+# (79ea417, unit 5.2) — without it the journal mkdir fails read-only at boot
+# (bench round-1 finding, 2026-07-14). Same pattern as lexa-hub.service.
+StateDirectory=lexa
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

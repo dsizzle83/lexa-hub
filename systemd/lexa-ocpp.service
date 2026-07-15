@@ -17,9 +17,11 @@ Wants=mosquitto.service
 
 [Service]
 # WS-1 sandboxing (V1.0 punch list, 2026-07-09): bounds blast radius on top
-# of the existing User=lexa. lexa-ocpp writes nothing to disk (it only reads
-# ocpp.json + certs/basic-auth-pass files; OCPP session state is in-memory) —
-# no ReadWritePaths= needed.
+# of the existing User=lexa. StateDirectory grants /var/lib/lexa under
+# ProtectSystem=strict for the WP-13 pairing allowlist (allowlist_path in
+# ocpp.json) — without it the first pairing approval fails read-only (same
+# class as the bench round-1 lexa-modbus journal finding, 2026-07-14).
+StateDirectory=lexa
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
