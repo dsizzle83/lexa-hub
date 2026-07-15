@@ -186,6 +186,79 @@ func TestFollowRedirects_IssueErrorPropagates(t *testing.T) {
 	}
 }
 
+// === RedirectsTotal: lexa_nb_redirects_total (bench round 2 gap) ==========
+//
+// redirectsTotal is process-global (see its doc in redirect.go) and shared
+// with every other test in this package, so these compare BEFORE/AFTER
+// deltas rather than absolute values — the same discipline
+// internal/northbound/discovery's IgnoredContentTotal tests use for its
+// analogous process-global WP-8 counter.
+
+func TestRedirectsTotal_CountsFollowedHop(t *testing.T) {
+	before := RedirectsTotal()
+	s := &scriptedIssuer{t: t, resps: []*HTTPResponse{redirectResp(302, "/dcap-v2"), okResp()}}
+	if _, err := followRedirects("GET", "/dcap", 3, testServerAddr, s.issue); err != nil {
+		t.Fatalf("followRedirects: %v", err)
+	}
+	if got := RedirectsTotal() - before; got != 1 {
+		t.Errorf("RedirectsTotal delta = %d, want 1 for a single followed hop", got)
+	}
+}
+
+func TestRedirectsTotal_CountsEveryHopUpToTheLimit(t *testing.T) {
+	const max = 3
+	// initial + max follows, every one a redirect — same script as
+	// TestFollowRedirects_HopLimitExceeded: 3 hops are actually followed
+	// (resolved + re-issued) before the 4th response trips the limit check,
+	// so the delta must be exactly max, not max+1.
+	resps := make([]*HTTPResponse, max+1)
+	for i := range resps {
+		resps[i] = redirectResp(302, "/loop")
+	}
+	s := &scriptedIssuer{t: t, resps: resps}
+
+	before := RedirectsTotal()
+	if _, err := followRedirects("GET", "/dcap", max, testServerAddr, s.issue); err == nil {
+		t.Fatal("expected redirect-limit error, got nil")
+	}
+	if got := RedirectsTotal() - before; got != max {
+		t.Errorf("RedirectsTotal delta = %d, want %d (one per followed hop before the limit tripped)", got, max)
+	}
+}
+
+func TestRedirectsTotal_RefusedRedirectNotCounted(t *testing.T) {
+	cases := []struct {
+		name string
+		loc  string
+	}{
+		{"cross-host", "https://evil.example:11111/dcap"},
+		{"scheme-downgrade", "http://" + testServerAddr + "/dcap"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &scriptedIssuer{t: t, resps: []*HTTPResponse{redirectResp(302, tc.loc)}}
+			before := RedirectsTotal()
+			if _, err := followRedirects("GET", "/dcap", 3, testServerAddr, s.issue); err == nil {
+				t.Fatal("expected the refused redirect to error")
+			}
+			if got := RedirectsTotal() - before; got != 0 {
+				t.Errorf("RedirectsTotal delta = %d, want 0 — a refused Location must never count as followed", got)
+			}
+		})
+	}
+}
+
+func TestRedirectsTotal_ZeroDisablesNeverCounts(t *testing.T) {
+	s := &scriptedIssuer{t: t, resps: []*HTTPResponse{redirectResp(302, "/dcap-v2")}}
+	before := RedirectsTotal()
+	if _, err := followRedirects("GET", "/dcap", 0, testServerAddr, s.issue); err != nil {
+		t.Fatalf("followRedirects: %v", err)
+	}
+	if got := RedirectsTotal() - before; got != 0 {
+		t.Errorf("RedirectsTotal delta = %d, want 0 when redirect following is disabled", got)
+	}
+}
+
 // === resolveRedirectLocation: the fail-closed rules =======================
 
 func TestResolveRedirectLocation(t *testing.T) {

@@ -160,6 +160,14 @@ func main() {
 	reg.Collect(func(r *metrics.Registry) {
 		r.Counter("lexa_nb_ignored_control_content_total").Set(discovery.IgnoredContentTotal())
 	})
+	// WP-3/D3 (bench round 2 gap: named in architecture.md §8, never wired):
+	// 301/302 hops followed across all three wolfSSL fetchers — scrape-time
+	// snapshot of tlsclient's process-global recorder, same shape as
+	// IgnoredContentTotal just above (internal/tlsclient stays
+	// metrics-decoupled; see RedirectsTotal's doc).
+	reg.Collect(func(r *metrics.Registry) {
+		r.Counter("lexa_nb_redirects_total").Set(tlsclient.RedirectsTotal())
+	})
 
 	mqttPass, err := mqttutil.LoadPassword(cfg.MQTTPassFile)
 	if err != nil {

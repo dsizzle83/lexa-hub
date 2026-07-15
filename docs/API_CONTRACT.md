@@ -95,7 +95,10 @@ Each is pinned by a golden fixture and the CI gate. Fields are grouped by route;
   `stale_sources[str]`, `last_plan{timestamp, decisions[{rule, reason, impact}]}`,
   `plan_heartbeat{state, age_s}`,
   `csip_control{source, mrid, valid_until, base{exp_lim_W?, max_lim_W?, imp_lim_W?, fixed_W?, connect?}}`,
-  `cert_status{client_days_left, ca_days_left, days_left, checked_at}`,
+  `cert_status{client_days_left, ca_days_left, days_left, checked_at, pin_ok?}`
+  (`pin_ok`, bench round 2 gap: additive per the rule above, omitted like
+  `client_err`/`ca_err` when northbound hasn't produced a verdict — not
+  required by the golden fixture, `apicontract.Version` unchanged at 1),
   `cloud_link{connected, endpoint, spool_bytes, cert_days_left}`,
   `reserve{effective_pct?, floor_pct?, source}`,
   `tariff{source, updated_at, spec{currency, periods[{label, days, start_hh, end_hh, import_per_kwh, export_per_kwh?}]}}`.

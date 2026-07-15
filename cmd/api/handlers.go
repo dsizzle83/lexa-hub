@@ -124,6 +124,14 @@ type certStatusJSON struct {
 	ClientErr      string `json:"client_err,omitempty"`
 	CAErr          string `json:"ca_err,omitempty"`
 	CheckedAt      string `json:"checked_at"` // RFC3339 timestamp of the check (bus.CertStatus.Ts)
+	// PinOK mirrors bus.CertStatus.PinOK (WP-7, D4) — the registration-PIN
+	// verification verdict from lexa-northbound's per-walk Registration
+	// check. nil/omitted (the common case: check disabled, or no verdict
+	// yet) rather than a fabricated false, same additive/nullable
+	// discipline as ClientErr/CAErr above; true/false once a verdict
+	// exists. Bench round 2 gap: previously dropped on the floor here even
+	// though northbound already published it.
+	PinOK *bool `json:"pin_ok,omitempty"`
 }
 
 type planHeartbeatJSON struct {
@@ -243,6 +251,7 @@ func buildStatus(snap snapshot, hb heartbeatStatus) statusResp {
 			ClientErr:      cs.ClientErr,
 			CAErr:          cs.CAErr,
 			CheckedAt:      time.Unix(cs.Ts, 0).UTC().Format(time.RFC3339),
+			PinOK:          cs.PinOK,
 		}
 		if cs.ClientNotAfter != 0 {
 			csj.ClientNotAfter = time.Unix(cs.ClientNotAfter, 0).UTC().Format(time.RFC3339)

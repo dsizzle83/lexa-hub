@@ -77,6 +77,11 @@ func TestBuildStatus_CertStatus(t *testing.T) {
 	if got.CertStatus.ClientNotAfter != wantClientNotAfter {
 		t.Errorf("CertStatus.ClientNotAfter = %q, want %q", got.CertStatus.ClientNotAfter, wantClientNotAfter)
 	}
+	// PinOK unset on the bus message (registration_pin disabled, or no
+	// verdict yet) must stay nil/omitted, never a fabricated false.
+	if got.CertStatus.PinOK != nil {
+		t.Errorf("CertStatus.PinOK = %v, want nil when bus.CertStatus.PinOK is nil", *got.CertStatus.PinOK)
+	}
 
 	// An error state (unreadable file) must carry through, not be dropped.
 	errStatus := &bus.CertStatus{
@@ -95,3 +100,38 @@ func TestBuildStatus_CertStatus(t *testing.T) {
 		t.Errorf("ClientNotAfter = %q, want empty when ClientNotAfter is 0 (inspection failed)", got.CertStatus.ClientNotAfter)
 	}
 }
+
+// TestBuildStatus_CertStatus_PinOK pins the GAP-1 (bench round 2) fix:
+// bus.CertStatus.PinOK must reach /status's cert_status.pin_ok unchanged —
+// nil stays omitted, true and false both carry through (a verdict of
+// "false" — PIN mismatch or freeze — is exactly the case the app needs to
+// see, so it must never be silently dropped like the pre-fix behavior).
+func TestBuildStatus_CertStatus_PinOK(t *testing.T) {
+	now := time.Now()
+
+	for _, want := range []*bool{nil, boolPtr(true), boolPtr(false)} {
+		cs := &bus.CertStatus{
+			Envelope: bus.Envelope{V: bus.CertStatusV},
+			DaysLeft: 10,
+			Ts:       now.Unix(),
+			PinOK:    want,
+		}
+		snap := snapshot{now: now, certStatus: cs}
+		got := buildStatus(snap, heartbeatStatus{State: heartbeatNever})
+		if got.CertStatus == nil {
+			t.Fatalf("PinOK=%v: CertStatus = nil, want the populated field", want)
+		}
+		switch {
+		case want == nil:
+			if got.CertStatus.PinOK != nil {
+				t.Errorf("PinOK=nil: got.CertStatus.PinOK = %v, want nil", *got.CertStatus.PinOK)
+			}
+		default:
+			if got.CertStatus.PinOK == nil || *got.CertStatus.PinOK != *want {
+				t.Errorf("PinOK=%v: got.CertStatus.PinOK = %v, want %v", *want, got.CertStatus.PinOK, *want)
+			}
+		}
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }

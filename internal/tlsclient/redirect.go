@@ -25,6 +25,7 @@ package tlsclient
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 )
 
 // maxRedirectLocation caps the Location value followRedirects will act on.
@@ -33,6 +34,28 @@ import (
 // a much tighter bound: a real CSIP Location is a short resource href, and
 // a kilobytes-long one is a hostile server, not a big deployment.
 const maxRedirectLocation = 2048
+
+// redirectsTotal is the monotonic count of 301/302 hops followRedirects has
+// actually followed (a validated Location, about to be re-issued) — for
+// lexa_nb_redirects_total (architecture.md §8, bench round 2 gap: named
+// there but never wired up). internal/tlsclient is a leaf package that must
+// stay decoupled from any metrics implementation (see internal/metrics'
+// package doc and the CLAUDE.md dependency-posture rationale), so this is a
+// package-level atomic with an exported accessor — the same shape
+// discovery.IgnoredContentTotal uses for the analogous WP-8 counter — rather
+// than importing internal/metrics or threading a callback through Config
+// (three independent fetchers — discovery/response/flow-reservation, see
+// cmd/northbound/main.go — would each need wiring; a single process-wide
+// total needs none). cmd/northbound's metrics Collect callback scrapes it
+// via RedirectsTotal, mirroring IgnoredContentTotal's wiring exactly.
+var redirectsTotal uint64
+
+// RedirectsTotal returns the total number of redirect hops followRedirects
+// has followed across every WolfSSLFetcher in this process, for a metrics
+// Collect callback to snapshot into lexa_nb_redirects_total.
+func RedirectsTotal() uint64 {
+	return atomic.LoadUint64(&redirectsTotal)
+}
 
 // isRedirectStatus reports whether code is one of the two redirect statuses
 // followRedirects acts on. 303/307/308 are deliberately NOT followed: the
@@ -124,6 +147,7 @@ func followRedirects(verb, path string, redirectMax int, serverAddr string, issu
 		if rerr != nil {
 			return nil, fmt.Errorf("%s %s: status %d: %w", verb, cur, resp.StatusCode, rerr)
 		}
+		atomic.AddUint64(&redirectsTotal, 1)
 		cur = next
 		resp, err = issue(cur)
 		if err != nil {
