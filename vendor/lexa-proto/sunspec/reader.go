@@ -36,19 +36,51 @@ func (r *Reader) Blocks() []Block {
 	return r.blocks
 }
 
+// maxHoldingRead is the Modbus spec ceiling on holding registers per single
+// ReadHolding transaction (PI-MBUS-300: 0x7D = 125). A SunSpec model whose data
+// block is wider than this — notably model 701, whose full layout is 137
+// registers — MUST be read in consecutive chunks: a single ReadHolding of >125
+// is refused by the transport, which would otherwise make the whole model
+// (and, since 701 is read during discovery, the whole device) fail to read.
+const maxHoldingRead = 125
+
 // ReadModel reads all data registers for the given model and returns them as a
-// []uint16 slice indexed by 0-based register offset within the model.
+// []uint16 slice indexed by 0-based register offset within the model. Blocks
+// wider than the Modbus per-read ceiling (maxHoldingRead) are read in
+// consecutive transactions and concatenated, transparently to the caller.
 func (r *Reader) ReadModel(modelID uint16) ([]uint16, error) {
 	b, err := FindModel(r.blocks, modelID)
 	if err != nil {
 		return nil, err
 	}
-	regs, err := r.t.ReadHolding(b.BaseAddr, b.Length)
+	regs, err := r.readChunked(b.BaseAddr, b.Length)
 	if err != nil {
 		return nil, fmt.Errorf("sunspec: read model %d at %d+%d: %w",
 			modelID, b.BaseAddr, b.Length, err)
 	}
 	return regs, nil
+}
+
+// readChunked reads quantity holding registers starting at addr, splitting the
+// request into consecutive transactions of at most maxHoldingRead registers and
+// concatenating the results — so a model wider than the Modbus per-read ceiling
+// is read correctly rather than refused. A quantity <= maxHoldingRead is a
+// single ReadHolding, identical to the pre-chunking behaviour.
+func (r *Reader) readChunked(addr, quantity uint16) ([]uint16, error) {
+	out := make([]uint16, 0, quantity)
+	for read := uint16(0); read < quantity; {
+		n := quantity - read
+		if n > maxHoldingRead {
+			n = maxHoldingRead
+		}
+		chunk, err := r.t.ReadHolding(addr+read, n)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, chunk...)
+		read += n
+	}
+	return out, nil
 }
 
 // WriteModel writes values into the given model starting at offset (0-based
