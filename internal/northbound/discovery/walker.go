@@ -237,7 +237,7 @@ func (w *Walker) Discover(ctx context.Context, dcapPath string) (*ResourceTree, 
 	if dcap.EndDeviceListLink == nil {
 		return nil, fmt.Errorf("step 3: DeviceCapability has no EndDeviceListLink")
 	}
-	edl, err := w.fetchEndDeviceList(ctx, dcap.EndDeviceListLink.Href)
+	edl, err := w.fetchEndDeviceListPaged(ctx, dcap.EndDeviceListLink.Href)
 	if err != nil {
 		return nil, fmt.Errorf("step 3 (EndDeviceList): %w", err)
 	}
@@ -310,7 +310,7 @@ func (w *Walker) Discover(ctx context.Context, dcapPath string) (*ResourceTree, 
 			continue // FSA with no programs is valid but uninteresting
 		}
 
-		progList, err := w.fetchDERProgramList(ctx, fsa.DERProgramListLink.Href)
+		progList, err := w.fetchDERProgramListPaged(ctx, fsa.DERProgramListLink.Href)
 		if err != nil {
 			return nil, fmt.Errorf("step 5 (DERProgramList from FSA %d): %w", i, err)
 		}
@@ -336,7 +336,7 @@ func (w *Walker) Discover(ctx context.Context, dcapPath string) (*ResourceTree, 
 			// scheduler's scalar evaluation view alongside (the full base is
 			// carried in ExtendedControls, WP-8 — nothing is dropped).
 			if prog.DERControlListLink != nil {
-				ext, err := w.fetchExtendedDERControlList(ctx, prog.DERControlListLink.Href)
+				ext, err := w.fetchExtendedDERControlListPaged(ctx, prog.DERControlListLink.Href)
 				if err != nil {
 					return nil, fmt.Errorf("step 6 (DERControlList for %s): %w", prog.MRID, err)
 				}
@@ -401,7 +401,7 @@ func (w *Walker) Discover(ctx context.Context, dcapPath string) (*ResourceTree, 
 
 	// MirrorUsagePointList (for telemetry — Milestone 5, but discover it now)
 	if dcap.MirrorUsagePointListLink != nil {
-		mupList, err := w.fetchMirrorUsagePointList(ctx, dcap.MirrorUsagePointListLink.Href)
+		mupList, err := w.fetchMirrorUsagePointListPaged(ctx, dcap.MirrorUsagePointListLink.Href)
 		if err != nil {
 			// MUP failure is not fatal to discovery — we can still operate
 			// without telemetry. Log it but don't fail.
@@ -469,6 +469,70 @@ func (w *Walker) fetchDERList(ctx context.Context, path string) (*model.DERList,
 func (w *Walker) fetchMirrorUsagePointList(ctx context.Context, path string) (*model.MirrorUsagePointList, error) {
 	var r model.MirrorUsagePointList
 	return &r, w.fetchAndParse(ctx, path, &r)
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Paged list fetchers (P1-1) — each wraps a single-page typed helper above
+// in fetchPagedList so a spec-compliant paging server (results < all across
+// pages) has every entry collected, not just the first page. See paginate.go
+// for the loop + its fail-closed contract. The single-page helpers stay for
+// the non-list resources and as the per-page fetch func here.
+// ───────────────────────────────────────────────────────────────────────
+
+func (w *Walker) fetchEndDeviceListPaged(ctx context.Context, path string) (*model.EndDeviceList, error) {
+	return fetchPagedList(ctx, path, pagedList[model.EndDeviceList, model.EndDevice]{
+		fetch:   w.fetchEndDeviceList,
+		all:     func(l *model.EndDeviceList) uint32 { return l.All },
+		results: func(l *model.EndDeviceList) uint32 { return l.Results },
+		entries: func(l *model.EndDeviceList) []model.EndDevice { return l.EndDevice },
+		href:    func(e model.EndDevice) string { return e.Href },
+		install: func(l *model.EndDeviceList, e []model.EndDevice) {
+			l.EndDevice = e
+			l.All, l.Results = uint32(len(e)), uint32(len(e))
+		},
+	})
+}
+
+func (w *Walker) fetchDERProgramListPaged(ctx context.Context, path string) (*model.DERProgramList, error) {
+	return fetchPagedList(ctx, path, pagedList[model.DERProgramList, model.DERProgram]{
+		fetch:   w.fetchDERProgramList,
+		all:     func(l *model.DERProgramList) uint32 { return l.All },
+		results: func(l *model.DERProgramList) uint32 { return l.Results },
+		entries: func(l *model.DERProgramList) []model.DERProgram { return l.DERProgram },
+		href:    func(e model.DERProgram) string { return e.Href },
+		install: func(l *model.DERProgramList, e []model.DERProgram) {
+			l.DERProgram = e
+			l.All, l.Results = uint32(len(e)), uint32(len(e))
+		},
+	})
+}
+
+func (w *Walker) fetchExtendedDERControlListPaged(ctx context.Context, path string) (*model.ExtendedDERControlList, error) {
+	return fetchPagedList(ctx, path, pagedList[model.ExtendedDERControlList, model.ExtendedDERControl]{
+		fetch:   w.fetchExtendedDERControlList,
+		all:     func(l *model.ExtendedDERControlList) uint32 { return l.All },
+		results: func(l *model.ExtendedDERControlList) uint32 { return l.Results },
+		entries: func(l *model.ExtendedDERControlList) []model.ExtendedDERControl { return l.DERControl },
+		href:    func(e model.ExtendedDERControl) string { return e.Href },
+		install: func(l *model.ExtendedDERControlList, e []model.ExtendedDERControl) {
+			l.DERControl = e
+			l.All, l.Results = uint32(len(e)), uint32(len(e))
+		},
+	})
+}
+
+func (w *Walker) fetchMirrorUsagePointListPaged(ctx context.Context, path string) (*model.MirrorUsagePointList, error) {
+	return fetchPagedList(ctx, path, pagedList[model.MirrorUsagePointList, model.MirrorUsagePoint]{
+		fetch:   w.fetchMirrorUsagePointList,
+		all:     func(l *model.MirrorUsagePointList) uint32 { return l.All },
+		results: func(l *model.MirrorUsagePointList) uint32 { return l.Results },
+		entries: func(l *model.MirrorUsagePointList) []model.MirrorUsagePoint { return l.MirrorUsagePoint },
+		href:    func(e model.MirrorUsagePoint) string { return e.Href },
+		install: func(l *model.MirrorUsagePointList, e []model.MirrorUsagePoint) {
+			l.MirrorUsagePoint = e
+			l.All, l.Results = uint32(len(e)), uint32(len(e))
+		},
+	})
 }
 
 func (w *Walker) fetchDERCurveList(ctx context.Context, path string) (*model.DERCurveList, error) {
