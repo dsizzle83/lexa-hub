@@ -848,22 +848,28 @@ func (o *DefaultOptimizer) planExportDischargeCapW(limits gridConstraints, state
 	}
 	conservativeW := limits.exportLimitW * (1 - margin)
 	// baseExport = meter export attributable to everything BUT the battery
-	// (solar − load − EV) = SIGNED net export minus the discharge now flowing.
-	// Signed (not floored at 0) so a net-IMPORTING site correctly credits its
-	// local load: under a 0 W export cap a pack may still discharge up to the
-	// load (offsetting import, exporting nothing). Without a grid meter we cannot
-	// credit load, so fall back to a base of 0 ⇒ cap = conservative limit, a
-	// pure-discharge bound that can never itself exceed the cap.
+	// (solar − load − EV) = SIGNED net export minus the SIGNED battery power now
+	// flowing. Subtracting the signed power (discharge positive, CHARGE negative)
+	// is what makes this "everything but the battery": a charging pack draws from
+	// the site, so its negative power must be added back out of the base, not
+	// treated as immovable load. Summing only positive (discharge) power inflated
+	// the cap by the full charge magnitude at every charge→discharge plan flip
+	// (audit EXPCAP-1), briefly letting the plan discharge export past the cap.
+	// Signed net export (not floored at 0) also credits a net-IMPORTING site's
+	// local load: under a 0 W export cap a pack may still discharge up to the load
+	// (offsetting import, exporting nothing). Without a grid meter we cannot credit
+	// load, so fall back to a base of 0 ⇒ cap = conservative limit, a pure-discharge
+	// bound that can never itself exceed the cap.
 	baseExportW := 0.0
 	if !math.IsNaN(state.Grid.NetW) {
 		signedNetExportW := -state.Grid.NetW
-		measuredDischargeW := 0.0
+		measuredBatterySignedW := 0.0
 		for _, b := range state.Batteries {
-			if b.Connected && b.PowerW > 0 {
-				measuredDischargeW += b.PowerW
+			if b.Connected && !math.IsNaN(b.PowerW) {
+				measuredBatterySignedW += b.PowerW
 			}
 		}
-		baseExportW = signedNetExportW - measuredDischargeW
+		baseExportW = signedNetExportW - measuredBatterySignedW
 	}
 	return math.Max(0, conservativeW-baseExportW)
 }

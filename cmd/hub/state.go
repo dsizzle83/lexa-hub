@@ -609,11 +609,17 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 	}
 
 	// Pre-scan: does the world appear to be moving? Frozen-meter detection requires
-	// at least one inverter to have changed its W recently; otherwise a legitimately
-	// steady grid (stable load, zero wind) would produce a false positive.
+	// at least one INVERTER OR BATTERY to have changed its W recently; otherwise a
+	// legitimately steady grid (stable load, zero wind) would produce a false
+	// positive. A battery is included because at night — precisely when peak-TOU
+	// plan discharge runs — solar W is flat, so an inverter-only pre-scan never
+	// fires and a stuck meter measuring a kilowatt-ramping pack is never excluded;
+	// its frozen reading then feeds the export cap's measured-discharge subtraction
+	// and re-opens the pre-fix breach (audit EXPCAP-3). A ramping pack is the
+	// strongest evidence a flat meter is stuck.
 	worldMoving := false
 	for _, dc := range r.devices {
-		if dc.Role == "inverter" {
+		if dc.Role == "inverter" || dc.Role == "battery" {
 			s := r.lastMeas[dc.Name]
 			if !s.wChangedAt.IsZero() && now.Sub(s.wChangedAt) < solarMovingWindow {
 				worldMoving = true
