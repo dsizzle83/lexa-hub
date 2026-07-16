@@ -43,7 +43,7 @@ the active `name` file. Envelope: `v`, `ts` (local wall clock), `srv_t`
 | `control_released` | hub (`onCSIPControl` + `ReadSystemState`'s expiry-drop branch) | `reason`: `cleared` (source → none), `replaced` (mRID switch, no intervening clear), or `expired` (aged past `ValidUntil` with no replacement message) |
 | `dispatch` | hub (`cmd/hub/desired.go`, all three actuators) | a desired-state doc is actually published (post content-dedupe — a repeat tick with unchanged intent journals nothing) |
 | `breach_begin` / `breach_end` | hub (`cmd/hub/breach.go`'s `breachEpisodes` component) | the same edges that publish a `bus.ComplianceAlert`: one begin per episode onset/mRID-switch, one end when all evidence sources clear |
-| `cannot_comply_posted` | northbound (`cmd/northbound/main.go`'s `responseTracker.alertCannotComply`) | after a successful (not merely attempted) CannotComply Response POST |
+| `cannot_comply_posted` | northbound (`internal/northbound/responses/tracker.go`'s `responses.Tracker.AlertCannotComply`) | after a successful (not merely attempted) CannotComply Response POST |
 
 ## `jq` one-liners
 

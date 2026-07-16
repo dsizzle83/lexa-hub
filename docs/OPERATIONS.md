@@ -58,8 +58,8 @@ differs by what MQTT gives each service back for free:
 
 **lexa-hub**: loses `MQTTSystemReader`'s in-memory snapshot (last
 measurement per device, staleness-edge state, the resolved CSIP control's
-expiry-confirm tick count) and the compliance-breach episode
-(`activeBreachMRID`) and every actuator's command deduper. Effects:
+expiry-confirm tick count) and the compliance-breach episode state
+(`breachEpisodes`, `cmd/hub/breach.go`) and every actuator's command deduper. Effects:
   - The staleness/frozen-meter edge detectors (`noteStaleness`,
     `state.go`'s meter-frozen block) start from "never seen" — a real
     stale/frozen device won't re-alarm until its own staleness window
@@ -97,17 +97,20 @@ restart-timing artifact, not a new protocol bug). The next discovery walk
 (within `discovery_interval_s`) re-publishes retained control fresh either
 way.
 
-**lexa-modbus**: loses each device's `lastCtrl` (the desired command
-`reassertLocked` re-applies on reconnect). Operator gotcha: if lexa-modbus
-restarts while a control is active and UNCHANGED since lexa-hub last sent
-it, lexa-hub's own dedupe (`cmdDeduper`, 60 s `reassertEvery`) may not
-resend that command for up to 60 s, because from lexa-hub's point of view
-nothing changed — it does not know lexa-modbus restarted. A battery/inverter
-can therefore run on its last-applied setpoint (not a released/default
-state — Modbus device registers hold whatever was last written) for up to
-that window. This is bounded and self-correcting, not a hang; if faster
-reconvergence is needed operationally, restart lexa-hub too (its dedupers
-reset unconditionally, per above).
+**lexa-modbus**: loses the Device Reconciler's in-memory desired/verdict
+state (last desired doc + readback/convergence tracking). On restart it
+re-subscribes to the retained `lexa/desired/{class}/{device}` doc (AD-013),
+which redelivers immediately and re-seeds each active-mode reconciler —
+readback + write-on-diff brings the device back to its standing setpoint
+without waiting on lexa-hub to resend anything, so there is no 60 s
+hub-dedupe window to bridge. Reassert-on-reconnect (a pack/inverter that
+drops and reopens its Modbus session) runs through the reconciler as the
+single reasserter (`retryDevice.onReconnect` → `shell.markReconnected` →
+`Reconciler.Reconnected`, an unconditional write of current desired; ledger
+L4, TASK-032). A battery/inverter runs on its last-applied setpoint (not a
+released/default state — Modbus device registers hold whatever was last
+written) until that re-seed lands, which is one MQTT round trip of
+reconnecting, not a fixed window.
 
 **lexa-ocpp**: loses all in-memory station/session state
 (`mqttBridge`'s `stationState` map). Real chargers reconnect per the OCPP

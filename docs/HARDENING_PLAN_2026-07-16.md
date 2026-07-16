@@ -1,6 +1,10 @@
 # Hardening Plan — post-audit of the 2026-07-16 QA session
 
-**Status:** PROPOSED (awaiting owner sign-off on the decision points in Part IV)
+**Status:** EXECUTED — hub Workstream H + P1 landed on `standards-buildout`; the csip QA
+hardening (Q2 identity-exact cap adoption, Q4 aus shed-lever proof, …) landed on
+`feat/dashboard-v2`. See git log and the per-phase execution note in Part III; the Part IV
+decision points below are now resolved (1–2 shipped). Genuinely-open items are the Phase 5
+bench-soak / csip coverage clocks (Q5/Q6/Q7/Q10, constraint-shadow soak), flagged there.
 **Inputs:** `docs/QA_SESSION_REPORT_2026-07-16.md` (the Opus session's hand-off) audited by a
 39-agent adversarial fleet — full findings with per-claim verifier verdicts in
 `docs/AUDIT_2026-07-16_FINDINGS.md`; raw soak artifacts preserved at
@@ -309,6 +313,17 @@ the next reader isn't misled; leave the original text intact as history.
 
 ## Part III — Sequencing & verification protocol
 
+**Execution status (verified against the tree, not just planned):** the hub-side items across
+Phases 0–4 have landed on `standards-buildout` — P1 (`legacy_cannotcomply_code` dropped from
+`configs/northbound.json`), H1 (reserve latch `updateReserveHolds`/`battReserveHold`), H2
+(signed export-cap in `planExportDischargeCapW`, EXPCAP-1), H3-D3 (`expZeroLeverTicks`
+debounce), H4 (`run.go` `TmParsedAt` anchor + scheduler `DebouncedExpiry{Confirm:2}`), H5
+(`ActiveControl.DefaultFallback` degrade path in `cmd/hub/state.go`), H6 (`EVModelled` plan
+gate), H7 (`ReadLooksCorrupt` guard on `write704`/`write703`, `proto.pin` 85af8d5), and H9
+(fixed-PF signed-VAr direction). The Phase 5 close-out — the Q10 combined-config bench pass, the
+restarted constraint-shadow soak clocks, and the Q5/Q6/Q7 coverage additions — remains
+outstanding, along with any bench-soak re-verification through the corrected runner.
+
 **Phase 0 — stop the bleeding (no design risk):** P1 (config flip) · P3 (preserve/commit/push) ·
 H8-deploy (ship lexa-northbound; the P1-1 field failure is live until then) · Q1 (runner
 integrity) · Q8+S1 (health gates + modsim fix) · restore `enforce_aus_limits` per Q10.
@@ -344,15 +359,17 @@ mayhem sweep ×3 cycles through the corrected runner · updated QA report addend
   the affected scenario at STOCK before calling it closed (CS-1's product exposure is *worse* at
   STOCK).
 
-## Part IV — Decisions needed from the owner
+## Part IV — Decisions (1–2 resolved & shipped; 3–4 still open)
 
-1. **H6 (EV plan-follow):** approve option (b) — plan owns the EV axis only when it modelled an EV,
-   reactive rule otherwise + session-connect replan wake? This changes live EV behavior on
-   battery+EVSE sites (today: standing 0 A suspend when the EV is unmodelled). Alternatives and
+1. **H6 (EV plan-follow):** **DECIDED & SHIPPED** — option (b) approved and landed on
+   `standards-buildout`: the plan owns the EV axis only when it modelled an EV (the `EVModelled`
+   gate in `planner.go`/`optimizer.go`), reactive rule otherwise. This changed live EV behavior on
+   battery+EVSE sites (was: standing 0 A suspend when the EV is unmodelled). Alternatives and
    trade-offs in AUDIT findings A-1.
-2. **H5 (expiry-during-outage):** approve falling back to the last-known DefaultDERControl instead
-   of unconstrained? 2030.5-correct and fail-closed, but it is a control-behavior change and adds
-   (additive) bus schema.
+2. **H5 (expiry-during-outage):** **DECIDED & SHIPPED** — the fallback to the last-known
+   DefaultDERControl (instead of unconstrained) is approved and landed on `standards-buildout`
+   (`ActiveControl.DefaultFallback` + the degrade path in `cmd/hub/state.go`). 2030.5-correct and
+   fail-closed; it is a control-behavior change and adds (additive) bus schema.
 3. **Scope:** FlowReservation + lexa-openadr bench coverage (CC-4/5) in this campaign, or defer to
    the next one? (Both need new sim/gridsim surface.)
 4. **Merge strategy:** PR review + merge `standards-buildout` and `feat/dashboard-v2` after Phase 1,

@@ -214,7 +214,8 @@ systemctl stop   lexa-hub lexa-telemetry lexa-northbound lexa-api lexa-ocpp lexa
 journalctl -f -u lexa-hub -u lexa-modbus -u lexa-northbound
 
 # Confirm the API answers (from the desktop or the device)
-curl http://69.0.0.2:9100/status
+# lexa-api serves HTTPS on :9100 with a self-signed leaf (configs/api.json tls:true) — use -k
+curl -sk https://69.0.0.2:9100/status
 ```
 
 ---
@@ -294,7 +295,7 @@ After rebooting the **dev kit**:
 
 1. `ip -br addr show eth0` → `69.0.0.2/24` (static IP persisted)
 2. `for s in mosquitto lexa-hub lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry; do systemctl is-active $s; done` → all `active`
-3. `curl http://69.0.0.2:9100/status` → live device readings
+3. `curl -sk https://69.0.0.2:9100/status` → live device readings (HTTPS, self-signed leaf)
 4. Northbound mTLS: `journalctl -u lexa-northbound -n 20` → `discovery OK`
 
 After rebooting the **desktop** (gridsim/dashboard host), nothing on the dev kit

@@ -13,7 +13,7 @@ Status legend: ⬜ pending · 🔵 in progress · ✅ done (tests green) · 🟠
 | WP-4 | DER* reporting (dersite + derreport) | M | 2,3 | ✅ (see git log) | closes CORE-009/014, BASIC-028 |
 | WP-5 | telemetry VAr + Wh MMRs | S | 2 | ✅ 656a0fe | closes BASIC-029 VAr gap |
 | WP-6 | LogEvent pipeline | M | 1,2 | ✅ 16d2bef | closes BASIC-027; gridsim LogEvent endpoint pending (bench queue) |
-| WP-7 | PIN verify + Table 27 codes | S | 1 | ✅ ea8b228 | 252 + 13/14 are documented seams; bench config keeps legacy 0xF0 until gridsim flips |
+| WP-7 | PIN verify + Table 27 codes | S | 1 | ✅ ea8b228 | 252 + 13/14 are documented seams; Table 27 codes are the default, example config drops the legacy key (gridsim flipped 2026-07) |
 | WP-8 | Advanced-control carriage northbound | M | 2 | ✅ 619494c | BUS LANE; retires extended→simple silent drop |
 | WP-9 | Adv desired doc + hub authoring | M | 8 | ✅ eae6b4d | BUS LANE; `advanced_der` flag |
 | WP-10 | Advanced reconciler execution | L | 9 | ✅ bd6190e | `reconciler.adv` off/shadow/active; closes BASIC-004..012 exec half |
@@ -30,8 +30,8 @@ WP-13(slice) → WP-14 → WP-15(slice). One owner at a time.
 
 Cross-repo: WP-1 commits in ../lexa-proto (local, no remote per AD-003(c)); proto.pin + vendor/
 regenerated in BOTH lexa-hub and ../csip-tls-test same session (TASK-024 CI gate). WP-7 default-flip
-of CannotComply codes needs gridsim expectation update in csip-tls-test same session (or bench configs
-set legacy_cannotcomply_code=true).
+of CannotComply codes was completed 2026-07: the gridsim expectation was updated in csip-tls-test and
+the example config dropped the `legacy_cannotcomply_code` escape-hatch key (default false ⇒ Table 27).
 
 Bench-deferred queue (WP-17f): adv-shell shadow soak · AUS shadow week · 1.6 evsim · PIN drill ·
 COMM-004 pcaps · dersite/PUT vs gridsim (gridsim needs PUT/LogEvent endpoints — csip-tls-test work) ·
@@ -39,7 +39,7 @@ lexa-openadr deploy wiring (WP-15 service half shipped WITHOUT deploy-hub-pi.sh 
 must still provision /etc/lexa/mqtt/openadr.pass + patch openadr.json creds + install/enable the
 unit + a client_secret_file, per architecture §2.3's deploy note — tracked separately).
 
-Vendor quirks for next proto bump: (WP-4) csipmodel DERList lacks pollRate; DERCapability/Settings lack rtg/setMaxWh; DERStatus lacks alarmStatus; derreport parses putResult error strings for 404/405 — switch to typed error when tlsclient gains one. (WP-5) csipmodel KindVoltage=12 collides with 2030.5 KindType energy(12); KindFreq=38 is not a KindType member. Telemetry uses local spec-correct constants meanwhile. (WP-13) ocppserver16 lacks an Authorize seam — 1.6 Authorize gating needs it. **(QA-A, 2026-07-15, real latent bug) `lexa-proto/modbus` `ReadRegisters` errors on any read >125 registers without chunking — the full 137-register SunSpec model 701 (a 1547-2018-certified inverter's primary measurement model) is UNREADABLE in one transaction; a real device serving it would fail. The QA sim truncates 701 to 121 regs as a workaround. FIX: split reads at the 125-register Modbus limit in the transport.**
+Vendor quirks for next proto bump: (WP-4) csipmodel DERList lacks pollRate; DERCapability/Settings lack rtg/setMaxWh; DERStatus lacks alarmStatus; derreport parses putResult error strings for 404/405 — switch to typed error when tlsclient gains one. (WP-5) csipmodel KindVoltage=12 collides with 2030.5 KindType energy(12); KindFreq=38 is not a KindType member. Telemetry uses local spec-correct constants meanwhile. (WP-13) ocppserver16 lacks an Authorize seam — 1.6 Authorize gating needs it. **(QA-A, 2026-07-15, real latent bug) `lexa-proto/modbus` `ReadRegisters` errors on any read >125 registers without chunking — the full 137-register SunSpec model 701 (a 1547-2018-certified inverter's primary measurement model) is UNREADABLE in one transaction; a real device serving it would fail. The QA sim truncates 701 to 121 regs as a workaround. FIX: split reads at the 125-register Modbus limit in the transport. RESOLVED (proto pin 85af8d5): `lexa-proto/sunspec/reader.go`'s `readChunked` splits reads at `maxHoldingRead=125`, so model 701 now reads in chunked transactions.**
 
 ## Campaign status (WP-17 gate, 2026-07-14)
 
@@ -69,7 +69,7 @@ pre-campaign behavior). Verification (branch `standards-buildout`, `GOWORK=off`)
 |---|---|---|
 | northbound.json | `registration_pin` | `0` (disabled+WARN) |
 | northbound.json | `der_report` | `true` |
-| northbound.json | `legacy_cannotcomply_code` | loader `false`; **bench config ships `true`** until gridsim flips |
+| northbound.json | `legacy_cannotcomply_code` | loader `false`; example config omits the key (gridsim flipped 2026-07, DRIFT-3) |
 | northbound.json | `redirect_max` | `3` |
 | hub.json | `advanced_der` | `"off"` |
 | hub.json | `enforce_aus_limits` | `false` |
@@ -91,7 +91,7 @@ prerequisite):
 2. **COMM-004 D–G pcaps** — blocked on 7 cert-chain fixtures + a `UseCertificateChainFile` wrapper in csip-tls-test (paired work item).
 3. **ERR-001 redirect bench check** — blocked on a redirect-injection `/admin/malform` kind in gridsim (paired work item).
 4. **dersite/PUT + LogEvent vs gridsim** — gridsim needs PUT + LogEventList endpoints (paired work item; blocks WP-4/WP-6 bench validation).
-5. **CannotComply code-flip pairing** — flip `legacy_cannotcomply_code` → false with gridsim's expectation updated same session (currently bench ships `true`).
+5. **CannotComply code-flip pairing** — ✅ DONE (2026-07): gridsim expectation flipped and the example config dropped `legacy_cannotcomply_code` (default false ⇒ IEEE Table 27 codes).
 6. **AUS shadow week** — ≥1-week `constraint_shadow` zero-diff before any `enforce_aus_limits` default-flip proposal.
 7. **adv-shell shadow soak** — `reconciler.adv` shadow→active against real inverter hardware (unvalidatable in sim alone, RSK-08).
 8. **1.6 evsim** — OCPP 1.6J evsim vs `port_16` dual-stack; 2.0.1 byte-identical preserved.

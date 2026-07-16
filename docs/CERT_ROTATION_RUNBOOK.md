@@ -121,8 +121,10 @@ successful walks — a WAN outage, a wedged server, or a rotation's brief
 reconnect window look identical to it: the retained `ActiveControl` stays
 published, and lexa-hub keeps enforcing it locally until either the next
 successful walk resolves something new, or the control's own `ValidUntil`
-expires and the hub's local expiry discipline releases it (`csipExpiredTicks`,
-`cmd/hub/state.go`).
+expires — at which point the hub degrades to the last-known DefaultDERControl
+if the expiring event carried one (still enforcing, never dropping to
+unconstrained), and only releases control entirely if no fallback was present
+(`cmd/hub/state.go`'s DefaultFallback branch).
 
 **This must be VERIFIED, not assumed, on the bench** (acceptance criteria):
 run a long export-cap DERControl through the dashboard/gridsim, rotate the

@@ -5,8 +5,8 @@ description: Bring up the LEXA hub's side of the bench demo, verify the full cha
 
 # Run the demo (hub side)
 
-The demo chain: gridsim on the desktop (69.0.0.20) ←mTLS← **this hub** (hub-pi
-`dhpi4`, 69.0.0.1) ←Modbus/OCPP→ device sims on the Pis, visualized at
+The demo chain: gridsim on the desktop (69.0.0.20) ←mTLS← **this hub** (ConnectCore
+dev kit `ccimx93-dvk`, 69.0.0.2) ←Modbus/OCPP→ device sims on the Pis, visualized at
 **http://69.0.0.20:8080**. Topology: `../csip-tls-test/docs/BENCH.md`.
 
 Division of labour:
@@ -14,19 +14,19 @@ Division of labour:
   its `run-demo` skill has the exact `systemd-run` commands). The desktop pieces are
   transient units that die on desktop reboot — that is the usual "demo is broken" cause,
   not the hub.
-- **This repo** owns the six lexa services on hub-pi (root units — they survive reboots).
+- **This repo** owns the six lexa services on the dev kit (root units — they survive reboots).
 
 ## 1. Hub health
 
 ```bash
-ssh dmitri@69.0.0.1 'sudo systemctl is-active mosquitto lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-api lexa-hub'
-curl -s --max-time 3 http://69.0.0.1:9100/status | head -c 300
+ssh root@69.0.0.2 'sudo systemctl is-active mosquitto lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-api lexa-hub'
+curl -sk --max-time 3 https://69.0.0.2:9100/status | head -c 300
 ```
 All seven `active` + a JSON status with device readings ⇒ hub side is demo-ready.
 
 Restart order if multiple services are down (dependencies flow downward):
 ```bash
-ssh dmitri@69.0.0.1 'sudo systemctl restart mosquitto && \
+ssh root@69.0.0.2 'sudo systemctl restart mosquitto && \
   sudo systemctl restart lexa-modbus lexa-ocpp lexa-api && \
   sudo systemctl restart lexa-northbound lexa-telemetry && \
   sudo systemctl restart lexa-hub'
@@ -34,12 +34,12 @@ ssh dmitri@69.0.0.1 'sudo systemctl restart mosquitto && \
 
 ## 2. Confirm the hub is in the chain
 
-1. Northbound walking gridsim: `ssh dmitri@69.0.0.1 'sudo journalctl -u lexa-northbound -n 10'`
+1. Northbound walking gridsim: `ssh root@69.0.0.2 'sudo journalctl -u lexa-northbound -n 10'`
    shows periodic walk cycles, no TLS errors. (Desktop-side proof:
    `journalctl --user -u csip-gridsim` shows `GET ... peer=<LFDI>`.)
-2. Controls on the bus: `ssh dmitri@69.0.0.1 'timeout 5 mosquitto_sub -t lexa/csip/control -v'`
+2. Controls on the bus: `ssh root@69.0.0.2 'timeout 5 mosquitto_sub -t lexa/csip/control -v'`
    returns the retained control immediately.
-3. Measurements ticking: `ssh dmitri@69.0.0.1 'timeout 12 mosquitto_sub -t "lexa/measurements/+" -v'`
+3. Measurements ticking: `ssh root@69.0.0.2 'timeout 12 mosquitto_sub -t "lexa/measurements/+" -v'`
    shows updates within ~10 s.
 4. EV connected: `lexa/evse/+/state` shows the station, or check the dashboard EV card.
 

@@ -293,12 +293,13 @@ or a paired csip-tls-test change.
    "gridsim needs PUT/LogEvent endpoints — csip-tls-test work"); blocks bench validation of WP-4's
    DER* reporting and WP-6's LogEvent poster against a real (simulated) CSIP-AUS-shaped server.
    Paired csip-tls-test work item.
-5. **CannotComply code-flip pairing** — `00_PROGRESS.md:32-34`: WP-7's default-flip of
-   CannotComply codes (0xF0 → IEEE 2030.5 Table 27, D5) needs gridsim's own expectation update in
-   the SAME session, or bench configs must set `legacy_cannotcomply_code=true` in the meantime
-   (`configs/northbound.json` currently ships `legacy_cannotcomply_code: true` — confirmed still
-   the case in-repo — i.e. the pairing has NOT happened yet and the bench is running the legacy
-   code path). Paired csip-tls-test work item.
+5. **CannotComply code-flip pairing** — **DONE.** `00_PROGRESS.md:32-34`: WP-7's default-flip of
+   CannotComply codes (0xF0 → IEEE 2030.5 Table 27, D5) needed gridsim's own expectation update in
+   the SAME session. That pairing has landed: `configs/northbound.json` no longer carries
+   `legacy_cannotcomply_code` at all (loader default `false` = Table 27,
+   `cmd/northbound/config.go:106-114`), and the bench gridsim flipped 2026-07 (audit DRIFT-3). The
+   `true` escape hatch remains for a bench whose gridsim predates Table-27 acceptance, but the repo
+   default and the bench now both run the Table 27 path — no bench action remaining.
 6. **AUS shadow week** — run `constraint_shadow` against real or simulated CSIP-AUS envelope
    traffic (`opModGenLimW`/`opModLoadLimW`) for ≥1 week per `architecture.md` §6's gate, comparing
    `internal/orchestrator/auslimits.go`'s cascade against

@@ -55,8 +55,9 @@ with TLS required — every EV Mayhem scenario goes BLIND until both sides flip
 together. Full runbook: `csip-tls-test/docs/BENCH.md`.
 
 **Lockstep warning**: if this deploy includes a SunSpec register-map change
-(`internal/southbound/sunspec`), the sims in csip-tls-test must be redeployed in the same
-session (audit MTR-4) — otherwise hub and metersim read garbage from each other.
+(`lexa-proto/sunspec`, vendored — a change there ships as a paired `proto.pin` bump
+in both repos), the sims in csip-tls-test must be redeployed in the same session
+(audit MTR-4) — otherwise hub and metersim read garbage from each other.
 
 ## Verify
 

@@ -22,20 +22,21 @@ are swept 0..1e9 W and cross-checked against each other in
 ```
 device/    Device interface: ApplyControl, ReadMeasurements, Status, Close.
            Measurements and DeviceStatus types. Only package knowing both CSIP and hardware shapes.
-modbus/    Transport wrapping simonvetter/modbus.
-           URL selects layer: tcp://host:502 | rtu:///dev/ttyUSB0 | rtuovertcp://host:502
-sunspec/   Scan (model discovery, reads IDs only — no data burst).
-           Reader: ReadModel(id) / WriteModel(id, offset, values), 0-based offsets within named block.
-           scale.go: ApplyScaleSigned/Unsigned, RawFromScaleSigned/Unsigned. 0x8000 → NaN.
-           layout.go + derlayout.go: declarative point tables for the IEEE 1547-2018
-           DER models 701-714 (exact spec order/type). der1547.go: typed parse/encode.
-derbase/   Shared DER device logic + CSIP DERControlBase → SunSpec write mapping.
 inverter/  Inverter implements Device. Reads Model 103 (or 101/102 fallback), nameplate from 121, controls via 123.
 battery/   BatteryDevice implements Device. Model 103 AC + 802 Li-Ion battery state.
 meter/     MeterDevice for bi-directional smart meter. Model 201 (single-phase AC).
 registry/  Registry: fan-out ApplyControl, background poll, MeasurementUpdate channel.
-sim/       Animated Modbus TCP servers. NewSolarServer / NewBatteryServer / NewMeterServer.
+sunspecsweep/  Runs the shared codec's scale/wrap/sentinel contract test against this
+           repo's vendored lexa-proto/sunspec copy (GS-1/MTR-1 sweep, TASK-053 — see above).
 ```
+
+The Modbus transport (`lexa-proto/modbus`), the SunSpec codec — Scan/Reader,
+`scale.go`, `layout.go`/`derlayout.go`, `der1547.go` (`lexa-proto/sunspec`) — and the
+shared DER device logic + CSIP DERControlBase → SunSpec write mapping
+(`lexa-proto/derbase`) moved out of this package into the shared **lexa-proto** module
+(TASK-023); they're imported here and vendored under `vendor/lexa-proto/`. The
+wire-format / offset reference below still documents that shared codec accurately — only
+the source now lives in lexa-proto.
 
 ## SunSpec wire format
 Header at address 40000 (0-based): `0x5375 0x6E53` ("SunS")
@@ -55,7 +56,7 @@ End sentinel: ModelID = `0xFFFF`
 | 802 (Li-Ion) | SoC, SoH, DoD, ChaSt | 10, 11, 12, 16 |
 
 ## IEEE 1547-2018 DER models (701-714)
-Defined declaratively in `sunspec/derlayout.go` as ordered point tables (`L701`,
+Defined declaratively in `lexa-proto/sunspec/derlayout.go` as ordered point tables (`L701`,
 `L704`, `L705Hdr`/`L705Crv`, …) — **do not** hand-number offsets; add/edit the
 `Field` list and offsets/lengths follow. A `View` over a register slice gives
 typed, scale-factor-aware, sentinel-safe access (`Float`, `Enum`, `SetFloat`, …).
@@ -69,11 +70,10 @@ inject/absorb → 704 PFWInj/PFWAbs sync groups; FixedVar → 704 VarSet; energi
 703 ES. Curve writers run the §3.1.2 adopt handshake (write staging curve →
 AdptCrvReq=2 → poll AdptCrvRslt → Ena=1).
 
-## Simulator API summary
-All sims expose HTTP + WebSocket via `internal/simapi/`:
-- Ports: modsim 5020/6020 · batsim 5021/6021 · metersim 5022/6022 · evsim —/6024
-- `GET /state` → typed JSON · `POST /inject {"W_W":3000}` · `POST /control {"cmd":"pause","speed":5}` · `GET /registers` · `GET /ws` (2 s push)
-- CORS wildcard enabled (legacy — the web dashboard proxies same-origin and does not need it).
+## Simulators
+The device simulators (animated Modbus TCP servers) and their HTTP + WebSocket
+`internal/simapi/` live in the bench repo `~/projects/csip-tls-test`, not here — this
+repo is the product (see the top-level CLAUDE.md).
 
 ## Tests
 Inverter, battery, meter packages test against an in-process simonvetter Modbus server — no hardware required.

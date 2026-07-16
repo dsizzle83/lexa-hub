@@ -19,8 +19,9 @@ description: Run the right tests for the most recently changed code and report r
 
 3. **Integration / conformance** tests live in the harness repo
    (`~/projects/csip-tls-test`: `make test-fast`, `go test ./tests/`,
-   `scripts/run-conformance.sh`). Run them there when changing `internal/northbound`,
-   `internal/southbound/sunspec` (lockstep packages!), or `internal/ocppserver`.
+   `scripts/run-conformance.sh`). Run them there when changing `internal/northbound`
+   or the shared `lexa-proto` packages (`sunspec`, `ocppserver` — lockstep via
+   `proto.pin`, enforced by `check-proto-pin.sh`).
 
 4. **Report format**
    - All pass: "All N tests pass." One line. Done.
@@ -32,5 +33,5 @@ description: Run the right tests for the most recently changed code and report r
 - Re-run a test that just passed.
 - Deploy or restart bench services as part of "testing" — that's the hub-deploy skill,
   and only on request.
-- Change `internal/southbound/sunspec` or `internal/ocppserver` without planning the
-  matching csip-tls-test change.
+- Change the shared `lexa-proto` packages (`sunspec`, `ocppserver`) without planning the
+  matching csip-tls-test change (both repos must repin `proto.pin` in lockstep).
