@@ -63,8 +63,15 @@ func freshController(activeLimitW float64) exportController {
 }
 
 // resetControllerForNewLimit starts a fresh controller session for a changed cap
-// value WITHOUT touching overTicks — the load-bearing separation. Ports
-// optimizer.go:661-663.
+// value WITHOUT touching overTicks/zeroLeverTicks — the load-bearing separation.
+// Ports optimizer.go's applyExportLimitRule value-change reset.
+//
+// NOTE (audit D1, DEFERRED to bench validation): preserving the plant-continuous
+// controller state across a cap-VALUE change to avoid the onset one-step-correction
+// overshoot was tried and reverted on both sides — under a slow/frozen meter it
+// lets the ceiling integrator wind DOWN below the physically-correct feed-forward
+// value (the full reset re-anchors it each rewrite). The primary control-churn fix
+// is the release-side debounce (D2); this stays a full reset until bench evidence.
 func (s *ExportSession) resetControllerForNewLimit(limitW float64) {
 	s.ctrl = freshController(limitW)
 }

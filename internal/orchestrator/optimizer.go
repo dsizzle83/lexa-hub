@@ -1079,6 +1079,15 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	}
 
 	// New limit value → start the guard fresh.
+	//
+	// NOTE (audit D1, DEFERRED to bench validation): preserving the ceiling
+	// integrator across a cap-VALUE change (control-churn) to avoid the onset
+	// one-step-correction overshoot was tried and reverted — under a slow/frozen
+	// meter it lets the integrator wind the ceiling DOWN below the physically-
+	// correct feed-forward value (this full reset re-anchors it each rewrite), a
+	// countervailing over-curtailment the verifier flagged as needing a hub-journal
+	// capture to weigh against the overshoot. The primary control-churn fix is the
+	// release-side debounce (D2); this stays a full reset until bench evidence.
 	if limits.exportLimitW != o.expGuard.activeLimitW {
 		o.expGuard = exportGuard{evSetpointA: math.NaN(), evCmdW: math.NaN(), batteryAbsorbW: math.NaN(), activeLimitW: limits.exportLimitW, filteredExportW: math.NaN(), solarCeilingW: math.NaN()}
 	}
