@@ -106,7 +106,31 @@ type ActiveControl struct {
 	// resolvable curves.
 	CurveSetID string `json:"curve_set_id,omitempty"`
 
+	// DefaultFallback carries the highest-priority program's DefaultDERControl
+	// ALONGSIDE an active event, so the hub can degrade to it — IEEE 2030.5
+	// event-end revert-to-default — instead of to UNCONSTRAINED when the event
+	// expires during a discovery outage (ED-3/H5). nil when the active control IS
+	// the default (Source=="default") or the program carries no DefaultDERControl.
+	// Additive at ActiveControlV=1 (AD-006: old subscribers ignore the key); its
+	// *float64 members participate in Finite() (GAP-09).
+	DefaultFallback *DefaultDERControlMsg `json:"default_fallback,omitempty"`
+
 	Ts int64 `json:"ts"`
+}
+
+// DefaultDERControlMsg is the scalar-limit subset of a DefaultDERControl carried
+// on ActiveControl.DefaultFallback (H5/ED-3). Curves ride lexa/csip/curves
+// separately, so only the enforced scalar op-modes are needed here.
+type DefaultDERControlMsg struct {
+	MRID     string   `json:"mrid,omitempty"`
+	Connect  *bool    `json:"connect,omitempty"`
+	Energize *bool    `json:"energize,omitempty"`
+	ExpLimW  *float64 `json:"exp_lim_w,omitempty"`
+	ImpLimW  *float64 `json:"imp_lim_w,omitempty"`
+	MaxLimW  *float64 `json:"max_lim_w,omitempty"`
+	GenLimW  *float64 `json:"gen_lim_w,omitempty"`  // CSIP-AUS — the case that makes this matter
+	LoadLimW *float64 `json:"load_lim_w,omitempty"` // CSIP-AUS
+	FixedW   *float64 `json:"fixed_w,omitempty"`
 }
 
 // FixedPF is a fixed power-factor command (opModFixedPFInjectW /

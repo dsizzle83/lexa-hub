@@ -386,6 +386,40 @@ func ToActiveControl(ac *scheduler.ActiveControl, clockOffset int64) bus.ActiveC
 	}
 	entries := curveSetEntries(ac)
 	msg.CurveSetID = bus.CurveSetContentHash(entries)
+
+	// H5/ED-3: carry the program's DefaultDERControl alongside an active EVENT so
+	// the hub degrades to it (2030.5 event-end revert-to-default) instead of to
+	// unconstrained when the event expires during a discovery outage. A
+	// default-sourced control already carries its limits in the primary fields.
+	if ac.Source == "event" && ac.Default != nil {
+		d := ac.Default
+		df := &bus.DefaultDERControlMsg{MRID: ac.DefaultMRID, Connect: d.OpModConnect, Energize: d.OpModEnergize}
+		if l := d.OpModExpLimW; l != nil {
+			w := apW(l)
+			df.ExpLimW = &w
+		}
+		if l := d.OpModImpLimW; l != nil {
+			w := apW(l)
+			df.ImpLimW = &w
+		}
+		if l := d.OpModMaxLimW; l != nil {
+			w := apW(l)
+			df.MaxLimW = &w
+		}
+		if l := d.OpModGenLimW; l != nil {
+			w := apW(l)
+			df.GenLimW = &w
+		}
+		if l := d.OpModLoadLimW; l != nil {
+			w := apW(l)
+			df.LoadLimW = &w
+		}
+		if l := d.OpModFixedW; l != nil {
+			w := apW(l)
+			df.FixedW = &w
+		}
+		msg.DefaultFallback = df
+	}
 	return msg
 }
 

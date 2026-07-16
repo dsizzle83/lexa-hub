@@ -140,6 +140,25 @@ func (a ActiveControl) Finite() error {
 			return err
 		}
 	}
+	// H5/ED-3: a NaN in the carried default-fallback must drop the whole retained
+	// message (fail-closed), not seed a NaN cap once the event expires.
+	if d := a.DefaultFallback; d != nil {
+		for _, f := range []struct {
+			name string
+			v    *float64
+		}{
+			{"default_fallback.exp_lim_w", d.ExpLimW},
+			{"default_fallback.imp_lim_w", d.ImpLimW},
+			{"default_fallback.max_lim_w", d.MaxLimW},
+			{"default_fallback.gen_lim_w", d.GenLimW},
+			{"default_fallback.load_lim_w", d.LoadLimW},
+			{"default_fallback.fixed_w", d.FixedW},
+		} {
+			if err := finite(f.name, f.v); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

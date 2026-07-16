@@ -223,6 +223,60 @@ func TestReadSystemState_ExpiredCSIPControlDropped(t *testing.T) {
 	}
 }
 
+// TestReadSystemState_ExpiredEventDegradesToDefaultFallback is the H5/ED-3
+// regression: an event that expires while its DefaultDERControl fallback is
+// carried must DEGRADE to that default (2030.5 event-end revert-to-default),
+// not drop to nil and run the optimizer UNCONSTRAINED (which would run a site
+// uncapped mid-outage until discovery recovers).
+func TestReadSystemState_ExpiredEventDegradesToDefaultFallback(t *testing.T) {
+	r := newMQTTSystemReader(nil, testFastInterval, nil)
+	eventLim := 1000.0
+	defaultLim := 5000.0
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
+		Source:     "event",
+		MRID:       "evt-1",
+		ExpLimW:    &eventLim,
+		ValidUntil: time.Now().Unix() - 10, // already past in server time
+		Ts:         time.Now().Unix(),
+		DefaultFallback: &bus.DefaultDERControlMsg{
+			MRID:    "default-1",
+			ExpLimW: &defaultLim,
+		},
+	})
+
+	// Ride out the confirm window.
+	state, err := r.ReadSystemState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < r.expiry.Confirm; i++ {
+		state, _ = r.ReadSystemState()
+	}
+
+	if state.CSIPControl == nil {
+		t.Fatal("an expired event with a DefaultDERControl fallback must degrade to the default, not drop to unconstrained")
+	}
+	if state.CSIPControl.Source != "default" {
+		t.Errorf("degraded control Source = %q, want \"default\"", state.CSIPControl.Source)
+	}
+	if state.CSIPControl.MRID != "default-1" {
+		t.Errorf("degraded control MRID = %q, want \"default-1\"", state.CSIPControl.MRID)
+	}
+	if ap := state.CSIPControl.Base.OpModExpLimW; ap == nil {
+		t.Error("degraded control carries no export limit")
+	} else if got := float64(ap.Value) * math.Pow10(int(ap.Multiplier)); math.Abs(got-defaultLim) > 1 {
+		t.Errorf("degraded export limit = %.0fW, want %.0fW (the default's cap, not the expired event's %.0fW)", got, defaultLim, eventLim)
+	}
+
+	// It PERSISTS (ValidUntil=0 never expires) — the default is not itself dropped.
+	for i := 0; i < 3; i++ {
+		state, _ = r.ReadSystemState()
+		if state.CSIPControl == nil || state.CSIPControl.Source != "default" {
+			t.Fatalf("degraded default must persist across ticks; tick %d got %+v", i, state.CSIPControl)
+		}
+	}
+}
+
 // TestReadSystemState_ClockLurchKeepsControl is the clock-lurch regression: a
 // non-monotonic server clock that repeatedly jumps past ValidUntil and back must
 // NOT drop a control that is still valid once the clock settles. Before the fix,

@@ -742,23 +742,43 @@ func (r *MQTTSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
 	serverNow := r.utclk.ServerNow()
 	expired := r.lastCSIP != nil && utilitytime.Expired(r.lastCSIP.ValidUntil, serverNow)
 	if r.expiry.Observe(expired) {
-		// TASK-045: migrated to slog (control expiry edge).
-		slog.Info("[hub] CSIP control expired; dropping",
-			"mrid", r.lastCSIP.MRID, "source", r.lastCSIP.Source,
-			"valid_until", r.lastCSIP.ValidUntil, "server_now", serverNow,
-			"confirm_ticks", r.expiry.Confirm)
-		// TASK-040: journal the release BEFORE nilling r.lastCSIP — this is
-		// the "aged out with no replacement message" release path, distinct
-		// from journalControlChange's onCSIPControl-driven releases
-		// (cleared/replaced), which only ever fire on message ARRIVAL and
-		// so can never observe the passage of time on their own.
+		// TASK-040: journal the event's release BEFORE reassigning r.lastCSIP —
+		// this is the "aged out with no replacement message" release path,
+		// distinct from journalControlChange's onCSIPControl-driven releases
+		// (cleared/replaced), which only ever fire on message ARRIVAL and so can
+		// never observe the passage of time on their own.
 		if r.jw != nil {
 			if ev, err := journal.NewControlReleasedEvent("hub", journal.NewControlReleased(r.lastCSIP.MRID, journal.ReasonExpired)); err == nil {
 				ev.SrvT = serverNow
 				_ = r.jw.Append(ev)
 			}
 		}
-		r.lastCSIP = nil
+		// H5/ED-3: if the expiring event carried a DefaultDERControl fallback,
+		// DEGRADE to it instead of dropping to nil (which runs the optimizer
+		// UNCONSTRAINED — a site whose event expires mid-outage would otherwise
+		// run uncapped until discovery recovers). IEEE 2030.5 event-end reverts
+		// the client to the default. ValidUntil=0 never expires, so next tick's
+		// Expired check is false, r.expiry resets, and the default persists until
+		// a fresh control arrives — the existing Source=="default"/ValidUntil=0
+		// path (busToCSIPControl, deriveGridConstraints) enforces it unchanged.
+		if fb := r.lastCSIP.DefaultFallback; fb != nil {
+			slog.Info("[hub] CSIP event expired during a discovery outage — degrading to the last-known DefaultDERControl (not unconstrained)",
+				"event_mrid", r.lastCSIP.MRID, "default_mrid", fb.MRID, "server_now", serverNow)
+			r.lastCSIP = &bus.ActiveControl{
+				Source: "default", MRID: fb.MRID, ValidUntil: 0, // 0 = never expires
+				Connect: fb.Connect, Energize: fb.Energize,
+				ExpLimW: fb.ExpLimW, ImpLimW: fb.ImpLimW, MaxLimW: fb.MaxLimW,
+				GenLimW: fb.GenLimW, LoadLimW: fb.LoadLimW, FixedW: fb.FixedW,
+				ClockOffset: r.lastCSIP.ClockOffset,
+				// DefaultFallback intentionally nil — a default has no further fallback.
+			}
+		} else {
+			slog.Info("[hub] CSIP control expired; dropping",
+				"mrid", r.lastCSIP.MRID, "source", r.lastCSIP.Source,
+				"valid_until", r.lastCSIP.ValidUntil, "server_now", serverNow,
+				"confirm_ticks", r.expiry.Confirm)
+			r.lastCSIP = nil
+		}
 	}
 	if r.lastCSIP != nil {
 		state.CSIPControl = busToCSIPControl(r.lastCSIP)

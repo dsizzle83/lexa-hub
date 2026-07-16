@@ -111,6 +111,15 @@ type ActiveControl struct {
 	// rule (events ramp via Base.RampTms).
 	SetGradW     *uint16
 	SetSoftGradW *uint16
+
+	// Default is the highest-priority program's DefaultDERControl base, carried
+	// alongside an ACTIVE event (Source=="event") so publish can emit the
+	// fallback the hub reverts to on event-end during a discovery outage
+	// (H5/ED-3 — 2030.5 event-end revert-to-default). nil when Source=="default"
+	// (the control already IS the default) or the program has no
+	// DefaultDERControl. The scheduler never evaluates it — pure carriage.
+	Default     *model.DERControlBase
+	DefaultMRID string
 }
 
 // ModeCurve pairs a curve-linked mode name (the bus.CurveMode* vocabulary)
@@ -253,6 +262,15 @@ func (s *Scheduler) resolve(programs []discovery.ProgramState, serverNow int64) 
 
 	if hp.Controls != nil && len(hp.Controls.DERControl) > 0 {
 		if ac := s.activeEvent(hp, serverNow); ac != nil {
+			// Carry the program's DefaultDERControl alongside the active event so
+			// publish can emit the fallback the hub reverts to on event-end during
+			// an outage (H5/ED-3). Pure carriage — the scheduler's decision logic
+			// does not read it.
+			if hp.DefaultControl != nil {
+				base := hp.DefaultControl.DERControlBase
+				ac.Default = &base
+				ac.DefaultMRID = hp.DefaultControl.MRID
+			}
 			return ac, true
 		}
 	}

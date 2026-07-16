@@ -325,6 +325,54 @@ func TestToActiveControl_FieldMapping(t *testing.T) {
 	if msg.FixedW == nil || *msg.FixedW != -1000 {
 		t.Errorf("FixedW = %v, want -1000", msg.FixedW)
 	}
+	// No default carried on this event ⇒ no fallback published.
+	if msg.DefaultFallback != nil {
+		t.Errorf("DefaultFallback = %+v, want nil (event carried no default)", msg.DefaultFallback)
+	}
+}
+
+// TestToActiveControl_CarriesDefaultFallback pins H5/ED-3: an active event that
+// carried its program's DefaultDERControl publishes it in DefaultFallback so the
+// hub can degrade to it on event-end during an outage.
+func TestToActiveControl_CarriesDefaultFallback(t *testing.T) {
+	ac := &scheduler.ActiveControl{
+		Source:      "event",
+		MRID:        "EVT-1",
+		ValidUntil:  99999,
+		Base:        model.DERControlBase{OpModExpLimW: apw(0, 1000)}, // event caps at 1000 W
+		Default:     &model.DERControlBase{OpModExpLimW: apw(0, 5000), OpModGenLimW: apw(0, 8000)},
+		DefaultMRID: "DEFAULT-1",
+	}
+	msg := ToActiveControl(ac, 0)
+
+	if msg.ExpLimW == nil || *msg.ExpLimW != 1000 {
+		t.Errorf("primary ExpLimW = %v, want 1000 (the active event's cap)", msg.ExpLimW)
+	}
+	df := msg.DefaultFallback
+	if df == nil {
+		t.Fatal("DefaultFallback = nil; an event carrying a default must publish it")
+	}
+	if df.MRID != "DEFAULT-1" {
+		t.Errorf("fallback MRID = %q, want DEFAULT-1", df.MRID)
+	}
+	if df.ExpLimW == nil || *df.ExpLimW != 5000 {
+		t.Errorf("fallback ExpLimW = %v, want 5000 (the default's cap)", df.ExpLimW)
+	}
+	if df.GenLimW == nil || *df.GenLimW != 8000 {
+		t.Errorf("fallback GenLimW = %v, want 8000", df.GenLimW)
+	}
+}
+
+// A default-SOURCED control never carries a self-fallback.
+func TestToActiveControl_DefaultSourceNoSelfFallback(t *testing.T) {
+	ac := &scheduler.ActiveControl{
+		Source: "default", MRID: "DEFAULT-1",
+		Base:    model.DERControlBase{OpModExpLimW: apw(0, 5000)},
+		Default: &model.DERControlBase{OpModExpLimW: apw(0, 5000)}, // even if set, must not self-carry
+	}
+	if msg := ToActiveControl(ac, 0); msg.DefaultFallback != nil {
+		t.Errorf("a default-sourced control must not carry a DefaultFallback, got %+v", msg.DefaultFallback)
+	}
 }
 
 // TestCountProgramsWithCurves counts only programs carrying at least one

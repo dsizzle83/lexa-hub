@@ -186,6 +186,11 @@ func TestActiveControlNaNLimitNeverReachesOptimizer(t *testing.T) {
 		{"ImpLimW", ActiveControl{Source: "event", MRID: "m1", ImpLimW: &nan, Ts: 1}},
 		{"MaxLimW", ActiveControl{Source: "event", MRID: "m1", MaxLimW: &nan, Ts: 1}},
 		{"FixedW", ActiveControl{Source: "event", MRID: "m1", FixedW: &nan, Ts: 1}},
+		// H5/ED-3: a NaN in the carried default-fallback must also drop the
+		// whole retained message — else the hub would seed a NaN cap the moment
+		// the event expires.
+		{"DefaultFallback.ExpLimW", ActiveControl{Source: "event", MRID: "m1", Ts: 1, DefaultFallback: &DefaultDERControlMsg{ExpLimW: &nan}}},
+		{"DefaultFallback.GenLimW", ActiveControl{Source: "event", MRID: "m1", Ts: 1, DefaultFallback: &DefaultDERControlMsg{GenLimW: &nan}}},
 	}
 	for _, tc := range limits {
 		t.Run(tc.name, func(t *testing.T) {
