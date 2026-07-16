@@ -101,10 +101,13 @@ const advClass = "adv"
 // Convergence bands and pacing (config-defaulted constants, mirroring the
 // scalar shells' tolerance style — reconcileCeilingTolerance et al).
 const (
-	// advPFBand is the one-sided fixed-PF convergence band: a measured |PF|
-	// at or above commanded−band is compliant (running CLOSER to unity than
-	// commanded injects LESS reactive power than allowed — the limit
-	// direction); only a sustained shortfall beyond the band is divergence.
+	// advPFBand is the two-sided fixed-PF convergence band: a measured |PF|
+	// within ±band of the commanded value converges. Fixed PF is a SETPOINT,
+	// not a limit (same as advVarBandFrac below) — IEEE 1547.1 §5.14.3.3
+	// verifies the DER's reactive power TRACKS the commanded PF, so an inverter
+	// left CLOSER to unity than commanded is failing to deliver the requested
+	// reactive support (accept-but-ignore) just as a shortfall on the other
+	// side is. Both directions beyond the band are divergence.
 	advPFBand = 0.02
 	// advPFAssessMinW is the |W| floor below which a PF measurement is
 	// meaningless (cosφ of noise) and the assessment HOLDS — never evidence.
@@ -1231,9 +1234,14 @@ func (s *advShell) synthesizeLocked(rn *advAxisRunner, m device.Measurements) (m
 		}
 		want := math.Abs(target)
 		got := math.Abs(m.PF)
-		// One-sided: |PF| at or above commanded−band is compliant (closer to
-		// unity ⇒ less reactive than allowed).
-		if got >= want-advPFBand {
+		// Two-sided: constant power factor is a SETPOINT, not a ceiling. IEEE
+		// 1547.1 §5.14.3.3 verifies the DER's reactive power TRACKS the commanded
+		// PF, so a measured |PF| that stays closer to unity than commanded is
+		// failing to deliver the requested reactive support (accept-but-ignore,
+		// mayhem pf-var-measured-convergence) exactly as a shortfall on the other
+		// side is. Mirrors fixed_var's two-sided band below; the advPFAssessMinW
+		// floor above already holds an unassessable low-power sample.
+		if math.Abs(got-want) <= advPFBand {
 			return map[reconcile.Field]float64{reconcile.FixedPF: target}, advVerdictConverged
 		}
 		return map[reconcile.Field]float64{reconcile.FixedPF: math.Copysign(got, target)}, advVerdictDiverged

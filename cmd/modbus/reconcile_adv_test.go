@@ -601,21 +601,26 @@ func TestAdvShell_FixedPFMeasuredConvergence(t *testing.T) {
 		t.Fatalf("under-W-floor sample must hold, got %q", got)
 	}
 
-	// One-sided: measured |PF| ABOVE commanded (closer to unity) is compliant.
-	s.observe(meas(func(m *device.Measurements) { m.W = 2000; m.PF = 0.99 }), true, t0.Add(4*time.Second))
+	// Two-sided (IEEE 1547.1 §5.14.3.3 — reactive power must TRACK the commanded
+	// PF, not merely stay under a ceiling): a measured |PF| WITHIN ±band of the
+	// commanded value converges.
+	s.observe(meas(func(m *device.Measurements) { m.W = 2000; m.PF = 0.96 }), true, t0.Add(4*time.Second))
 	if got := s.runners[bus.AdvAxisFixedPF].adoptState; got != bus.AdoptStateAdopted {
-		t.Fatalf("above-commanded PF must converge (one-sided), got %q", got)
+		t.Fatalf("within-band PF must converge, got %q", got)
 	}
 	if !strings.Contains(mreg.Format(), "lexa_mb_adv_matches_total 1") {
 		t.Errorf("expected 1 match, got:\n%s", mreg.Format())
 	}
 
-	// Sustained shortfall: diverged + a corrective write (first of the episode
-	// is immediate per the core's contract).
+	// Accept-but-ignore: an inverter left near unity (0.99) while commanded 0.95
+	// is NOT delivering the requested reactive support. Two-sided catches this as
+	// a divergence (+ a corrective write) where the old one-sided rule wrongly
+	// passed it — the mayhem pf-var-measured-convergence fault. A shortfall on the
+	// FAR side (e.g. 0.7) diverges identically.
 	before := drv.countOps("SetFixedPF(")
-	s.observe(meas(func(m *device.Measurements) { m.W = 2000; m.PF = 0.7 }), true, t0.Add(6*time.Second))
+	s.observe(meas(func(m *device.Measurements) { m.W = 2000; m.PF = 0.99 }), true, t0.Add(6*time.Second))
 	if got := s.runners[bus.AdvAxisFixedPF].adoptState; got != bus.AdoptStateDiverged {
-		t.Fatalf("PF shortfall must diverge, got %q", got)
+		t.Fatalf("near-unity PF under a 0.95 command must diverge (two-sided), got %q", got)
 	}
 	if drv.countOps("SetFixedPF(") != before+1 {
 		t.Fatalf("diverged PF must trigger a corrective write, ops=%v", drv.ops)
