@@ -234,3 +234,25 @@ func TestRequestRewalk_NilHandlerIsNoop(t *testing.T) {
 	r := newMQTTSystemReader(nil, testFastInterval, nil)
 	r.RequestRewalk("decode") // must not panic
 }
+
+// TestOnEVSEState_SessionConnectRisingEdge pins the H6/A-1 replan trigger: only a
+// session-connect transition (idle→active) reports the rising edge the handler
+// uses to request an immediate replan.
+func TestOnEVSEState_SessionConnectRisingEdge(t *testing.T) {
+	r := newMQTTSystemReader(nil, testFastInterval, nil)
+	ev := func(active bool) bus.EVSEState { return bus.EVSEState{StationID: "cs1", SessionActive: active} }
+
+	if r.onEVSEState("lexa/evse/cs1/state", ev(false)) {
+		t.Error("first idle message is not a session-connect edge")
+	}
+	if !r.onEVSEState("lexa/evse/cs1/state", ev(true)) {
+		t.Error("idle→active must report a session-connect edge (triggers replan)")
+	}
+	if r.onEVSEState("lexa/evse/cs1/state", ev(true)) {
+		t.Error("active→active is not a new session-connect edge")
+	}
+	r.onEVSEState("lexa/evse/cs1/state", ev(false)) // session ends
+	if !r.onEVSEState("lexa/evse/cs1/state", ev(true)) {
+		t.Error("a fresh session after an idle gap must report a new edge")
+	}
+}

@@ -537,10 +537,17 @@ func (r *MQTTSystemReader) ControlAdoptionAge(now time.Time) time.Duration {
 	return now.Sub(r.lastCSIPChangedAt)
 }
 
-func (r *MQTTSystemReader) onEVSEState(_ string, msg bus.EVSEState) {
+// onEVSEState stores the latest EVSE state and reports whether this message is a
+// SESSION-CONNECT rising edge (a charger that was not session-active now is) —
+// the caller pokes an immediate replan so a modelled-EV site re-plans for the new
+// session promptly instead of after a full replan interval (H6/A-1).
+func (r *MQTTSystemReader) onEVSEState(_ string, msg bus.EVSEState) (sessionStarted bool) {
 	r.mu.Lock()
+	prev := r.lastEVSE[msg.StationID]
+	sessionStarted = msg.SessionActive && !prev.SessionActive
 	r.lastEVSE[msg.StationID] = evseSnapshot{EVSEState: msg, at: time.Now()}
 	r.mu.Unlock()
+	return
 }
 
 // noteStaleness edge-triggers a warning when a measurement source goes stale

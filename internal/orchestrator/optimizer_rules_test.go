@@ -1316,7 +1316,7 @@ func TestEVChargingRule_SkipsAlreadyCommandedEVSE(t *testing.T) {
 func TestPlanRule_EVDischargeTarget_SetsSetpointW(t *testing.T) {
 	batteries := []BatteryState{ruleBat("bat", 0, 50, 5000)}
 	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
-	target := &PlanTarget{BattSetpointW: 1000, EVMaxCurrentA: 0, EVSetpointW: 3000}
+	target := &PlanTarget{BattSetpointW: 1000, EVMaxCurrentA: 0, EVSetpointW: 3000, EVModelled: true}
 	plan := &Plan{}
 
 	applyPlanRule(target, batteries, evses, 10, 90, 0, math.NaN(), instReserve(10), plan)
@@ -1341,7 +1341,7 @@ func TestPlanRule_EVDischargeTarget_SetsSetpointW(t *testing.T) {
 func TestPlanRule_EVChargeTarget_UsesMaxCurrentAOnly(t *testing.T) {
 	batteries := []BatteryState{ruleBat("bat", 0, 50, 5000)}
 	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
-	target := &PlanTarget{BattSetpointW: 1000, EVMaxCurrentA: 16, EVSetpointW: -1500}
+	target := &PlanTarget{BattSetpointW: 1000, EVMaxCurrentA: 16, EVSetpointW: -1500, EVModelled: true}
 	plan := &Plan{}
 
 	applyPlanRule(target, batteries, evses, 10, 90, 0, math.NaN(), instReserve(10), plan)
@@ -1355,6 +1355,73 @@ func TestPlanRule_EVChargeTarget_UsesMaxCurrentAOnly(t *testing.T) {
 	}
 	if cmd.MaxCurrentA != 16 {
 		t.Errorf("MaxCurrentA = %.1f, want 16 (target.EVMaxCurrentA passthrough, unchanged)", cmd.MaxCurrentA)
+	}
+}
+
+func findEVSECmd(plan Plan, station string) *EVSECommand {
+	for i := range plan.EVSECommands {
+		if plan.EVSECommands[i].StationID == station {
+			return &plan.EVSECommands[i]
+		}
+	}
+	return nil
+}
+
+// TestPlanRule_UnmodelledEV_LeavesUncommanded (audit A-2/H6): a plan that
+// modelled no chargeable EV (EVModelled=false) has a FORCED 0 A, not a plan
+// decision — applyPlanRule must leave the session uncommanded, not push a
+// standing 0 A suspend.
+func TestPlanRule_UnmodelledEV_LeavesUncommanded(t *testing.T) {
+	batteries := []BatteryState{ruleBat("bat", 0, 50, 5000)}
+	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
+	target := &PlanTarget{BattSetpointW: 1000, EVMaxCurrentA: 0, EVSetpointW: math.NaN(), EVModelled: false}
+	plan := &Plan{}
+	applyPlanRule(target, batteries, evses, 10, 90, 0, math.NaN(), instReserve(10), plan)
+	if len(plan.EVSECommands) != 0 {
+		t.Errorf("unmodelled-EV plan must NOT command the EV (a forced 0 A is not a plan decision), got %+v", plan.EVSECommands)
+	}
+}
+
+// TestOptimize_UnmodelledEVChargesReactivelyUnderPlanFollow (audit A-2/H6): the
+// worst case — a battery site whose planner.ev_capacity_kwh is unset. Under
+// plan-follow, the EV session must still charge reactively from surplus, not sit
+// at a standing 0 A suspend forever.
+func TestOptimize_UnmodelledEVChargesReactivelyUnderPlanFollow(t *testing.T) {
+	o := NewDefaultOptimizer()
+	st := SystemState{
+		Solar:     []SolarState{{Name: "pv", PowerW: 6000, MaxW: 8000, Connected: true, Energized: true}},
+		Batteries: []BatteryState{{Name: "bat", PowerW: 0, SOC: 50, MaxChargeW: 5000, MaxDischargeW: 5000, Connected: true, Energized: true}},
+		EVSEs:     []EVSEState{ruleEVSE("cs1", true, 32, 230)},
+		Grid:      GridState{NetW: -3000, ExportLimitW: math.NaN(), ImportLimitW: math.NaN(), MaxLimitW: math.NaN()},
+		// Battery-planned (plan-follow), but no chargeable EV modelled.
+		DailyPlanTarget: &PlanTarget{BattSetpointW: -1000, EVMaxCurrentA: 0, EVSetpointW: math.NaN(), EVModelled: false},
+	}
+	plan := o.Optimize(st)
+	cmd := findEVSECmd(plan, "cs1")
+	if cmd == nil || cmd.MaxCurrentA <= 0 {
+		t.Fatalf("unmodelled-EV session must charge reactively under plan-follow, not stay at a standing 0 A suspend; got %+v", cmd)
+	}
+}
+
+// TestOptimize_ModelledEVDeferralRespected: EVModelled=true with EVMaxCurrentA=0
+// is a legitimate cost-optimal "charge later" decision — the reactive fall-through
+// must NOT override it.
+func TestOptimize_ModelledEVDeferralRespected(t *testing.T) {
+	o := NewDefaultOptimizer()
+	st := SystemState{
+		Solar:           []SolarState{{Name: "pv", PowerW: 6000, MaxW: 8000, Connected: true, Energized: true}},
+		Batteries:       []BatteryState{{Name: "bat", PowerW: 0, SOC: 50, MaxChargeW: 5000, MaxDischargeW: 5000, Connected: true, Energized: true}},
+		EVSEs:           []EVSEState{ruleEVSE("cs1", true, 32, 230)},
+		Grid:            GridState{NetW: -3000, ExportLimitW: math.NaN(), ImportLimitW: math.NaN(), MaxLimitW: math.NaN()},
+		DailyPlanTarget: &PlanTarget{BattSetpointW: -1000, EVMaxCurrentA: 0, EVSetpointW: math.NaN(), EVModelled: true},
+	}
+	plan := o.Optimize(st)
+	cmd := findEVSECmd(plan, "cs1")
+	if cmd == nil {
+		t.Fatal("modelled-EV plan must command the session (its 0 A defer)")
+	}
+	if cmd.MaxCurrentA != 0 || cmd.SetpointW != nil {
+		t.Errorf("modelled-EV deferral (ceiling-mode 0 A) must be respected, got MaxCurrentA=%.1f SetpointW=%v", cmd.MaxCurrentA, cmd.SetpointW)
 	}
 }
 

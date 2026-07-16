@@ -931,7 +931,11 @@ func main() {
 		log.Fatalf("lexa-hub: subscribe csip control: %v", err)
 	}
 	if err := mqttutil.Subscribe(mc, bus.SubEVSEState, func(topic string, msg bus.EVSEState) {
-		reader.onEVSEState(topic, msg)
+		if reader.onEVSEState(topic, msg) {
+			// Session-connect edge: re-plan promptly so a modelled EV is scheduled
+			// with the new session (H6/A-1) instead of waiting a full replan cycle.
+			eng.RequestReplan()
+		}
 		dersite.OnEVSEState(msg) // WP-4: stored, inert until ev_storage (D2)
 	}); err != nil {
 		log.Fatalf("lexa-hub: subscribe evse state: %v", err)

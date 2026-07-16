@@ -172,6 +172,13 @@ type DailyPlan struct {
 	WindowEnd   int64 // Unix s
 	Intervals   [planSteps]PlanInterval
 	TotalCost   float64
+	// EVModelled is true when this plan was built with a usable EV action space
+	// (EVCapacityKwh > 0 AND EVMaxChargeKw > 0). When false, every interval's
+	// EVMaxCurrentA is a FORCED 0 (the DP had no charge lever), NOT a cost-optimal
+	// "charge later" decision — so applyPlanRule must NOT push that 0 A as a
+	// standing EV suspend; the reactive EV rule handles the session instead
+	// (audit A-2/H6). Plan-level constant.
+	EVModelled bool
 }
 
 // PlanTarget is the current-interval directive extracted from a DailyPlan.
@@ -183,6 +190,10 @@ type PlanTarget struct {
 	// EVSetpointW is PlanInterval.EVSetpointW's counterpart here — see that
 	// field's doc (D8/WP-14).
 	EVSetpointW float64
+	// EVModelled mirrors DailyPlan.EVModelled: false ⇒ EVMaxCurrentA=0 is a
+	// forced no-EV-lever value, not a plan decision, so applyPlanRule must not
+	// push it as a standing suspend (audit A-2/H6).
+	EVModelled bool
 }
 
 // CurrentTarget returns the PlanTarget for the interval containing t,
@@ -204,13 +215,18 @@ func (dp *DailyPlan) CurrentTarget(t time.Time) *PlanTarget {
 		BattSetpointW: iv.BattSetpointW,
 		EVMaxCurrentA: iv.EVMaxCurrentA,
 		EVSetpointW:   iv.EVSetpointW,
+		EVModelled:    dp.EVModelled,
 	}
 }
 
 // PlannerCfg holds the operator-tunable parameters for DailyPlanner.
 // It is read from hub.json and passed to Engine via Config.
 type PlannerCfg struct {
-	// EV asset. EVCapacityKwh == 0 disables EV planning.
+	// EV asset. EVCapacityKwh == 0 (or EVMaxChargeKw == 0) means no chargeable EV
+	// was modelled: the plan sets DailyPlan.EVModelled=false and the optimizer
+	// hands any live EV session to the reactive charging rule instead of pushing
+	// the plan's forced 0 A as a standing suspend (audit A-2/H6). It does NOT
+	// leave the EV uncharged.
 	EVCapacityKwh  float64 `json:"ev_capacity_kwh"`
 	EVMaxChargeKw  float64 `json:"ev_max_charge_kw"`
 	EVEfficiency   float64 `json:"ev_efficiency"`   // default 0.95
@@ -664,6 +680,7 @@ func (pl *DailyPlanner) Plan(p PlannerParams) *DailyPlan {
 		WindowStart: ws,
 		WindowEnd:   we,
 		TotalCost:   totalCost,
+		EVModelled:  hasEV && p.EVMaxChargeKw > 0,
 	}
 
 	bi, ej := bestBatt, bestEV

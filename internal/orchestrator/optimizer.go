@@ -551,6 +551,9 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// every tick, so a headroom cap — which shrinks once the meter reflects the
 	// discharge — would oscillate. See planExportDischargeCapW.
 	planDischargeCapW := o.planExportDischargeCapW(limits, state)
+	// Preserve the surplus BEFORE applyPlanRule zeroes it: the plan-follow-but-
+	// unmodelled-EV fall-through below needs a solar-aware EV budget, not 0 (H6).
+	preplanSurplusW := surplusW
 	planFollowed := false
 	if state.CSIPControl == nil || state.CSIPControl.Base.OpModFixedW == nil {
 		batteries, surplusW, planFollowed = applyPlanRule(state.DailyPlanTarget, batteries, state.EVSEs, o.SOCReserve, o.SOCFullThreshold, surplusW, planDischargeCapW, blocked, &plan)
@@ -644,6 +647,21 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 		}
 		evImportSuppressed := !math.IsNaN(limits.importLimitW) && o.impGuard.evSafeCount < cooldown
 		applyEVChargingRule(state.EVSEs, limits, state.Grid.NetW, solarW, surplusW, evImportSuppressed, &plan)
+	} else {
+		// Plan-follow suppresses the reactive rules — EXCEPT EV charging for any
+		// EVSE the plan did NOT command (a plan that modelled no chargeable EV
+		// asset, audit A-2/H6). Without this, a battery+EVSE site whose
+		// planner.ev_capacity_kwh is unset would push a standing 0 A suspend to
+		// every session forever. applyEVChargingRule's per-EVSE hasEVSECommand
+		// guard skips any EVSE the plan DID command, so a modelled-EV plan is
+		// unaffected. Uses the pre-plan surplus (applyPlanRule zeroed the working
+		// copy) so a solar-aware EV budget isn't floored to 0.
+		cooldown := o.EVImportCooldownCycles
+		if cooldown <= 0 {
+			cooldown = 20
+		}
+		evImportSuppressed := !math.IsNaN(limits.importLimitW) && o.impGuard.evSafeCount < cooldown
+		applyEVChargingRule(state.EVSEs, limits, state.Grid.NetW, solarW, preplanSurplusW, evImportSuppressed, &plan)
 	}
 
 	// Rule 3.7 (WP-11, gated on `enforce_aus_limits`): CSIP-AUS gross-LOAD cap
@@ -962,9 +980,16 @@ func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSESta
 	// Set EV current from plan; only override EVSEs with active sessions.
 	// An idle charger gets no command — when a session starts, this rule
 	// applies the plan target on the next tick.
+	//
+	// GATE on target.EVModelled (audit A-2/H6): only claim EV authority when the
+	// plan was built with a usable EV action space. When the planner modelled NO
+	// chargeable EV (ev_capacity_kwh unset, or ev_max_charge_kw 0), EVMaxCurrentA
+	// is a FORCED 0, not a cost-optimal defer — pushing it would suspend every
+	// session forever. Leave those EVSEs uncommanded here; Optimize runs the
+	// reactive EV rule for them even under plan-follow.
 	evCmds := 0
 	for _, ev := range evses {
-		if ev.Connected && ev.SessionActive {
+		if target.EVModelled && ev.Connected && ev.SessionActive {
 			cmd := EVSECommand{
 				StationID:   ev.StationID,
 				ConnectorID: ev.ConnectorID,

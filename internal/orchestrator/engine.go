@@ -341,6 +341,14 @@ func (e *Engine) signalReplan() {
 	}
 }
 
+// RequestReplan pokes the planner goroutine to rebuild the 24h plan off the tick
+// path WITHOUT mutating any planner input — the planner re-reads live device
+// state (including EV sessions) on every rebuild. Used on an EVSE session-connect
+// edge (H6/A-1) so a modelled-EV site re-evaluates promptly, with the new
+// session's SOC/departure, instead of waiting up to a full replan interval.
+// Coalesced by the buffered(1) plannerWake; safe from any goroutine.
+func (e *Engine) RequestReplan() { e.signalReplan() }
+
 // Intent setters (Unit 3.1 / DEVICE_ROADMAP §3.2). Each is a byte-for-byte copy
 // of the SetPrices idiom: enqueue a closure onto cmdCh (cap 16, drop-and-count
 // on overflow), which the control goroutine applies via setPlanIn's atomic
