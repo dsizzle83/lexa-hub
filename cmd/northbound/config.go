@@ -107,10 +107,10 @@ type Config struct {
 	// default) makes responses.Tracker emit standard IEEE 2030.5 Table 27
 	// codes (8 at breach-episode onset, 3/8/10 at event end, 253 at
 	// receipt-reject) — interop bug #6's 0xF0 is dead by default. true
-	// restores the pre-WP-7 LEXA 0xF0 extension byte-for-byte, for benches
-	// whose gridsim expectation has not been updated in the same session
-	// (configs/northbound.json ships true for exactly that reason —
-	// MTR-4 paired-change discipline).
+	// restores the pre-WP-7 LEXA 0xF0 extension byte-for-byte, an escape
+	// hatch for a bench whose gridsim predates Table-27 acceptance (the
+	// bench gridsim flipped 2026-07, so the example config no longer
+	// carries the key — audit DRIFT-3).
 	LegacyCannotComplyCode bool `json:"legacy_cannotcomply_code,omitempty"`
 
 	// DERReport (WP-4, standards-buildout A2 — CORE-009/CORE-014/BASIC-028)

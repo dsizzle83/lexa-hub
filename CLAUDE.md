@@ -508,7 +508,7 @@ Flag inventory + shipped defaults (all in `configs/*.json`):
 |---|---|---|---|
 | northbound.json | `registration_pin` | `0` | 0 = PIN check disabled + WARN (WS-8 pattern) |
 | northbound.json | `der_report` | `true` | DER* PUT reporting (404/405-skip per resource) |
-| northbound.json | `legacy_cannotcomply_code` | `false`* | false = IEEE Table 27 codes; true = legacy 0xF0 (*bench config ships `true` until gridsim flips — MTR-4 paired change) |
+| northbound.json | `legacy_cannotcomply_code` | `false` | false = IEEE Table 27 codes; true = legacy 0xF0 escape hatch for benches with a pre-Table-27 gridsim (gridsim flipped 2026-07; example config omits the key) |
 | northbound.json | `redirect_max` | `3` | 301/302 same-host follow bound (0 disables) |
 | hub.json | `advanced_der` | `"off"` | "off"\|"on" — adv desired-doc author (curve/PF/energize) |
 | hub.json | `enforce_aus_limits` | `false` | GenLimW/LoadLimW cascade (shadow always runs under `constraint_shadow`) |
