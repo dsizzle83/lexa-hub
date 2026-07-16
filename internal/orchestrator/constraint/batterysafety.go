@@ -155,6 +155,11 @@ func (c *BatterySafetyConstraint) Evaluate(in Input, s *Session) ([]Demand, *orc
 // identical across all three.
 func (c *BatterySafetyConstraint) evaluateTrips(in Input, threshold int, chargeCommanded func(name string) bool) []string {
 	sess := &c.sess
+	// The shared reserve-floor gate — the LATCHED hold when the Stack wired it,
+	// else the instantaneous fallback. Gating the drain counter on the latch,
+	// not the bare SOC, lets the counter accumulate through SOC dither at the
+	// reserve line (audit B-2); mirrors the legacy checkBatterySafety change.
+	blocked := reserveBlocker(in, c.socReserve)
 	var tripped []string
 	for _, b := range in.State.Batteries {
 		// Prune + skip offline / unmeasurable packs (optimizer.go:1527-1532).
@@ -163,8 +168,10 @@ func (c *BatterySafetyConstraint) evaluateTrips(in Input, threshold int, chargeC
 			continue
 		}
 
-		// Check 1: reserve drain (SOC-gated) — optimizer.go:1534-1540.
-		if b.PowerW > exportComplianceBreachW && b.SOC <= c.socReserve {
+		// Check 1: reserve drain. Gate on the latched reserve state, not the
+		// instantaneous SOC (audit B-2). Reset (not decay) on a non-draining
+		// sample is kept, so a legitimate ramp-down clears before the threshold.
+		if b.PowerW > exportComplianceBreachW && blocked(b) {
 			sess.drainTicks[b.Name]++
 		} else {
 			sess.drainTicks[b.Name] = 0

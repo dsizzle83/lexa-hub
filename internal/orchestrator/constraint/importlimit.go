@@ -110,7 +110,7 @@ func (c *ImportLimitConstraint) Evaluate(in Input, s *Session) ([]Demand, *orche
 	}
 
 	c.manageSession(s, importLimitW, st.Grid.NetW)
-	demands, headroomBreach := c.applyImportControl(st, importLimitW)
+	demands, headroomBreach := c.applyImportControl(st, importLimitW, reserveBlocker(in, importSOCReserve))
 	convBreach := c.checkConvergence(in, importLimitW)
 
 	// The headroom breach (battery cannot discharge further) takes precedence; the
@@ -163,7 +163,7 @@ func (c *ImportLimitConstraint) evCooldown(s *Session) int {
 // charge-neutralisation — see the type doc): conservation identity → hysteresis
 // counters → sticky slew-limited target discharge → per-battery distribution
 // respecting the SOC reserve → battery-headroom breach.
-func (c *ImportLimitConstraint) applyImportControl(st orchestrator.SystemState, importLimitW float64) ([]Demand, *orchestrator.ComplianceBreach) {
+func (c *ImportLimitConstraint) applyImportControl(st orchestrator.SystemState, importLimitW float64, blocked func(orchestrator.BatteryState) bool) ([]Demand, *orchestrator.ComplianceBreach) {
 	sess := &c.sess
 	netW := st.Grid.NetW
 
@@ -245,8 +245,8 @@ func (c *ImportLimitConstraint) applyImportControl(st orchestrator.SystemState, 
 		if !b.Connected {
 			continue
 		}
-		if !math.IsNaN(b.SOC) && b.SOC <= importSOCReserve {
-			continue
+		if blocked(b) {
+			continue // protect reserve (hysteretic latch, audit B-1)
 		}
 		add := math.Min(b.AvailableDischargeW(), remaining)
 		if add <= 0 {

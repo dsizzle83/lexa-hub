@@ -284,11 +284,13 @@ func benchFullStack(st orchestrator.SystemState) *Stack {
 	in := benchInput(st)
 	// One shared cooldown across the import (writer) and economics (reader) tiers.
 	cd := NewEVImportCooldown()
-	return NewStack(in.Plant, 0,
+	s := NewStack(in.Plant, 0,
 		NewBatterySafetyConstraint(benchSOCReserve),
 		NewExportConstraint(), NewGenLimitConstraint(), NewImportLimitConstraint(cd),
 		NewEconomicsConstraint(orchestrator.DefaultTOUCostModel(),
 			benchSOCReserve, benchSOCFull, benchExcessSolar, benchExportMargin, benchEVCooldown, cd))
+	s.SetReserveFloor(benchSOCReserve) // shared reserve latch tracks the authors' floor (audit B-1)
+	return s
 }
 
 // TestEconomics_ShadowParityOffCap drives the full stack and the legacy optimizer

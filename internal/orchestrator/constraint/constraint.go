@@ -161,6 +161,14 @@ type Input struct {
 	// layer never reads a clock). Used to convert plant latencies (per-second)
 	// into tick-denominated detection windows.
 	TickSeconds float64
+
+	// DischargeBlocked is the Stack's shared hysteretic reserve-floor gate for
+	// THIS tick (audit B-1): the single owner of "may this pack discharge?",
+	// advanced by the Stack before the constraint pass and consulted by every
+	// discharge author in place of a bare SOC ≤ reserve check. Nil when a
+	// constraint's Evaluate is driven directly in a unit test without a Stack —
+	// reserveBlocker then falls back to the instantaneous check.
+	DischargeBlocked func(orchestrator.BatteryState) bool
 }
 
 // Constraint is one narrowing (or proposing) rule in the ladder. Evaluate is

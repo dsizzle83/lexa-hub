@@ -35,6 +35,13 @@ type Stack struct {
 	// next Optimize call, exactly the Wrapper's existing contract for
 	// SessionNames().
 	lastAuthors map[string]string
+
+	// reserve is the shared per-pack reserve-floor latch (audit B-1), the
+	// shadow twin of DefaultOptimizer's battReserveHold. Advanced once per
+	// Optimize before the constraint pass and exposed to every constraint via
+	// Input.DischargeBlocked, so the candidate stack holds discharge at the
+	// reserve line under SOC dither exactly as the legacy cascade now does.
+	reserve *reserveLatch
 }
 
 // compile-time proof the Stack is a drop-in Optimizer AND, once a fast-safety
@@ -75,6 +82,7 @@ func NewStack(plant Plant, tickInterval time.Duration, constraints ...Constraint
 		plant:        plant,
 		tickInterval: tickInterval,
 		lastAuthors:  map[string]string{},
+		reserve:      newReserveLatch(0, tickInterval), // 0 ⇒ default reserve (20)
 	}
 	for _, c := range constraints {
 		if _, ok := s.sessions[c.Name()]; !ok {
@@ -82,6 +90,17 @@ func NewStack(plant Plant, tickInterval time.Duration, constraints ...Constraint
 		}
 	}
 	return s
+}
+
+// SetReserveFloor sets the SOC-reserve percentage the shared discharge latch
+// defends, matching the value the discharge constraints were constructed with
+// (DefaultOptimizer.SOCReserve). Call once at wiring time before Optimize; a
+// non-positive value leaves the default (20). Keeps the shadow latch in step
+// with a site that runs a non-default reserve.
+func (s *Stack) SetReserveFloor(pct float64) {
+	if pct > 0 {
+		s.reserve.socReserve = pct
+	}
 }
 
 // SessionNames returns the constraint names in the Stack's fixed evaluation
@@ -137,7 +156,12 @@ func (s *Stack) Optimize(state orchestrator.SystemState) orchestrator.Plan {
 	}
 	plan := orchestrator.Plan{Timestamp: now}
 
-	in := Input{State: state, Plant: s.plant, TickSeconds: s.tickSeconds()}
+	// Advance the shared reserve latch from this tick's measured SOC before any
+	// constraint proposes discharge, and expose it as the single reserve-floor
+	// gate (audit B-1) — mirrors DefaultOptimizer.updateReserveHolds + the
+	// `blocked` closure at the top of Optimize.
+	s.reserve.update(state.Batteries)
+	in := Input{State: state, Plant: s.plant, TickSeconds: s.tickSeconds(), DischargeBlocked: s.reserve.blocked}
 
 	var demands []Demand
 	var post []postArbiter

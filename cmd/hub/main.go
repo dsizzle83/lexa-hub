@@ -362,6 +362,7 @@ func main() {
 		}
 
 		stack := constraint.NewStack(buildConstraintPlant(cfg), cfg.EngineInterval(), constraints...)
+		stack.SetReserveFloor(opt.SOCReserve) // shared reserve latch tracks the same floor as the authors (audit B-1)
 		reg.Counter("lexa_constraint_shadow_divergence_total")
 		reg.Counter("lexa_constraint_active_fallback_total")
 		wrapper := constraint.Wrap(opt, stack, constraint.Options{
@@ -819,6 +820,7 @@ func main() {
 		constraint.NewGenLimitConstraint(),
 		constraint.NewImportLimitConstraint(constraint.NewEVImportCooldown()),
 		constraint.NewCSIPPassthrough(cfg.GatewayPolicy()))
+	gatewayStack.SetReserveFloor(opt.SOCReserve) // shared reserve latch tracks the same floor as the authors (audit B-1)
 	// The safety delegate is whatever the engine's fast loop would have used
 	// BEFORE the mode manager existed: the shadow wrapper when
 	// constraint_shadow is on, else the raw optimizer (principal review,

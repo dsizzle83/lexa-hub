@@ -131,6 +131,12 @@ func (c *EconomicsConstraint) Evaluate(in Input, s *Session) ([]Demand, *orchest
 
 	e := newEcoPlan(c.Name())
 
+	// The shared reserve-floor gate for this tick (audit B-1) — the hysteretic
+	// latch when the Stack wired it, else the instantaneous fallback for unit
+	// tests. Threaded into every discharge sub-rule below, mirroring the legacy
+	// cascade's `blocked` closure.
+	blocked := reserveBlocker(in, c.socReserve)
+
 	solarW := st.TotalSolarW()
 	evseW := st.TotalEVSEW()
 	surplusW := economicSurplusW(st, solarW, evseW)
@@ -153,12 +159,12 @@ func (c *EconomicsConstraint) Evaluate(in Input, s *Session) ([]Demand, *orchest
 	// (TASK-064 single owner) — no local advance here.
 
 	// Rule 2: CSIP fixed dispatch — discharge battery to meet an explicit export request.
-	batteries = c.applyFixedDispatch(st.CSIPControl, batteries, solarW, homeLoadW, e)
+	batteries = c.applyFixedDispatch(st.CSIPControl, batteries, solarW, homeLoadW, blocked, e)
 
 	// Rule 2.5: follow the 24 h cost-optimal plan, unless CSIP mandates fixed dispatch.
 	planFollowed := false
 	if st.CSIPControl == nil || st.CSIPControl.Base.OpModFixedW == nil {
-		batteries, surplusW, planFollowed = c.applyPlan(st.DailyPlanTarget, batteries, st.EVSEs, surplusW, e)
+		batteries, surplusW, planFollowed = c.applyPlan(st.DailyPlanTarget, batteries, st.EVSEs, surplusW, blocked, e)
 	}
 
 	if !planFollowed {
@@ -169,7 +175,7 @@ func (c *EconomicsConstraint) Evaluate(in Input, s *Session) ([]Demand, *orchest
 		// is Rule 2). serverNow uses the tick's server time verbatim (AD-004): the
 		// same now.Unix()+ClockOffset arithmetic, single-owned by utilitytime — a
 		// pure call, no wall-clock read (HARD-preserve clock leg, TASK-063).
-		batteries, surplusW = c.applyTOU(st, batteries, surplusW, exportLimitW, e)
+		batteries, surplusW = c.applyTOU(st, batteries, surplusW, exportLimitW, blocked, e)
 
 		// Rule 6: EV charging allocation — remaining budget to EVSEs.
 		c.applyEVCharging(st.EVSEs, exportLimitW, importLimitW, st.Grid.NetW, solarW, surplusW, e)
@@ -233,7 +239,7 @@ func (e *ecoPlan) setEVSE(station string, connector int, currentA float64) {
 // applyFixedDispatch ports applyFixedDispatchRule (optimizer.go:585-641): solar is
 // credited toward the OpModFixedW export request first, batteries cover the
 // shortfall up to their SOC reserve.
-func (c *EconomicsConstraint) applyFixedDispatch(cc *orchestrator.CSIPControlState, batteries []orchestrator.BatteryState, solarW, homeLoadW float64, e *ecoPlan) []orchestrator.BatteryState {
+func (c *EconomicsConstraint) applyFixedDispatch(cc *orchestrator.CSIPControlState, batteries []orchestrator.BatteryState, solarW, homeLoadW float64, blocked func(orchestrator.BatteryState) bool, e *ecoPlan) []orchestrator.BatteryState {
 	if cc == nil || cc.Base.OpModFixedW == nil {
 		return batteries
 	}
@@ -254,8 +260,8 @@ func (c *EconomicsConstraint) applyFixedDispatch(cc *orchestrator.CSIPControlSta
 		if !b.Connected || !b.Energized {
 			continue
 		}
-		if !math.IsNaN(b.SOC) && b.SOC <= c.socReserve {
-			continue // protect reserve
+		if blocked(b) {
+			continue // protect reserve (hysteretic latch)
 		}
 		if e.hasBattery(b.Name) {
 			continue
@@ -282,7 +288,7 @@ func (c *EconomicsConstraint) applyFixedDispatch(cc *orchestrator.CSIPControlSta
 // battery setpoint across connected packs proportionally to their power rating
 // (with the live-SOC safety clamp), set EV current on active sessions, and zero
 // surplusW so Rules 4/5 do not fire. Returns (batteries, surplusW, planFollowed).
-func (c *EconomicsConstraint) applyPlan(target *orchestrator.PlanTarget, batteries []orchestrator.BatteryState, evses []orchestrator.EVSEState, surplusW float64, e *ecoPlan) ([]orchestrator.BatteryState, float64, bool) {
+func (c *EconomicsConstraint) applyPlan(target *orchestrator.PlanTarget, batteries []orchestrator.BatteryState, evses []orchestrator.EVSEState, surplusW float64, blocked func(orchestrator.BatteryState) bool, e *ecoPlan) ([]orchestrator.BatteryState, float64, bool) {
 	if target == nil || math.IsNaN(target.BattSetpointW) {
 		return batteries, surplusW, false
 	}
@@ -312,14 +318,14 @@ func (c *EconomicsConstraint) applyPlan(target *orchestrator.PlanTarget, batteri
 		}
 		share := setW * cap / totalCap
 		share = math.Max(-b.MaxChargeW, math.Min(b.MaxDischargeW, share))
-		// Live-SOC safety clamp (optimizer.go:540-551): a stale plan setpoint must
-		// never discharge below reserve or charge above full on the measured SOC.
-		if !math.IsNaN(b.SOC) {
-			if share > 0 && b.SOC <= c.socReserve {
-				share = 0
-			} else if share < 0 && b.SOC >= c.socFull {
-				share = 0
-			}
+		// Live-SOC safety clamp (optimizer.go): a stale plan setpoint must never
+		// discharge while the reserve latch holds or charge above full on the
+		// measured SOC. The discharge side is the hysteretic latch, not a bare
+		// SOC ≤ reserve, so dither cannot re-authorize discharge (audit B-1).
+		if share > 0 && blocked(b) {
+			share = 0
+		} else if share < 0 && !math.IsNaN(b.SOC) && b.SOC >= c.socFull {
+			share = 0
 		}
 		batteries[i].PowerW = share
 		e.setBattery(b.Name, share)
@@ -395,7 +401,7 @@ func (c *EconomicsConstraint) applySelfConsumption(batteries []orchestrator.Batt
 // (optimizer.go:1688-1738, isDR=false). It discharges batteries during peak TOU
 // hours, capping the total discharge so it cannot push export past an active
 // export limit before the compliance layer's next-tick correction.
-func (c *EconomicsConstraint) applyTOU(st orchestrator.SystemState, batteries []orchestrator.BatteryState, surplusW, exportLimitW float64, e *ecoPlan) ([]orchestrator.BatteryState, float64) {
+func (c *EconomicsConstraint) applyTOU(st orchestrator.SystemState, batteries []orchestrator.BatteryState, surplusW, exportLimitW float64, blocked func(orchestrator.BatteryState) bool, e *ecoPlan) ([]orchestrator.BatteryState, float64) {
 	if c.costModel == nil {
 		return batteries, surplusW
 	}
@@ -426,8 +432,8 @@ func (c *EconomicsConstraint) applyTOU(st orchestrator.SystemState, batteries []
 		if !b.Connected || !b.Energized {
 			continue
 		}
-		if !math.IsNaN(b.SOC) && b.SOC <= c.socReserve {
-			continue // protect reserve
+		if blocked(b) {
+			continue // protect reserve (hysteretic latch)
 		}
 		available := b.AvailableDischargeW()
 		if available < ecoMinBatteryW {
