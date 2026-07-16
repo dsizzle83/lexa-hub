@@ -1319,7 +1319,7 @@ func TestPlanRule_EVDischargeTarget_SetsSetpointW(t *testing.T) {
 	target := &PlanTarget{BattSetpointW: 1000, EVMaxCurrentA: 0, EVSetpointW: 3000}
 	plan := &Plan{}
 
-	applyPlanRule(target, batteries, evses, 10, 90, 0, plan)
+	applyPlanRule(target, batteries, evses, 10, 90, 0, math.NaN(), plan)
 
 	if len(plan.EVSECommands) != 1 {
 		t.Fatalf("expected 1 EVSE command, got %d", len(plan.EVSECommands))
@@ -1344,7 +1344,7 @@ func TestPlanRule_EVChargeTarget_UsesMaxCurrentAOnly(t *testing.T) {
 	target := &PlanTarget{BattSetpointW: 1000, EVMaxCurrentA: 16, EVSetpointW: -1500}
 	plan := &Plan{}
 
-	applyPlanRule(target, batteries, evses, 10, 90, 0, plan)
+	applyPlanRule(target, batteries, evses, 10, 90, 0, math.NaN(), plan)
 
 	if len(plan.EVSECommands) != 1 {
 		t.Fatalf("expected 1 EVSE command, got %d", len(plan.EVSECommands))
@@ -1355,5 +1355,108 @@ func TestPlanRule_EVChargeTarget_UsesMaxCurrentAOnly(t *testing.T) {
 	}
 	if cmd.MaxCurrentA != 16 {
 		t.Errorf("MaxCurrentA = %.1f, want 16 (target.EVMaxCurrentA passthrough, unchanged)", cmd.MaxCurrentA)
+	}
+}
+
+// ── Export limit must bound a plan-commanded discharge ────────────────────────
+// (mayhem: openadr-limit-adopt / openadr-csip-precedence). A 24h plan built
+// before the reactive export cap arrived commands a large discharge; Rule 3
+// curtails solar / absorbs surplus but never reduces a plan discharge, so
+// applyPlanRule must clamp it at the source.
+
+func TestPlanExportDischargeCapW(t *testing.T) {
+	o := NewDefaultOptimizer() // ExportMarginFrac = 0.20
+	// Pack discharging 5000 W while the meter exports 4750 W ⇒ non-battery base
+	// export is 4750−5000 = −250 W (a 250 W local load). Cap 1000 W ⇒
+	// conservative 800 W ⇒ discharge headroom 800−(−250) = 1050 W.
+	state := SystemState{
+		Batteries: []BatteryState{ruleBat("b", 5000, 80, 5000)},
+		Grid:      GridState{NetW: -4750},
+	}
+	if got := o.planExportDischargeCapW(gridConstraints{exportLimitW: 1000}, state); math.Abs(got-1050) > 1 {
+		t.Errorf("cap = %.1fW, want ~1050W", got)
+	}
+	// No export limit ⇒ NaN (no cap; byte-identical to pre-fix plans).
+	if got := o.planExportDischargeCapW(gridConstraints{exportLimitW: math.NaN()}, state); !math.IsNaN(got) {
+		t.Errorf("cap = %.1fW, want NaN when no export limit active", got)
+	}
+	// A 0 W export cap with the site already net-importing 250 W (NetW = +250,
+	// nothing discharging) still permits self-consumption up to the load.
+	idle := SystemState{Batteries: []BatteryState{ruleBat("b", 0, 80, 5000)}, Grid: GridState{NetW: 250}}
+	if got := o.planExportDischargeCapW(gridConstraints{exportLimitW: 0}, idle); math.Abs(got-250) > 1 {
+		t.Errorf("cap = %.1fW, want ~250W (discharge into local load under a 0 W export cap)", got)
+	}
+}
+
+func TestPlanRule_DischargeClampedToCap(t *testing.T) {
+	// Plan wants 5000 W discharge; the export headroom is 1050 W.
+	batteries := []BatteryState{ruleBat("bat", 0, 80, 5000)}
+	target := &PlanTarget{BattSetpointW: 5000, EVMaxCurrentA: math.NaN(), EVSetpointW: math.NaN()}
+	plan := &Plan{}
+	applyPlanRule(target, batteries, nil, 10, 90, 0, 1050, plan)
+	total := 0.0
+	for _, c := range plan.BatteryCommands {
+		total += c.SetpointW
+	}
+	if math.Abs(total-1050) > 1 {
+		t.Errorf("commanded discharge %.0fW, want capped to 1050W", total)
+	}
+
+	// A CHARGE plan is never capped by the export headroom (charging reduces export).
+	plan2 := &Plan{}
+	applyPlanRule(
+		&PlanTarget{BattSetpointW: -3000, EVMaxCurrentA: math.NaN(), EVSetpointW: math.NaN()},
+		[]BatteryState{ruleBat("bat", 0, 50, 5000)}, nil, 10, 90, 0, 1050, plan2)
+	total2 := 0.0
+	for _, c := range plan2.BatteryCommands {
+		total2 += c.SetpointW
+	}
+	if math.Abs(total2-(-3000)) > 1 {
+		t.Errorf("charge plan commanded %.0fW, want -3000W (charge never export-capped)", total2)
+	}
+
+	// NaN cap (no export limit) ⇒ the full 5000 W discharge passes through.
+	plan3 := &Plan{}
+	applyPlanRule(
+		&PlanTarget{BattSetpointW: 5000, EVMaxCurrentA: math.NaN(), EVSetpointW: math.NaN()},
+		[]BatteryState{ruleBat("bat", 0, 80, 5000)}, nil, 10, 90, 0, math.NaN(), plan3)
+	total3 := 0.0
+	for _, c := range plan3.BatteryCommands {
+		total3 += c.SetpointW
+	}
+	if math.Abs(total3-5000) > 1 {
+		t.Errorf("uncapped plan commanded %.0fW, want 5000W", total3)
+	}
+}
+
+// TestOptimize_PlanDischargeRespectsExportCap drives the full Optimize path: a
+// plan discharge target under an OpenADR-style export cap (grid.ExportLimitW,
+// no CSIP control) must not leave a battery command that would export past it.
+func TestOptimize_PlanDischargeRespectsExportCap(t *testing.T) {
+	o := NewDefaultOptimizer()
+	state := SystemState{
+		Timestamp:       time.Now(),
+		Batteries:       []BatteryState{ruleBat("bat", 5000, 80, 5000)},
+		Grid:            GridState{NetW: -4750, ExportLimitW: 1000}, // exporting 4750 W, cap 1000 W
+		DailyPlanTarget: &PlanTarget{BattSetpointW: 5000, EVMaxCurrentA: math.NaN(), EVSetpointW: math.NaN()},
+	}
+	plan := o.Optimize(state)
+
+	var cmd *BatteryCommand
+	for i := range plan.BatteryCommands {
+		if plan.BatteryCommands[i].Name == "bat" {
+			cmd = &plan.BatteryCommands[i]
+		}
+	}
+	if cmd == nil {
+		t.Fatal("no battery command emitted for the plan-followed pack")
+	}
+	// Headroom is ~1050 W; the raw plan target was 5000 W. Anything near 5000 W
+	// means the export cap failed to bound the plan discharge.
+	if cmd.SetpointW > 1100 {
+		t.Errorf("plan-followed discharge %.0fW exceeds export-cap headroom (~1050W) — cap not enforced on the plan path", cmd.SetpointW)
+	}
+	if cmd.SetpointW <= 0 {
+		t.Errorf("plan-followed discharge %.0fW — over-capped; the pack should still cover local load", cmd.SetpointW)
 	}
 }

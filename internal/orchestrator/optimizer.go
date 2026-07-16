@@ -417,9 +417,23 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// Fires only when a plan exists and CSIP has not already mandated fixed dispatch.
 	// Sets battery setpoints and EV current limits from the plan; downstream limit
 	// rules (3 & 3.5) still run to enforce live CSIP constraints.
+	//
+	// An active export limit must ALSO cap the plan's discharge guidance: the
+	// export-limit rule (Rule 3) absorbs surplus into battery-charge/EV and
+	// curtails solar, but it does NOT reduce a plan-commanded battery *discharge*
+	// (it models discharge as an immovable export source). So a stale 24h-plan
+	// discharge target — one built before the OpenADR/CSIP export cap arrived,
+	// since the planner never sees the reactive export limit — would export past
+	// the cap for a whole replan interval (mayhem: openadr-limit-adopt /
+	// openadr-csip-precedence). Cap it here at the source, with an ABSOLUTE bound
+	// (conservative limit minus the non-battery base export) rather than the
+	// autonomous TOU rule's headroom bound: applyPlanRule re-issues the command
+	// every tick, so a headroom cap — which shrinks once the meter reflects the
+	// discharge — would oscillate. See planExportDischargeCapW.
+	planDischargeCapW := o.planExportDischargeCapW(limits, state)
 	planFollowed := false
 	if state.CSIPControl == nil || state.CSIPControl.Base.OpModFixedW == nil {
-		batteries, surplusW, planFollowed = applyPlanRule(state.DailyPlanTarget, batteries, state.EVSEs, o.SOCReserve, o.SOCFullThreshold, surplusW, &plan)
+		batteries, surplusW, planFollowed = applyPlanRule(state.DailyPlanTarget, batteries, state.EVSEs, o.SOCReserve, o.SOCFullThreshold, surplusW, planDischargeCapW, &plan)
 	}
 
 	// Rule 3: Export/import limit — absorb excess into EVSEs, battery, then curtail solar.
@@ -697,20 +711,79 @@ func computePowerBalance(state SystemState) (solarW, batteryW, evseW, surplusW f
 	return
 }
 
+// planExportDischargeCapW returns the maximum AGGREGATE battery discharge (W)
+// the plan may command without driving meter export past the active export
+// limit, or NaN when no export limit is active (⇒ no cap, byte-identical to
+// pre-fix plans). Unlike the autonomous TOU rule's headroom cap (which relies
+// on "no command ⇒ hold last setpoint" to stay stable), this is an ABSOLUTE
+// bound so applyPlanRule can re-issue a stable command every tick:
+//
+//	cap = conservativeLimit − baseExport
+//	baseExport = measuredExport − measuredBatteryDischarge   (solar − load − EV)
+//
+// i.e. the export attributable to everything BUT the battery. Discharging up to
+// `cap` on top of that base lands the meter exactly at the conservative limit;
+// the measured-discharge subtraction is what makes the value stable tick-to-tick
+// (the discharge already flowing does not eat its own headroom). Charging plans
+// (setW < 0) are never capped — they reduce export.
+func (o *DefaultOptimizer) planExportDischargeCapW(limits gridConstraints, state SystemState) float64 {
+	if math.IsNaN(limits.exportLimitW) {
+		return math.NaN()
+	}
+	margin := o.ExportMarginFrac
+	if margin <= 0 {
+		margin = 0.20
+	}
+	conservativeW := limits.exportLimitW * (1 - margin)
+	// baseExport = meter export attributable to everything BUT the battery
+	// (solar − load − EV) = SIGNED net export minus the discharge now flowing.
+	// Signed (not floored at 0) so a net-IMPORTING site correctly credits its
+	// local load: under a 0 W export cap a pack may still discharge up to the
+	// load (offsetting import, exporting nothing). Without a grid meter we cannot
+	// credit load, so fall back to a base of 0 ⇒ cap = conservative limit, a
+	// pure-discharge bound that can never itself exceed the cap.
+	baseExportW := 0.0
+	if !math.IsNaN(state.Grid.NetW) {
+		signedNetExportW := -state.Grid.NetW
+		measuredDischargeW := 0.0
+		for _, b := range state.Batteries {
+			if b.Connected && b.PowerW > 0 {
+				measuredDischargeW += b.PowerW
+			}
+		}
+		baseExportW = signedNetExportW - measuredDischargeW
+	}
+	return math.Max(0, conservativeW-baseExportW)
+}
+
 // applyPlanRule applies the battery setpoint and EV current limit from the
 // 24-hour cost-optimal plan.  Returns updated batteries, updated surplusW, and
 // true when the plan was applied (suppressing the reactive self-consumption,
 // TOU, and EV charging rules downstream).
 //
 // The plan setpoint is a guidance value; the export/import limit rules still
-// run after this to enforce live CSIP compliance.
-func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSEState, socReserve, socFull, surplusW float64, plan *Plan) ([]BatteryState, float64, bool) {
+// run after this to enforce live CSIP compliance. planDischargeCapW (NaN ⇒
+// none) additionally bounds the AGGREGATE discharge this rule commands so a
+// stale plan cannot export past an active limit for a whole interval — see
+// planExportDischargeCapW.
+func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSEState, socReserve, socFull, surplusW, planDischargeCapW float64, plan *Plan) ([]BatteryState, float64, bool) {
 	if target == nil {
 		return batteries, surplusW, false
 	}
 	setW := target.BattSetpointW
 	if math.IsNaN(setW) {
 		return batteries, surplusW, false
+	}
+
+	// Clamp a planned DISCHARGE (setW > 0) to the export-limit headroom before
+	// distributing it across packs — the aggregate discharge is proportional to
+	// setW, so bounding setW bounds the total the reconciler will actuate. A
+	// charge plan (setW < 0) is left untouched.
+	if setW > 0 && !math.IsNaN(planDischargeCapW) && setW > planDischargeCapW {
+		plan.AddDecision("plan/export-cap",
+			fmt.Sprintf("plan discharge %.0fW would export past the active limit", setW),
+			fmt.Sprintf("capped to %.0fW (export headroom)", planDischargeCapW))
+		setW = planDischargeCapW
 	}
 
 	// Distribute the planned setpoint across connected batteries proportionally
