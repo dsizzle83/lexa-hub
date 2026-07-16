@@ -200,6 +200,53 @@ func (v View) notImpl(o int, f Field) bool {
 	return false
 }
 
+// ReadLooksCorrupt reports whether a register block just READ for this layout
+// looks like a failed or partial read that must NOT be written back (audit E2).
+// A whole-block read-modify-write trusts its own read; if that read returned
+// sentinel garbage (a device rebooting mid-poll, or a fault-injected all-0x8000
+// read), writing it back programs junk — sentinel setpoints, spurious sync-group
+// enables — into the device's control registers.
+//
+// Two signals, in priority order:
+//
+//  1. A scale-factor field (Tsunssf) reads the 0x8000 sentinel. Scale factors
+//     are read-only device constants; a healthy SunSpec block ALWAYS carries
+//     valid ones, so a sentinel SF is a low-false-positive corruption signal and
+//     is authoritative when the layout defines any SF fields.
+//  2. Only when the layout has NO scale factors to check: the block is
+//     saturated with the int16 not-implemented sentinel (≥ half its registers) —
+//     the all-0x8000 shape of a failed read.
+//
+// It reads only; the caller decides what to do (derbase's writers refuse the
+// write-back and return an error).
+func (v View) ReadLooksCorrupt() bool {
+	hasSF := false
+	for _, f := range v.l.Fields {
+		if f.Type != Tsunssf {
+			continue
+		}
+		hasSF = true
+		if v.Present(f.Name) && v.reg(v.l.off[f.Name]) == sentI16 {
+			return true
+		}
+	}
+	if hasSF {
+		return false // scale factors present and sane ⇒ the read is real
+	}
+	// No SF fields — fall back to whole-block sentinel saturation.
+	n := v.l.Len()
+	if n == 0 {
+		return false
+	}
+	sent := 0
+	for o := 0; o < n; o++ {
+		if v.reg(o) == sentI16 {
+			sent++
+		}
+	}
+	return sent*2 >= n
+}
+
 // ── Integer getters (ok=false on absent or sentinel) ─────────────────────────
 
 func (v View) Enum(name string) (uint16, bool) {
@@ -365,10 +412,10 @@ func clamp(v, lo, hi float64) float64 {
 // helpers read/write a raw register at an absolute model offset and apply a
 // scale factor resolved by name from the (full-model) View.
 
-func (v View) U16At(o int) uint16 { return v.reg(o) }
-func (v View) I16At(o int) int16  { return int16(v.reg(o)) }
-func (v View) U32At(o int) uint32 { return v.rawU32(o) }
-func (v View) U64At(o int) uint64 { return v.rawU64(o) }
+func (v View) U16At(o int) uint16         { return v.reg(o) }
+func (v View) I16At(o int) int16          { return int16(v.reg(o)) }
+func (v View) U32At(o int) uint32         { return v.rawU32(o) }
+func (v View) U64At(o int) uint64         { return v.rawU64(o) }
 func (v View) SetU16At(o int, val uint16) { v.setReg(o, val) }
 
 // ScaleSignedAt reads an int16 at offset o and scales it by the named SF.

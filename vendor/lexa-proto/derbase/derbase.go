@@ -324,6 +324,11 @@ func (b *Base) SetEnterService(s sunspec.EnterService, tag string) error {
 	if err != nil {
 		return fmt.Errorf("%s: read M703: %w", tag, err)
 	}
+	// Same corrupt-read guard as write704 (audit E2): never write a
+	// sentinel-corrupt read of the enter-service block back to the device.
+	if sunspec.L703.View(regs).ReadLooksCorrupt() {
+		return fmt.Errorf("%s: refusing to write M703 — read block is sentinel-corrupt (partial/failed read)", tag)
+	}
 	if err := sunspec.Encode703(regs, s); err != nil {
 		return err
 	}
@@ -361,6 +366,14 @@ func (b *Base) write704(tag string, fn func(v sunspec.View)) error {
 	regs, err := b.Reader.ReadModel(sunspec.ModelDERCtlAC)
 	if err != nil {
 		return fmt.Errorf("%s: read M704: %w", tag, err)
+	}
+	// Refuse to write back a corrupt read (audit E2): this whole-block
+	// read-modify-write would otherwise persist a sentinel-saturated read (a
+	// device rebooting mid-poll, or a fault-injected all-0x8000 read) into the
+	// inverter's control registers — garbage setpoints and spurious sync-group
+	// enables. A healthy 704 always carries valid scale factors.
+	if sunspec.L704.View(regs).ReadLooksCorrupt() {
+		return fmt.Errorf("%s: refusing to write M704 — read block is sentinel-corrupt (partial/failed read); not programming garbage back to the device", tag)
 	}
 	fn(sunspec.L704.View(regs))
 	return b.Reader.WriteModel(sunspec.ModelDERCtlAC, 0, regs[:sunspec.L704.Len()])
