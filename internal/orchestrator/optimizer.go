@@ -213,6 +213,24 @@ type DefaultOptimizer struct {
 	// the SOC-reserve check alone misses it when SoC is high (audit: battery-wrong-sign).
 	battWrongDirTicks map[string]int
 
+	// battReserveHold latches per-pack discharge suppression at the SOC-reserve
+	// floor (audit B-1 / GAP-08). It is the SINGLE owner of the reserve-floor
+	// decision, consulted by every discharge author via dischargeBlocked. Enter
+	// is immediate when measured SOC ≤ SOCReserve (protect fast); release requires
+	// SOC ≥ SOCReserve+reserveReleaseMarginPct sustained for reserveReleaseTicks
+	// ticks (release slow). Without this hysteresis every author gated discharge
+	// on the INSTANTANEOUS SOC ≤ reserve, so ±1pt BMS telemetry dither at the
+	// reserve line re-authorized full discharge on every above-line tick — a
+	// multi-kW↔0 W command square wave that walked the pack below reserve at ~50%
+	// duty. Owned and advanced by updateReserveHolds at the top of each Optimize.
+	battReserveHold map[string]bool
+
+	// battReserveRecoverTicks counts, per held pack, consecutive ticks measured
+	// SOC has stayed at/above the release threshold (reserve+margin). Any tick
+	// below it resets the run to 0, so a value dithering in the margin band never
+	// releases the hold.
+	battReserveRecoverTicks map[string]int
+
 	// tickInterval is the engine cadence. When > 0 it scales the tick-denominated
 	// breach/debounce thresholds so their WALL-CLOCK meaning is constant across
 	// cadences (fast 3 s vs stock 15 s) — the product ships in stock timing but is
@@ -357,13 +375,99 @@ func NewDefaultOptimizer() *DefaultOptimizer {
 			dischargeW:   math.NaN(),
 			activeLimitW: math.NaN(),
 		},
-		genGuard:          genGuard{activeLimitW: math.NaN()},
-		ausGenGuard:       ausGenGuard{activeLimitW: math.NaN()},
-		ausLoadGuard:      ausLoadGuard{activeLimitW: math.NaN(), evLimitA: math.NaN()},
-		battDrainTicks:    make(map[string]int),
-		battWrongDirTicks: make(map[string]int),
-		lastBattCmd:       make(map[string]float64),
+		genGuard:                genGuard{activeLimitW: math.NaN()},
+		ausGenGuard:             ausGenGuard{activeLimitW: math.NaN()},
+		ausLoadGuard:            ausLoadGuard{activeLimitW: math.NaN(), evLimitA: math.NaN()},
+		battDrainTicks:          make(map[string]int),
+		battWrongDirTicks:       make(map[string]int),
+		battReserveHold:         make(map[string]bool),
+		battReserveRecoverTicks: make(map[string]int),
+		lastBattCmd:             make(map[string]float64),
 	}
+}
+
+// reserveReleaseMarginPct is the SOC margin above SOCReserve (percentage points)
+// a held pack must recover to before its reserve hold releases. Set well above
+// realistic BMS quantization/telemetry noise (±1pt) so a value dithering at the
+// reserve line can never flip the latch. See battReserveHold.
+const reserveReleaseMarginPct = 2.0
+
+// reserveReleaseTicks is how many CONSECUTIVE ticks a held pack must read at/above
+// (SOCReserve+reserveReleaseMarginPct) before its hold releases — scaled to
+// wall-clock via scaleTicks like every other debounce threshold.
+const reserveReleaseTicks = 3
+
+// updateReserveHolds advances the per-pack reserve latch (battReserveHold) from
+// THIS tick's measured SOC, before any discharge author runs. The asymmetry is
+// deliberate — enter immediately to protect the reserve, release only after a
+// sustained recovery above a noise margin — so telemetry dither at the reserve
+// line cannot chatter the discharge command (audit B-1 / GAP-08).
+func (o *DefaultOptimizer) updateReserveHolds(batteries []BatteryState) {
+	if o.battReserveHold == nil {
+		o.battReserveHold = make(map[string]bool)
+		o.battReserveRecoverTicks = make(map[string]int)
+	}
+	release := o.scaleTicks(reserveReleaseTicks)
+	seen := make(map[string]bool, len(batteries))
+	for _, b := range batteries {
+		seen[b.Name] = true
+		if !b.Connected {
+			// A disconnected pack cannot discharge, and the immediate-entry rule
+			// re-arms the hold on the reconnect tick (updateReserveHolds runs
+			// before the authors) if SOC is still low — so dropping the latch
+			// here is safe and lets a pack that recharged while dark re-evaluate
+			// from live SOC. Matches battDrainTicks' !Connected handling.
+			delete(o.battReserveHold, b.Name)
+			delete(o.battReserveRecoverTicks, b.Name)
+			continue
+		}
+		if math.IsNaN(b.SOC) {
+			// Unknown SOC: RETAIN an existing hold (fail-safe — never discharge
+			// into an unknown reserve) but do not newly arm one (no evidence of a
+			// low reserve) and do not count toward recovery.
+			o.battReserveRecoverTicks[b.Name] = 0
+			continue
+		}
+		if b.SOC <= o.SOCReserve {
+			o.battReserveHold[b.Name] = true
+			o.battReserveRecoverTicks[b.Name] = 0
+			continue
+		}
+		// SOC above the reserve line.
+		if !o.battReserveHold[b.Name] {
+			continue // not held — a pack that never touched reserve is never blocked
+		}
+		if b.SOC >= o.SOCReserve+reserveReleaseMarginPct {
+			o.battReserveRecoverTicks[b.Name]++
+			if o.battReserveRecoverTicks[b.Name] >= release {
+				delete(o.battReserveHold, b.Name)
+				delete(o.battReserveRecoverTicks, b.Name)
+			}
+		} else {
+			// Above reserve but inside the release-margin (dither) band: hold, and
+			// reset the recovery run so the release needs an UNBROKEN sustained run.
+			o.battReserveRecoverTicks[b.Name] = 0
+		}
+	}
+	// Prune packs that vanished from the state.
+	for name := range o.battReserveHold {
+		if !seen[name] {
+			delete(o.battReserveHold, name)
+			delete(o.battReserveRecoverTicks, name)
+		}
+	}
+}
+
+// dischargeBlocked reports whether the named pack's reserve latch currently
+// suppresses discharge. It is the single reserve-floor gate every discharge
+// author consults. The instantaneous SOC ≤ reserve fold-in is belt-and-suspenders:
+// updateReserveHolds runs first so a sub-reserve pack is already latched, but the
+// reserve floor is safety-critical enough to double-check the live sample.
+func (o *DefaultOptimizer) dischargeBlocked(name string, soc float64) bool {
+	if o.battReserveHold[name] {
+		return true
+	}
+	return !math.IsNaN(soc) && soc <= o.SOCReserve
 }
 
 // gridConstraints holds effective export/import/max limits after applying CSIP
@@ -410,8 +514,16 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	batteries := make([]BatteryState, len(state.Batteries))
 	copy(batteries, state.Batteries)
 
+	// Advance the per-pack reserve latch from this tick's measured SOC BEFORE any
+	// discharge author runs, and expose it as `blocked` — the single hysteretic
+	// reserve-floor gate every author consults in place of the old instantaneous
+	// SOC ≤ reserve check (audit B-1 / GAP-08). Enter is immediate, release is
+	// sustained, so dither at the reserve line cannot chatter the discharge command.
+	o.updateReserveHolds(state.Batteries)
+	blocked := func(b BatteryState) bool { return o.dischargeBlocked(b.Name, b.SOC) }
+
 	// Rule 2: CSIP fixed dispatch — discharge battery to meet explicit grid export request.
-	batteries = applyFixedDispatchRule(state.CSIPControl, batteries, solarW, homeLoadW, o.SOCReserve, &plan)
+	batteries = applyFixedDispatchRule(state.CSIPControl, batteries, solarW, homeLoadW, o.SOCReserve, blocked, &plan)
 
 	// Rule 2.5: Follow the 24-hour cost-optimal plan.
 	// Fires only when a plan exists and CSIP has not already mandated fixed dispatch.
@@ -433,7 +545,7 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	planDischargeCapW := o.planExportDischargeCapW(limits, state)
 	planFollowed := false
 	if state.CSIPControl == nil || state.CSIPControl.Base.OpModFixedW == nil {
-		batteries, surplusW, planFollowed = applyPlanRule(state.DailyPlanTarget, batteries, state.EVSEs, o.SOCReserve, o.SOCFullThreshold, surplusW, planDischargeCapW, &plan)
+		batteries, surplusW, planFollowed = applyPlanRule(state.DailyPlanTarget, batteries, state.EVSEs, o.SOCReserve, o.SOCFullThreshold, surplusW, planDischargeCapW, blocked, &plan)
 	}
 
 	// Rule 3: Export/import limit — absorb excess into EVSEs, battery, then curtail solar.
@@ -515,7 +627,7 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 		// discharge too — battery discharge is INSIDE the capped quantity.
 		// NaN when the flag is off or no gen cap is active (nanMin no-op).
 		dischargeCapW = nanMin(dischargeCapW, ausGenTOUCapW)
-		batteries, surplusW = applyDemandResponseRule(batteries, surplusW, o.SOCReserve, false, isPeak, peakReason, dischargeCapW, &plan)
+		batteries, surplusW = applyDemandResponseRule(batteries, surplusW, o.SOCReserve, false, isPeak, peakReason, dischargeCapW, blocked, &plan)
 
 		// Rule 6: EV charging allocation.
 		cooldown := o.EVImportCooldownCycles
@@ -766,7 +878,7 @@ func (o *DefaultOptimizer) planExportDischargeCapW(limits gridConstraints, state
 // none) additionally bounds the AGGREGATE discharge this rule commands so a
 // stale plan cannot export past an active limit for a whole interval — see
 // planExportDischargeCapW.
-func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSEState, socReserve, socFull, surplusW, planDischargeCapW float64, plan *Plan) ([]BatteryState, float64, bool) {
+func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSEState, socReserve, socFull, surplusW, planDischargeCapW float64, dischargeBlocked func(BatteryState) bool, plan *Plan) ([]BatteryState, float64, bool) {
 	if target == nil {
 		return batteries, surplusW, false
 	}
@@ -815,16 +927,16 @@ func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSESta
 		// Clamp to device limits.
 		share = math.Max(-b.MaxChargeW, math.Min(b.MaxDischargeW, share))
 		// Live-SOC safety clamp: the plan setpoint is computed from a forecast
-		// SOC trajectory and can lag reality, so never discharge below the
-		// reserve or charge above the full threshold based on the measured SOC.
-		// Without this, a stale plan can drive a battery flat (and the device
-		// would report phantom power it can't deliver).
-		if !math.IsNaN(b.SOC) {
-			if share > 0 && b.SOC <= socReserve {
-				share = 0
-			} else if share < 0 && b.SOC >= socFull {
-				share = 0
-			}
+		// SOC trajectory and can lag reality, so never discharge while the reserve
+		// latch holds or charge above the full threshold based on the measured
+		// SOC. Without this, a stale plan can drive a battery flat (and the device
+		// would report phantom power it can't deliver). The discharge side is the
+		// hysteretic latch (dischargeBlocked), not a bare SOC ≤ reserve, so dither
+		// at the reserve line cannot re-authorize discharge (audit B-1).
+		if share > 0 && dischargeBlocked(b) {
+			share = 0
+		} else if share < 0 && !math.IsNaN(b.SOC) && b.SOC >= socFull {
+			share = 0
 		}
 		batteries[i].PowerW = share
 		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
@@ -876,7 +988,7 @@ func applyPlanRule(target *PlanTarget, batteries []BatteryState, evses []EVSESta
 // applyFixedDispatchRule discharges batteries to meet an explicit grid export
 // request (CSIP OpModFixedW).  Solar is credited first; batteries cover the
 // shortfall up to SOC reserve.
-func applyFixedDispatchRule(cc *CSIPControlState, batteries []BatteryState, solarW, homeLoadW, socReserve float64, plan *Plan) []BatteryState {
+func applyFixedDispatchRule(cc *CSIPControlState, batteries []BatteryState, solarW, homeLoadW, socReserve float64, dischargeBlocked func(BatteryState) bool, plan *Plan) []BatteryState {
 	if cc == nil || cc.Base.OpModFixedW == nil {
 		return batteries
 	}
@@ -902,9 +1014,9 @@ func applyFixedDispatchRule(cc *CSIPControlState, batteries []BatteryState, sola
 		if !b.Connected || !b.Energized {
 			continue
 		}
-		if !math.IsNaN(b.SOC) && b.SOC <= socReserve {
+		if dischargeBlocked(b) {
 			plan.AddDecision("csip/fixed-dispatch",
-				fmt.Sprintf("battery %s SOC=%.1f%% at reserve minimum", b.Name, b.SOC),
+				fmt.Sprintf("battery %s SOC=%.1f%% at/near reserve minimum (hold latched)", b.Name, b.SOC),
 				"skip discharge — protecting reserve")
 			continue
 		}
@@ -1837,8 +1949,19 @@ func (o *DefaultOptimizer) checkBatterySafety(batteries []BatteryState, plan *Pl
 			continue
 		}
 
-		// Check 1: reserve drain (SOC-gated).
-		dischargingAtReserve := b.PowerW > complianceBreachW && b.SOC <= o.SOCReserve
+		// Check 1: reserve drain. Gate on the LATCHED reserve state, not the
+		// instantaneous SOC: telemetry that dithers ±1pt across the reserve line
+		// would otherwise flip this gate every tick and the counter could never
+		// accumulate to the trip (audit B-2). The latch (updateReserveHolds, run
+		// earlier in Optimize) is hold-biased, so a pack MEASURED discharging
+		// throughout a reserve episode accumulates cleanly toward the disconnect.
+		// The instantaneous check is folded in so the drain guard still works on
+		// the fast/economic paths that call checkBatterySafety without a prior
+		// updateReserveHolds. Reset (not decay) on a non-draining sample keeps the
+		// single-glitch tolerance and lets a legitimate ramp-down clear before the
+		// threshold — the latch, not decay, is what makes the trip reachable here.
+		atReserve := o.battReserveHold[b.Name] || b.SOC <= o.SOCReserve
+		dischargingAtReserve := b.PowerW > complianceBreachW && atReserve
 		if dischargingAtReserve {
 			o.battDrainTicks[b.Name]++
 		} else {
@@ -1991,7 +2114,7 @@ func applySelfConsumptionRule(batteries []BatteryState, surplusW, excessThreshol
 // maxDischargeW caps the total discharge commanded across all batteries so
 // the rule cannot push site export over an active CSIP export limit while
 // waiting for the export-limit rule's next-tick correction.  NaN = uncapped.
-func applyDemandResponseRule(batteries []BatteryState, surplusW, socReserve float64, isDR, isPeak bool, peakReason string, maxDischargeW float64, plan *Plan) ([]BatteryState, float64) {
+func applyDemandResponseRule(batteries []BatteryState, surplusW, socReserve float64, isDR, isPeak bool, peakReason string, maxDischargeW float64, dischargeBlocked func(BatteryState) bool, plan *Plan) ([]BatteryState, float64) {
 	if !isDR && !isPeak {
 		return batteries, surplusW
 	}
@@ -2005,9 +2128,9 @@ func applyDemandResponseRule(batteries []BatteryState, surplusW, socReserve floa
 		if !b.Connected || !b.Energized {
 			continue
 		}
-		if !math.IsNaN(b.SOC) && b.SOC <= socReserve {
+		if dischargeBlocked(b) {
 			plan.AddDecision("demand-response",
-				fmt.Sprintf("battery %s SOC=%.1f%% at reserve minimum", b.Name, b.SOC),
+				fmt.Sprintf("battery %s SOC=%.1f%% at/near reserve minimum (hold latched)", b.Name, b.SOC),
 				"skip discharge — protecting reserve")
 			continue
 		}
@@ -2387,7 +2510,7 @@ func (o *DefaultOptimizer) applyImportLimitRule(batteries []BatteryState, limits
 		if !b.Connected {
 			continue
 		}
-		if !math.IsNaN(b.SOC) && b.SOC <= socReserve {
+		if o.dischargeBlocked(b.Name, b.SOC) {
 			continue
 		}
 		// AvailableDischargeW is the headroom from the current setpoint (which a

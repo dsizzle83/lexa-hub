@@ -779,7 +779,7 @@ func TestDemandResponseRule_DischargesWhenDR(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	plan := &Plan{}
 
-	updated, surplusW := applyDemandResponseRule(bats, 0, 20, true, false, "", math.NaN(), plan)
+	updated, surplusW := applyDemandResponseRule(bats, 0, 20, true, false, "", math.NaN(), instReserve(20), plan)
 
 	if len(plan.BatteryCommands) == 0 {
 		t.Fatal("expected discharge command during DR")
@@ -799,7 +799,7 @@ func TestDemandResponseRule_RespectsSOCReserve(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 15, 5000)} // SOC=15 < reserve=20
 	plan := &Plan{}
 
-	applyDemandResponseRule(bats, 0, 20, true, false, "", math.NaN(), plan)
+	applyDemandResponseRule(bats, 0, 20, true, false, "", math.NaN(), instReserve(20), plan)
 
 	for _, cmd := range plan.BatteryCommands {
 		if cmd.SetpointW > 0 {
@@ -812,7 +812,7 @@ func TestDemandResponseRule_NoActionWhenInactive(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	plan := &Plan{}
 
-	applyDemandResponseRule(bats, 0, 20, false, false, "", math.NaN(), plan)
+	applyDemandResponseRule(bats, 0, 20, false, false, "", math.NaN(), instReserve(20), plan)
 
 	if len(plan.BatteryCommands) != 0 {
 		t.Errorf("expected no commands when isDR=false isPeak=false, got %d", len(plan.BatteryCommands))
@@ -823,7 +823,7 @@ func TestDemandResponseRule_SkipsExistingCommand(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	plan := &Plan{BatteryCommands: []BatteryCommand{{Name: "bat", SetpointW: -2000}}}
 
-	applyDemandResponseRule(bats, 0, 20, true, false, "", math.NaN(), plan)
+	applyDemandResponseRule(bats, 0, 20, true, false, "", math.NaN(), instReserve(20), plan)
 
 	if len(plan.BatteryCommands) != 1 {
 		t.Errorf("expected 1 command (no duplicate), got %d", len(plan.BatteryCommands))
@@ -834,7 +834,7 @@ func TestDemandResponseRule_DischargesWhenPeak(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	plan := &Plan{}
 
-	applyDemandResponseRule(bats, 0, 20, false, true, "peak TOU hour", math.NaN(), plan)
+	applyDemandResponseRule(bats, 0, 20, false, true, "peak TOU hour", math.NaN(), instReserve(20), plan)
 
 	if len(plan.BatteryCommands) == 0 {
 		t.Fatal("expected discharge command during TOU peak")
@@ -850,7 +850,7 @@ func TestDemandResponseRule_CappedByExportHeadroom(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	plan := &Plan{}
 
-	updated, _ := applyDemandResponseRule(bats, 0, 20, false, true, "peak TOU hour", 1200, plan)
+	updated, _ := applyDemandResponseRule(bats, 0, 20, false, true, "peak TOU hour", 1200, instReserve(20), plan)
 
 	if len(plan.BatteryCommands) != 1 {
 		t.Fatalf("expected 1 discharge command, got %d", len(plan.BatteryCommands))
@@ -869,7 +869,7 @@ func TestDemandResponseRule_CapSharedAcrossBatteries(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat-0", 0, 80, 5000), ruleBat("bat-1", 0, 80, 5000)}
 	plan := &Plan{}
 
-	applyDemandResponseRule(bats, 0, 20, true, false, "", 3000, plan)
+	applyDemandResponseRule(bats, 0, 20, true, false, "", 3000, instReserve(20), plan)
 
 	if len(plan.BatteryCommands) != 1 {
 		t.Fatalf("expected 1 discharge command (second withheld), got %d", len(plan.BatteryCommands))
@@ -883,7 +883,7 @@ func TestDemandResponseRule_ZeroHeadroomNoDischarge(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	plan := &Plan{}
 
-	applyDemandResponseRule(bats, 0, 20, false, true, "peak TOU hour", 0, plan)
+	applyDemandResponseRule(bats, 0, 20, false, true, "peak TOU hour", 0, instReserve(20), plan)
 
 	if len(plan.BatteryCommands) != 0 {
 		t.Errorf("expected no discharge with zero export headroom, got %d commands", len(plan.BatteryCommands))
@@ -1157,7 +1157,7 @@ func TestFixedDispatchRule_NilCSIP_NoAction(t *testing.T) {
 	bats := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	plan := &Plan{}
 
-	applyFixedDispatchRule(nil, bats, 0, math.NaN(), 20, plan)
+	applyFixedDispatchRule(nil, bats, 0, math.NaN(), 20, instReserve(20), plan)
 
 	if len(plan.BatteryCommands) != 0 {
 		t.Error("expected no commands with nil CSIP")
@@ -1170,7 +1170,7 @@ func TestFixedDispatchRule_SolarCoversTarget_NoBatteryNeeded(t *testing.T) {
 	cc := &CSIPControlState{Base: model.DERControlBase{OpModFixedW: &model.ActivePower{Value: 5000}}}
 	plan := &Plan{}
 
-	applyFixedDispatchRule(cc, bats, 10000, 1000, 20, plan)
+	applyFixedDispatchRule(cc, bats, 10000, 1000, 20, instReserve(20), plan)
 
 	if len(plan.BatteryCommands) != 0 {
 		t.Error("expected no battery commands when solar covers target")
@@ -1186,7 +1186,7 @@ func TestFixedDispatchRule_DischargesBatteryForShortfall(t *testing.T) {
 	cc := &CSIPControlState{Base: model.DERControlBase{OpModFixedW: &model.ActivePower{Value: 10000}}}
 	plan := &Plan{}
 
-	updated := applyFixedDispatchRule(cc, bats, 10000, 1000, 20, plan)
+	updated := applyFixedDispatchRule(cc, bats, 10000, 1000, 20, instReserve(20), plan)
 
 	if len(plan.BatteryCommands) == 0 {
 		t.Fatal("expected battery discharge command")
@@ -1209,7 +1209,7 @@ func TestFixedDispatchRule_RespectsSOCReserve(t *testing.T) {
 	cc := &CSIPControlState{Base: model.DERControlBase{OpModFixedW: &model.ActivePower{Value: 5000}}}
 	plan := &Plan{}
 
-	applyFixedDispatchRule(cc, bats, 0, math.NaN(), 20, plan)
+	applyFixedDispatchRule(cc, bats, 0, math.NaN(), 20, instReserve(20), plan)
 
 	for _, cmd := range plan.BatteryCommands {
 		if cmd.SetpointW > 0 {
@@ -1225,7 +1225,7 @@ func TestFixedDispatchRule_NoMeter_UsesSolarAsFallback(t *testing.T) {
 	cc := &CSIPControlState{Base: model.DERControlBase{OpModFixedW: &model.ActivePower{Value: 5000}}}
 	plan := &Plan{}
 
-	applyFixedDispatchRule(cc, bats, 3000, math.NaN(), 20, plan)
+	applyFixedDispatchRule(cc, bats, 3000, math.NaN(), 20, instReserve(20), plan)
 
 	if len(plan.BatteryCommands) == 0 {
 		t.Fatal("expected battery discharge for shortfall")
@@ -1319,7 +1319,7 @@ func TestPlanRule_EVDischargeTarget_SetsSetpointW(t *testing.T) {
 	target := &PlanTarget{BattSetpointW: 1000, EVMaxCurrentA: 0, EVSetpointW: 3000}
 	plan := &Plan{}
 
-	applyPlanRule(target, batteries, evses, 10, 90, 0, math.NaN(), plan)
+	applyPlanRule(target, batteries, evses, 10, 90, 0, math.NaN(), instReserve(10), plan)
 
 	if len(plan.EVSECommands) != 1 {
 		t.Fatalf("expected 1 EVSE command, got %d", len(plan.EVSECommands))
@@ -1344,7 +1344,7 @@ func TestPlanRule_EVChargeTarget_UsesMaxCurrentAOnly(t *testing.T) {
 	target := &PlanTarget{BattSetpointW: 1000, EVMaxCurrentA: 16, EVSetpointW: -1500}
 	plan := &Plan{}
 
-	applyPlanRule(target, batteries, evses, 10, 90, 0, math.NaN(), plan)
+	applyPlanRule(target, batteries, evses, 10, 90, 0, math.NaN(), instReserve(10), plan)
 
 	if len(plan.EVSECommands) != 1 {
 		t.Fatalf("expected 1 EVSE command, got %d", len(plan.EVSECommands))
@@ -1393,7 +1393,7 @@ func TestPlanRule_DischargeClampedToCap(t *testing.T) {
 	batteries := []BatteryState{ruleBat("bat", 0, 80, 5000)}
 	target := &PlanTarget{BattSetpointW: 5000, EVMaxCurrentA: math.NaN(), EVSetpointW: math.NaN()}
 	plan := &Plan{}
-	applyPlanRule(target, batteries, nil, 10, 90, 0, 1050, plan)
+	applyPlanRule(target, batteries, nil, 10, 90, 0, 1050, instReserve(10), plan)
 	total := 0.0
 	for _, c := range plan.BatteryCommands {
 		total += c.SetpointW
@@ -1406,7 +1406,7 @@ func TestPlanRule_DischargeClampedToCap(t *testing.T) {
 	plan2 := &Plan{}
 	applyPlanRule(
 		&PlanTarget{BattSetpointW: -3000, EVMaxCurrentA: math.NaN(), EVSetpointW: math.NaN()},
-		[]BatteryState{ruleBat("bat", 0, 50, 5000)}, nil, 10, 90, 0, 1050, plan2)
+		[]BatteryState{ruleBat("bat", 0, 50, 5000)}, nil, 10, 90, 0, 1050, instReserve(10), plan2)
 	total2 := 0.0
 	for _, c := range plan2.BatteryCommands {
 		total2 += c.SetpointW
@@ -1419,7 +1419,7 @@ func TestPlanRule_DischargeClampedToCap(t *testing.T) {
 	plan3 := &Plan{}
 	applyPlanRule(
 		&PlanTarget{BattSetpointW: 5000, EVMaxCurrentA: math.NaN(), EVSetpointW: math.NaN()},
-		[]BatteryState{ruleBat("bat", 0, 80, 5000)}, nil, 10, 90, 0, math.NaN(), plan3)
+		[]BatteryState{ruleBat("bat", 0, 80, 5000)}, nil, 10, 90, 0, math.NaN(), instReserve(10), plan3)
 	total3 := 0.0
 	for _, c := range plan3.BatteryCommands {
 		total3 += c.SetpointW
