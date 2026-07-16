@@ -366,8 +366,15 @@ func TestEvaluate_ClockRegressionDoesNotResurrectEndedEvent(t *testing.T) {
 	if ac := s.Evaluate(progsNoDefault(evt), epoch+30); ac == nil {
 		t.Fatal("expected fresh control")
 	}
+	// CS-2: the FIRST expired reading is held one confirm cycle (forward-step
+	// debounce) in case serverNow glitched past ValidUntil.
+	if held := s.Evaluate(progsNoDefault(evt), epoch+200); held == nil || !held.Held || held.MRID != "E1" {
+		t.Fatalf("first expired reading must be held (forward-step debounce), got %+v", held)
+	}
+	// A SUSTAINED expiry (confirming walk) releases — the guard must not
+	// resurrect a genuinely finished event.
 	if got := s.Evaluate(progsNoDefault(evt), epoch+200); got != nil {
-		t.Errorf("ended event must stay released while still listed, got %+v", got)
+		t.Errorf("ended event must release after the confirm cycle, got %+v", got)
 	}
 }
 
@@ -418,9 +425,38 @@ func TestEvaluate_EndedEventFallsBackToDefault(t *testing.T) {
 	if ac := s.Evaluate(programs, epoch+30); ac == nil || ac.MRID != "E1" {
 		t.Fatalf("expected fresh control E1, got %+v", ac)
 	}
+	// CS-2: first expired reading held one confirm cycle.
+	if held := s.Evaluate(programs, epoch+200); held == nil || !held.Held || held.MRID != "E1" {
+		t.Fatalf("first expired reading must be held (forward-step debounce), got %+v", held)
+	}
+	// Sustained expiry → fall back to the fresh default.
 	got := s.Evaluate(programs, epoch+200)
 	if got == nil || got.Source != "default" || got.Held {
-		t.Errorf("ended event must yield the fresh default, got %+v", got)
+		t.Errorf("ended event must yield the fresh default after the confirm cycle, got %+v", got)
+	}
+}
+
+// TestEvaluate_ForwardStepDoesNotUnseatEvent is the CS-2 positive case: a single
+// forward-poisoned/glitched serverNow that reads an active event as expired must
+// HOLD it (not fall back to the default in one cycle); the event resumes fresh
+// once the clock recovers within its window. This is the symmetric twin of the
+// backward-step guard above.
+func TestEvaluate_ForwardStepDoesNotUnseatEvent(t *testing.T) {
+	s := New()
+	evt := eventWithExpLim("E1", epoch, 600, 0, 0) // 0 W cap, active [epoch, epoch+600)
+	programs := progs(evt)                         // program carries a 5000 W default
+
+	if ac := s.Evaluate(programs, epoch+30); ac == nil || ac.MRID != "E1" || ac.Held {
+		t.Fatalf("expected fresh control E1, got %+v", ac)
+	}
+	// A single forward step reads serverNow well past ValidUntil (epoch+600).
+	held := s.Evaluate(programs, epoch+1000)
+	if held == nil || held.MRID != "E1" || held.Source != "event" || !held.Held {
+		t.Fatalf("a single forward-poisoned serverNow must hold the event, not unseat it to the default, got %+v", held)
+	}
+	// Clock recovers within the event window: the event is fresh-resolved again.
+	if ac := s.Evaluate(programs, epoch+35); ac == nil || ac.MRID != "E1" || ac.Held {
+		t.Errorf("event must resume fresh after the transient forward step, got %+v", ac)
 	}
 }
 

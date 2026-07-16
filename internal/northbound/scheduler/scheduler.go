@@ -169,6 +169,18 @@ type Scheduler struct {
 	// dropping an unexpired safety control (see Evaluate / failClosed).
 	lastGood *ActiveControl
 
+	// expiryHold debounces a FORWARD clock excursion (audit CS-2): a still-served
+	// event that reads as EXPIRED in a single Evaluate is held for
+	// expiryHold.Confirm consecutive cycles before any release path unseats it to
+	// the default/nil, so one forward-poisoned or transiently-glitched serverNow
+	// cannot drop an active control. The backward-step guards (event not-yet-
+	// started) are unchanged; this is the symmetric forward-step defense CS-1's
+	// coherent anchor makes rarely-needed but that a genuine SERVER-clock
+	// excursion still requires. Reset the instant the event is unexpired, its
+	// MRID changes, or it is genuinely withdrawn/cancelled (those release now).
+	expiryHold     utilitytime.DebouncedExpiry
+	expiryHoldMRID string
+
 	// RejectHook (WP-7, D5), when non-nil, is invoked by failClosed each
 	// Evaluate cycle that REJECTS a freshly-served control at receipt —
 	// the plausibility gate (implausibleReason, audit:
@@ -201,6 +213,9 @@ func New() *Scheduler {
 		randOffsets: make(map[string]int32),
 		randDurs:    make(map[string]int32),
 		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
+		// One confirming walk to release a genuine event-end; a single glitched
+		// expired reading is held (audit CS-2).
+		expiryHold: utilitytime.DebouncedExpiry{Confirm: 2},
 	}
 }
 
@@ -313,6 +328,32 @@ func (s *Scheduler) failClosed(resolved *ActiveControl, programFound bool, hp *d
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// CS-2 forward-step debounce, evaluated once per cycle. holdExpired is true
+	// when lastGood is a still-served event that has just flipped to EXPIRED and
+	// the debounce has not yet confirmed a sustained end — the two release
+	// branches below consult it so one forward-poisoned/glitched serverNow cannot
+	// unseat the event. Advancing (or resetting) it EVERY cycle here is what makes
+	// the confirm count track CONSECUTIVE expired readings: an intervening active
+	// or not-yet-started cycle resets it, so two non-consecutive glitches never
+	// add up to a release.
+	holdExpired := false
+	if lg := s.lastGood; lg != nil && lg.Source == "event" &&
+		stillServed(hp, lg.MRID) && controlExpired(lg, serverNow) {
+		if s.expiryHoldMRID != lg.MRID {
+			s.expiryHold.Reset()
+			s.expiryHoldMRID = lg.MRID
+		}
+		holdExpired = !s.expiryHold.Observe(true)
+	} else {
+		s.expiryHold.Reset()
+		s.expiryHoldMRID = ""
+	}
+	heldExpiredEvent := func() *ActiveControl {
+		held := *s.lastGood
+		held.Held = true
+		return &held
+	}
+
 	rejectReason := ""
 	if resolved != nil {
 		rejectReason = implausibleReason(resolved)
@@ -339,6 +380,13 @@ func (s *Scheduler) failClosed(resolved *ActiveControl, programFound bool, hp *d
 			held := *s.lastGood
 			held.Held = true
 			return &held
+		}
+		// CS-2 forward-step debounce: the event just READ as expired and would
+		// fall back to the default here — hold it for a confirm cycle first, in
+		// case serverNow forward-stepped/glitched past ValidUntil. A genuine end
+		// releases on the confirming walk.
+		if resolved.Source == "default" && holdExpired {
+			return heldExpiredEvent()
 		}
 		stored := *resolved
 		s.lastGood = &stored
@@ -393,6 +441,11 @@ func (s *Scheduler) failClosed(resolved *ActiveControl, programFound bool, hp *d
 			held := *s.lastGood
 			held.Held = true
 			return &held
+		}
+		// CS-2 forward-step debounce (no-default program): the still-served event
+		// just read as expired — hold it one confirm cycle before releasing.
+		if holdExpired {
+			return heldExpiredEvent()
 		}
 		s.lastGood = nil
 		return nil

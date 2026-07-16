@@ -361,8 +361,11 @@ func TestEvaluate_StateTransitions(t *testing.T) {
 		{"before start", eventStart - 1, "default"},
 		{"at start", eventStart, "event"},
 		{"mid event", eventStart + 300, "event"},
-		{"at end (exclusive)", eventStart + int64(eventDuration), "default"},
-		{"after end", eventStart + int64(eventDuration) + 60, "default"},
+		// CS-2 forward-step debounce: the first walk that reads the event as
+		// expired HOLDS it one confirm cycle (in case serverNow forward-stepped),
+		// so the event is still served here; the next confirming walk releases.
+		{"at end (first walk — debounce holds)", eventStart + int64(eventDuration), "event"},
+		{"after end (confirming walk releases)", eventStart + int64(eventDuration) + 60, "default"},
 	}
 
 	for _, tc := range cases {
