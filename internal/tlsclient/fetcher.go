@@ -4,7 +4,26 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
+
+// shouldRedialAfter reports whether a failed GET is worth an immediate
+// same-path retry on a fresh connection. A failure that CONSUMED the read
+// deadline is a STALL — the same request would just stall again, doubling the
+// walk-loop blackout (audit ED-2: a per-resource stall cost ~2×ReadTimeout per
+// failed walk, sized the northbound watchdog, and widened the ED-1 contamination
+// window). Only a FAST failure (a dead keep-alive: write error / immediate EOF /
+// reset) is worth the redial+retry; those are indistinguishable from a stall by
+// error VALUE (both surface as an unstructured wolfSSL_read/write string), so the
+// discriminator is timing. Retry only when the failure landed well inside the
+// deadline; with no deadline configured (readTimeout ≤ 0) fall back to the prior
+// always-retry behaviour.
+func shouldRedialAfter(elapsed, readTimeout time.Duration) bool {
+	if readTimeout <= 0 {
+		return true
+	}
+	return elapsed < readTimeout*3/4
+}
 
 // WolfSSLFetcher implements discovery.Fetcher using wolfSSL mTLS.
 //
@@ -160,10 +179,15 @@ func (f *WolfSSLFetcher) doGet(path string) (*HTTPResponse, error) {
 	if err := f.ensureDialed(); err != nil {
 		return nil, fmt.Errorf("dial: %w", err)
 	}
+	start := time.Now()
 	raw, err := f.client.Get(path)
 	if err != nil {
-		// Stale connection — close and retry once.
+		// Stale connection — close and retry once, UNLESS the failure consumed
+		// the read deadline (a stall would just stall again — audit ED-2).
 		f.client.Close()
+		if !shouldRedialAfter(time.Since(start), f.client.cfg.ReadTimeout) {
+			return nil, err
+		}
 		if err2 := f.client.Dial(); err2 != nil {
 			return nil, fmt.Errorf("redial: %w", err2)
 		}
