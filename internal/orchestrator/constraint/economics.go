@@ -162,9 +162,14 @@ func (c *EconomicsConstraint) Evaluate(in Input, s *Session) ([]Demand, *orchest
 	batteries = c.applyFixedDispatch(st.CSIPControl, batteries, solarW, homeLoadW, blocked, e)
 
 	// Rule 2.5: follow the 24 h cost-optimal plan, unless CSIP mandates fixed dispatch.
+	// An active export limit caps the plan's discharge guidance (audit EXPCAP-1/2):
+	// the export constraint never reduces a plan-commanded discharge, so a stale
+	// plan built before the cap arrived would export past it — the same
+	// planExportDischargeCapW bound the legacy cascade applies at optimizer.go.
+	planDischargeCapW := c.planExportDischargeCapW(st)
 	planFollowed := false
 	if st.CSIPControl == nil || st.CSIPControl.Base.OpModFixedW == nil {
-		batteries, surplusW, planFollowed = c.applyPlan(st.DailyPlanTarget, batteries, st.EVSEs, surplusW, blocked, e)
+		batteries, surplusW, planFollowed = c.applyPlan(st.DailyPlanTarget, batteries, st.EVSEs, surplusW, planDischargeCapW, blocked, e)
 	}
 
 	if !planFollowed {
@@ -282,17 +287,55 @@ func (c *EconomicsConstraint) applyFixedDispatch(cc *orchestrator.CSIPControlSta
 	return batteries
 }
 
+// planExportDischargeCapW mirrors DefaultOptimizer.planExportDischargeCapW
+// (audit EXPCAP-1/2): the maximum AGGREGATE plan discharge that will not drive
+// meter export past the active export limit, or NaN when none is active. Base
+// export is signed net export minus the SIGNED battery power now flowing (a
+// charging pack draws from the site, so its negative power is added back out of
+// the base — not treated as immovable load). Kept identical to the legacy bound
+// so the shadow diff stays clean.
+func (c *EconomicsConstraint) planExportDischargeCapW(st orchestrator.SystemState) float64 {
+	exportLimitW := effectiveExportLimitW(st)
+	if math.IsNaN(exportLimitW) {
+		return math.NaN()
+	}
+	margin := c.exportMarginFrac
+	if margin <= 0 {
+		margin = exportMarginFrac // package default (0.20)
+	}
+	conservativeW := exportLimitW * (1 - margin)
+	baseExportW := 0.0
+	if !math.IsNaN(st.Grid.NetW) {
+		signedNetExportW := -st.Grid.NetW
+		measuredBatterySignedW := 0.0
+		for _, b := range st.Batteries {
+			if b.Connected && !math.IsNaN(b.PowerW) {
+				measuredBatterySignedW += b.PowerW
+			}
+		}
+		baseExportW = signedNetExportW - measuredBatterySignedW
+	}
+	return math.Max(0, conservativeW-baseExportW)
+}
+
 // ── Rule 2.5: plan following ────────────────────────────────────────────────────
 
 // applyPlan ports applyPlanRule (optimizer.go:503-580): distribute the DP planner's
 // battery setpoint across connected packs proportionally to their power rating
 // (with the live-SOC safety clamp), set EV current on active sessions, and zero
 // surplusW so Rules 4/5 do not fire. Returns (batteries, surplusW, planFollowed).
-func (c *EconomicsConstraint) applyPlan(target *orchestrator.PlanTarget, batteries []orchestrator.BatteryState, evses []orchestrator.EVSEState, surplusW float64, blocked func(orchestrator.BatteryState) bool, e *ecoPlan) ([]orchestrator.BatteryState, float64, bool) {
+func (c *EconomicsConstraint) applyPlan(target *orchestrator.PlanTarget, batteries []orchestrator.BatteryState, evses []orchestrator.EVSEState, surplusW, planDischargeCapW float64, blocked func(orchestrator.BatteryState) bool, e *ecoPlan) ([]orchestrator.BatteryState, float64, bool) {
 	if target == nil || math.IsNaN(target.BattSetpointW) {
 		return batteries, surplusW, false
 	}
 	setW := target.BattSetpointW
+
+	// Clamp a planned DISCHARGE to the export-limit headroom before distributing
+	// it across packs — mirrors optimizer.go's applyPlanRule (audit EXPCAP-2). A
+	// charge plan (setW < 0) is never capped (it reduces export); NaN cap ⇒ none.
+	if setW > 0 && !math.IsNaN(planDischargeCapW) && setW > planDischargeCapW {
+		setW = planDischargeCapW
+	}
 
 	totalCap := 0.0
 	for _, b := range batteries {
