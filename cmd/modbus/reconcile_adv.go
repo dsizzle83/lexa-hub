@@ -24,8 +24,10 @@
 //   - Fixed PF / fixed var: derbase.SetFixedPF / SetConstantVar (704 sync
 //     groups — whole-block RMW, this shell is the SOLE writer of the PF/var
 //     groups, see "Single-writer" below). Convergence is judged from MEASURED
-//     PF/Var in the poll-loop observe() feed, one-sided/toleranced (bands
-//     below) — a write's success is never convergence.
+//     PF/Var in the poll-loop observe() feed, TWO-SIDED/toleranced (constant
+//     PF/var are SETPOINTS, not ceilings — the bands below reject both a
+//     shortfall AND an overshoot, and fixed PF also cross-checks the measured
+//     reactive DIRECTION, audit PF-1) — a write's success is never convergence.
 //   - Energize: derbase.SetEnterServiceEnabled (703 ES) with convergence from
 //     measured cessation (W → ~0, or ConnSt) — one-sided like solar: a dark
 //     inverter commanded TO energize is never called diverged (night is not
@@ -112,6 +114,12 @@ const (
 	// advPFAssessMinW is the |W| floor below which a PF measurement is
 	// meaningless (cosφ of noise) and the assessment HOLDS — never evidence.
 	advPFAssessMinW = 100.0
+	// advPFVarFloorVAr is the |measured reactive power| floor below which the
+	// EXCITATION direction of a fixed-PF command is unassessable (near-unity
+	// commands, or a genuinely-idle var axis): below it the direction cross-check
+	// is skipped and |PF| convergence alone decides. Above it, a wrong direction
+	// at the right |PF| is caught (audit PF-1). Same magnitude as advPFAssessMinW.
+	advPFVarFloorVAr = 100.0
 	// advVarBandFrac is the fixed-var convergence band as a fraction of the
 	// device's reactive rating: |measured − target| ≤ frac·rating converges.
 	// Two-sided by design — fixed var is a SETPOINT, not a limit, and a
@@ -1220,11 +1228,12 @@ const (
 	advVerdictDiverged
 )
 
-// synthesizeLocked builds the one-sided/toleranced readback the measured
-// axes feed the core: the DESIRED value on a converged assessment (so the
-// core sees exact match), a genuinely-different measured value on
-// divergence, nil when unassessable (hold — mirrors the solar shell's
-// one-sided synthesis). mu held.
+// synthesizeLocked builds the toleranced readback the measured axes feed the
+// core: the DESIRED value on a converged assessment (so the core sees exact
+// match), a genuinely-different measured value on divergence, nil when
+// unassessable (hold). The PF/var axes are TWO-SIDED (setpoint tracking, plus a
+// direction cross-check for fixed PF); the energize axis stays one-sided like
+// the solar shell (a dark inverter commanded to energize is never diverged). mu held.
 func (s *advShell) synthesizeLocked(rn *advAxisRunner, m device.Measurements) (map[reconcile.Field]float64, advVerdict) {
 	switch rn.axis {
 	case bus.AdvAxisFixedPF:
@@ -1242,6 +1251,20 @@ func (s *advShell) synthesizeLocked(rn *advAxisRunner, m device.Measurements) (m
 		// side is. Mirrors fixed_var's two-sided band below; the advPFAssessMinW
 		// floor above already holds an unassessable low-power sample.
 		if math.Abs(got-want) <= advPFBand {
+			// |PF| tracks. But constant power factor is DIRECTIONAL: target's sign
+			// carries the commanded excitation (target>0 = over-excited / inject
+			// VARs; target<0 = under-excited / absorb). Model-701 PF is UNSIGNED on
+			// the wire, so |PF| alone cannot see direction — cross-check the SIGNED
+			// measured reactive power m.Var (positive = capacitive = injecting, per
+			// derbase). Wrong-direction VARs at the right |PF| (absorbing when
+			// commanded to inject) AGGRAVATE a voltage event instead of relieving it
+			// and must NOT read as adopted (audit PF-1). Only assess direction when
+			// meaningful reactive is flowing: below advPFVarFloorVAr the direction is
+			// noise, and a wrong MAGNITUDE was already caught by the band above.
+			if !math.IsNaN(m.Var) && math.Abs(m.Var) >= advPFVarFloorVAr &&
+				math.Signbit(m.Var) != math.Signbit(target) {
+				return map[reconcile.Field]float64{reconcile.FixedPF: math.Copysign(got, m.Var)}, advVerdictDiverged
+			}
 			return map[reconcile.Field]float64{reconcile.FixedPF: target}, advVerdictConverged
 		}
 		return map[reconcile.Field]float64{reconcile.FixedPF: math.Copysign(got, target)}, advVerdictDiverged

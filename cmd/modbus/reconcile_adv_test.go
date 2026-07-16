@@ -627,6 +627,49 @@ func TestAdvShell_FixedPFMeasuredConvergence(t *testing.T) {
 	}
 }
 
+// TestAdvShell_FixedPFWrongExcitationDiverges is the audit-PF-1 regression:
+// constant power factor is DIRECTIONAL. A device at the right |PF| but the WRONG
+// excitation — absorbing VARs when commanded to inject — must read as diverged
+// (it aggravates a voltage event instead of relieving it), because |PF| is
+// unsigned on the wire and only the signed measured reactive power reveals
+// direction.
+func TestAdvShell_FixedPFWrongExcitationDiverges(t *testing.T) {
+	drv := newFakeAdvDriver(fullCaps())
+	s, _, _ := testShell(t, "7xx", drv, nil)
+	t0 := time.Now()
+	rvrt := int64(3600)
+	// Command 0.90 OVER-excited (inject VARs).
+	s.setDesired(advTestDoc(1, t0, func(d *bus.DesiredAdvanced) {
+		d.ReactiveMode = &bus.AdvReactiveMode{Kind: bus.AdvReactiveFixedPF, FixedPF: &bus.FixedPF{PF: 0.90, OverExcited: true}}
+		d.RvrtTmsS = &rvrt
+	}), t0)
+
+	// Right |PF| (0.90) but measured reactive is ABSORBING (Var<0) — the opposite
+	// of the commanded over-excited injection. Must diverge + correct.
+	before := drv.countOps("SetFixedPF(")
+	s.observe(meas(func(m *device.Measurements) { m.W = 2000; m.PF = 0.90; m.Var = -900 }), true, t0.Add(2*time.Second))
+	if got := s.runners[bus.AdvAxisFixedPF].adoptState; got != bus.AdoptStateDiverged {
+		t.Fatalf("right |PF| but wrong excitation (absorbing when commanded to inject) must diverge (audit PF-1), got %q", got)
+	}
+	if drv.countOps("SetFixedPF(") != before+1 {
+		t.Fatalf("wrong-excitation divergence must trigger a corrective write, ops=%v", drv.ops)
+	}
+
+	// Same |PF| with the CORRECT direction (injecting, Var>0) converges — the
+	// check rejects only wrong direction, not all reactive.
+	s.observe(meas(func(m *device.Measurements) { m.W = 2000; m.PF = 0.90; m.Var = 900 }), true, t0.Add(4*time.Second))
+	if got := s.runners[bus.AdvAxisFixedPF].adoptState; got != bus.AdoptStateAdopted {
+		t.Fatalf("right |PF| and right direction (injecting) must converge, got %q", got)
+	}
+
+	// And a near-zero measured reactive (direction unassessable) falls back to
+	// |PF| convergence — no false divergence on a genuinely-idle var axis.
+	s.observe(meas(func(m *device.Measurements) { m.W = 2000; m.PF = 0.90; m.Var = 10 }), true, t0.Add(6*time.Second))
+	if got := s.runners[bus.AdvAxisFixedPF].adoptState; got != bus.AdoptStateAdopted {
+		t.Fatalf("right |PF| with sub-floor reactive must converge on magnitude, got %q", got)
+	}
+}
+
 func TestAdvShell_FixedVarBandAndUnknownRating(t *testing.T) {
 	t0 := time.Now()
 	pct := 30.0
