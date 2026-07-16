@@ -22,8 +22,9 @@ import "math"
 //	            TestExportConstraint_ChurnEscalatesCannotComply here and
 //	            TestOptimizer_ExportChurnEscalatesCannotComply upstream).
 type ExportSession struct {
-	ctrl      exportController
-	overTicks int // ports expOverTicks (optimizer.go:143); compliance-cadence reset
+	ctrl           exportController
+	overTicks      int // ports expOverTicks (optimizer.go:143); compliance-cadence reset
+	zeroLeverTicks int // ports expZeroLeverTicks (audit D3); same compliance-cadence reset as overTicks
 }
 
 // exportController ports exportGuard (optimizer.go:13-23) field-for-field. Every
@@ -75,4 +76,5 @@ func (s *ExportSession) resetControllerForNewLimit(limitW float64) {
 func (s *ExportSession) clearForNoLimit() {
 	s.ctrl = freshController(math.NaN())
 	s.overTicks = 0
+	s.zeroLeverTicks = 0
 }

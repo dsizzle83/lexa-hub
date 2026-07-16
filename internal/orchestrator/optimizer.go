@@ -179,6 +179,14 @@ type DefaultOptimizer struct {
 	// reset only when the export limit clears entirely (checkExportLimitConvergence).
 	expOverTicks int
 
+	// expZeroLeverTicks debounces the export rule's OWN "last lever exhausted"
+	// breach (audit D3): the feed-forward ceiling can drive the solar ceiling to
+	// ~0 in a single tick against a 1-2-tick-lagged meter, so an undebounced
+	// zero-lever emitter posts a spurious CannotComply on any brief meter-noise
+	// excursion under a tight cap. Same leaky accumulation and session scope as
+	// expOverTicks (a transient blip decays; a genuine no-lever episode escalates).
+	expZeroLeverTicks int
+
 	// impGuard holds per-limit-session state for the import-limit rule.
 	impGuard importGuard
 
@@ -1066,6 +1074,7 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 ) ([]BatteryState, float64) {
 	if math.IsNaN(limits.exportLimitW) {
 		o.expGuard = exportGuard{evSetpointA: math.NaN(), evCmdW: math.NaN(), batteryAbsorbW: math.NaN(), activeLimitW: math.NaN(), filteredExportW: math.NaN(), solarCeilingW: math.NaN()}
+		o.expZeroLeverTicks = 0 // cap cleared — no-lever compliance session over (like expOverTicks)
 		return batteries, surplusW
 	}
 
@@ -1563,7 +1572,25 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	// site still exports over the hard limit (e.g. an islanded surplus with no
 	// load and a full battery). Curtailing to zero is the last lever, so report
 	// it upstream rather than silently missing the cap.
-	if actualExportW > limits.exportLimitW+complianceBreachW && desiredCeilingW <= complianceBreachW {
+	//
+	// DEBOUNCED (audit D3): the feed-forward ceiling term can drive desiredCeilingW
+	// to ~0 in ONE tick while the meter still lags 1-2 ticks behind, so an
+	// undebounced check posts a spurious CannotComply on any brief meter-noise
+	// excursion under a tight (e.g. 0 W) cap — where the converged ceiling sits
+	// permanently adjacent to the trip. Accumulate the no-lever condition with the
+	// same leaky counter as expOverTicks: a 1-2-tick transient decays; a genuine
+	// no-lever episode escalates within exportBreachTicks. recordBreach keeps the
+	// worst, so this never double-reports with checkExportLimitConvergence.
+	threshold := o.scaleTicks(exportBreachTicks)
+	noLever := actualExportW > limits.exportLimitW+complianceBreachW && desiredCeilingW <= complianceBreachW
+	if noLever {
+		if o.expZeroLeverTicks < threshold {
+			o.expZeroLeverTicks++
+		}
+	} else if o.expZeroLeverTicks > 0 {
+		o.expZeroLeverTicks--
+	}
+	if o.expZeroLeverTicks >= threshold {
 		o.recordBreach(plan, &ComplianceBreach{
 			LimitType:  "export",
 			LimitW:     limits.exportLimitW,

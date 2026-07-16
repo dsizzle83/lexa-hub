@@ -432,9 +432,24 @@ func (c *ExportConstraint) applyExportControl(in Input, s *Session, exportLimitW
 		}
 	}
 
-	// Zero-lever compliance breach (optimizer.go:1144-1156).
+	// Zero-lever compliance breach — DEBOUNCED (audit D3, mirrors the legacy
+	// expZeroLeverTicks): the feed-forward ceiling can drop desiredCeilingW to ~0
+	// in one tick against a lagged meter, so a single-sample check posts a
+	// spurious CannotComply on a brief noise excursion under a tight cap.
+	// Accumulate with the same leaky counter and adaptive window as the
+	// convergence check; sess.zeroLeverTicks survives cap-value churn and resets
+	// only when the cap clears (clearForNoLimit), exactly like overTicks.
 	var breach *orchestrator.ComplianceBreach
-	if actualExportW > exportLimitW+exportComplianceBreachW && desiredCeilingW <= exportComplianceBreachW {
+	threshold := c.detectionWindowTicks(in)
+	noLever := actualExportW > exportLimitW+exportComplianceBreachW && desiredCeilingW <= exportComplianceBreachW
+	if noLever {
+		if c.sess.zeroLeverTicks < threshold {
+			c.sess.zeroLeverTicks++
+		}
+	} else if c.sess.zeroLeverTicks > 0 {
+		c.sess.zeroLeverTicks--
+	}
+	if c.sess.zeroLeverTicks >= threshold {
 		breach = &orchestrator.ComplianceBreach{
 			LimitType:  "export",
 			LimitW:     exportLimitW,
