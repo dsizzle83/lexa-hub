@@ -117,7 +117,7 @@ func TestHandleRewalkRequest_RepublishesCachedControlWithFreshTsAndPokesWalk(t *
 	rewalkChan := make(chan struct{}, 1)
 	now := time.Now()
 
-	handleRewalkRequest(fc, lp, gate, rewalkChan, bus.RewalkRequest{Reason: "stale", Ts: now.Unix()}, now)
+	handleRewalkRequest(fc, lp, gate, rewalkChan, nil, bus.RewalkRequest{Reason: "stale", Ts: now.Unix()}, now)
 
 	if len(fc.publishes) != 1 {
 		t.Fatalf("Publish called %d times, want 1", len(fc.publishes))
@@ -159,7 +159,7 @@ func TestHandleRewalkRequest_NoCacheStillPokesWalk(t *testing.T) {
 	gate := &rewalkGate{}
 	rewalkChan := make(chan struct{}, 1)
 
-	handleRewalkRequest(fc, lp, gate, rewalkChan, bus.RewalkRequest{Reason: "decode"}, time.Now())
+	handleRewalkRequest(fc, lp, gate, rewalkChan, nil, bus.RewalkRequest{Reason: "decode"}, time.Now())
 
 	if len(fc.publishes) != 0 {
 		t.Errorf("Publish called %d times with no cached control, want 0", len(fc.publishes))
@@ -181,12 +181,12 @@ func TestHandleRewalkRequest_RateLimited(t *testing.T) {
 	rewalkChan := make(chan struct{}, 1)
 	t0 := time.Now()
 
-	handleRewalkRequest(fc, lp, gate, rewalkChan, bus.RewalkRequest{Reason: "stale"}, t0)
+	handleRewalkRequest(fc, lp, gate, rewalkChan, nil, bus.RewalkRequest{Reason: "stale"}, t0)
 	// Drain the first poke so the second call's behavior is unambiguous.
 	<-rewalkChan
 	firstPublishes := len(fc.publishes)
 
-	handleRewalkRequest(fc, lp, gate, rewalkChan, bus.RewalkRequest{Reason: "stale"}, t0.Add(1*time.Second))
+	handleRewalkRequest(fc, lp, gate, rewalkChan, nil, bus.RewalkRequest{Reason: "stale"}, t0.Add(1*time.Second))
 
 	if len(fc.publishes) != firstPublishes {
 		t.Errorf("Publish called again inside the rate limit: %d -> %d", firstPublishes, len(fc.publishes))
@@ -209,13 +209,13 @@ func TestHandleRewalkRequest_RepeatedPokesCoalesce(t *testing.T) {
 	rewalkChan := make(chan struct{}, 1)
 	t0 := time.Now()
 
-	handleRewalkRequest(fc, lp, gate, rewalkChan, bus.RewalkRequest{Reason: "stale"}, t0)
+	handleRewalkRequest(fc, lp, gate, rewalkChan, nil, bus.RewalkRequest{Reason: "stale"}, t0)
 	// Second call well past the rate limit, but BEFORE the channel is
 	// drained — must not block (buffered chan, non-blocking send with a
 	// default branch) even though one poke is already sitting there.
 	done := make(chan struct{})
 	go func() {
-		handleRewalkRequest(fc, lp, gate, rewalkChan, bus.RewalkRequest{Reason: "stale"}, t0.Add(nbRewalkRateLimit+time.Second))
+		handleRewalkRequest(fc, lp, gate, rewalkChan, nil, bus.RewalkRequest{Reason: "stale"}, t0.Add(nbRewalkRateLimit+time.Second))
 		close(done)
 	}()
 	select {

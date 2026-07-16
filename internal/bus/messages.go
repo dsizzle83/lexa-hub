@@ -115,6 +115,13 @@ type ActiveControl struct {
 	// *float64 members participate in Finite() (GAP-09).
 	DefaultFallback *DefaultDERControlMsg `json:"default_fallback,omitempty"`
 
+	// ServerTs is the publisher's estimate of SERVER time at publish, derived
+	// coherently from the /tm instant + monotonic elapsed (audit CS-1) rather
+	// than the two independently-clocked fields Ts+ClockOffset. The hub anchors
+	// its utility clock on this when present; a legacy publisher omits it (0) and
+	// the hub falls back to Ts+ClockOffset. Additive at ActiveControlV=1 (AD-006).
+	ServerTs int64 `json:"server_ts,omitempty"`
+
 	Ts int64 `json:"ts"`
 }
 

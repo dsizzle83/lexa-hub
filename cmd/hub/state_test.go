@@ -223,6 +223,42 @@ func TestReadSystemState_ExpiredCSIPControlDropped(t *testing.T) {
 	}
 }
 
+// TestOnCSIPControl_AnchorsOnServerTs is the CS-1 regression: when the publisher
+// supplies a coherent ServerTs (server-time-at-publish, immune to a wall step
+// between the /tm read and publish), the hub anchors its utility clock on THAT,
+// not on the two independently-clocked fields Ts+ClockOffset which a wall step
+// could have desynced.
+func TestOnCSIPControl_AnchorsOnServerTs(t *testing.T) {
+	r := newMQTTSystemReader(nil, testFastInterval, nil)
+	fixed := time.Now() // monotonic reading intact so ServerNow's elapsed term is ~0 right after anchor
+	r.utclk = utilitytime.New(utilitytime.Config{Now: func() time.Time { return fixed }})
+	expLim := 5000.0
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
+		Source: "event", MRID: "m1", ExpLimW: &expLim,
+		ServerTs:    1_000_000, // coherent server time — the hub must anchor on this
+		Ts:          500,       // Ts+ClockOffset = 500, the poison a wall step would produce
+		ClockOffset: 0,
+	})
+	if got := r.utclk.ServerNow(); got != 1_000_000 {
+		t.Errorf("hub anchored ServerNow = %d, want 1000000 (msg.ServerTs); ~500 means it used the poisonable Ts+ClockOffset (audit CS-1)", got)
+	}
+}
+
+// A legacy publisher omits ServerTs (0) → the hub falls back to Ts+ClockOffset.
+func TestOnCSIPControl_AnchorFallsBackWhenNoServerTs(t *testing.T) {
+	r := newMQTTSystemReader(nil, testFastInterval, nil)
+	fixed := time.Now()
+	r.utclk = utilitytime.New(utilitytime.Config{Now: func() time.Time { return fixed }})
+	expLim := 5000.0
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
+		Source: "event", MRID: "m1", ExpLimW: &expLim,
+		Ts: 1_000_000, ClockOffset: 7, // ServerTs omitted ⇒ fall back to 1_000_007
+	})
+	if got := r.utclk.ServerNow(); got != 1_000_007 {
+		t.Errorf("legacy-fallback ServerNow = %d, want 1000007 (Ts+ClockOffset)", got)
+	}
+}
+
 // TestReadSystemState_ExpiredEventDegradesToDefaultFallback is the H5/ED-3
 // regression: an event that expires while its DefaultDERControl fallback is
 // carried must DEGRADE to that default (2030.5 event-end revert-to-default),

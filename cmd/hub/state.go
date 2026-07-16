@@ -383,15 +383,21 @@ func (r *MQTTSystemReader) onCSIPControl(_ string, msg bus.ActiveControl) {
 	prev := r.lastCSIP
 	r.lastCSIP = &msg
 	r.clockOffset = msg.ClockOffset
-	// Anchor utility time at this message's arrival (TASK-037). msg.Ts is
-	// stamped by lexa-northbound with time.Now().Unix() at publish
-	// (cmd/northbound/main.go's toActiveControl); msg.Ts+msg.ClockOffset is
-	// therefore server time AT PUBLISH. This is only valid because
-	// lexa-northbound and lexa-hub share the same host clock (the hub Pi/SOM
-	// — see CLAUDE.md's bench topology) and MQTT localhost latency is
-	// negligible (≪ 1 s) — a split-host deployment would have to re-derive
-	// this anchor from its own local receipt time instead.
-	r.utclk.Anchor(msg.Ts + msg.ClockOffset)
+	// Anchor utility time at this message's arrival (TASK-037). Prefer the
+	// publisher's coherent ServerTs (audit CS-1: server-time-at-publish derived
+	// from the /tm instant + monotonic elapsed, immune to a wall step between the
+	// two clock reads). A legacy publisher omits ServerTs (0); fall back to
+	// msg.Ts+msg.ClockOffset (the two independently-clocked fields), valid because
+	// lexa-northbound and lexa-hub share the same host clock (the hub Pi/SOM) and
+	// MQTT localhost latency is negligible — a split-host deployment would
+	// re-derive this from its own local receipt time instead.
+	anchorServerTs := serverTsOf(msg)
+	// Capture the server-time reading from the PREVIOUS anchor before re-anchoring
+	// — monotonic-derived, so it is immune to a local wall step since the last
+	// message. This is the step-safe reference for the CS-4 stale-age check below
+	// (using the post-anchor clock would trivially read age 0 against itself).
+	prevServerNow := r.utclk.ServerNow()
+	r.utclk.Anchor(anchorServerTs)
 	if msg.MRID != r.lastCSIPMRID {
 		r.lastCSIPMRID = msg.MRID
 		r.lastCSIPChangedAt = time.Now()
@@ -416,18 +422,19 @@ func (r *MQTTSystemReader) onCSIPControl(_ string, msg bus.ActiveControl) {
 	// must not change"). Source=="none" is excluded: an aged "no active
 	// control" sentinel carries no compliance risk to flag.
 	//
-	// age is computed via utilitytime.ServerNowAt using THIS message's own
-	// ClockOffset, not r.utclk (which was just re-anchored to this exact
-	// message a few lines up and would trivially read back age==0 against
-	// itself). ServerNowAt(now, offset) = now.Unix()+offset, so this reduces
-	// to local-now minus msg.Ts — the offset term cancels — i.e. "how long
-	// ago, in wall-clock seconds, did lexa-northbound stamp this message",
-	// valid under the same shared-host-clock assumption the Anchor call above
-	// already relies on.
+	// age = (server time per the PREVIOUS anchor, captured above) − (this
+	// message's own server-time-at-publish). Both are server-time, so the age is
+	// "how long ago did lexa-northbound stamp this message". Using prevServerNow
+	// (monotonic-derived from the last anchor) instead of a fresh wall read makes
+	// the check immune to a LOCAL wall-clock step between the two messages (audit
+	// CS-4: a forward step used to inflate the raw local-now−Ts age past the
+	// bound and fire a spurious stale WARN + rewalk) while still catching a
+	// genuinely-old retained control (an unclean-broker-restart resurrection with
+	// a real 300 s-old ServerTs). Enforce-but-verify, never reject.
 	r.lastCSIPStaleSuspect = false
 	if controlIsReal(&msg) && r.retainedAdoptionMaxAge > 0 {
 		boundS := int64(r.retainedAdoptionMaxAge.Seconds())
-		age := utilitytime.ServerNowAt(time.Now(), msg.ClockOffset) - (msg.Ts + msg.ClockOffset)
+		age := prevServerNow - anchorServerTs
 		if age > boundS {
 			r.lastCSIPStaleSuspect = true
 			slog.Warn("[hub] retained CSIP control is stale at adoption — enforcing (fail-closed) and requesting re-publish",
@@ -443,6 +450,16 @@ func (r *MQTTSystemReader) onCSIPControl(_ string, msg bus.ActiveControl) {
 // the same absence check busToCSIPControl already applies.
 func controlIsReal(c *bus.ActiveControl) bool {
 	return c != nil && c.Source != "" && c.Source != "none"
+}
+
+// serverTsOf returns the publisher's estimate of server-time-at-publish for msg:
+// the coherent ServerTs (audit CS-1: /tm instant + monotonic elapsed) when
+// present, else the legacy two-field Ts+ClockOffset.
+func serverTsOf(msg bus.ActiveControl) int64 {
+	if msg.ServerTs != 0 {
+		return msg.ServerTs
+	}
+	return msg.Ts + msg.ClockOffset
 }
 
 // controlChanged reports whether the resolved control identity/limits

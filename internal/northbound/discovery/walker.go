@@ -86,6 +86,14 @@ type ResourceTree struct {
 	// estimated server time. Required by CSIP for event scheduling.
 	ClockOffset int64
 
+	// TmParsedAt is the LOCAL monotonic instant (time.Now() value, monotonic
+	// clock intact) at which ClockOffset was measured against Time.CurrentTime.
+	// It lets the anchor be derived from server-time-as-of-/tm plus monotonic
+	// elapsed, so a wall-clock step landing between the /tm read and the anchor
+	// (or the publish) cannot displace utility time (audit CS-1). Zero when Time
+	// was not fetched this walk.
+	TmParsedAt time.Time
+
 	// ResponseSetPath is the server-advertised href from DeviceCapability's
 	// ResponseSetListLink.  Use this for response POSTs instead of a
 	// hardcoded default.  Empty if the server did not advertise the link.
@@ -230,7 +238,14 @@ func (w *Walker) Discover(ctx context.Context, dcapPath string) (*ResourceTree, 
 		// Clock offset: server time minus local time. Add to time.Now().Unix()
 		// to get estimated server time. Required for correct event scheduling
 		// (CSIP §5.2.1.3: client clock must be within 30s of server time).
-		tree.ClockOffset = tm.CurrentTime - time.Now().Unix()
+		// Capture the offset AND the local monotonic instant it was measured at
+		// from ONE clock read, so the anchor/publish can derive server-time from
+		// server-time-as-of-/tm + monotonic elapsed rather than a second, later
+		// wall read (audit CS-1: a wall step between reads must not poison utility
+		// time).
+		now := time.Now()
+		tree.ClockOffset = tm.CurrentTime - now.Unix()
+		tree.TmParsedAt = now
 	}
 
 	// Step 3: EndDeviceList — find ourselves by LFDI

@@ -272,7 +272,7 @@ func TestFlowReservations_NoFlowReservationsPublishesEmpty(t *testing.T) {
 // through — the hub's clock-jitter/expiry logic depends on ClockOffset being
 // populated even when Source="none".
 func TestToActiveControl_NilYieldsNoneSourceButPassesClockOffset(t *testing.T) {
-	msg := ToActiveControl(nil, 42)
+	msg := ToActiveControl(nil, 42, 0)
 	if msg.Source != "none" {
 		t.Errorf("Source = %q, want %q", msg.Source, "none")
 	}
@@ -302,7 +302,7 @@ func TestToActiveControl_FieldMapping(t *testing.T) {
 		},
 	}
 
-	msg := ToActiveControl(ac, 7)
+	msg := ToActiveControl(ac, 7, 0)
 
 	if msg.Source != "event" || msg.MRID != "EVT-1" || msg.ValidUntil != 99999 {
 		t.Errorf("identity fields = %+v, want source=event mrid=EVT-1 validUntil=99999", msg)
@@ -343,7 +343,7 @@ func TestToActiveControl_CarriesDefaultFallback(t *testing.T) {
 		Default:     &model.DERControlBase{OpModExpLimW: apw(0, 5000), OpModGenLimW: apw(0, 8000)},
 		DefaultMRID: "DEFAULT-1",
 	}
-	msg := ToActiveControl(ac, 0)
+	msg := ToActiveControl(ac, 0, 0)
 
 	if msg.ExpLimW == nil || *msg.ExpLimW != 1000 {
 		t.Errorf("primary ExpLimW = %v, want 1000 (the active event's cap)", msg.ExpLimW)
@@ -370,7 +370,7 @@ func TestToActiveControl_DefaultSourceNoSelfFallback(t *testing.T) {
 		Base:    model.DERControlBase{OpModExpLimW: apw(0, 5000)},
 		Default: &model.DERControlBase{OpModExpLimW: apw(0, 5000)}, // even if set, must not self-carry
 	}
-	if msg := ToActiveControl(ac, 0); msg.DefaultFallback != nil {
+	if msg := ToActiveControl(ac, 0, 0); msg.DefaultFallback != nil {
 		t.Errorf("a default-sourced control must not carry a DefaultFallback, got %+v", msg.DefaultFallback)
 	}
 }

@@ -69,7 +69,7 @@ func wp8EventControl() *scheduler.ActiveControl {
 // passthrough table: every §2.2 scalar decodes with the right units, signs,
 // and excitation convention, and curve_set_id names the resolved content.
 func TestToActiveControl_WP8FieldMapping(t *testing.T) {
-	msg := ToActiveControl(wp8EventControl(), 7)
+	msg := ToActiveControl(wp8EventControl(), 7, 0)
 
 	if msg.Energize == nil || !*msg.Energize {
 		t.Errorf("Energize = %v, want true", msg.Energize)
@@ -119,7 +119,7 @@ func TestToActiveControl_DefaultRampFields(t *testing.T) {
 		SetGradW:     u16p(30), // 30 hundredths of a % per s = 0.3 %/s
 		SetSoftGradW: u16p(10),
 	}
-	msg := ToActiveControl(ac, 0)
+	msg := ToActiveControl(ac, 0, 0)
 	if msg.SetGradW == nil || *msg.SetGradW != 0.3 {
 		t.Errorf("SetGradW = %v, want 0.3", msg.SetGradW)
 	}
@@ -135,7 +135,7 @@ func TestToActiveControl_DefaultRampFields(t *testing.T) {
 // loaded event control (Ts pinned post-conversion — it is the only
 // wall-clock field).
 func TestToActiveControl_WP8GoldenFixture(t *testing.T) {
-	msg := ToActiveControl(wp8EventControl(), 7)
+	msg := ToActiveControl(wp8EventControl(), 7, 0)
 	msg.Ts = 1700000000
 	b, err := json.Marshal(msg)
 	if err != nil {

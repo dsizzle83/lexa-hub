@@ -5,7 +5,50 @@ import (
 	"time"
 
 	"lexa-hub/internal/bus"
+	"lexa-hub/internal/utilitytime"
 )
+
+// TestOnCSIPControl_StaleCheckUsesCoherentServerTs is the CS-4 regression: the
+// stale-at-adoption age is measured from the previous anchor's MONOTONIC clock
+// against the message's coherent ServerTs — not a raw local-now−Ts wall diff
+// that a forward wall step (or a rewalk timestamp refresh) between messages
+// would inflate. A second message that is genuinely FRESH (coherent ServerTs =
+// current server time) must not be flagged stale even if its raw Ts field looks
+// old.
+func TestOnCSIPControl_StaleCheckUsesCoherentServerTs(t *testing.T) {
+	r := newMQTTSystemReader(nil, testFastInterval, nil)
+	r.SetRetainedAdoptionMaxAge(60 * time.Second)
+	var rewalkCalls int
+	r.SetRewalkHandler(func(string) { rewalkCalls++ })
+	base := time.Now() // time.Now()-derived so it carries a monotonic reading
+	fakeNow := base
+	r.utclk = utilitytime.New(utilitytime.Config{Now: func() time.Time { return fakeNow }})
+
+	expLim := 5000.0
+	// Message 1 anchors utility time at server-time = base.
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
+		Source: "event", MRID: "m1", ExpLimW: &expLim,
+		ServerTs: base.Unix(), Ts: base.Unix(), ClockOffset: 0,
+	})
+	rewalkCalls = 0 // ignore anything from the first message
+
+	// 5 s of TRUE elapsed time (monotonic advances).
+	fakeNow = base.Add(5 * time.Second)
+
+	// Message 2 is genuinely fresh (coherent ServerTs = current server time) but
+	// its raw Ts field looks 1000 s old. The check must trust ServerTs.
+	r.onCSIPControl("lexa/csip/control", bus.ActiveControl{
+		Source: "event", MRID: "m2", ExpLimW: &expLim,
+		ServerTs: base.Add(5 * time.Second).Unix(),
+		Ts:       base.Unix() - 1000, ClockOffset: 0,
+	})
+	if r.lastCSIPStaleSuspect {
+		t.Error("stale-suspect for a message with a FRESH coherent ServerTs — the age check must key off ServerTs, not the raw Ts (audit CS-4)")
+	}
+	if rewalkCalls != 0 {
+		t.Errorf("rewalk fired %d times for a fresh coherent ServerTs, want 0", rewalkCalls)
+	}
+}
 
 // TestOnCSIPControl_FreshControlNoAlarmNoRewalk is TASK-042's fresh-adoption
 // control case: a retained control whose Ts is effectively "now" must not be

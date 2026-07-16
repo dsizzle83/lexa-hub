@@ -322,11 +322,12 @@ func unitValueToFloat(uv *model.UnitValue) float64 {
 // (curve_set_id, "" = no resolvable curves). rvrt_tms_s stays nil here: its
 // computation is hub-side at desired-doc authoring (C3/WP-9). Curve CONTENT
 // never rides this message — see the Curves publisher below.
-func ToActiveControl(ac *scheduler.ActiveControl, clockOffset int64) bus.ActiveControl {
+func ToActiveControl(ac *scheduler.ActiveControl, clockOffset, serverTs int64) bus.ActiveControl {
 	msg := bus.ActiveControl{
 		Envelope:    bus.Envelope{V: bus.ActiveControlV},
 		Source:      "none",
 		ClockOffset: clockOffset,
+		ServerTs:    serverTs, // CS-1: coherent server-time-at-publish for the hub's anchor
 		Ts:          time.Now().Unix(),
 	}
 	if ac == nil {

@@ -185,7 +185,7 @@ func (d *Discovery) SetDERReporter(s DERReportSink) {
 // wire it directly into mqttutil.Subscribe from main(). See
 // handleRewalkRequest for the mechanism.
 func (d *Discovery) HandleRewalk(req bus.RewalkRequest) {
-	handleRewalkRequest(d.mc, d.lastPub, d.rewalkGate, d.rewalkChan, req, time.Now())
+	handleRewalkRequest(d.mc, d.lastPub, d.rewalkGate, d.rewalkChan, d.clk, req, time.Now())
 }
 
 // SetPinVerifier wires the WP-7/D4 registration-PIN verifier. Call before
@@ -357,7 +357,17 @@ func (d *Discovery) RunOnce(ctx context.Context) {
 	// local clock makes this bit-identical to the pre-TASK-037 formula: the
 	// anchor is reset to the same raw value every walk, so nothing changes
 	// under the common case this task's "must not change" list protects.
-	d.clk.Anchor(utilitytime.ServerNowAt(time.Now(), tree.ClockOffset))
+	// Anchor from the /tm instant carried forward by the MONOTONIC clock (audit
+	// CS-1): server-time-as-of-/tm + monotonic-elapsed-since-/tm. tree.TmParsedAt
+	// holds the local monotonic reading from the same instant ClockOffset was
+	// measured, so a LOCAL wall step between the /tm read and this anchor cannot
+	// displace utility time. Falls back to the former fresh-wall formula when
+	// Time was not fetched this walk (TmParsedAt zero) — bit-identical to before.
+	anchorServerNow := utilitytime.ServerNowAt(time.Now(), tree.ClockOffset)
+	if tree.Time != nil && !tree.TmParsedAt.IsZero() {
+		anchorServerNow = tree.Time.CurrentTime + int64(time.Since(tree.TmParsedAt).Seconds())
+	}
+	d.clk.Anchor(anchorServerNow)
 
 	// serverNow now reads from the single-owner, now-anchored Clock (AD-004,
 	// TASK-035/037). Immediately after Anchor above this is arithmetically
@@ -386,7 +396,7 @@ func (d *Discovery) RunOnce(ctx context.Context) {
 	// re-checks, and a match resumes the normal path below.
 	if d.pin.Check(ctx, walker, tree.SelfDevice) {
 		held := d.sched.Evaluate(nil, serverNow)
-		msg := publish.ToActiveControl(held, tree.ClockOffset)
+		msg := publish.ToActiveControl(held, tree.ClockOffset, serverNow)
 		if err := mqttutil.PublishJSONRetained(d.mc, bus.TopicCSIPControl, msg); err != nil {
 			log.Printf("lexa-northbound: publish control: %v", err)
 		} else {
@@ -412,7 +422,7 @@ func (d *Discovery) RunOnce(ctx context.Context) {
 		}
 	}
 
-	msg := publish.ToActiveControl(active, tree.ClockOffset)
+	msg := publish.ToActiveControl(active, tree.ClockOffset, serverNow)
 	if err := mqttutil.PublishJSONRetained(d.mc, bus.TopicCSIPControl, msg); err != nil {
 		log.Printf("lexa-northbound: publish control: %v", err)
 	} else {
@@ -587,7 +597,7 @@ func (g *rewalkGate) allow(now time.Time) bool {
 //     single-flight is free there (that goroutine is the only caller of
 //     RunOnce); the buffered size-1 channel coalesces repeat pokes that
 //     arrive while a walk is already in flight rather than queuing them.
-func handleRewalkRequest(mc mqtt.Client, lp *lastPublishedStore, gate *rewalkGate, rewalkChan chan<- struct{}, req bus.RewalkRequest, now time.Time) {
+func handleRewalkRequest(mc mqtt.Client, lp *lastPublishedStore, gate *rewalkGate, rewalkChan chan<- struct{}, clk *utilitytime.Clock, req bus.RewalkRequest, now time.Time) {
 	if !gate.allow(now) {
 		slog.Debug("lexa-northbound: rewalk request rate-limited, ignoring", "reason", req.Reason)
 		return
@@ -598,6 +608,12 @@ func handleRewalkRequest(mc mqtt.Client, lp *lastPublishedStore, gate *rewalkGat
 	if cached := lp.get(); cached != nil {
 		refreshed := *cached
 		refreshed.Ts = now.Unix()
+		// CS-1: refresh the anchor basis from the ANCHORED clock, never
+		// fresh-wall + the cached (stale) ClockOffset — the latter re-poisons the
+		// hub's re-anchor if the local wall stepped since the cached message.
+		if clk != nil {
+			refreshed.ServerTs = clk.ServerNow()
+		}
 		if err := mqttutil.PublishJSONRetained(mc, bus.TopicCSIPControl, refreshed); err != nil {
 			log.Printf("lexa-northbound: rewalk republish: %v", err)
 		} else {
