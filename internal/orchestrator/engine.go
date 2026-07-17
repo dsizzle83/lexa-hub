@@ -741,13 +741,12 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 	// the diurnal fallback needs kept warm: if an external forecast arrives fresh
 	// today but goes stale tomorrow, the fallback must still have a peak to shape.
 	// Only the diurnal ASSIGNMENT to p.SolarForecastKw is gated (Unit 3.1 §3.3).
-	if curKw := state.TotalSolarW() / 1000; curKw > 0 {
-		if shape := clearSkyShape(localHourOf(now.Unix())); shape > 0.15 {
-			if est := curKw / shape; est > e.state.lastSolarPeakKw {
-				e.state.lastSolarPeakKw = est
-			}
-		}
-	}
+	e.state.lastSolarPeakKw = estimateSolarPeakKw(
+		state.TotalSolarW()/1000,
+		clearSkyShape(localHourOf(now.Unix())),
+		state.TotalSolarNameplateW()/1000,
+		e.state.lastSolarPeakKw,
+	)
 	// Solar forecast gate (§11 staleness rule): a FRESH external forecast wins;
 	// otherwise fall back to the clear-sky diurnal curve (the block below is the
 	// pre-existing forecast code, unchanged, just moved into the else arm).
@@ -760,6 +759,14 @@ func (e *Engine) buildPlannerParams(state SystemState, inp plannerInput) Planner
 		peakKw := e.state.lastSolarPeakKw
 		if cfg.SolarPeakKw > peakKw {
 			peakKw = cfg.SolarPeakKw
+		}
+		// Clamp the diurnal peak to the inverter nameplate from ANY source (the
+		// estimator OR a too-generous cfg.SolarPeakKw): an inverter cannot exceed
+		// its rating, and a peak above the export cap for sustained hours drives
+		// the daily planner infeasible (it has no PV-curtailment lever), which
+		// silently flattens the battery schedule.
+		if npKw := state.TotalSolarNameplateW() / 1000; npKw > 0 && peakKw > npKw {
+			peakKw = npKw
 		}
 		p.SolarForecastKw = diurnalSolarForecast(p.WindowStart, peakKw)
 		e.forecastSource.Store(forecastDiurnal)

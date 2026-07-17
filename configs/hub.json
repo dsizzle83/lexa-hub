@@ -48,7 +48,7 @@
     {
       "name": "inverter-0",
       "role": "inverter",
-      "max_w": 10000,
+      "max_w": 5000,
       "plant": {
         "max_ramp_down_w_per_s": 500.0,
         "max_ramp_up_w_per_s": 166.6666666667,

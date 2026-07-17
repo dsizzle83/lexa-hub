@@ -231,6 +231,20 @@ func (s SystemState) TotalSolarW() float64 {
 	return total
 }
 
+// TotalSolarNameplateW sums the nameplate (MaxW) generation capacity of the
+// connected inverters — the physical ceiling on clear-sky output, used to clamp
+// the solar-peak estimator so a low-sun reading can't extrapolate to a peak the
+// hardware cannot produce. 0 when no connected inverter reports a nameplate.
+func (s SystemState) TotalSolarNameplateW() float64 {
+	total := 0.0
+	for _, sol := range s.Solar {
+		if sol.Connected && sol.MaxW > 0 {
+			total += sol.MaxW
+		}
+	}
+	return total
+}
+
 // TotalBatteryW sums net battery power (+ discharge, - charge).
 func (s SystemState) TotalBatteryW() float64 {
 	total := 0.0

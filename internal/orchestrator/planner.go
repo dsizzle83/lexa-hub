@@ -853,6 +853,37 @@ func clearSkyShape(hour float64) float64 {
 	return math.Sin(math.Pi * (hour - solarSunriseHr) / (solarSunsetHr - solarSunriseHr))
 }
 
+// solarEstMinShape is the minimum clear-sky shape at which the peak back-calc
+// curKw/shape is trusted. Near sunrise/sunset the shape is tiny, so a modest
+// reading divided by it extrapolates to a wildly inflated "peak" (a 4 kW dusk
+// reading / 0.15 ≈ 27 kW). Only sample when the sun is high (~10:00–14:00 for a
+// 6–20h day), where the ratio is a reliable estimate of the clear-sky peak.
+const solarEstMinShape = 0.6
+
+// estimateSolarPeakKw updates the clear-sky solar-peak high-water mark that
+// seeds the diurnal forecast. It back-calculates the peak from a live reading
+// (curKw / shape) ONLY when the sun is high enough to trust the ratio
+// (shape ≥ solarEstMinShape) and clamps the result to the inverter nameplate
+// (nameplateKw, a physical ceiling) — an inverter cannot produce more than its
+// rating, and an unclamped low-sun estimate that overshoots the export cap for
+// hours is what drives the daily planner infeasible (it has no PV-curtailment
+// lever). The mark only ratchets UP (never below prev) so a replan after dark
+// still forecasts tomorrow; the nameplate clamp bounds that ratchet. A
+// nameplateKw ≤ 0 (unknown rating) leaves the high-sun gate as the only guard.
+func estimateSolarPeakKw(curKw, shape, nameplateKw, prev float64) float64 {
+	if curKw <= 0 || shape < solarEstMinShape {
+		return prev
+	}
+	est := curKw / shape
+	if nameplateKw > 0 && est > nameplateKw {
+		est = nameplateKw
+	}
+	if est > prev {
+		return est
+	}
+	return prev
+}
+
 // localHourOf returns the local hour-of-day (with fractional minutes) of a Unix
 // time. The forecast must use the same clock the optimizer evaluates TOU on, so
 // callers pass server (offset-adjusted) Unix seconds.

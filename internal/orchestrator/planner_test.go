@@ -312,6 +312,42 @@ func TestPlan_AusLoadLim_CapsChargePlusLoad(t *testing.T) {
 
 // ── Plan: EV departure constraint ─────────────────────────────────────────────
 
+// TestEstimateSolarPeakKw guards the solar-peak estimator against the
+// low-sun-division blowup that inflated a 5 kW inverter's forecast to ~24 kW —
+// which then exceeded the export cap for hours and flattened the battery plan.
+func TestEstimateSolarPeakKw(t *testing.T) {
+	const nameplate = 5.0 // a 5 kW inverter
+	cases := []struct {
+		name                     string
+		curKw, shape, prev, want float64
+	}{
+		// A 3.6 kW reading at a low-sun shape (0.15) would back-calc to 24 kW.
+		// The high-sun gate rejects the sample entirely → prev is unchanged.
+		{"low-sun reading is not extrapolated", 3.6, 0.15, 5.0, 5.0},
+		// Even a high-sun reading is clamped to the inverter nameplate: a brief
+		// edge-of-cloud over-nameplate blip can't ratchet the peak past 5 kW.
+		{"high-sun over-nameplate reading is clamped", 6.0, 0.95, 0, nameplate},
+		// A clean mid-day reading estimates the true peak (curKw/shape).
+		{"high-sun reading estimates the peak", 4.0, 0.8, 0, 5.0},
+		// The mark only ratchets up — a lower fresh estimate never lowers it.
+		{"never ratchets down", 2.0, 0.9, 4.5, 4.5},
+		// No generation → no update.
+		{"no sun, no update", 0, 1.0, 3.0, 3.0},
+	}
+	for _, c := range cases {
+		got := estimateSolarPeakKw(c.curKw, c.shape, nameplate, c.prev)
+		if math.Abs(got-c.want) > 1e-9 {
+			t.Errorf("%s: estimateSolarPeakKw(%.2f,%.2f,%.1f,%.2f)=%.3f, want %.3f",
+				c.name, c.curKw, c.shape, nameplate, c.prev, got, c.want)
+		}
+	}
+	// Unknown nameplate (0): the high-sun gate is the only guard, but it still
+	// blocks the low-sun blowup (the original bug's trigger).
+	if got := estimateSolarPeakKw(3.6, 0.15, 0, 5.0); got != 5.0 {
+		t.Errorf("unknown nameplate + low sun: got %.3f, want 5.0 (unchanged)", got)
+	}
+}
+
 func TestPlan_EV_MeetsTargetByDeparture(t *testing.T) {
 	p := plannerTestBase()
 	// Use 0.25 kWh step: 7.2 kW × (5/60) × 0.95 ≈ 0.57 kWh/step → ~2 levels per step.
