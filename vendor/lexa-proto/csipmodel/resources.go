@@ -23,7 +23,12 @@
 // resources_test.go plus both consumers' conformance suites.
 package csipmodel
 
-import "encoding/xml"
+import (
+	"encoding/xml"
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // XMLNamespace is the IEEE 2030.5 XML namespace required on all root elements.
 const XMLNamespace = "urn:ieee:std:2030.5:ns"
@@ -48,6 +53,55 @@ type ListLink struct {
 // Resource is the base of most 2030.5 types — it carries an href.
 type Resource struct {
 	Href string `xml:"href,attr,omitempty"`
+}
+
+// ResponseRequired is the IEEE 2030.5 Event-base `responseRequired` bitmap
+// (XSD type hexBinary8), carried as an XML attribute on Event-derived
+// resources such as DERControl. It tells the client which Response
+// acknowledgements the server wants for that event (Table 27 / §D.2.2
+// RespondableResource semantics):
+//
+//	bit 0 (0x01) — the client shall POST a Response indicating the event
+//	               message was received;
+//	bit 1 (0x02) — the client shall POST a Response with the specific
+//	               outcome (started/completed/etc.);
+//	bit 2 (0x04) — end-user / customer response is required.
+//
+// A value of 0 means the server explicitly wants NO Response. On DERControl
+// this is modelled as a *pointer* so a consumer can distinguish "attribute
+// absent" (nil — no server instruction, keep the consumer's default
+// behaviour) from "attribute present and zero" (an explicit request for
+// silence). Added additively for audit CSIP-004 (replyTo/responseRequired
+// were dropped at parse time); absent on the wire ⇒ nil ⇒ byte-identical
+// round-trips, so lexa-hub and gridsim are unaffected until they populate it.
+type ResponseRequired uint8
+
+// responseRequired bit flags (IEEE 2030.5 RespondableResource).
+const (
+	RespReqMessageReceived  ResponseRequired = 1 << 0 // 0x01
+	RespReqSpecificResponse ResponseRequired = 1 << 1 // 0x02
+	RespReqCustomerResponse ResponseRequired = 1 << 2 // 0x04
+)
+
+// UnmarshalXMLAttr decodes the hexBinary8 attribute (e.g. "03") into the
+// bitmap. Accepts upper- or lower-case hex; a malformed or out-of-range
+// (>0xFF) value is an error so a corrupt control is rejected rather than
+// silently misread — mirroring the package's XML silent-failure discipline.
+func (r *ResponseRequired) UnmarshalXMLAttr(attr xml.Attr) error {
+	v, err := strconv.ParseUint(strings.TrimSpace(attr.Value), 16, 8)
+	if err != nil {
+		return fmt.Errorf("csipmodel: responseRequired %q: %w", attr.Value, err)
+	}
+	*r = ResponseRequired(v)
+	return nil
+}
+
+// MarshalXMLAttr encodes the bitmap back to a two-digit hexBinary8 attribute
+// (uppercase, matching the 2030.5 example encodings). Value receiver so a
+// *ResponseRequired struct field marshals correctly; a nil pointer field is
+// omitted by encoding/xml before this is ever reached (attr,omitempty).
+func (r ResponseRequired) MarshalXMLAttr(name xml.Name) (xml.Attr, error) {
+	return xml.Attr{Name: name, Value: fmt.Sprintf("%02X", uint8(r))}, nil
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -295,6 +349,22 @@ type EventStatus struct {
 type DERControl struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERControl"`
 	Resource
+
+	// ReplyTo and ResponseRequired are the IEEE 2030.5 Event-base
+	// (RespondableResource) addressing/requirement attributes. Before audit
+	// CSIP-004 they were dropped at parse time, so a Response could not be
+	// routed to the server's own reply URI nor gated by its stated
+	// requirement. Both are additive and omitempty: a wire DERControl without
+	// them round-trips byte-identically.
+	//
+	// ReplyTo is the href the client should POST Response objects for THIS
+	// event to, overriding the default ResponseSet. Empty ⇒ absent ⇒ the
+	// consumer falls back to its configured/advertised default response set.
+	ReplyTo string `xml:"replyTo,attr,omitempty"`
+	// ResponseRequired is the responseRequired bitmap (hexBinary8). nil ⇒
+	// absent ⇒ no server instruction (consumer keeps its default). Present
+	// and zero ⇒ the server explicitly requests no Response for this event.
+	ResponseRequired *ResponseRequired `xml:"responseRequired,attr,omitempty"`
 
 	MRID           string           `xml:"mRID,omitempty"`
 	Description    string           `xml:"description,omitempty"`

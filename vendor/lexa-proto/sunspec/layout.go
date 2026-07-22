@@ -179,6 +179,29 @@ const (
 	sentI64 = uint64(0x8000000000000000)
 )
 
+// ── Max-valid clamp edges (audit SUN-004) ────────────────────────────────────
+//
+// The largest-magnitude value a point of each type may carry as REAL data: the
+// full type range MINUS the single bit pattern the SunSpec spec reserves as the
+// "not implemented / unknown" sentinel. A finite, in-service value that merely
+// exceeds the range clamps to THESE edges, never onto the reserved sentinel —
+// encoding a real measurement/command AS 0x8000 / 0xFFFF / 0x80000000 /
+// 0xFFFFFFFF would corrupt it into "not implemented" on the wire.
+//
+// Signed types reserve the negative extreme (0x8000 / 0x80000000), so their
+// max-valid LOW edge is one above the type minimum (−32767 / −2147483647), NOT
+// the type MIN itself. Accumulators (Tacc*) instead reserve 0 as their
+// sentinel, so their full-scale maximum (0xFFFFFFFF) is valid data — they are
+// deliberately NOT listed here and take a plain clamp to the type maximum.
+const (
+	maxValidI16 = float64(32767)       // hi 0x7FFF     (0x8000     reserved sentinel)
+	minValidI16 = float64(-32767)      // lo 0x8001     (0x8000     reserved sentinel)
+	maxValidU16 = float64(65534)       // hi 0xFFFE     (0xFFFF     reserved sentinel)
+	maxValidI32 = float64(2147483647)  // hi 0x7FFFFFFF (0x80000000 reserved sentinel)
+	minValidI32 = float64(-2147483647) // lo 0x80000001 (0x80000000 reserved sentinel)
+	maxValidU32 = float64(4294967294)  // hi 0xFFFFFFFE (0xFFFFFFFF reserved sentinel)
+)
+
 // notImpl reports whether the raw value of a field equals its type's
 // "not implemented" sentinel.
 func (v View) notImpl(o int, f Field) bool {
@@ -363,8 +386,10 @@ func (v View) SetU32(name string, val uint32) {
 }
 
 // SetFloat writes an engineering value to a scaled point, encoding it with the
-// point's scale factor (read live from the slice). Out-of-range values clamp to
-// the field's representable range. Unknown/NaN scale factor → no-op.
+// point's scale factor (read live from the slice). A finite out-of-range value
+// clamps to the field's MAX-VALID representable edge, never onto the reserved
+// not-implemented sentinel (audit SUN-004). Unknown/NaN scale factor → no-op;
+// NaN value → no-op (nothing to write).
 func (v View) SetFloat(name string, val float64) {
 	o, f, ok := v.fieldOff(name)
 	if !ok || math.IsNaN(val) {
@@ -381,15 +406,21 @@ func (v View) SetFloat(name string, val float64) {
 	scaled := math.Round(val / math.Pow10(int(sf)))
 	switch f.Type {
 	case Tint16, Tsunssf:
-		v.setReg(o, uint16(int16(clamp(scaled, math.MinInt16, math.MaxInt16))))
+		v.setReg(o, uint16(int16(clamp(scaled, minValidI16, maxValidI16))))
 	case Tuint16, Tenum16:
-		v.setReg(o, uint16(clamp(scaled, 0, math.MaxUint16)))
+		v.setReg(o, uint16(clamp(scaled, 0, maxValidU16)))
 	case Tint32:
-		x := int32(clamp(scaled, math.MinInt32, math.MaxInt32))
+		x := int32(clamp(scaled, minValidI32, maxValidI32))
 		v.setReg(o, uint16(uint32(x)>>16))
 		v.setReg(o+1, uint16(uint32(x)))
-	case Tuint32, Tacc32:
+	case Tacc32:
+		// Accumulator: the not-implemented sentinel is 0, so the full-scale
+		// 0xFFFFFFFF is valid data — plain clamp to the type maximum.
 		x := uint32(clamp(scaled, 0, math.MaxUint32))
+		v.setReg(o, uint16(x>>16))
+		v.setReg(o+1, uint16(x))
+	case Tuint32:
+		x := uint32(clamp(scaled, 0, maxValidU32))
 		v.setReg(o, uint16(x>>16))
 		v.setReg(o+1, uint16(x))
 	}
@@ -452,7 +483,7 @@ func (v View) SetScaledSignedAt(o int, val float64, sfName string) {
 		return
 	}
 	r := math.Round(val / math.Pow10(int(s)))
-	v.setReg(o, uint16(int16(clamp(r, math.MinInt16, math.MaxInt16))))
+	v.setReg(o, uint16(int16(clamp(r, minValidI16, maxValidI16))))
 }
 
 // SetScaledUintAt encodes val as a uint16 at offset o using the named SF.
@@ -462,7 +493,7 @@ func (v View) SetScaledUintAt(o int, val float64, sfName string) {
 		return
 	}
 	r := math.Round(val / math.Pow10(int(s)))
-	v.setReg(o, uint16(clamp(r, 0, math.MaxUint16)))
+	v.setReg(o, uint16(clamp(r, 0, maxValidU16)))
 }
 
 // SetScaledU32At encodes val as a big-endian uint32 at offset o using the SF.
@@ -471,7 +502,7 @@ func (v View) SetScaledU32At(o int, val float64, sfName string) {
 	if !ok || math.IsNaN(val) {
 		return
 	}
-	x := uint32(clamp(math.Round(val/math.Pow10(int(s))), 0, math.MaxUint32))
+	x := uint32(clamp(math.Round(val/math.Pow10(int(s))), 0, maxValidU32))
 	v.setReg(o, uint16(x>>16))
 	v.setReg(o+1, uint16(x))
 }

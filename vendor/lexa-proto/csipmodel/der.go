@@ -268,6 +268,13 @@ type ExtendedDERControl struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERControl"`
 	Resource
 
+	// Event-base RespondableResource attributes (audit CSIP-004) — the
+	// extended (curve-linked) DERControl carries the same replyTo/
+	// responseRequired the plain DERControl does; see DERControl in
+	// resources.go for semantics. Additive/omitempty.
+	ReplyTo          string            `xml:"replyTo,attr,omitempty"`
+	ResponseRequired *ResponseRequired `xml:"responseRequired,attr,omitempty"`
+
 	MRID              string                 `xml:"mRID,omitempty"`
 	Description       string                 `xml:"description,omitempty"`
 	Version           uint16                 `xml:"version,omitempty"`

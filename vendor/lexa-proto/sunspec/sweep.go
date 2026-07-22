@@ -52,6 +52,15 @@ func SweepRoundTripSigned(sfs []int16) []string {
 		}
 		for r := 0; r <= 0xFFFF; r++ {
 			raw := uint16(r)
+			if raw == sentI16 {
+				// 0x8000 is the reserved NOT_IMPLEMENTED bit pattern for a signed
+				// point. ApplyScaleSigned still decodes it as the ordinary int16
+				// −32768 (FIX-B, read side), but the encoder deliberately never
+				// re-emits the reserved pattern for a data value: −32768 clamps to
+				// the max-valid 0x8001 (SUN-004). So the exact round-trip is not
+				// required at this one reserved pattern — see SweepSentinel.
+				continue
+			}
 			decoded := ApplyScaleSigned(raw, sf)
 			re := RawFromScaleSigned(decoded, sf)
 			if re != raw {
@@ -74,6 +83,12 @@ func SweepRoundTripUint(sfs []int16) []string {
 		}
 		for r := 0; r <= 0xFFFF; r++ {
 			raw := uint16(r)
+			if raw == sentU16 {
+				// 0xFFFF is the reserved NOT_IMPLEMENTED pattern for an unsigned
+				// point; 65535 clamps to the max-valid 0xFFFE on encode (SUN-004),
+				// so the exact round-trip is not required at this reserved pattern.
+				continue
+			}
 			decoded := ApplyScaleUint(raw, sf)
 			re := RawFromScaleUint(decoded, sf)
 			if re != raw {
@@ -120,12 +135,16 @@ func SweepWrapGuardSigned(sfs []int16) []string {
 			raw := RawFromScaleSigned(val, sf)
 			decoded := ApplyScaleSigned(raw, sf)
 
+			// Clamp to the MAX-VALID int16 edges, never the reserved sentinel:
+			// high +32767 (0x7FFF), low −32767 (0x8001). −32768/0x8000 is the
+			// reserved NOT_IMPLEMENTED pattern, so it is out of the valid data
+			// range and a value at/below it clamps to −32767 (audit SUN-004).
 			wantBase := base
-			if wantBase > math.MaxInt16 {
-				wantBase = math.MaxInt16
+			if wantBase > 32767 {
+				wantBase = 32767
 			}
-			if wantBase < math.MinInt16 {
-				wantBase = math.MinInt16
+			if wantBase < -32767 {
+				wantBase = -32767
 			}
 			want := float64(wantBase) * scale
 			if decoded != want {
@@ -185,9 +204,11 @@ func SweepWrapGuardUint(sfs []int16) []string {
 			raw := RawFromScaleUint(val, sf)
 			decoded := ApplyScaleUint(raw, sf)
 
+			// Clamp to the MAX-VALID uint16 edge 65534 (0xFFFE), never the
+			// reserved 0xFFFF sentinel; negative floors at 0 (audit SUN-004).
 			wantBase := base
-			if wantBase > math.MaxUint16 {
-				wantBase = math.MaxUint16
+			if wantBase > 65534 {
+				wantBase = 65534
 			}
 			if wantBase < 0 {
 				wantBase = 0
@@ -261,70 +282,86 @@ func SweepSentinel() []string {
 		}
 	}
 
-	// FIX-B pin: raw 0x8000 at a normal (non-sentinel) sf is an ordinary
-	// int16 value, -32768 -- NOT the "not implemented" marker.
+	// FIX-B pin (READ side, KEEP): raw 0x8000 at a normal (non-sentinel) sf is
+	// an ordinary int16 value, −32768 — it decodes to −32768, NOT NaN and NOT
+	// the "not implemented" marker (the MTR-4 bilateral-register-semantics
+	// guard: the sentinel guards the SCALE FACTOR, not raw register values).
+	//
+	// SUN-004 (WRITE side): re-encoding that same −32768 must NOT emit the
+	// reserved 0x8000 pattern — a finite value at the reserved negative extreme
+	// clamps to the max-valid −32767 (0x8001). So the read side keeps
+	// 0x8000 → −32768 while the write side maps −32768 → 0x8001; the round-trip
+	// intentionally does not hold at this one reserved bit pattern.
 	for _, sf := range ScaleFactors {
-		want := -32768.0 * math.Pow10(int(sf))
-		got := ApplyScaleSigned(0x8000, sf)
-		if got != want {
+		dec := -32768.0 * math.Pow10(int(sf))
+		if got := ApplyScaleSigned(0x8000, sf); got != dec {
 			violations = appendViolation(violations,
-				"FIX-B: ApplyScaleSigned(0x8000, %d) = %v, want %v (raw 0x8000 at a normal sf is an ordinary int16, not the sentinel)",
-				sf, got, want)
+				"FIX-B: ApplyScaleSigned(0x8000, %d) = %v, want %v (raw 0x8000 at a normal sf is an ordinary int16 −32768, not the sentinel)",
+				sf, got, dec)
 		}
-		if re := RawFromScaleSigned(want, sf); re != 0x8000 {
+		if re := RawFromScaleSigned(dec, sf); re != 0x8001 {
 			violations = appendViolation(violations,
-				"FIX-B: RawFromScaleSigned(%v, %d) = 0x%04x, want 0x8000 (must round-trip)",
-				want, sf, re)
+				"SUN-004: RawFromScaleSigned(%v, %d) = 0x%04x, want 0x8001 (finite −32768 clamps to max-valid −32767, never the reserved 0x8000 sentinel)",
+				dec, sf, re)
 		}
 	}
 
 	return violations
 }
 
-// SweepNaNInfEncode pins the (previously undocumented, now regression-swept)
-// behavior of the RawFromScale* encoders when handed a non-finite float:
-// encoding NaN/+-Inf must not produce a spurious sentinel raw value and must
-// not wrap -- it must clamp/degrade predictably (step 4).
+// SweepNaNInfEncode pins the RawFromScale* encoders' handling of the two
+// distinct out-of-range classes the codec must NOT conflate (audit SUN-004):
 //
-//   - NaN encodes to raw 0 (Go's float->int conversion of NaN; harmless
-//     because raw 0 decodes back to an ordinary in-range value, 0, not the
-//     sentinel raw 0x8000).
-//   - +Inf clamps to the maximum representable raw (MaxInt16 / MaxUint16).
-//   - -Inf clamps to the minimum representable raw (MinInt16 signed / 0
-//     unsigned).
+//   - NON-FINITE (NaN, ±Inf) — a genuinely unknown / unrepresentable value —
+//     encodes the reserved NOT_IMPLEMENTED sentinel (signed 0x8000, unsigned
+//     0xFFFF). This is correct: it marks the point "not implemented" on the
+//     wire, which is exactly what a value with no representable magnitude is.
+//
+//   - FINITE but out-of-range — a real, in-service measurement/command that
+//     merely exceeds the register's range — clamps to the MAX-VALID edge
+//     (signed +32767/−32767, unsigned 65534/0), NEVER the reserved sentinel.
+//     Encoding such a value AS 0x8000/0xFFFF would silently corrupt it into
+//     "not implemented" — the SUN-004 bug this test now guards against.
 func SweepNaNInfEncode() []string {
 	var violations []string
 	for _, sf := range ScaleFactors {
-		if got := RawFromScaleSigned(math.NaN(), sf); got != 0 {
-			violations = appendViolation(violations,
-				"RawFromScaleSigned(NaN, %d) = 0x%04x, want 0", sf, got)
-		}
-		if got := RawFromScaleUint(math.NaN(), sf); got != 0 {
-			violations = appendViolation(violations,
-				"RawFromScaleUint(NaN, %d) = 0x%04x, want 0", sf, got)
-		}
-
-		wantMaxSignedRaw := uint16(int16(math.MaxInt16))
-		if got := RawFromScaleSigned(math.Inf(1), sf); got != wantMaxSignedRaw {
-			violations = appendViolation(violations,
-				"RawFromScaleSigned(+Inf, %d) = 0x%04x, want 0x%04x (MaxInt16 clamp)",
-				sf, got, wantMaxSignedRaw)
-		}
-		if got := RawFromScaleUint(math.Inf(1), sf); got != math.MaxUint16 {
-			violations = appendViolation(violations,
-				"RawFromScaleUint(+Inf, %d) = 0x%04x, want 0xffff (MaxUint16 clamp)", sf, got)
+		// Non-finite ⇒ reserved NOT_IMPLEMENTED sentinel.
+		for _, nf := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+			if got := RawFromScaleSigned(nf, sf); got != sentI16 {
+				violations = appendViolation(violations,
+					"RawFromScaleSigned(%v, %d) = 0x%04x, want 0x8000 (non-finite → NOT_IMPLEMENTED sentinel)",
+					nf, sf, got)
+			}
+			if got := RawFromScaleUint(nf, sf); got != sentU16 {
+				violations = appendViolation(violations,
+					"RawFromScaleUint(%v, %d) = 0x%04x, want 0xffff (non-finite → NOT_IMPLEMENTED sentinel)",
+					nf, sf, got)
+			}
 		}
 
-		minInt16 := int16(math.MinInt16) // break constant folding: uint16(int16(-32768)) is a valid runtime reinterpretation (-> 0x8000) but not a valid constant conversion.
-		wantMinSignedRaw := uint16(minInt16)
-		if got := RawFromScaleSigned(math.Inf(-1), sf); got != wantMinSignedRaw {
+		// Finite but far out of range ⇒ MAX-VALID edge, never the sentinel.
+		scale := math.Pow10(int(sf))
+		hi := 1e6 * scale
+		lo := -1e6 * scale
+		if got := RawFromScaleSigned(hi, sf); got != 0x7FFF {
 			violations = appendViolation(violations,
-				"RawFromScaleSigned(-Inf, %d) = 0x%04x, want 0x%04x (MinInt16 clamp)",
-				sf, got, wantMinSignedRaw)
+				"RawFromScaleSigned(%g, %d) = 0x%04x, want 0x7fff (finite over-range high → max-valid +32767, not sentinel)",
+				hi, sf, got)
 		}
-		if got := RawFromScaleUint(math.Inf(-1), sf); got != 0 {
+		if got := RawFromScaleSigned(lo, sf); got != 0x8001 {
 			violations = appendViolation(violations,
-				"RawFromScaleUint(-Inf, %d) = 0x%04x, want 0 (negative clamp)", sf, got)
+				"RawFromScaleSigned(%g, %d) = 0x%04x, want 0x8001 (finite over-range low → max-valid −32767, not sentinel 0x8000)",
+				lo, sf, got)
+		}
+		if got := RawFromScaleUint(hi, sf); got != 0xFFFE {
+			violations = appendViolation(violations,
+				"RawFromScaleUint(%g, %d) = 0x%04x, want 0xfffe (finite over-range high → max-valid 65534, not sentinel 0xffff)",
+				hi, sf, got)
+		}
+		if got := RawFromScaleUint(lo, sf); got != 0 {
+			violations = appendViolation(violations,
+				"RawFromScaleUint(%g, %d) = 0x%04x, want 0 (finite negative → unsigned floor 0)",
+				lo, sf, got)
 		}
 	}
 	return violations
