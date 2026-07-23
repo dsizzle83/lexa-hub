@@ -2,6 +2,10 @@
 
 Status: **proposed** (contract shared with `lexa-hub`; hub-side implementation
 is net-new — see H.* units in ROADMAP.md) · Date: 2026-07-10
+· **Amended 2026-07-23: §v2 additive extension** (Ethernet status, WAN
+preference, static IPv4, active-uplink echo, held-connection disconnect —
+implementation contract: `lexa-platform/provision/{sec1,netmgr}`; the v1 body
+below is unchanged and remains a complete description of a v1 session)
 
 ## Context
 
@@ -162,3 +166,143 @@ stdlib/`x/crypto` (curve25519, hkdf); Dart side uses `package:cryptography`.
 - **Wired/mDNS-only TOFU (status quo of hub roadmap)**: requires the hub to
   already be online, which is exactly the bootstrap problem; blind TOFU also
   weakens the pinning story.
+
+---
+
+## v2 — additive extension (2026-07-23)
+
+Motivated by the P2 network-role pivot (`lan0` / `wan0` / `wifi-wan0`,
+wired-preferred failover by NetworkManager route metrics) and the P3
+BLE-provisioning close-out. **The GATT layout is UNCHANGED** — same service,
+same five characteristics, same UUIDs, same framing/crypto; v2 rides entirely
+inside existing message payloads as new optional JSON fields (plus one new
+`reason` enum value). No new characteristic was needed: every v2 datum is
+either read-time (info), join-scoped (config), or join-result-scoped (status),
+all of which already have a home.
+
+### Version signaling
+
+The info document's existing `"v"` field is the protocol version — the one
+version mechanism, per v1's convention; no parallel signal is introduced. A
+v2 hub reports `"v": 2`. Clients: read `v`; send v2 join fields only when
+`v >= 2` (a v1 hub would silently ignore them — tolerated but pointless).
+
+### Back-compat rules
+
+- **v1 client ↔ v2 hub**: works unchanged. New info/status fields are unknown
+  keys the client already tolerates (its parsers ignore unknown JSON keys);
+  the new failure reason `bad_config` parses through the client's
+  unknown-reason path as `internal`.
+- **v2 client ↔ v1 hub**: `v:1` tells the client not to expect or send v2
+  fields.
+- **Server tolerance**: every v2 field is optional; absence means exactly the
+  v1 behavior (DHCP, auto preference, no echo). A field that is *present but
+  structurally malformed* (wrong JSON type, bad CIDR) is rejected
+  **fail-closed** as `state:failed reason:"bad_config"` before any
+  NetworkManager call — it is never silently degraded to the default.
+
+### info (0002): Ethernet status
+
+```
+{"v":2,"serial":"...","fw":"...","commissioned":false,"sec":["sec1"],
+ "wan0":{"present":true,"link":"up"}}
+```
+
+- `wan0.present` — a `wan0`-role Ethernet device exists (NM device type 1
+  named `wan0`).
+- `wan0.link` — `"up"` iff NetworkManager reports the device ACTIVATED
+  (cable in AND addressing complete — i.e. genuinely online via wire, not
+  merely carrier), `"down"` otherwise, `"absent"` when `present` is false.
+- The whole `wan0` key is **omitted** when the hub cannot answer (no
+  NetworkManager wiring, or a read fault) — treat absence as "unknown",
+  not "absent".
+- UX intent: `link:"up"` lets the app offer "already online via cable —
+  skip Wi-Fi?".
+
+### join (config, 0005): WAN preference + static IPv4
+
+```
+{"op":"join","ssid":"...","psk":"...",
+ "wan_preference":"wired"|"wifi"|"auto",          // optional; absent = auto
+ "ipv4":{"method":"auto"}                          // optional; absent = auto
+       | {"method":"manual","address":"192.168.1.50/24",
+          "gateway":"192.168.1.1","dns":["9.9.9.9","1.1.1.1"]}}
+```
+
+- `wan_preference` selects the uplink policy via the route metric written
+  into the Wi-Fi profile (exact table below). `"auto"` ≡ absent ≡ the P2
+  default: wired-preferred failover. `"wifi"` makes Wi-Fi win the default
+  route **without disabling wired** (pull the cable and wired is still a
+  live failover target, and vice versa). `"wired"` is numerically identical
+  to auto today; the distinct value is reserved for a future hard-exclusive
+  mode. Unknown values → `bad_config`.
+- `ipv4.method:"manual"` requires `address` as IPv4 CIDR (`a.b.c.d/nn`,
+  1 ≤ nn ≤ 32, not unspecified/multicast); `gateway` optional (empty/absent =
+  none); `dns` optional, each entry a dotted-quad IPv4. Validation is
+  fail-closed on the hub (`bad_config`) **before** any NetworkManager call.
+  With `method:"auto"` (or the whole object absent) any address/gateway/dns
+  fields are ignored.
+- New failure reason: `reason ∈ {not_found, auth_failed, dhcp_timeout,
+  timeout, internal, bad_config}`. v1 clients degrade `bad_config` →
+  `internal` by their unknown-reason rule.
+
+### Route-metric semantics (the exact contract)
+
+The hub ALWAYS writes the failover-policy keys explicitly into the profile it
+creates (mirroring the image's `10-lexa-wifi-wan0.conf` connection default,
+so a BLE-provisioned profile behaves identically to a hand-added one — and
+independently of that conf.d file):
+
+| Profile / key | auto (default) | "wired" | "wifi" |
+|---|---|---|---|
+| wan0 profile `ipv4/ipv6.route-metric` (shipped in image, not touched by BLE) | 100 | 100 | 100 |
+| BLE Wi-Fi profile `ipv4.route-metric` | 200 | 200 | **90** |
+| BLE Wi-Fi profile `ipv6.route-metric` | 200 | 200 | **90** |
+| BLE Wi-Fi profile `connection.autoconnect-priority` | 0 | 0 | 0 |
+| Default-route winner with both links up | wan0 | wan0 | wifi-wan0 |
+
+Lower metric wins; NM withdraws a downed interface's routes, so failover in
+both directions is pure metric arithmetic — no scripting, no profile
+disable/enable. `autoconnect-priority` stays 0 in all modes (it orders NM's
+autoconnect candidates per device; it does not affect routing).
+
+### state (status, 0006): active-uplink echo
+
+```
+{"op":"state","state":"joined","ip":"...","port":9100,
+ "api_cert_fp":"...","token":"...","serial":"...",
+ "active_uplink":"wan0"}
+```
+
+- `active_uplink` ∈ `{"wan0","wifi-wan0"}` or omitted. Read from
+  NetworkManager's PrimaryConnection (which IS the route-metric winner) at
+  join-success time, best-effort. With wired-preferred defaults and a live
+  cable it is **legitimately `"wan0"` right after a successful Wi-Fi join** —
+  that tells the app "Wi-Fi is configured as failover; you're online via
+  cable". Omitted when unknown or when the primary is a non-role interface
+  (bench pre-rename devices, `lan0` is never-default by profile).
+
+### Advertising amendment: held-connection disconnect
+
+v1's throttle ("after 3 failed PoP handshakes: stop advertising for 5
+minutes") gates only NEW advertising — a central that stays connected never
+re-meets it and could grind PoPs at BLE round-trip speed. v2 closes this:
+after **3 consecutive** `pop_mismatch` on one connection (same threshold as
+the advertising throttle, and the same failures feed it), the hub forcibly
+disconnects the central (BlueZ `Device1.Disconnect`) and recycles the
+session. A successful confirm resets the consecutive count (the counterpart
+that knows the PoP is not grinding). Client impact: none for correct
+implementations; a client whose user typo'd the setup code 3 times must
+reconnect — and will find the radio silent for the throttle window, exactly
+as v1 already promised.
+
+### What a v2 demo client must implement
+
+1. Read info; require `v >= 2` for the features below (else run v1 flow).
+2. Optionally surface `wan0.link == "up"` as "skip Wi-Fi?".
+3. Optionally send `wan_preference` and/or `ipv4` in the join op (omit both
+   for pure-v1 behavior; expect `state:failed reason:"bad_config"` on
+   malformed input rather than a partial apply).
+4. Optionally display `active_uplink` from the joined state (absent = show
+   nothing).
+5. Treat the 3-strike disconnect as a normal disconnect + retry-later UX.
